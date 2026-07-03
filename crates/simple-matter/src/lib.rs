@@ -15,6 +15,7 @@ pub mod crypto;
 pub mod error;
 pub mod exchange;
 pub mod fabric;
+pub mod im;
 pub mod sc;
 pub mod tlv;
 pub mod transport;

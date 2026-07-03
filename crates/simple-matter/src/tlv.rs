@@ -449,6 +449,20 @@ impl<'a> TlvReader<'a> {
         }
         Ok(())
     }
+
+    /// 次の要素(コンテナならその全体)を 1 つ読み進め、その要素の生エンコード
+    /// バイト列(制御バイトから末尾まで、元のタグを含む)を借用スライスで返す。
+    ///
+    /// Interaction Model の属性値/コマンドフィールドのように「TLV 要素をそのまま
+    /// 転写する」用途で使う。終端に達している場合は `Error::Decode`。
+    pub fn take_element_raw(&mut self) -> Result<&'a [u8]> {
+        let start = self.pos;
+        let elem = self.read_next()?.ok_or(Error::Decode)?;
+        if matches!(elem.value, TlvValue::ContainerStart(_)) {
+            self.exit_container()?;
+        }
+        self.buf.get(start..self.pos).ok_or(Error::Decode)
+    }
 }
 
 /// `&mut [u8]` に書き込むストリーミング TLV ライタ。
