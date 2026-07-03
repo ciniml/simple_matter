@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: thumbv6m-none-eabi, riscv32imc-unknown-none-elf
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-features -- -D warnings
+      - name: Test (host)
+        run: cargo test --all-features
+      - name: Check no_std (Cortex-M0)
+        run: cargo check --all-features --target thumbv6m-none-eabi
+      - name: Check no_std (RISC-V)
+        run: cargo check --all-features --target riscv32imc-unknown-none-elf
