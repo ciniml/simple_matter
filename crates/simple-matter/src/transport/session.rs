@@ -36,7 +36,7 @@ use crate::transport::net::PeerAddr;
 use crate::transport::secure::{AeadKeyRef, SecureCodec};
 use crate::transport::util::ParseBuf;
 
-mod fixed;
+pub mod fixed;
 use fixed::FixedVec;
 
 /// セッションの安定ハンドル。
@@ -50,6 +50,14 @@ impl SessionId {
     /// 内部の生値を返す(ロギング用途など)。
     pub const fn as_raw(self) -> u32 {
         self.0
+    }
+
+    /// 生値から [`SessionId`] を構築する。
+    ///
+    /// 通常は [`SessionManager`] が採番するが、上位層(exchange)がハンドルを合成する
+    /// 用途やテストのために公開する。
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
     }
 }
 
@@ -590,6 +598,10 @@ impl<const SESSIONS: usize> SessionManager<SESSIONS> {
     /// アプリケーション payload を指す。セッション不明は [`Error::NotFound`]、
     /// 復号失敗は [`Error::Crypto`]、リプレイ/重複は [`Error::Duplicate`]。
     ///
+    /// exchange 層は重複メッセージでも再 ACK 判定のため PayloadHeader を必要とするため、
+    /// 実処理は [`decode_rx_detailed`](Self::decode_rx_detailed) に委譲し、本関数はその
+    /// 薄いラッパとして重複を [`Error::Duplicate`] に射影する(既存呼び出し互換)。
+    ///
     /// # 設計との乖離(§10 のデータフロー順序)
     ///
     /// §10 の全体像スケッチはリプレイ判定を復号の**前**に置くが、本実装は参照実装
@@ -604,6 +616,29 @@ impl<const SESSIONS: usize> SessionManager<SESSIONS> {
         now_ms: u64,
         buf: &mut ParseBuf<'_>,
     ) -> Result<(SessionId, PayloadHeader)> {
+        let decoded = self.decode_rx_detailed(crypto, peer, now_ms, buf)?;
+        if decoded.duplicate {
+            return Err(Error::Duplicate);
+        }
+        Ok((decoded.session, decoded.header))
+    }
+
+    /// 二段デコードを行い、重複でも [`PayloadHeader`] を保持したまま結果を返す。
+    ///
+    /// [`decode_rx`](Self::decode_rx) と手順は同じだが、リプレイ窓で弾かれた場合でも
+    /// エラーにせず [`DecodedRx::duplicate`] を `true` にして返す。exchange 層は重複した
+    /// 信頼メッセージに対し ACK を再送する(こちらの ACK がロストした可能性への対処、
+    /// 設計 §6)ため、重複時も Exchange ID や信頼フラグ・受信カウンタを知る必要がある。
+    ///
+    /// 窓は重複時には進めない([`PeerWindow::accept`] が `false` 時に状態を変えない)。
+    /// セッション不明は [`Error::NotFound`]、復号失敗は [`Error::Crypto`]。
+    pub fn decode_rx_detailed<C: Crypto>(
+        &mut self,
+        crypto: &C,
+        peer: PeerAddr,
+        now_ms: u64,
+        buf: &mut ParseBuf<'_>,
+    ) -> Result<DecodedRx> {
         // 1. 平文ヘッダ。
         let pkt = PacketHeader::decode(buf)?;
 
@@ -622,12 +657,31 @@ impl<const SESSIONS: usize> SessionManager<SESSIONS> {
         // 4. リプレイ窓を復号後に進める(§10 との乖離、上記参照)。
         let session = self.get_mut(id, now_ms).ok_or(Error::NotFound)?;
         let encrypted = session.is_encrypted();
-        if !session.rx_window.accept(pkt.ctr, encrypted) {
-            return Err(Error::Duplicate);
-        }
+        let accepted = session.rx_window.accept(pkt.ctr, encrypted);
 
-        Ok((id, phdr))
+        Ok(DecodedRx {
+            session: id,
+            header: phdr,
+            msg_ctr: pkt.ctr,
+            duplicate: !accepted,
+        })
     }
+}
+
+/// [`SessionManager::decode_rx_detailed`] の結果。
+///
+/// 復号済みの [`PayloadHeader`] に加え、ACK 生成に必要な受信メッセージカウンタと、
+/// リプレイ窓による重複判定を持つ。
+#[derive(Debug, Clone, Copy)]
+pub struct DecodedRx {
+    /// 解決したセッションの安定ハンドル。
+    pub session: SessionId,
+    /// 復号済みの暗号内ヘッダ。
+    pub header: PayloadHeader,
+    /// 受信メッセージカウンタ([`PacketHeader::ctr`])。ACK 対象として用いる。
+    pub msg_ctr: u32,
+    /// リプレイ窓で重複/窓外と判定された(受理はしていない)なら `true`。
+    pub duplicate: bool,
 }
 
 #[cfg(test)]

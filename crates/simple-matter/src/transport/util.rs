@@ -186,6 +186,19 @@ impl<'a> WriteBuf<'a> {
         &mut self.buf[self.start..self.end]
     }
 
+    /// 書き込み済み領域の先頭オフセット(バッファ先頭からのバイト数)を返す。
+    ///
+    /// [`prepend`](WriteBuf::prepend) でヘッダを前置した後、組み上がったパケットが
+    /// バッファ内のどこから始まるかを知るために用いる(バッファ先頭へ詰め直す等)。
+    pub const fn start(&self) -> usize {
+        self.start
+    }
+
+    /// 書き込み済み領域の末尾オフセット(バッファ先頭からのバイト数)を返す。
+    pub const fn end(&self) -> usize {
+        self.end
+    }
+
     /// 書き込み済み領域の長さ(バイト数)を返す。
     pub const fn len(&self) -> usize {
         self.end - self.start
