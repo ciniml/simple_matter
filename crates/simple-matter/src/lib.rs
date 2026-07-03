@@ -12,6 +12,7 @@
 pub mod buf;
 pub mod cert;
 pub mod crypto;
+pub mod discovery;
 pub mod dm;
 pub mod error;
 pub mod exchange;

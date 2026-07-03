@@ -11,19 +11,25 @@
 //! - EP1: On/Off / Descriptor
 //! - パスコード 20202021 + テスト DAC([`TestDacProvider`])。On/Off 変化を `println!`。
 //!
-//! mDNS(コミッショナブル/オペレーショナル広告)は本ピースのスコープ外(次ピース)。
-//! 動作確認はテストクライアント(`stack::tests` のメモリ内縦通し)で行う。実機では
-//! `UDP/5540` に手動でコミッショナを向ける、または mDNS ピースの追加後に自動発見する。
+//! mDNS ディスカバリ(commissionable / operational 広告)を
+//! [`MdnsResponder`](simple_matter::discovery::MdnsResponder) で駆動する。sans-IO の
+//! レスポンダはソケットに触れず、この example が 224.0.0.251:5353 の送受信を担う
+//! (`join_multicast_v4`)。コミッショニングで fabric が増えたら operational 広告に
+//! 反映する。mDNS ソケットを開けない環境(既存の avahi 等)では警告して継続する。
 //!
 //! 実行: `cargo run --example onoff-light`
 
 use std::cell::RefCell;
 use std::io::ErrorKind;
-use std::net::UdpSocket;
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use simple_matter::crypto::rustcrypto::RustCrypto;
 use simple_matter::crypto::Rng;
+use simple_matter::discovery::{
+    Commissionable, CommissioningMode, Host, MdnsResponder, Operational, MATTER_PORT, MDNS_IPV4,
+    MDNS_PORT,
+};
 use simple_matter::dm::clusters::{
     BasicInfoConfig, BasicInformationCluster, DescriptorCluster, GeneralCommissioning,
     NetworkCommissioning, OnOffCluster, OpCredsCluster, TestDacProvider,
@@ -39,6 +45,11 @@ use simple_matter::transport::net::{PeerAddr, MAX_RX_PACKET_SIZE};
 const PASSCODE: u32 = 20202021;
 const SALT: [u8; 16] = *b"SPAKE2P Key Salt";
 const NF: usize = 5;
+
+/// コミッショニング discriminator(12 ビット)。chip-tool の既定テスト値。
+const DISCRIMINATOR: u16 = 3840;
+/// mDNS インスタンス識別子(hostname / commissionable インスタンス名の素)。
+const MDNS_INSTANCE_ID: u64 = 0x0011_2233_4455_6677;
 
 type Backend = RustCrypto<DemoRng>;
 type Dac = TestDacProvider<Backend>;
@@ -185,30 +196,48 @@ fn main() -> std::io::Result<()> {
     let mut stack: DefaultStack<Backend, DemoRng, Light> = MatterStack::new(&crypto, sc, im);
 
     let socket = UdpSocket::bind("0.0.0.0:5540")?;
+    socket.set_nonblocking(true)?;
     let start = Instant::now();
     let now_ms = |start: &Instant| start.elapsed().as_millis() as u64;
 
+    // --- mDNS ディスカバリ ---
+    let local_ipv4 = discover_local_ipv4();
+    let mac = MDNS_INSTANCE_ID.to_be_bytes(); // 下位 6 バイトをホスト名(MAC 相当)に使う
+    let host = Host::from_mac(&mac[2..8], None, Some(local_ipv4));
+    let mut mdns: MdnsResponder<NF> = MdnsResponder::new(host, MATTER_PORT);
+    mdns.set_commissionable(Some(Commissionable {
+        device_type: Some(0x0100),
+        device_name: Some(CFG.product_name),
+        ..Commissionable::new(
+            MDNS_INSTANCE_ID,
+            DISCRIMINATOR,
+            CFG.vendor_id,
+            CFG.product_id,
+            CommissioningMode::Standard,
+        )
+    }));
+    let mdns_socket = open_mdns_socket();
+
     println!("simple-matter On/Off light listening on UDP/5540");
-    println!("  passcode: {PASSCODE}");
-    println!("  (mDNS discovery is out of scope; point a commissioner at this UDP port.)");
+    println!("  passcode: {PASSCODE}  discriminator: {DISCRIMINATOR}");
+    match &mdns_socket {
+        Some(_) => println!("  mDNS advertising on 224.0.0.251:5353 (A record: {local_ipv4})"),
+        None => println!("  (mDNS socket unavailable; point a commissioner at this UDP port.)"),
+    }
 
     let mut rx = [0u8; MAX_RX_PACKET_SIZE];
     let mut tx = [0u8; MAX_RX_PACKET_SIZE];
+    let mut mdns_rx = [0u8; 1500];
+    let mut mdns_tx = [0u8; 1500];
+    // 直近に広告済みの fabric 世代(変化検知に使う)。
+    let mut last_generation = fabrics.borrow().generation();
 
     loop {
-        // 次に処理すべき期限まで recv をブロックする(なければ 1 秒でタイムアウト)。
-        let now = now_ms(&start);
-        let timeout = match stack.next_deadline(now) {
-            Some(d) => Duration::from_millis(d.saturating_sub(now).max(1)),
-            None => Duration::from_secs(1),
-        };
-        socket.set_read_timeout(Some(timeout))?;
-
+        // 1) Matter UDP の受信処理。
         match socket.recv_from(&mut rx) {
             Ok((n, src)) => {
-                let peer = PeerAddr::Udp(src);
                 let now = now_ms(&start);
-                if let Some(dir) = stack.handle_rx(&mut rx[..n], peer, now, &mut tx) {
+                if let Some(dir) = stack.handle_rx(&mut rx[..n], PeerAddr::Udp(src), now, &mut tx) {
                     if let Some(addr) = dir.addr.socket_addr() {
                         let _ = socket.send_to(&tx[..dir.len], addr);
                     }
@@ -218,12 +247,74 @@ fn main() -> std::io::Result<()> {
             Err(e) => return Err(e),
         }
 
-        // 時間駆動の送出(MRP 再送・standalone ACK・購読レポート)を排出する。
+        // 2) 時間駆動の送出(MRP 再送・standalone ACK・購読レポート)を排出する。
         let now = now_ms(&start);
         while let Some(dir) = stack.poll(now, &mut tx) {
             if let Some(addr) = dir.addr.socket_addr() {
                 let _ = socket.send_to(&tx[..dir.len], addr);
             }
         }
+
+        // 3) fabric が増減したら operational 広告に反映して再 announce。
+        let gen = fabrics.borrow().generation();
+        if gen != last_generation {
+            last_generation = gen;
+            let ops: Vec<Operational> = fabrics
+                .borrow()
+                .iter()
+                .map(|f| Operational::new(f.compressed_fabric_id(), f.node_id()))
+                .collect();
+            mdns.set_operational(ops);
+            mdns.notify_change(now_ms(&start));
+        }
+
+        // 4) mDNS の受信応答と announce。
+        if let Some(msock) = &mdns_socket {
+            match msock.recv_from(&mut mdns_rx) {
+                Ok((n, _src)) => {
+                    if let Some(len) = mdns.handle_query(&mdns_rx[..n], &mut mdns_tx) {
+                        let _ = msock.send_to(&mdns_tx[..len], (MDNS_IPV4, MDNS_PORT));
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
+                Err(_) => {}
+            }
+            if let Some(len) = mdns.poll_announce(now_ms(&start), &mut mdns_tx) {
+                let _ = msock.send_to(&mdns_tx[..len], (MDNS_IPV4, MDNS_PORT));
+            }
+        }
+
+        // ビジーループ回避のため短くスリープする(sans-IO なので駆動間隔は任意)。
+        std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// mDNS 用 UDP ソケットを開き、224.0.0.251 のマルチキャストグループに参加する。
+///
+/// ポート 5353 を他プロセス(avahi 等)が使用中なら `None` を返し、example は mDNS
+/// 無しで継続する。
+fn open_mdns_socket() -> Option<UdpSocket> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, MDNS_PORT)).ok()?;
+    socket
+        .join_multicast_v4(&MDNS_IPV4, &Ipv4Addr::UNSPECIFIED)
+        .ok()?;
+    socket.set_nonblocking(true).ok()?;
+    Some(socket)
+}
+
+/// ローカルの IPv4 アドレスを推定する(外部宛 UDP ソケットの `local_addr` から)。
+///
+/// 実際にはパケットを送らない。取得できない場合はループバックを返す。
+fn discover_local_ipv4() -> Ipv4Addr {
+    UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .and_then(|s| {
+            s.connect((Ipv4Addr::new(8, 8, 8, 8), 53))?;
+            s.local_addr()
+        })
+        .ok()
+        .and_then(|addr| match addr {
+            SocketAddr::V4(v4) => Some(*v4.ip()),
+            SocketAddr::V6(_) => None,
+        })
+        .unwrap_or(Ipv4Addr::LOCALHOST)
 }
