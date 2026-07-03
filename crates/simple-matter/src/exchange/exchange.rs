@@ -453,6 +453,12 @@ impl<H, const EXCHANGES: usize> ExchangeManager<H, EXCHANGES> {
     ///
     /// セッション不明は [`Error::NotFound`]、復号失敗は [`Error::Crypto`]、会話プール枯渇は
     /// [`Error::NoSpace`]。不正入力・枯渇でも `panic` しない。
+    ///
+    /// `tx` はハンドラが応答 payload を書くための出力バッファ。ハンドラが
+    /// [`HandlerAction::Respond`] / [`HandlerAction::Close`] を返した場合、
+    /// [`RecvReport::action`] にその宣言(opcode / len 等)が載る。呼び出し側は
+    /// `tx[..len]` を [`send_reliable`](Self::send_reliable) /
+    /// [`send_unreliable`](Self::send_unreliable) で送出する(送受信分離)。
     pub fn recv<C: Crypto, const SESSIONS: usize>(
         &mut self,
         sessions: &mut SessionManager<SESSIONS>,
@@ -460,6 +466,7 @@ impl<H, const EXCHANGES: usize> ExchangeManager<H, EXCHANGES> {
         peer: PeerAddr,
         now_ms: u64,
         datagram: &mut [u8],
+        tx: &mut [u8],
     ) -> Result<RecvReport>
     where
         H: Dispatcher,
@@ -528,7 +535,10 @@ impl<H, const EXCHANGES: usize> ExchangeManager<H, EXCHANGES> {
             exchange: handle,
             role,
         };
-        if let Ok(action) = self.handler.dispatch(phdr.proto_id, &rx) {
+        if let Ok(action) = self
+            .handler
+            .dispatch(phdr.proto_id, &rx, tx, sessions, now_ms)
+        {
             report.action = action;
             report.dispatched = true;
         }
@@ -782,7 +792,14 @@ mod tests {
         calls: u32,
     }
     impl Dispatcher for RecordingDispatcher {
-        fn dispatch(&mut self, proto_id: u16, _rx: &RxMessage<'_>) -> Result<HandlerAction> {
+        fn dispatch<const S: usize>(
+            &mut self,
+            proto_id: u16,
+            _rx: &RxMessage<'_>,
+            _tx: &mut [u8],
+            _sessions: &mut SessionManager<S>,
+            _now_ms: u64,
+        ) -> Result<HandlerAction> {
             self.last_proto = Some(proto_id);
             self.calls += 1;
             Ok(HandlerAction::None)
@@ -936,8 +953,15 @@ mod tests {
             initiator: true,
         };
         let n = build_incoming(&crypto(), &base, &mut wire);
-        mgr.recv(&mut sessions, &crypto(), peer, 10, &mut wire[..n])
-            .unwrap();
+        mgr.recv(
+            &mut sessions,
+            &crypto(),
+            peer,
+            10,
+            &mut wire[..n],
+            &mut [0u8; 512],
+        )
+        .unwrap();
         // 別 exch_id の新規 responder はプール満杯で NoSpace。
         let m2 = Incoming {
             ctr: 2,
@@ -946,7 +970,14 @@ mod tests {
         };
         let n2 = build_incoming(&crypto(), &m2, &mut wire);
         assert_eq!(
-            mgr.recv(&mut sessions, &crypto(), peer, 11, &mut wire[..n2]),
+            mgr.recv(
+                &mut sessions,
+                &crypto(),
+                peer,
+                11,
+                &mut wire[..n2],
+                &mut [0u8; 512]
+            ),
             Err(Error::NoSpace)
         );
     }
@@ -974,7 +1005,14 @@ mod tests {
         };
         let n = build_incoming(&crypto(), &m, &mut wire);
         let report = mgr
-            .recv(&mut sessions, &crypto(), peer, 10, &mut wire[..n])
+            .recv(
+                &mut sessions,
+                &crypto(),
+                peer,
+                10,
+                &mut wire[..n],
+                &mut [0u8; 512],
+            )
             .unwrap();
         assert!(report.dispatched);
         assert!(!report.duplicate);
@@ -987,7 +1025,14 @@ mod tests {
         let m2 = Incoming { ctr: 2, ..m };
         let n2 = build_incoming(&crypto(), &m2, &mut wire);
         let r2 = mgr
-            .recv(&mut sessions, &crypto(), peer, 11, &mut wire[..n2])
+            .recv(
+                &mut sessions,
+                &crypto(),
+                peer,
+                11,
+                &mut wire[..n2],
+                &mut [0u8; 512],
+            )
             .unwrap();
         assert_eq!(r2.exchange, Some(ex));
         assert_eq!(mgr.len(), 1);
@@ -1017,7 +1062,14 @@ mod tests {
         };
         let n = build_incoming(&crypto(), &m, &mut wire);
         let report = mgr
-            .recv(&mut sessions, &crypto(), peer, 1000, &mut wire[..n])
+            .recv(
+                &mut sessions,
+                &crypto(),
+                peer,
+                1000,
+                &mut wire[..n],
+                &mut [0u8; 512],
+            )
             .unwrap();
         assert!(report.dispatched);
         let ex = report.exchange.unwrap();
@@ -1076,7 +1128,14 @@ mod tests {
         let mut wire = [0u8; 256];
         let n = build_incoming(&crypto(), &m, &mut wire);
         let r1 = mgr
-            .recv(&mut sessions, &crypto(), peer, 1000, &mut wire[..n])
+            .recv(
+                &mut sessions,
+                &crypto(),
+                peer,
+                1000,
+                &mut wire[..n],
+                &mut [0u8; 512],
+            )
             .unwrap();
         assert!(r1.dispatched);
         let ex = r1.exchange.unwrap();
@@ -1084,7 +1143,14 @@ mod tests {
         // 同一 ctr の再送(リプレイ)。ディスパッチせず重複扱い。
         let n2 = build_incoming(&crypto(), &m, &mut wire);
         let r2 = mgr
-            .recv(&mut sessions, &crypto(), peer, 1500, &mut wire[..n2])
+            .recv(
+                &mut sessions,
+                &crypto(),
+                peer,
+                1500,
+                &mut wire[..n2],
+                &mut [0u8; 512],
+            )
             .unwrap();
         assert!(r2.duplicate);
         assert!(!r2.dispatched);
@@ -1122,7 +1188,14 @@ mod tests {
         let mut wire = [0u8; 256];
         let n = build_incoming(&crypto(), &m, &mut wire);
         let report = mgr
-            .recv(&mut sessions, &crypto(), peer, 10, &mut wire[..n])
+            .recv(
+                &mut sessions,
+                &crypto(),
+                peer,
+                10,
+                &mut wire[..n],
+                &mut [0u8; 512],
+            )
             .unwrap();
         assert!(!report.dispatched);
         assert!(report.exchange.is_none());
@@ -1151,7 +1224,14 @@ mod tests {
         // 別のアドレスからにしてセッション照合を外す。
         let other = addr(9999);
         assert_eq!(
-            mgr.recv(&mut sessions, &crypto(), other, 0, &mut wire[..n]),
+            mgr.recv(
+                &mut sessions,
+                &crypto(),
+                other,
+                0,
+                &mut wire[..n],
+                &mut [0u8; 512]
+            ),
             Err(Error::NotFound)
         );
     }
@@ -1182,7 +1262,14 @@ mod tests {
         let mut wire = [0u8; 256];
         let n0 = build_incoming(&crypto(), &m0, &mut wire);
         let ex = mgr
-            .recv(&mut sessions, &crypto(), peer, 100, &mut wire[..n0])
+            .recv(
+                &mut sessions,
+                &crypto(),
+                peer,
+                100,
+                &mut wire[..n0],
+                &mut [0u8; 512],
+            )
             .unwrap()
             .exchange
             .unwrap();
@@ -1223,7 +1310,14 @@ mod tests {
         };
         let na = build_incoming(&crypto(), &m_ack, &mut wire);
         let report = mgr
-            .recv(&mut sessions, &crypto(), peer, 300, &mut wire[..na])
+            .recv(
+                &mut sessions,
+                &crypto(),
+                peer,
+                300,
+                &mut wire[..na],
+                &mut [0u8; 512],
+            )
             .unwrap();
         assert_eq!(report.freed_tx, Some(sent.buf));
         assert!(!mgr.is_retrans_pending(ex));
@@ -1336,7 +1430,14 @@ mod tests {
         let mut wire = [0u8; 256];
         let n = build_incoming(&crypto(), &m, &mut wire);
         let ex = mgr
-            .recv(&mut sessions, &crypto(), peer, 1000, &mut wire[..n])
+            .recv(
+                &mut sessions,
+                &crypto(),
+                peer,
+                1000,
+                &mut wire[..n],
+                &mut [0u8; 512],
+            )
             .unwrap()
             .exchange
             .unwrap();

@@ -286,6 +286,138 @@ impl Spake2pVerifier {
     }
 }
 
+/// SPAKE2+ prover(commissioner / initiator)側の演算。
+///
+/// デバイス(responder)実装の対向として、コミッショナ側の pA 生成と
+/// cA / Ke 導出を提供する。本体は責務外(sc 層はデバイス側のみ)だが、PASE
+/// フルハンドシェイクの結合テストやコントローラ用途のために対称なプリミティブを
+/// 同一モジュール(楕円曲線算術が集約された箇所)に置く。
+///
+/// 典型的な流れ:
+/// 1. [`Spake2pProver::from_passcode`] でパスコードから prover を作り、`pA` を得て送る。
+/// 2. responder の `pB` を [`Spake2pProver::confirm`] に渡し確認値を計算する。
+/// 3. [`Spake2pProverConfirm::confirmation_a`](cA)を送り、
+///    [`Spake2pProverConfirm::verify_b`] で cB を検証する。
+/// 4. [`Spake2pProverConfirm::shared_secret`](Ke)をセッション鍵に用いる。
+pub struct Spake2pProver {
+    w0: Scalar,
+    w1: Scalar,
+    x: Scalar,
+    pa: [u8; SPAKE2P_POINT_LEN],
+}
+
+impl Spake2pProver {
+    /// パスコード・salt・iteration count と乱数スカラ x から prover を構築する。
+    ///
+    /// `pA = x*P + w0*M` を計算して内部に保持する。
+    ///
+    /// # 失敗
+    /// PBKDF2 導出や点算術に失敗した場合は [`Error::Crypto`] を返す(panic しない)。
+    pub fn from_passcode<R: Rng>(
+        rng: &mut R,
+        passcode: u32,
+        salt: &[u8],
+        iterations: u32,
+    ) -> Result<Self> {
+        let (w0, w1) = compute_w0_w1(passcode, salt, iterations)?;
+        let x = generate_scalar(rng)?;
+        let m_pt = decode_valid_point(&MATTER_M)?;
+        let pa_pt = ProjectivePoint::GENERATOR * x + m_pt * w0;
+        let pa = encode_point(&pa_pt)?;
+        Ok(Self { w0, w1, x, pa })
+    }
+
+    /// prover の共有点 `pA`(SEC1 非圧縮 65 バイト)を返す。
+    pub fn share(&self) -> &[u8; SPAKE2P_POINT_LEN] {
+        &self.pa
+    }
+
+    /// responder の共有点 `pB` を受けて確認値と共有鍵を導出する。
+    ///
+    /// `context` は verifier 側と同一のトランスクリプトコンテキスト(Matter では
+    /// 32 バイトのコンテキストハッシュ)。識別子は Matter 仕様に従い空とする。
+    ///
+    /// # 失敗
+    /// `pB` が不正な点である・内部演算に失敗した場合は [`Error::Crypto`] を返す。
+    pub fn confirm(
+        &self,
+        context: &[u8],
+        pb: &[u8; SPAKE2P_POINT_LEN],
+    ) -> Result<Spake2pProverConfirm> {
+        let n_pt = decode_valid_point(&MATTER_N)?;
+        let pb_pt = decode_valid_point(pb)?;
+
+        // Y* = pB - w0*N,  Z = x*Y*,  V = w1*Y*
+        let y_star = pb_pt - n_pt * self.w0;
+        let z_pt = y_star * self.x;
+        let v_pt = y_star * self.w1;
+        let z = encode_point(&z_pt)?;
+        let v = encode_point(&v_pt)?;
+
+        let mut w0_bytes = Zeroizing::new([0u8; SPAKE2P_SCALAR_LEN]);
+        w0_bytes.copy_from_slice(&self.w0.to_repr());
+
+        // TT を verifier と同一順序で構成する。
+        let mut tt = Sha256::new();
+        tt_add(&mut tt, context);
+        tt_add(&mut tt, &[]);
+        tt_add(&mut tt, &[]);
+        tt_add(&mut tt, &MATTER_M);
+        tt_add(&mut tt, &MATTER_N);
+        tt_add(&mut tt, &self.pa);
+        tt_add(&mut tt, pb);
+        tt_add(&mut tt, &z);
+        tt_add(&mut tt, &v);
+        tt_add(&mut tt, &w0_bytes[..]);
+        let tt_hash: [u8; 32] = tt.finalize().into();
+
+        let mut ka = Zeroizing::new([0u8; 16]);
+        ka.copy_from_slice(&tt_hash[..16]);
+        let mut ke = Zeroizing::new([0u8; SPAKE2P_KE_LEN]);
+        ke.copy_from_slice(&tt_hash[16..]);
+
+        let mut kca_kcb = Zeroizing::new([0u8; 32]);
+        hkdf_sha256(&[], &ka[..], KEY_CONFIRM_INFO, &mut kca_kcb[..])?;
+
+        let mut ca = [0u8; SPAKE2P_CONFIRMATION_LEN];
+        hmac_sha256(&kca_kcb[..16], pb, &mut ca)?;
+        let mut cb = [0u8; SPAKE2P_CONFIRMATION_LEN];
+        hmac_sha256(&kca_kcb[16..], &self.pa, &mut cb)?;
+
+        Ok(Spake2pProverConfirm { ke, ca, cb })
+    }
+}
+
+/// [`Spake2pProver::confirm`] の結果(確認値と共有鍵)。
+pub struct Spake2pProverConfirm {
+    ke: Zeroizing<[u8; SPAKE2P_KE_LEN]>,
+    ca: [u8; SPAKE2P_CONFIRMATION_LEN],
+    cb: [u8; SPAKE2P_CONFIRMATION_LEN],
+}
+
+impl Spake2pProverConfirm {
+    /// responder へ送る確認値 cA(= HMAC(KcA, pB))を返す。
+    pub fn confirmation_a(&self) -> &[u8; SPAKE2P_CONFIRMATION_LEN] {
+        &self.ca
+    }
+
+    /// responder から受信した確認値 cB を定数時間で照合する。
+    ///
+    /// 一致すれば `Ok(())`、不一致なら [`Error::Crypto`]。
+    pub fn verify_b(&self, cb: &[u8; SPAKE2P_CONFIRMATION_LEN]) -> Result<()> {
+        if self.cb.ct_eq(cb).into() {
+            Ok(())
+        } else {
+            Err(Error::Crypto)
+        }
+    }
+
+    /// 導出された共有鍵 Ke(16 バイト)を返す。
+    pub fn shared_secret(&self) -> &[u8; SPAKE2P_KE_LEN] {
+        &self.ke
+    }
+}
+
 /// トランスクリプト TT に 1 要素を追加する。
 ///
 /// 各要素は「8 バイトリトルエンディアンの長さ || データ」として連結する
@@ -610,6 +742,55 @@ mod tests {
         assert_eq!(
             Spake2pVerifier::respond(&mut rng, RFC_CONTEXT, &params, &bad_pa).err(),
             Some(Error::Crypto)
+        );
+    }
+
+    // prover(commissioner)と verifier(device)が同一パスコードから同じ Ke へ
+    // 到達し、互いの確認値 cA / cB を検証できること(空識別子 = Matter モード)。
+    #[test]
+    fn prover_verifier_round_trip() {
+        let salt: [u8; 16] = [
+            0x04, 0xa1, 0xd2, 0xc6, 0x11, 0xf0, 0xbd, 0x36, 0x78, 0x67, 0x79, 0x7b, 0xfe, 0x82,
+            0x36, 0x00,
+        ];
+        let passcode = 123456u32;
+        let iterations = 2000u32;
+        let context: &[u8] = b"unit-test-context-hash-32-bytes!";
+
+        // device 側の検証子。
+        let params = compute_verifier(passcode, &salt, iterations).unwrap();
+
+        // commissioner 側 prover。pA を生成。
+        let mut prover_rng = TestRng(0xdead_beef_0011_2233);
+        let prover =
+            Spake2pProver::from_passcode(&mut prover_rng, passcode, &salt, iterations).unwrap();
+        let pa = *prover.share();
+
+        // device 側 verifier が pB / cB を計算。
+        let mut dev_rng = TestRng(0x0123_4567_89ab_cdef);
+        let (verifier, pb) = Spake2pVerifier::respond(&mut dev_rng, context, &params, &pa).unwrap();
+
+        // prover が pB を受けて cA / Ke を導出。
+        let confirm = prover.confirm(context, &pb).unwrap();
+
+        // 相互の確認値検証が成功する。
+        verifier.verify(confirm.confirmation_a()).unwrap();
+        confirm.verify_b(verifier.confirmation_b()).unwrap();
+
+        // 共有鍵 Ke が一致する。
+        assert_eq!(confirm.shared_secret(), verifier.shared_secret());
+
+        // 誤ったパスコードの prover は cA 検証に失敗する。
+        let mut bad_rng = TestRng(0x9999_8888_7777_6666);
+        let bad_prover =
+            Spake2pProver::from_passcode(&mut bad_rng, passcode + 1, &salt, iterations).unwrap();
+        let bad_pa = *bad_prover.share();
+        let (bad_verifier, bad_pb) =
+            Spake2pVerifier::respond(&mut dev_rng, context, &params, &bad_pa).unwrap();
+        let bad_confirm = bad_prover.confirm(context, &bad_pb).unwrap();
+        assert_eq!(
+            bad_verifier.verify(bad_confirm.confirmation_a()),
+            Err(Error::Crypto)
         );
     }
 
