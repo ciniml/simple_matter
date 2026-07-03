@@ -28,7 +28,9 @@
 //! Fabrics は fabric フィルタせず全 fabric 行を返す(設計 §10 の割り切り。full ACL /
 //! fabric-filtered read は後日)。CurrentFabricIndex も同様に 0 を返す。
 
+use core::cell::RefCell;
 use core::num::NonZeroU8;
+use core::ops::{Deref, DerefMut};
 
 use crate::cert;
 use crate::crypto::{Crypto, P256Keypair, P256PublicKey, P256_SIGNATURE_LEN};
@@ -177,11 +179,53 @@ const fn cx(n: u8) -> TlvTag {
     TlvTag::ContextSpecific(n)
 }
 
+/// [`OpCredsCluster`] が [`FabricTable`] を保持する方法の抽象(統合層向け)。
+///
+/// クラスタ単独では [`FabricTable`] を **所有**(`RefCell<FabricTable>`)する。しかし CASE
+/// responder([`crate::sc::SecureChannel`])と OpCreds が同一の fabric テーブルを共有する
+/// 必要がある(片方が AddNOC で書き、もう片方が Sigma2 で読む)。両者は同一の
+/// [`ProtocolMux`](crate::exchange::ProtocolMux) 内に格納されるため相互参照できず、fabric
+/// テーブルは**外部所有の `RefCell`** を双方が参照する形にする(統合層 `stack` 参照)。
+///
+/// この trait は「所有(`RefCell<FabricTable>`)」と「共有参照(`&RefCell<FabricTable>`)」の
+/// 両方を同じコードパスで扱うための内部境界で、いずれも `&self` 経由(内部可変性)で
+/// 読み書きできる。既定の型引数は所有版なので、既存の `OpCredsCluster<C, DAC, N>` は不変。
+pub trait FabricAccess<C: Crypto, const N: usize> {
+    /// fabric テーブルへの共有アクセス。
+    fn get(&self) -> impl Deref<Target = FabricTable<C, N>> + '_;
+    /// fabric テーブルへの排他アクセス(内部可変性で `&self` から取得)。
+    fn get_mut(&self) -> impl DerefMut<Target = FabricTable<C, N>> + '_;
+}
+
+impl<C: Crypto, const N: usize> FabricAccess<C, N> for RefCell<FabricTable<C, N>> {
+    fn get(&self) -> impl Deref<Target = FabricTable<C, N>> + '_ {
+        self.borrow()
+    }
+    fn get_mut(&self) -> impl DerefMut<Target = FabricTable<C, N>> + '_ {
+        self.borrow_mut()
+    }
+}
+
+impl<C: Crypto, const N: usize> FabricAccess<C, N> for &RefCell<FabricTable<C, N>> {
+    fn get(&self) -> impl Deref<Target = FabricTable<C, N>> + '_ {
+        (**self).borrow()
+    }
+    fn get_mut(&self) -> impl DerefMut<Target = FabricTable<C, N>> + '_ {
+        (**self).borrow_mut()
+    }
+}
+
 /// Operational Credentials クラスタ(0x003E)。
 ///
-/// `C` は暗号 backend、`DAC` は [`DacProvider`]、`N` は最大 fabric 数。
-pub struct OpCredsCluster<C: Crypto, DAC: DacProvider, const N: usize> {
-    fabrics: FabricTable<C, N>,
+/// `C` は暗号 backend、`DAC` は [`DacProvider`]、`N` は最大 fabric 数。`FT` は fabric テーブルの
+/// 保持方法([`FabricAccess`]、既定は所有 `RefCell<FabricTable<C, N>>`)。
+pub struct OpCredsCluster<
+    C: Crypto,
+    DAC: DacProvider,
+    const N: usize,
+    FT = RefCell<FabricTable<C, N>>,
+> {
+    fabrics: FT,
     crypto: C,
     dac: DAC,
     /// AddTrustedRootCertificate で受理した pending root cert(TLV)。
@@ -193,10 +237,10 @@ pub struct OpCredsCluster<C: Crypto, DAC: DacProvider, const N: usize> {
 }
 
 impl<C: Crypto, DAC: DacProvider, const N: usize> OpCredsCluster<C, DAC, N> {
-    /// crypto backend と DAC provider を与えて空のクラスタを作る。
+    /// crypto backend と DAC provider を与えて、fabric テーブルを**所有**する空のクラスタを作る。
     pub fn new(crypto: C, dac: DAC) -> Self {
         Self {
-            fabrics: FabricTable::new(),
+            fabrics: RefCell::new(FabricTable::new()),
             crypto,
             dac,
             pending_root: [0u8; MAX_CERT_TLV_LEN],
@@ -205,10 +249,34 @@ impl<C: Crypto, DAC: DacProvider, const N: usize> OpCredsCluster<C, DAC, N> {
             dirty: Dirty::new(),
         }
     }
+}
 
+impl<'f, C: Crypto, DAC: DacProvider, const N: usize>
+    OpCredsCluster<C, DAC, N, &'f RefCell<FabricTable<C, N>>>
+{
+    /// **外部所有の** fabric テーブル(`RefCell`)を共有するクラスタを作る(統合層 `stack` 用)。
+    ///
+    /// CASE responder([`crate::sc::SecureChannel`])と同じ [`FabricTable`] を共有し、AddNOC で
+    /// 追加した fabric を CASE が Sigma2 で読めるようにする。
+    pub fn new_shared(fabrics: &'f RefCell<FabricTable<C, N>>, crypto: C, dac: DAC) -> Self {
+        Self {
+            fabrics,
+            crypto,
+            dac,
+            pending_root: [0u8; MAX_CERT_TLV_LEN],
+            pending_root_len: 0,
+            pending_keypair: None,
+            dirty: Dirty::new(),
+        }
+    }
+}
+
+impl<C: Crypto, DAC: DacProvider, const N: usize, FT: FabricAccess<C, N>>
+    OpCredsCluster<C, DAC, N, FT>
+{
     /// 背後の fabric テーブルへの参照(コミッショニング結果の検査用)。
-    pub const fn fabrics(&self) -> &FabricTable<C, N> {
-        &self.fabrics
+    pub fn fabrics(&self) -> impl Deref<Target = FabricTable<C, N>> + '_ {
+        self.fabrics.get()
     }
 
     /// fail-safe 期限切れで pending(root cert / 運用鍵)を破棄する(設計 §9.4)。
@@ -221,7 +289,7 @@ impl<C: Crypto, DAC: DacProvider, const N: usize> OpCredsCluster<C, DAC, N> {
 
     fn read_nocs(&self, e: &mut AttrEncoder<'_, '_>) -> Result<(), ImStatus> {
         e.write_array(|a| {
-            for f in self.fabrics.iter() {
+            for f in self.fabrics.get().iter() {
                 a.push_struct(|s| {
                     s.field_bytes(1, f.noc())?;
                     match f.icac() {
@@ -237,7 +305,7 @@ impl<C: Crypto, DAC: DacProvider, const N: usize> OpCredsCluster<C, DAC, N> {
 
     fn read_fabrics(&self, e: &mut AttrEncoder<'_, '_>) -> Result<(), ImStatus> {
         e.write_array(|a| {
-            for f in self.fabrics.iter() {
+            for f in self.fabrics.get().iter() {
                 a.push_struct(|s| {
                     s.field_bytes(1, f.root_public_key())?;
                     s.field_u16(2, f.vendor_id())?;
@@ -253,7 +321,7 @@ impl<C: Crypto, DAC: DacProvider, const N: usize> OpCredsCluster<C, DAC, N> {
 
     fn read_trusted_roots(&self, e: &mut AttrEncoder<'_, '_>) -> Result<(), ImStatus> {
         e.write_array(|a| {
-            for f in self.fabrics.iter() {
+            for f in self.fabrics.get().iter() {
                 a.push_bytes(f.rcac())?;
             }
             Ok(())
@@ -457,7 +525,7 @@ impl<C: Crypto, DAC: DacProvider, const N: usize> OpCredsCluster<C, DAC, N> {
         let kp = self.pending_keypair.take().ok_or(ImStatus::Failure)?;
         let now_epoch = (acc.now_ms / 1000) as u32;
 
-        let result = self.fabrics.add(
+        let result = self.fabrics.get_mut().add(
             &self.crypto,
             &root_buf[..root_len],
             icac,
@@ -508,7 +576,7 @@ impl<C: Crypto, DAC: DacProvider, const N: usize> OpCredsCluster<C, DAC, N> {
         let Some(idx) = acc.fabric_idx else {
             return write_noc_response(resp, noc_status::INVALID_FABRIC_INDEX, None);
         };
-        match self.fabrics.update_label(idx, label) {
+        match self.fabrics.get_mut().update_label(idx, label) {
             Ok(()) => {
                 self.dirty.mark();
                 write_noc_response(resp, noc_status::OK, Some(idx.get()))
@@ -534,7 +602,7 @@ impl<C: Crypto, DAC: DacProvider, const N: usize> OpCredsCluster<C, DAC, N> {
         let Some(idx) = NonZeroU8::new(fabric_index) else {
             return write_noc_response(resp, noc_status::INVALID_FABRIC_INDEX, None);
         };
-        match self.fabrics.remove(idx) {
+        match self.fabrics.get_mut().remove(idx) {
             Ok(()) => {
                 self.dirty.mark();
                 write_noc_response(resp, noc_status::OK, Some(idx.get()))
@@ -579,7 +647,9 @@ fn write_noc_response(
     close_response(w)
 }
 
-impl<C: Crypto, DAC: DacProvider, const N: usize> ServerCluster for OpCredsCluster<C, DAC, N> {
+impl<C: Crypto, DAC: DacProvider, const N: usize, FT: FabricAccess<C, N>> ServerCluster
+    for OpCredsCluster<C, DAC, N, FT>
+{
     fn meta(&self) -> &'static ClusterMeta {
         &OPCREDS_META
     }
@@ -593,7 +663,7 @@ impl<C: Crypto, DAC: DacProvider, const N: usize> ServerCluster for OpCredsClust
             0x00 => self.read_nocs(enc),
             0x01 => self.read_fabrics(enc),
             0x02 => enc.write_u8(N as u8),
-            0x03 => enc.write_u8(self.fabrics.len() as u8),
+            0x03 => enc.write_u8(self.fabrics.get().len() as u8),
             0x04 => self.read_trusted_roots(enc),
             // CurrentFabricIndex: read_attribute は acc を持たないため 0(初期スコープ)。
             0x05 => enc.write_u8(0),

@@ -18,6 +18,8 @@ pub mod exchange;
 pub mod fabric;
 pub mod im;
 pub mod sc;
+#[cfg(feature = "rustcrypto")]
+pub mod stack;
 pub mod tlv;
 pub mod transport;
 

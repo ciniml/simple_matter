@@ -99,6 +99,18 @@ pub trait DataModel {
 
     /// (ep, cl) → クラスタの可変ビュー(write / invoke)。無ければ `None`。
     fn cluster_mut(&mut self, ep: EndpointId, cl: ClusterId) -> Option<&mut dyn ServerCluster>;
+
+    /// 時間駆動のデバイス内部処理(fail-safe 期限切れ等)を進める。
+    ///
+    /// 統合層([`crate::stack`])が `poll`/`handle_rx` の度に呼ぶ。既定は何もしない
+    /// (no-op)。fail-safe タイマ(General Commissioning)を持つデバイスは、この既定を
+    /// 上書きして `GeneralCommissioning::on_tick` と `OpCredsCluster::on_failsafe_expired`
+    /// を配線する。[`device!`](crate::device) マクロが生成する実装は既定のまま(汎用的に
+    /// どのクラスタが fail-safe を持つか判定できないため、乖離。手書き `DataModel` 実装で
+    /// 配線するか、将来の `device!` 拡張で対応)。返り値は次に処理すべき絶対時刻(あれば)。
+    fn on_tick(&mut self, _now_ms: u64) -> Option<u64> {
+        None
+    }
 }
 
 #[cfg(test)]
