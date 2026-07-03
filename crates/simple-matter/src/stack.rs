@@ -241,15 +241,7 @@ impl<
 
         match report.action {
             HandlerAction::None => None,
-            // Close も Respond と同じく送出する。信頼送信なら ACK を待つため exchange は
-            // 即閉じず、MRP の ACK/掃除に委ねる(乖離:終端 Close の即時 close は行わない)。
             HandlerAction::Respond {
-                opcode,
-                proto_id,
-                reliable,
-                len,
-            }
-            | HandlerAction::Close {
                 opcode,
                 proto_id,
                 reliable,
@@ -257,6 +249,20 @@ impl<
             } => {
                 let ex = report.exchange?;
                 self.stage_response(ex, proto_id, opcode, reliable, len, now_ms, tx_out)
+            }
+            // Close も Respond と同じく送出するが、会話は終端予約(mark_closing)する。
+            // 信頼送信の最終応答は ACK まで再送責務が残るため即時 close はせず、
+            // MRP 静穏後に ExchangeManager::poll が slot を回収する。
+            HandlerAction::Close {
+                opcode,
+                proto_id,
+                reliable,
+                len,
+            } => {
+                let ex = report.exchange?;
+                let dir = self.stage_response(ex, proto_id, opcode, reliable, len, now_ms, tx_out);
+                self.mgr.mark_closing(ex);
+                dir
             }
         }
     }
@@ -313,12 +319,18 @@ impl<
         if hdr.is_encrypted() {
             return;
         }
-        if self.sessions.find_for_rx(peer, &hdr, now_ms).is_some() {
+        if let Some(session) = self.sessions.find_for_rx(peer, &hdr, now_ms) {
+            // 既存の平文セッションでもピア Node ID が未確定なら、受信ヘッダの
+            // source Node ID で確定させる(以降の応答の宛先 echo に使う)。
+            session.set_peer_node_id_if_unset(hdr.src_node_id);
             return;
         }
-        let _ = self
-            .sessions
-            .insert(SessionInit::plaintext(peer, 0, 1), now_ms);
+        let mut init = SessionInit::plaintext(peer, 0, 1);
+        // イニシエータのエフェメラル source Node ID を記録し、応答時に宛先 Node ID
+        // として echo する(chip 側の非セキュアパケット検証が source/destination の
+        // いずれかを必須とするため)。
+        init.peer_node_id = hdr.src_node_id;
+        let _ = self.sessions.insert(init, now_ms);
     }
 
     /// ハンドラが `self.resp` に書いた応答 payload をワイヤ化して `tx_out` に置く。
@@ -616,11 +628,16 @@ impl<'s, C: Crypto, const N: usize> NocResolver for SharedFabricCreds<'s, C, N> 
 /// 標準プロファイル(数コントローラ + 並行 exchange)。設計 §8.1 の `DefaultStack`。
 ///
 /// サイジング: fabric=5 / session=4 / exchange=4 / TX バッファ=3 / handshake=1 /
-/// read=2 / subscribe=3 / paths=8。
-pub type DefaultStack<'s, C, R, D> = MatterStack<'s, C, R, D, 5, 4, 4, 3, 1, 2, 3, 8>;
+/// read=2 / subscribe=3 / paths=16。
+///
+/// paths は chip-tool のコミッショニング時 ReadCommissioningInfo が 1 リクエストで
+/// 10 本前後の属性パスを送るため、余裕を持って 16 とする。
+pub type DefaultStack<'s, C, R, D> = MatterStack<'s, C, R, D, 5, 4, 4, 3, 1, 2, 3, 16>;
 
 /// 極小プロファイル(単一コントローラ・RAM 最小)。設計 §8.1 の `MinimalStack`。
-pub type MinimalStack<'s, C, R, D> = MatterStack<'s, C, R, D, 2, 3, 3, 2, 1, 1, 2, 4>;
+///
+/// paths=12 は chip-tool でのコミッショニングが通る下限に余裕を足した値。
+pub type MinimalStack<'s, C, R, D> = MatterStack<'s, C, R, D, 2, 3, 3, 2, 1, 1, 2, 12>;
 
 #[cfg(all(test, feature = "rustcrypto"))]
 mod tests;

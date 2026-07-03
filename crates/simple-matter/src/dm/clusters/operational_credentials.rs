@@ -18,9 +18,9 @@
 //! octstr として転送**する(検証はコミッショナが PAA に対して行う、Core Spec §6.2.3)。
 //! AttestationRequest / CSRRequest の署名は **DAC 秘密鍵**で
 //! `sign(elements || attestationChallenge)` を計算する(§11.17.5.4–6、rs-matter
-//! `add_attestation` / `add_csr` と一致)。テスト実装 [`TestDacProvider`] は自己生成の
-//! 固定 DAC 鍵と不透明なプレースホルダ DER を用いる(出典: 本クレート自己生成の
-//! テストベクタ。chip `credentials/examples` の Example DAC も差し替え可能)。
+//! `add_attestation` / `add_csr` と一致)。テスト実装 [`TestDacProvider`] は chip の
+//! **開発用** DAC チェーン([`dev_creds`](TestDacProvider) 参照)を用いる。実 X.509 DER
+//! のため chip-tool が DAC 公開鍵を抽出して NOCSR 署名を検証できる(相互運用確認済み)。
 //!
 //! # fabric-scoped 属性の初期スコープ
 //!
@@ -370,7 +370,9 @@ impl<C: Crypto, DAC: DacProvider, const N: usize, FT: FabricAccess<C, N>>
         }
 
         // AttestationElements TLV: { 1: CD, 2: nonce, 3: timestamp }。
-        let mut elems = [0u8; 256];
+        // CD は CMS SignedData で大きい(chip 開発用 CD は 541B)。仕様の
+        // RESP_MAX(900B)を上限の目安とする。
+        let mut elems = [0u8; 704];
         let elems_len = {
             let mut w = TlvWriter::new(&mut elems);
             w.start_struct(&TlvTag::Anonymous).map_err(map_tlv)?;
@@ -617,7 +619,8 @@ impl<C: Crypto, DAC: DacProvider, const N: usize, FT: FabricAccess<C, N>>
         elements: &[u8],
         challenge: &[u8; 16],
     ) -> Result<[u8; P256_SIGNATURE_LEN], ImStatus> {
-        let mut tbs = [0u8; 512];
+        // AttestationElements(CD 541B 級)+ challenge 16B が収まる大きさ。
+        let mut tbs = [0u8; 768];
         let total = elements.len() + challenge.len();
         if total > tbs.len() {
             return Err(ImStatus::ResourceExhausted);
@@ -692,32 +695,23 @@ impl<C: Crypto, DAC: DacProvider, const N: usize, FT: FabricAccess<C, N>> Server
 
 /// テスト/デモ用の [`DacProvider`] 実装。
 ///
-/// DAC/PAI/CD は不透明なプレースホルダ DER(本クレート自己生成のテストベクタ)で、
-/// デバイスはこれらを検証せず転送する。署名は固定スカラから復元した DAC 鍵で行う。
+/// chip(connectedhomeip)の**開発用** DAC チェーン(VID=0xFFF1 / PID=0x8001、
+/// [`dev_creds`] 参照)を返す。実 X.509 DER のため、chip-tool 等の実コミッショナが
+/// DAC をパースして NOCSR/アテステーション署名を DAC 公開鍵で検証できる。
+/// 開発・テスト専用であり、製品では固有の DAC を持つ [`DacProvider`] 実装に差し替えること。
 pub struct TestDacProvider<C: Crypto> {
     dac_keypair: C::Keypair,
 }
 
-/// テスト DAC 鍵の固定スカラ(自己生成の決定的テストベクタ)。
-const TEST_DAC_PRIV: [u8; 32] = [0x4au8; 32];
-
-/// 不透明プレースホルダ DAC DER(SEQUENCE ラップのテストベクタ)。
-const TEST_DAC_DER: &[u8] = &[
-    0x30, 0x0e, 0x02, 0x01, 0x2a, 0x16, 0x09, b'T', b'E', b'S', b'T', b'-', b'D', b'A', b'C',
-];
-/// 不透明プレースホルダ PAI DER。
-const TEST_PAI_DER: &[u8] = &[
-    0x30, 0x0e, 0x02, 0x01, 0x2b, 0x16, 0x09, b'T', b'E', b'S', b'T', b'-', b'P', b'A', b'I',
-];
-/// 不透明プレースホルダ Certification Declaration(CMS 相当のテストベクタ)。
-const TEST_CD: &[u8] = &[
-    0x30, 0x0d, 0x02, 0x01, 0x2c, 0x16, 0x08, b'T', b'E', b'S', b'T', b'-', b'C', b'D', b'!',
-];
+pub mod dev_creds;
+use dev_creds::{
+    DEV_CD_FOR_ALL_EXAMPLES, DEV_DAC_CERT_FFF1_8001, DEV_DAC_PRIVKEY_FFF1_8001, DEV_PAI_CERT_FFF1,
+};
 
 impl<C: Crypto> TestDacProvider<C> {
-    /// crypto backend から固定スカラで DAC 鍵を復元して provider を作る。
+    /// crypto backend から chip 開発用 DAC 秘密鍵を復元して provider を作る。
     pub fn new(crypto: &C) -> crate::error::Result<Self> {
-        let dac_keypair = crypto.p256_keypair_from_bytes(&TEST_DAC_PRIV)?;
+        let dac_keypair = crypto.p256_keypair_from_bytes(&DEV_DAC_PRIVKEY_FFF1_8001)?;
         Ok(Self { dac_keypair })
     }
 
@@ -729,13 +723,13 @@ impl<C: Crypto> TestDacProvider<C> {
 
 impl<C: Crypto> DacProvider for TestDacProvider<C> {
     fn dac_der(&self) -> &[u8] {
-        TEST_DAC_DER
+        &DEV_DAC_CERT_FFF1_8001
     }
     fn pai_der(&self) -> &[u8] {
-        TEST_PAI_DER
+        &DEV_PAI_CERT_FFF1
     }
     fn certification_declaration(&self) -> &[u8] {
-        TEST_CD
+        &DEV_CD_FOR_ALL_EXAMPLES
     }
     fn sign_with_dac(
         &self,

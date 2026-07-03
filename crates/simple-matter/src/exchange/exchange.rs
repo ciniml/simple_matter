@@ -94,6 +94,12 @@ pub struct ExchangeState {
     role: Role,
     mrp: Mrp,
     config: MrpConfig,
+    /// トランザクション終端済み([`HandlerAction::Close`])の印。
+    ///
+    /// MRP が静穏(再送スロットなし・ACK 送信残なし)になり次第 [`ExchangeManager::poll`]
+    /// が slot を回収する。即時 close しないのは、信頼送信した最終応答の再送責務が
+    /// 残っている可能性があるため。
+    closing: bool,
 }
 
 impl ExchangeState {
@@ -105,7 +111,13 @@ impl ExchangeState {
             role,
             mrp: Mrp::new(),
             config: MrpConfig::DEFAULT,
+            closing: false,
         }
+    }
+
+    /// MRP に未了の責務(再送スロット・未送 ACK)が無いなら `true`。
+    fn is_quiescent(&self) -> bool {
+        self.mrp.retrans_buffer().is_none() && !self.mrp.is_ack_pending()
     }
 
     /// この会話のハンドルを返す。
@@ -345,6 +357,16 @@ impl<H, const EXCHANGES: usize> ExchangeManager<H, EXCHANGES> {
         freed
     }
 
+    /// 会話を終端予約する([`HandlerAction::Close`] の宣言を受けた統合層が呼ぶ)。
+    ///
+    /// 即時 close はせず、MRP の再送・ACK 責務が済み次第 [`poll`](Self::poll) が
+    /// slot を回収する。未知 ID は無視する。
+    pub fn mark_closing(&mut self, id: ExchangeId) {
+        if let Some(i) = self.index_of_id(id) {
+            self.exchanges[i].closing = true;
+        }
+    }
+
     /// `(session, exch_id)` から格納 index を引く。
     fn index_of_id(&self, id: ExchangeId) -> Option<usize> {
         self.exchanges
@@ -407,6 +429,15 @@ impl<H, const EXCHANGES: usize> ExchangeManager<H, EXCHANGES> {
     /// - 再送上限到達 → 会話を除去し [`PollAction::Failed`]。
     /// - standalone ACK 期限到達 → ACK 済みに印を付け [`PollAction::SendAck`]。
     pub fn poll(&mut self, now_ms: u64, jitter_rand: u8) -> PollAction {
+        // 終端済み(closing)かつ MRP 静穏の会話を回収する(プール枯渇防止)。
+        let mut i = 0;
+        while i < self.exchanges.len() {
+            if self.exchanges[i].closing && self.exchanges[i].is_quiescent() {
+                self.exchanges.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
         for i in 0..self.exchanges.len() {
             match self.exchanges[i].mrp.take_due_retrans(now_ms, jitter_rand) {
                 RetransAction::Retransmit { buf, len, addr } => {
@@ -733,12 +764,23 @@ fn build_packet<C: Crypto, const SESSIONS: usize>(
         vendor_id: None,
         ack_ctr,
     };
+    // 非セキュアセッションでは、connectedhomeip 側の受信検証(source/destination
+    // Node ID のいずれか必須)を満たすため、既知のピア Node ID(イニシエータの
+    // エフェメラル ID)を宛先として echo する(仕様 §4.6.2)。
+    let dst = if !session.is_encrypted() {
+        match session.peer_node_id() {
+            Some(id) => DstNodeId::Unicast(id),
+            None => DstNodeId::None,
+        }
+    } else {
+        DstNodeId::None
+    };
     let pkt = PacketHeader {
         session_id: session.peer_session_id(),
         sec_flags: SecFlags::from_bits(0),
         ctr,
         src_node_id: None,
-        dst: DstNodeId::None,
+        dst,
     };
 
     let key = session.enc_key().copied();

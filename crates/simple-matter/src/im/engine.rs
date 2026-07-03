@@ -29,8 +29,10 @@
 //!   持たない。`DataModel::take_dirty` は実装済み trait に無いため、[`InteractionModel::poll_subscriptions`]
 //!   が (endpoint, cluster) を走査して各クラスタの [`ServerCluster::take_dirty`](crate::dm::ServerCluster)
 //!   を集約する(設計 §6.2 の意図を trait 変更なしで実現)。
-//! - **DataVersion フィルタ非対応**: レポートは AttributeDataIB の DataVersion を省略し、
-//!   dirty クラスタに交差する購読はパス全体を再送する(設計 §6.2 の初期スコープ、過剰報告を許容)。
+//! - **DataVersion は単一共有カウンタ**: レポートの AttributeDataIB には DataVersion を必ず付与する
+//!   (chip 系コントローラの ClusterStateCache が要求)。ただしクラスタ毎の管理はせず、エンジン全体で
+//!   単一の単調カウンタを共有する(構造体フィールドの doc 参照)。リクエストの DataVersionFilter は
+//!   非対応で、dirty クラスタに交差する購読はパス全体を再送する(設計 §6.2 の初期スコープ)。
 
 use core::num::NonZeroU8;
 
@@ -62,9 +64,10 @@ const MAX_SWEEP: usize = 64;
 
 /// Invoke の生成レスポンスフィールドを一時構築するスクラッチバッファ長。
 ///
-/// Operational Credentials の CSRResponse(NOCSRElements = CSR DER + nonce + 署名)が
-/// 最大で、これに収まる大きさとする。
-const INVOKE_SCRATCH: usize = 512;
+/// Operational Credentials の AttestationResponse(AttestationElements = CD(CMS、
+/// chip 開発用は 541B)+ nonce + timestamp、に署名 64B が付く)が最大で、
+/// これに収まる大きさとする(仕様の RESP_MAX = 900B が上限の目安)。
+const INVOKE_SCRATCH: usize = 900;
 
 /// PASE セッションからアクセス可能なコミッショニング必須クラスタか(設計 §10.1)。
 const fn is_commissioning_cluster(cl: ClusterId) -> bool {
@@ -318,6 +321,7 @@ fn emit_chunk<D: DataModel + ?Sized, const P: usize>(
     dm: &D,
     txn: &mut ReadTxn<P>,
     builder: &mut ReportChunkBuilder<'_>,
+    data_version: u32,
 ) -> Result<ChunkOutcome> {
     if !txn.prechecked {
         txn.prechecked = true;
@@ -358,7 +362,7 @@ fn emit_chunk<D: DataModel + ?Sized, const P: usize>(
             true
         } else {
             let mut read_err: Option<ImStatus> = None;
-            let f = builder.try_push_data(None, &wire, |w, tag| {
+            let f = builder.try_push_data(Some(data_version), &wire, |w, tag| {
                 let mut enc = AttrEncoder::new(w, *tag);
                 let r = if is_global_attribute(cpath.attribute) {
                     read_global_attribute(cluster.meta(), cpath.attribute, &mut enc)
@@ -408,6 +412,15 @@ pub struct InteractionModel<D: DataModel, const READS: usize, const SUBS: usize,
     subs: FixedVec<Subscription<PATHS>, SUBS>,
     timed: FixedVec<TimedTxn, READS>,
     next_sub_id: u32,
+    /// レポートの AttributeDataIB に付与する DataVersion。
+    ///
+    /// 仕様上サーバのレポートには DataVersion が必須で、chip 系コントローラの
+    /// ClusterStateCache は DataVersion の無いデータをキャッシュに載せない。
+    /// 本実装はクラスタ毎ではなく単一の単調カウンタを共有する(変更のたびに
+    /// 全クラスタの version が進む)。仕様の要件「クラスタのデータ変更で version が
+    /// 変わる」は満たし、無関係な変更でも version が進む分はコントローラ側の
+    /// キャッシュ効率が下がるだけで正しさには影響しない。
+    data_version: u32,
 }
 
 impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
@@ -421,6 +434,7 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
             subs: FixedVec::new(),
             timed: FixedVec::new(),
             next_sub_id: 1,
+            data_version: 1,
         }
     }
 
@@ -480,7 +494,7 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         let len;
         {
             let mut builder = ReportChunkBuilder::new(tx, None)?;
-            outcome = emit_chunk(&self.dm, &mut txn, &mut builder)?;
+            outcome = emit_chunk(&self.dm, &mut txn, &mut builder, self.data_version)?;
             len = match outcome {
                 ChunkOutcome::Done => builder.finish(false, true)?,
                 ChunkOutcome::More => builder.finish(true, false)?,
@@ -543,7 +557,7 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         let len;
         {
             let mut builder = ReportChunkBuilder::new(tx, None)?;
-            outcome = emit_chunk(&self.dm, &mut txn, &mut builder)?;
+            outcome = emit_chunk(&self.dm, &mut txn, &mut builder, self.data_version)?;
             len = match outcome {
                 ChunkOutcome::Done => {
                     txn.priming_reports_done = true;
@@ -607,6 +621,7 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         let outcome;
         let len;
         {
+            let dv = self.data_version;
             let dm = &self.dm;
             let txn = &mut self.reads[idx];
             let sub_id = match txn.kind {
@@ -614,7 +629,7 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
                 _ => None,
             };
             let mut builder = ReportChunkBuilder::new(tx, sub_id)?;
-            outcome = emit_chunk(dm, txn, &mut builder)?;
+            outcome = emit_chunk(dm, txn, &mut builder, dv)?;
             len = match (outcome, txn.kind) {
                 (ChunkOutcome::Done, ReadKind::Read) => builder.finish(false, true)?,
                 (ChunkOutcome::Done, ReadKind::Priming(_)) => {
@@ -656,6 +671,8 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         now_ms: u64,
     ) -> Result<HandlerAction> {
         let req = WriteRequestRef::new(rx.payload)?;
+        // 変更系トランザクションが来たら DataVersion を進める(過剰に進む分は無害)。
+        self.data_version = self.data_version.wrapping_add(1);
         let suppress = req.suppress_response()?;
         let timed_flag = req.timed_request()?;
         if let Err(st) = self.check_timed(rx.exchange, timed_flag, now_ms) {
@@ -696,6 +713,8 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         now_ms: u64,
     ) -> Result<HandlerAction> {
         let req = InvokeRequestRef::new(rx.payload)?;
+        // コマンドは状態を変えうるため DataVersion を進める(過剰に進む分は無害)。
+        self.data_version = self.data_version.wrapping_add(1);
         let suppress = req.suppress_response()?;
         let timed_flag = req.timed_request()?;
         if let Err(st) = self.check_timed(rx.exchange, timed_flag, now_ms) {
@@ -889,7 +908,7 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         let len;
         {
             let mut builder = ReportChunkBuilder::new(tx, Some(subscription))?;
-            outcome = emit_chunk(&self.dm, &mut txn, &mut builder)?;
+            outcome = emit_chunk(&self.dm, &mut txn, &mut builder, self.data_version)?;
             len = match outcome {
                 ChunkOutcome::Done => builder.finish(false, false)?,
                 ChunkOutcome::More => builder.finish(true, false)?,
@@ -1004,6 +1023,8 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
                 .map(|c| c.take_dirty())
                 .unwrap_or(false);
             if is_dirty {
+                // アプリ側の直接変更(IM 外)でも DataVersion を進める。
+                self.data_version = self.data_version.wrapping_add(1);
                 for i in 0..self.subs.len() {
                     if sub_covers(&self.subs[i], ep, cl) {
                         self.subs[i].dirty = true;

@@ -295,6 +295,12 @@ impl<C: Crypto> Fabric for FabricEntry<C> {
 pub struct FabricTable<C: Crypto, const N: usize> {
     entries: FixedVec<FabricEntry<C>, N>,
     generation: u32,
+    /// Last Known Good UTC Time(Matter epoch 秒、仕様 §6.5.6.1 の最小実装)。
+    ///
+    /// 壁時計を持たないデバイスの証明書有効期間検証のための時刻下限。fabric 追加時に
+    /// 受理した証明書チェーンの notBefore で単調に前進させ、検証時刻には
+    /// `max(now, last_known_good_epoch)` を用いる。
+    last_known_good_epoch: u32,
 }
 
 impl<C: Crypto, const N: usize> Default for FabricTable<C, N> {
@@ -309,7 +315,18 @@ impl<C: Crypto, const N: usize> FabricTable<C, N> {
         Self {
             entries: FixedVec::new(),
             generation: 0,
+            last_known_good_epoch: 0,
         }
+    }
+
+    /// Last Known Good UTC Time(Matter epoch 秒)を返す。
+    pub const fn last_known_good_epoch(&self) -> u32 {
+        self.last_known_good_epoch
+    }
+
+    /// 証明書有効期間検証に使う実効時刻(`max(now, LKGT)`)を返す。
+    pub fn effective_time(&self, now: u32) -> u32 {
+        now.max(self.last_known_good_epoch)
     }
 
     /// 現在の fabric 数。
@@ -381,14 +398,23 @@ impl<C: Crypto, const N: usize> FabricTable<C, N> {
             return Err(Error::NoSpace);
         }
 
-        // 1. チェーン検証。
+        // 1. チェーン検証。壁時計を持たないデバイス(now が小さい)でも受理できるよう、
+        //    検証時刻は「現在時刻・LKGT・チェーンの notBefore」の最大値を使う
+        //    (LKGT の初期化に相当。chip の FabricTable も同等の扱い)。
         let rcac_cert = MatterCert::parse(rcac)?;
         let noc_cert = MatterCert::parse(noc)?;
         let icac_cert = match icac {
             Some(bytes) => Some(MatterCert::parse(bytes)?),
             None => None,
         };
-        verify_chain(crypto, &noc_cert, icac_cert.as_ref(), &rcac_cert, now)?;
+        let mut effective = self.effective_time(now).max(noc_cert.not_before());
+        effective = effective.max(rcac_cert.not_before());
+        if let Some(ic) = &icac_cert {
+            effective = effective.max(ic.not_before());
+        }
+        verify_chain(crypto, &noc_cert, icac_cert.as_ref(), &rcac_cert, effective)?;
+        // 受理したチェーンの notBefore は「過去に実在した時刻」なので LKGT を前進させる。
+        self.last_known_good_epoch = self.last_known_good_epoch.max(effective);
 
         // 2. NodeId / FabricId 抽出。
         let node_id = noc_cert.subject().node_id()?.ok_or(Error::CertInvalid)?;
@@ -549,7 +575,8 @@ impl<C: Crypto, const N: usize> FabricTable<C, N> {
             Some(bytes) => Some(MatterCert::parse(bytes)?),
             None => None,
         };
-        verify_chain(crypto, &noc, icac.as_ref(), &rcac, now)?;
+        // 壁時計を持たないデバイスでも検証できるよう LKGT で時刻を下支えする。
+        verify_chain(crypto, &noc, icac.as_ref(), &rcac, self.effective_time(now))?;
 
         let node_id = noc.subject().node_id()?.ok_or(Error::CertInvalid)?;
         let fabric_id = noc.subject().fabric_id()?.ok_or(Error::CertInvalid)?;

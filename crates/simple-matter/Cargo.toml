@@ -24,6 +24,11 @@ p256 = { version = "0.13", default-features = false, features = [
 zeroize = { version = "1", default-features = false, optional = true }
 subtle = { version = "2", default-features = false, optional = true }
 
+[dev-dependencies]
+# examples/onoff-light の mDNS ソケット用(SO_REUSEPORT で avahi と共存)。
+# コアクレートの依存ではない(dev-dependencies は examples/tests のみに効く)。
+socket2 = { version = "0.5", features = ["all"] }
+
 [features]
 default = ["rustcrypto"]
 # 低頻度パス(初期化・コミッショニング時等)でのヒープ利用を有効化する。

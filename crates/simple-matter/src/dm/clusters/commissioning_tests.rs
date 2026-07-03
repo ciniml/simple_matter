@@ -416,7 +416,7 @@ fn full_commissioning_flow() {
     {
         // sig は DAC 秘密鍵で (elements || attestationChallenge) を署名したもの。
         let dac = TestDacProvider::new(&crypto).unwrap();
-        let mut msg = [0u8; 512];
+        let mut msg = [0u8; 768];
         msg[..elems.len()].copy_from_slice(elems);
         msg[elems.len()..elems.len() + 16].copy_from_slice(&CHALLENGE);
         let key = crypto

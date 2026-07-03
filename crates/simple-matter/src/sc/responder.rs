@@ -115,6 +115,19 @@ pub struct SecureChannel<'c, C: Crypto, R: Rng, F, const H: usize> {
 }
 
 impl<'c, C: Crypto, R: Rng, F, const H: usize> SecureChannel<'c, C, R, F, H> {
+    /// 新規セキュアセッションの送信メッセージカウンタ初期値を作る。
+    ///
+    /// connectedhomeip と同様に下位 28bit の乱数 + 1 で初期化する(0 を避ける)。
+    /// 0 始まりだと chip 側の受信ウィンドウが初回メッセージを重複と誤判定する。
+    /// 乱数取得に失敗した場合は 1 にフォールバックする。
+    fn initial_tx_ctr(&mut self) -> u32 {
+        let mut b = [0u8; 4];
+        if self.rng.fill_bytes(&mut b).is_err() {
+            return 1;
+        }
+        (u32::from_le_bytes(b) & 0x0FFF_FFFF) + 1
+    }
+
     /// crypto・rng・PASE 設定・fabric 面を与えてハンドラを生成する。
     pub fn new(crypto: &'c C, rng: R, config: PaseConfig, fabrics: F) -> Self {
         Self {
@@ -365,12 +378,13 @@ impl<'c, C: Crypto, R: Rng, F, const H: usize> SecureChannel<'c, C, R, F, H> {
             None => return Err(Error::InvalidState),
         };
 
+        let tx_ctr_start = self.initial_tx_ctr();
         let init = SessionInit {
             peer_addr,
             local_node_id: 0,
             peer_node_id: None,
             peer_session_id,
-            tx_ctr_start: 0,
+            tx_ctr_start,
             rx_ctr_start: 0,
             mode: SessionMode::Pase { fabric_idx: 0 },
             enc_key,
@@ -803,12 +817,13 @@ impl<C: Crypto, R: Rng, F: FabricStore + NocResolver, const H: usize>
             Some(s) => s.peer_addr(),
             None => return Err(Error::InvalidState),
         };
+        let tx_ctr_start = self.initial_tx_ctr();
         let init = SessionInit {
             peer_addr,
             local_node_id,
             peer_node_id: Some(peer_node_id),
             peer_session_id,
-            tx_ctr_start: 0,
+            tx_ctr_start,
             rx_ctr_start: 0,
             mode: SessionMode::Case {
                 fabric_idx: ctx.fabric_index,

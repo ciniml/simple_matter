@@ -237,7 +237,17 @@ fn main() -> std::io::Result<()> {
         match socket.recv_from(&mut rx) {
             Ok((n, src)) => {
                 let now = now_ms(&start);
-                if let Some(dir) = stack.handle_rx(&mut rx[..n], PeerAddr::Udp(src), now, &mut tx) {
+                let dir = stack.handle_rx(&mut rx[..n], PeerAddr::Udp(src), now, &mut tx);
+                if std::env::var_os("MATTER_DEBUG").is_some() {
+                    eprintln!(
+                        "[rx] {n}B from {src} -> {}",
+                        match &dir {
+                            Some(d) => format!("respond {}B", d.len),
+                            None => "no response".into(),
+                        }
+                    );
+                }
+                if let Some(dir) = dir {
                     if let Some(addr) = dir.addr.socket_addr() {
                         let _ = socket.send_to(&tx[..dir.len], addr);
                     }
@@ -294,7 +304,22 @@ fn main() -> std::io::Result<()> {
 /// ポート 5353 を他プロセス(avahi 等)が使用中なら `None` を返し、example は mDNS
 /// 無しで継続する。
 fn open_mdns_socket() -> Option<UdpSocket> {
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, MDNS_PORT)).ok()?;
+    // avahi 等の既存 mDNS レスポンダと共存するため SO_REUSEADDR/SO_REUSEPORT を
+    // 立ててから 5353 に bind する(std の UdpSocket では bind 前に設定できないため
+    // socket2 を使う)。マルチキャストグループ参加で 224.0.0.251 宛のクエリが
+    // 両方のソケットに配送される。
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .ok()?;
+    socket.set_reuse_address(true).ok()?;
+    socket.set_reuse_port(true).ok()?;
+    socket
+        .bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, MDNS_PORT)).into())
+        .ok()?;
+    let socket: UdpSocket = socket.into();
     socket
         .join_multicast_v4(&MDNS_IPV4, &Ipv4Addr::UNSPECIFIED)
         .ok()?;

@@ -206,6 +206,16 @@ impl Session {
         self.peer_node_id
     }
 
+    /// ピアの Node ID が未確定の場合のみ設定する。
+    ///
+    /// 非セキュアセッションで、イニシエータの最初のパケットの source Node ID
+    /// (エフェメラル ID)を記録するために使う。確定済みの値は上書きしない。
+    pub fn set_peer_node_id_if_unset(&mut self, id: Option<u64>) {
+        if self.peer_node_id.is_none() {
+            self.peer_node_id = id;
+        }
+    }
+
     /// 自分側のワイヤ Session ID を返す。
     pub const fn local_session_id(&self) -> u16 {
         self.local_session_id
@@ -532,10 +542,10 @@ impl<const SESSIONS: usize> SessionManager<SESSIONS> {
             last_use: now_ms,
             state: SlotState::Reserved,
         };
-        // 予約は退避を伴わない(容量の先取りが目的)。満杯なら失敗。
-        let id = session.id;
-        self.sessions.push(session).map_err(|_| Error::NoSpace)?;
-        Ok(id)
+        // 満杯時は insert と同じ方針で退避する(Expired 優先 → 予約以外の LRU)。
+        // 新しいハンドシェイクは新鮮なピアの意思表示であり、古いセッションを残して
+        // Busy を返し続けるより退避して受け入れる方が回復性が高い(chip も同様)。
+        self.push_evicting(session)
     }
 
     /// 予約 slot に確立パラメータを書き込み [`SlotState::Active`] へ昇格する(第 2 相)。
