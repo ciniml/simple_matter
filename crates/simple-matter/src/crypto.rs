@@ -25,12 +25,19 @@
 //!
 //! SHA-256 / HMAC-SHA256 / HKDF-SHA256 / AES-128-CCM(nonce 13B・tag 16B)/
 //! P-256(ECDH・ECDSA・鍵ペア生成)/ CSPRNG 抽象。
-//! Spake2+(PASE)は本段階ではスコープ外。
+//!
+//! SPAKE2+(PASE の前提部品、Matter 仕様 §3.10)のデバイス側演算は独立モジュール
+//! [`spake2p`] で提供する。低レベルな楕円曲線算術を要し P-256 固有・低頻度パスであるため、
+//! 薄く保つ [`Crypto`] トレイトには含めず `rustcrypto` バックエンドと同様に `p256` を
+//! 直接用いる(判断の詳細は [`spake2p`] のモジュールドキュメント参照)。
 
 use crate::error::Result;
 
 #[cfg(feature = "rustcrypto")]
 pub mod rustcrypto;
+
+#[cfg(feature = "rustcrypto")]
+pub mod spake2p;
 
 /// SHA-256 ハッシュ長(バイト)。HMAC-SHA256 の出力長でもある。
 pub const SHA256_LEN: usize = 32;

@@ -19,6 +19,10 @@ p256 = { version = "0.13", default-features = false, features = [
     "ecdh",
     "arithmetic",
 ], optional = true }
+# SPAKE2+ 用。中間秘密のゼロ化と確認値の定数時間比較。いずれも p256 が既に
+# 内部依存しているため実質的な依存増はない(default-features = false)。
+zeroize = { version = "1", default-features = false, optional = true }
+subtle = { version = "2", default-features = false, optional = true }
 
 [features]
 default = ["rustcrypto"]
@@ -27,4 +31,13 @@ default = ["rustcrypto"]
 alloc = []
 # RustCrypto 系クレートによる暗号バックエンドを有効化する。
 # trait 定義自体は依存ゼロで、この feature 無効でも常時コンパイル可能。
-rustcrypto = ["dep:sha2", "dep:hmac", "dep:hkdf", "dep:aes", "dep:ccm", "dep:p256"]
+rustcrypto = [
+    "dep:sha2",
+    "dep:hmac",
+    "dep:hkdf",
+    "dep:aes",
+    "dep:ccm",
+    "dep:p256",
+    "dep:zeroize",
+    "dep:subtle",
+]
