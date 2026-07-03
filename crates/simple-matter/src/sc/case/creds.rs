@@ -183,3 +183,70 @@ pub trait NocResolver {
         icac_tlv: Option<&[u8]>,
     ) -> Result<PeerIdentity>;
 }
+
+/// fabric を 1 つも持たない空実装(PASE 単独運用向け。設計 §8「NullFabrics」)。
+///
+/// [`crate::sc::SecureChannel`] を **PASE だけ**で使う場合の型引数として渡す。
+/// [`FabricStore`] は空イテレータ、[`NocResolver`] は常に失敗を返すため、CASE 経路は
+/// destination-id 不一致([`crate::sc::status::ScStatusCode::NoSharedTrustRoots`])で
+/// 無効化される。CASE を使う場合は [`crate::fabric::FabricTable`] を包む実装を渡す。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoFabrics;
+
+/// [`NoFabrics`] の(決して構築されない)fabric ビュー型。
+///
+/// [`FabricStore::iter`] は空を返すため、本型のアクセサは実際には呼ばれない。
+/// `no_std` で参照を返すため、`'static` のゼロ値を返す。
+#[derive(Debug, Clone, Copy)]
+pub struct NoFabric;
+
+impl Fabric for NoFabric {
+    fn fabric_index(&self) -> NonZeroU8 {
+        // iter() が空のため到達しない。1 を返して panic を避ける。
+        NonZeroU8::new(1).unwrap()
+    }
+    fn fabric_id(&self) -> u64 {
+        0
+    }
+    fn node_id(&self) -> u64 {
+        0
+    }
+    fn ipk(&self) -> &[u8; IPK_LEN] {
+        &[0u8; IPK_LEN]
+    }
+    fn root_public_key(&self) -> &[u8; ROOT_PUBLIC_KEY_LEN] {
+        &[0u8; ROOT_PUBLIC_KEY_LEN]
+    }
+    fn noc(&self) -> &[u8] {
+        &[]
+    }
+    fn icac(&self) -> Option<&[u8]> {
+        None
+    }
+    fn sign(&self, _msg: &[u8], _out: &mut [u8; SIGNATURE_LEN]) -> Result<()> {
+        Err(crate::error::Error::Crypto)
+    }
+}
+
+impl FabricStore for NoFabrics {
+    type Fabric<'a> = NoFabric;
+
+    fn iter(&self) -> impl Iterator<Item = NoFabric> {
+        core::iter::empty()
+    }
+
+    fn get(&self, _idx: NonZeroU8) -> Option<NoFabric> {
+        None
+    }
+}
+
+impl NocResolver for NoFabrics {
+    fn verify_peer_noc(
+        &self,
+        _fabric_index: NonZeroU8,
+        _noc_tlv: &[u8],
+        _icac_tlv: Option<&[u8]>,
+    ) -> Result<PeerIdentity> {
+        Err(crate::error::Error::NotFound)
+    }
+}

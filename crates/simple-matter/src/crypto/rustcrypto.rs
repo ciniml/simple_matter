@@ -51,6 +51,10 @@ impl<R: Rng> RustCrypto<R> {
 }
 
 /// [`Sha256`] を実装するインクリメンタルハッシャ。
+///
+/// `Clone` は CASE のトランスクリプトハッシュが途中経過を複数回確定するために要る
+/// ([`Sha256`] のドキュメント参照)。`sha2::Sha256` は `Clone` を実装する。
+#[derive(Clone)]
 pub struct Sha256Hasher(sha2::Sha256);
 
 impl Sha256 for Sha256Hasher {

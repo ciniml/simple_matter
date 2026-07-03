@@ -1,17 +1,20 @@
 //! CASE responder(Sigma1/2/3)。
 //!
-//! `docs/design/secure-channel.md` §7/§8 に基づく。本ピース(第4段階)では CASE の
-//! state machine 本体は **未実装**であり、ここでは第4段階 fabric/credentials との
-//! **trait 境界**([`creds`])のみを提供する。CASE state machine は次タスクで
-//! [`creds`] の 3 つの trait だけに依存する形で追加する(依存性逆転)。
+//! `docs/design/secure-channel.md` §7/§8 に基づく。
 //!
-//! # 配置についての判断
+//! - [`creds`] — 第4段階 fabric/credentials との **trait 境界**([`FabricStore`] /
+//!   [`Fabric`] / [`NocResolver`])と、PASE 単独運用向けの空実装 [`creds::NoFabrics`]。
+//!   暗号 backend に依存せず `--no-default-features` でも常時コンパイルされる。
+//! - [`responder`] — CASE のプロトコルプリミティブ(Sigma1/2/3 の TLV codec と
+//!   S2K/S3K/SEKeys 導出・TBE 暗号化/復号・TBS 組み立て)。往復をまたぐ Mealy 状態機械
+//!   本体は [`crate::sc::SecureChannel`] に統合される(設計「SecureChannel ハンドラに統合」)。
+//!   crypto を要するため `rustcrypto` feature でのみ有効。
 //!
-//! 設計 §8 は「trait を `sc/case/creds.rs` に定義し、`fabric` モジュールが実装する」
-//! ことを求める。CASE 本体が未実装の現状でも、この trait 境界だけは先に確定させて
-//! おくことで、第4段階の [`crate::fabric`] は最終的な CASE の依存面(fabric の
-//! 読み取りビュー)に向けて実装できる。trait 定義は暗号 backend に依存しないため
-//! `--no-default-features` でも常時コンパイルされる(CASE state machine 本体は
-//! crypto を要するため、追加時に `rustcrypto` feature で gate する)。
+//! [`FabricStore`]: creds::FabricStore
+//! [`Fabric`]: creds::Fabric
+//! [`NocResolver`]: creds::NocResolver
 
 pub mod creds;
+
+#[cfg(feature = "rustcrypto")]
+pub mod responder;

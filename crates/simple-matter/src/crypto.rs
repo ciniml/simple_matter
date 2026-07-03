@@ -84,7 +84,17 @@ impl<T: Rng + ?Sized> Rng for &mut T {
 ///
 /// トランスクリプトハッシュ(CASE/PASE 等)のように、データを分割して逐次投入し
 /// 最後に確定させる用途に用いる。一括ハッシュは [`Crypto::sha256_oneshot`] を使う。
-pub trait Sha256: Sized {
+///
+/// # `Clone` を要求する理由(設計からの補足)
+///
+/// CASE のトランスクリプトハッシュ(TT)は、進行中に **途中経過のハッシュを複数回
+/// 覗く**必要がある(Sigma1 後の TT で S2K、Sigma1+2 後の TT で S3K、Sigma1+2+3 後の
+/// TT で SEKeys を導出する)。[`finish`](Sha256::finish) は `self` を消費するため、
+/// 途中経過を確定するには内部状態を複製できなければならない。よって本 trait は
+/// `Clone` を要求する(`clone()` した複製を `finish` して途中ハッシュを得、原本は
+/// 継続して `update` する)。PASE では複製は不要だが、実装型はいずれも複製可能な
+/// ため制約コストは無い。
+pub trait Sha256: Sized + Clone {
     /// ハッシュ計算に `data` を追加する。
     fn update(&mut self, data: &[u8]);
 
