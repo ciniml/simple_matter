@@ -20,6 +20,12 @@
 
 pub mod status;
 
+/// CASE responder と、第4段階 fabric/credentials との trait 境界(§8)。
+///
+/// 本ピースでは CASE state machine 本体は未実装で、[`case::creds`] の trait 境界のみを
+/// 提供する。trait 定義は暗号 backend に依存しないため常時コンパイルされる。
+pub mod case;
+
 pub use status::{GeneralCode, ScStatusCode, StatusReport, PROTO_ID_SECURE_CHANNEL};
 
 use crate::error::{Error, Result};
