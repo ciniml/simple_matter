@@ -10,8 +10,9 @@
 //!
 //! `docs/ARCHITECTURE.md` 設計原則2に従い、証明書は固定バッファ上のストリーミング
 //! TLV パースを基本とする。[`MatterCert`] は入力バイト列を **コピーせず借用**し、
-//! ヒープを確保しない。DN リスト・拡張・TBS(to-be-signed)範囲はいずれも入力
-//! バッファへの部分スライスとして保持する。
+//! ヒープを確保しない。DN リスト・拡張はいずれも入力バッファへの部分スライスとして
+//! 保持する。署名対象(TBS)の DER TBSCertificate は署名検証時に呼び出し側の固定
+//! バッファ上へ再構築する(下記「署名対象(TBS)についての設計判断」を参照)。
 //!
 //! # パースと暗号 backend の分離
 //!
@@ -21,18 +22,77 @@
 //!
 //! # 署名対象(TBS)についての設計判断
 //!
-//! Matter 仕様準拠の完全な実装では、証明書署名は TLV を X.509 **DER** に再エンコード
-//! した TBSCertificate に対して計算される。本タスクのスコープ(`docs/ARCHITECTURE.md`
-//! ロードマップ第4段階前半)では DER 変換系 crate を持ち込まない方針のため、
-//! 本モジュールは署名対象を **証明書 TLV の署名フィールド直前までのバイト列**
-//! ([`MatterCert::to_be_signed`])と定義する自己完結スキームを採る。
-//! DER ベースの署名検証(実 Matter コントローラとの相互運用)は DAC/CSR 段階での
-//! DER サポート導入時に差し替える。この差し替えでパース・チェーン走査ロジックは
-//! 変わらず、TBS 範囲の定義のみが変わる。
+//! Matter 仕様準拠の実 Matter 互換実装として、証明書署名は TLV 証明書を X.509
+//! **DER** の TBSCertificate へ再構築したバイト列に対して検証する
+//! (Matter Core Specification §6.5、connectedhomeip `CHIPCertToX509` の変換規則に
+//! 準拠)。[`MatterCert::to_be_signed`] はパース済み [`MatterCert`] から
+//! 呼び出し側バッファへ DER TBSCertificate をヒープなしで書き出す。
+//!
+//! 再構築する TBSCertificate は次のフィールドから成る(RFC 5280 / Matter §6.5):
+//! version(v3)、serial-number、signature(ecdsa-with-SHA256)、issuer DN、
+//! validity(Matter epoch 秒 → UTCTime/GeneralizedTime。`not-after = 0` は
+//! 無期限を表し `99991231235959Z` の GeneralizedTime として符号化)、subject DN、
+//! SubjectPublicKeyInfo(EC P-256)、extensions。Matter 固有 DN 属性は
+//! `1.3.6.1.4.1.37244.1.*` の OID + 16 桁(CAT は 8 桁)大文字 16 進の UTF8String
+//! として符号化する。DER 化は [`der`] の最小 DER ライタが担い、署名検証は
+//! 再構築した TBS を SHA-256 でハッシュして P-256 ECDSA 検証する。
+//!
+//! 再構築後の DER TBSCertificate の上限は [`MAX_TBS_DER_LEN`](600 バイト)とする。
+//! Matter 証明書の TLV 上限は約 400 バイト、DER 化後の上限は約 600 バイト級
+//! (rs-matter `MAX_CERT_ASN1_LEN` と同値)であり、署名を含まない TBS はこれを
+//! 下回る。
 
 use crate::crypto::{Crypto, P256PublicKey, P256_PUBLIC_KEY_LEN, P256_SIGNATURE_LEN};
 use crate::error::{Error, Result};
 use crate::tlv::{ContainerType, TlvReader, TlvTag, TlvValue};
+
+use self::der::DerWriter;
+
+mod der;
+
+/// Matter epoch(2000-01-01T00:00:00Z)の Unix タイムスタンプ(秒)。
+///
+/// Matter 証明書の validity は Matter epoch 秒で表現される。DER の UTCTime/
+/// GeneralizedTime へ変換する際にこの定数を加えて Unix 秒へ直す。
+const MATTER_EPOCH_SECS: u64 = 946_684_800;
+
+/// `not-after = 0`(無期限)を表す Matter epoch 秒。`99991231235959Z` に対応する。
+const MATTER_CERT_DOESNT_EXPIRE: u64 = 252_455_615_999;
+
+/// 再構築した DER TBSCertificate の最大バイト数。
+///
+/// Matter 証明書 TLV の上限は約 400 バイト、DER 化後(署名込みの完全な証明書)の
+/// 上限は約 600 バイト級であり、署名を含まない TBSCertificate はこれを下回る。
+/// [`MatterCert::to_be_signed`] はこのサイズのバッファに収まることを前提とする。
+pub const MAX_TBS_DER_LEN: usize = 600;
+
+// --- X.509 OID(DER 符号化済み内容オクテット)---
+
+/// ecdsa-with-SHA256(1.2.840.10045.4.3.2)。
+const OID_ECDSA_WITH_SHA256: [u8; 8] = [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02];
+/// id-ecPublicKey(1.2.840.10045.2.1)。
+const OID_EC_PUBLIC_KEY: [u8; 7] = [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01];
+/// prime256v1 / secp256r1(1.2.840.10045.3.1.7)。
+const OID_PRIME256V1: [u8; 8] = [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
+
+/// basic-constraints(2.5.29.19)。
+const OID_BASIC_CONSTRAINTS: [u8; 3] = [0x55, 0x1D, 0x13];
+/// key-usage(2.5.29.15)。
+const OID_KEY_USAGE: [u8; 3] = [0x55, 0x1D, 0x0F];
+/// ext-key-usage(2.5.29.37)。
+const OID_EXT_KEY_USAGE: [u8; 3] = [0x55, 0x1D, 0x25];
+/// subject-key-identifier(2.5.29.14)。
+const OID_SUBJECT_KEY_ID: [u8; 3] = [0x55, 0x1D, 0x0E];
+/// authority-key-identifier(2.5.29.35)。
+const OID_AUTHORITY_KEY_ID: [u8; 3] = [0x55, 0x1D, 0x23];
+
+/// extended-key-usage の purpose(値 1..=6)に対応する OID。
+const OID_EKU_SERVER_AUTH: [u8; 8] = [0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+const OID_EKU_CLIENT_AUTH: [u8; 8] = [0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
+const OID_EKU_CODE_SIGNING: [u8; 8] = [0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x03];
+const OID_EKU_EMAIL_PROTECTION: [u8; 8] = [0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x04];
+const OID_EKU_TIME_STAMPING: [u8; 8] = [0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x08];
+const OID_EKU_OCSP_SIGNING: [u8; 8] = [0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x09];
 
 // --- 証明書トップレベルのコンテキストタグ(§6.5.1)---
 
@@ -419,7 +479,6 @@ pub struct MatterCert<'a> {
     public_key: &'a [u8],
     extensions: Extensions<'a>,
     signature: &'a [u8],
-    tbs: &'a [u8],
 }
 
 impl<'a> MatterCert<'a> {
@@ -446,7 +505,6 @@ impl<'a> MatterCert<'a> {
         let mut public_key = None;
         let mut extensions = None;
         let mut signature = None;
-        let mut tbs = None;
 
         loop {
             let pos = r.position();
@@ -517,8 +575,6 @@ impl<'a> MatterCert<'a> {
                     if sig.len() != P256_SIGNATURE_LEN {
                         return Err(Error::Decode);
                     }
-                    // 署名フィールド開始位置までが署名対象(TBS)。
-                    tbs = Some(&cert[..pos]);
                     signature = Some(sig);
                 }
                 // 未知のトップレベルフィールドはスキップして継続する。
@@ -538,7 +594,6 @@ impl<'a> MatterCert<'a> {
             public_key: public_key.ok_or(Error::Decode)?,
             extensions: extensions.ok_or(Error::Decode)?,
             signature: signature.ok_or(Error::Decode)?,
-            tbs: tbs.ok_or(Error::Decode)?,
         })
     }
 
@@ -597,12 +652,66 @@ impl<'a> MatterCert<'a> {
         self.signature
     }
 
-    /// 署名対象(to-be-signed)バイト列。
+    /// 署名対象(to-be-signed)の X.509 DER TBSCertificate を `out` に再構築し、
+    /// 書き込んだバイト数を返す。
     ///
-    /// 本モジュールの自己完結スキームでは、証明書 TLV の署名フィールド直前までの
-    /// バイト列(struct 開始バイトを含む prefix)を指す。モジュールドキュメント参照。
-    pub fn to_be_signed(&self) -> &'a [u8] {
-        self.tbs
+    /// パース済みフィールドから RFC 5280 / Matter §6.5 に従う TBSCertificate を
+    /// DER 符号化する(モジュールドキュメント参照)。`out` は少なくとも
+    /// [`MAX_TBS_DER_LEN`] バイトの容量が望ましい。容量不足は [`Error::NoSpace`]、
+    /// 未対応の DN 属性など符号化不能な入力は [`Error::Decode`] を返し panic しない。
+    pub fn to_be_signed(&self, out: &mut [u8]) -> Result<usize> {
+        let mut w = DerWriter::new(out);
+        self.encode_tbs(&mut w)?;
+        Ok(w.len())
+    }
+
+    /// TBSCertificate を `w` へ DER 符号化する。
+    fn encode_tbs(&self, w: &mut DerWriter<'_>) -> Result<()> {
+        w.start_seq()?; // TBSCertificate
+
+        // version [0] { INTEGER 2 }(v3)。
+        w.start_ctx(0)?;
+        w.integer(&[2])?;
+        w.end_container()?;
+
+        // serialNumber。TLV の serial は DER INTEGER の内容オクテットそのもの。
+        w.integer(self.serial_number)?;
+
+        // signature(AlgorithmIdentifier)。
+        w.start_seq()?;
+        w.oid(&OID_ECDSA_WITH_SHA256)?;
+        w.end_container()?;
+
+        // issuer。
+        encode_dn(w, &self.issuer)?;
+
+        // validity。
+        w.start_seq()?;
+        encode_time(w, u64::from(self.not_before))?;
+        if self.not_after == 0 {
+            encode_time(w, MATTER_CERT_DOESNT_EXPIRE)?;
+        } else {
+            encode_time(w, u64::from(self.not_after))?;
+        }
+        w.end_container()?;
+
+        // subject。
+        encode_dn(w, &self.subject)?;
+
+        // subjectPublicKeyInfo。
+        w.start_seq()?;
+        w.start_seq()?;
+        w.oid(&OID_EC_PUBLIC_KEY)?;
+        w.oid(&OID_PRIME256V1)?;
+        w.end_container()?;
+        w.bit_string(false, self.public_key)?;
+        w.end_container()?;
+
+        // extensions [3] { SEQUENCE { ... } }。
+        encode_extensions(w, &self.extensions)?;
+
+        w.end_container()?; // TBSCertificate
+        Ok(())
     }
 
     /// subject DN から証明書種別を判定する。
@@ -648,8 +757,10 @@ impl<'a> MatterCert<'a> {
     pub fn verify_signature<C: Crypto>(&self, crypto: &C, issuer_public_key: &[u8]) -> Result<()> {
         let sig: &[u8; P256_SIGNATURE_LEN] =
             self.signature.try_into().map_err(|_| Error::Crypto)?;
+        let mut tbs = [0u8; MAX_TBS_DER_LEN];
+        let len = self.to_be_signed(&mut tbs)?;
         let key = crypto.p256_public_key_from_bytes(issuer_public_key)?;
-        if key.verify(self.tbs, sig)? {
+        if key.verify(&tbs[..len], sig)? {
             Ok(())
         } else {
             Err(Error::Crypto)
@@ -706,6 +817,293 @@ impl<'a> MatterCert<'a> {
         }
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// TLV → X.509 DER TBSCertificate 変換ヘルパ
+// ---------------------------------------------------------------------------
+
+/// DN 属性種別(`attr_type`)に対応する X.509 属性 OID と、整数属性の場合の
+/// 16 進符号化桁数を返す。未対応の種別は `None`。
+///
+/// Matter 固有属性(17..=22)は `1.3.6.1.4.1.37244.1.*`、標準属性(1..=16)は
+/// `2.5.4.*` 系または domainComponent。整数属性(node-id 等)は固定桁数の
+/// 大文字 16 進 UTF8String として符号化する(桁数を `Some` で返す)。
+fn dn_attr_oid(attr_type: u8) -> Option<(&'static [u8], Option<u8>)> {
+    // 標準属性 OID(2.5.4.*)。
+    const OID_COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
+    const OID_SURNAME: &[u8] = &[0x55, 0x04, 0x04];
+    const OID_SERIAL_NUMBER: &[u8] = &[0x55, 0x04, 0x05];
+    const OID_COUNTRY_NAME: &[u8] = &[0x55, 0x04, 0x06];
+    const OID_LOCALITY_NAME: &[u8] = &[0x55, 0x04, 0x07];
+    const OID_STATE_NAME: &[u8] = &[0x55, 0x04, 0x08];
+    const OID_ORG_NAME: &[u8] = &[0x55, 0x04, 0x0A];
+    const OID_ORG_UNIT_NAME: &[u8] = &[0x55, 0x04, 0x0B];
+    const OID_TITLE: &[u8] = &[0x55, 0x04, 0x0C];
+    const OID_NAME: &[u8] = &[0x55, 0x04, 0x29];
+    const OID_GIVEN_NAME: &[u8] = &[0x55, 0x04, 0x2A];
+    const OID_INITIALS: &[u8] = &[0x55, 0x04, 0x2B];
+    const OID_GEN_QUALIFIER: &[u8] = &[0x55, 0x04, 0x2C];
+    const OID_DN_QUALIFIER: &[u8] = &[0x55, 0x04, 0x2E];
+    const OID_PSEUDONYM: &[u8] = &[0x55, 0x04, 0x41];
+    const OID_DOMAIN_COMPONENT: &[u8] =
+        &[0x09, 0x92, 0x26, 0x89, 0x93, 0xF2, 0x2C, 0x64, 0x01, 0x19];
+    // Matter 固有属性 OID(1.3.6.1.4.1.37244.1.*)。
+    const OID_MATTER_NODE_ID: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xA2, 0x7C, 0x01, 0x01];
+    const OID_MATTER_FW_SIGN_ID: &[u8] =
+        &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xA2, 0x7C, 0x01, 0x02];
+    const OID_MATTER_ICAC_ID: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xA2, 0x7C, 0x01, 0x03];
+    const OID_MATTER_RCAC_ID: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xA2, 0x7C, 0x01, 0x04];
+    const OID_MATTER_FABRIC_ID: &[u8] =
+        &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xA2, 0x7C, 0x01, 0x05];
+    const OID_MATTER_CASE_AUTH_TAG: &[u8] =
+        &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xA2, 0x7C, 0x01, 0x06];
+
+    Some(match attr_type {
+        1 => (OID_COMMON_NAME, None),
+        2 => (OID_SURNAME, None),
+        3 => (OID_SERIAL_NUMBER, None),
+        4 => (OID_COUNTRY_NAME, None),
+        5 => (OID_LOCALITY_NAME, None),
+        6 => (OID_STATE_NAME, None),
+        7 => (OID_ORG_NAME, None),
+        8 => (OID_ORG_UNIT_NAME, None),
+        9 => (OID_TITLE, None),
+        10 => (OID_NAME, None),
+        11 => (OID_GIVEN_NAME, None),
+        12 => (OID_INITIALS, None),
+        13 => (OID_GEN_QUALIFIER, None),
+        14 => (OID_DN_QUALIFIER, None),
+        15 => (OID_PSEUDONYM, None),
+        16 => (OID_DOMAIN_COMPONENT, None),
+        dn_attr::MATTER_NODE_ID => (OID_MATTER_NODE_ID, Some(16)),
+        dn_attr::MATTER_FIRMWARE_SIGNING_ID => (OID_MATTER_FW_SIGN_ID, Some(16)),
+        dn_attr::MATTER_ICAC_ID => (OID_MATTER_ICAC_ID, Some(16)),
+        dn_attr::MATTER_RCAC_ID => (OID_MATTER_RCAC_ID, Some(16)),
+        dn_attr::MATTER_FABRIC_ID => (OID_MATTER_FABRIC_ID, Some(16)),
+        dn_attr::MATTER_NOC_CAT => (OID_MATTER_CASE_AUTH_TAG, Some(8)),
+        _ => return None,
+    })
+}
+
+/// `v` を大文字 16 進・幅 `width`(8 または 16)で `buf` に書き、そのスライスを返す。
+fn hex_upper(v: u64, width: usize, buf: &mut [u8; 16]) -> &[u8] {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for (i, slot) in buf.iter_mut().enumerate().take(width) {
+        let shift = (width - 1 - i) * 4;
+        *slot = HEX[((v >> shift) & 0xf) as usize];
+    }
+    &buf[..width]
+}
+
+/// DN リスト(issuer / subject)を X.509 Name(`RDNSequence`)として符号化する。
+fn encode_dn(w: &mut DerWriter<'_>, dn: &DnList<'_>) -> Result<()> {
+    w.start_seq()?;
+    for attr in dn.iter() {
+        let attr = attr?;
+        let (oid, int_width) = dn_attr_oid(attr.attr_type).ok_or(Error::Decode)?;
+        w.start_set()?;
+        w.start_seq()?;
+        w.oid(oid)?;
+        match attr.value {
+            DnValue::Uint(v) => {
+                let width = int_width.ok_or(Error::Decode)?;
+                let mut buf = [0u8; 16];
+                w.utf8_string(hex_upper(v, usize::from(width), &mut buf))?;
+            }
+            DnValue::Str(s) => {
+                if attr.printable {
+                    w.printable_string(s.as_bytes())?;
+                } else {
+                    w.utf8_string(s.as_bytes())?;
+                }
+            }
+        }
+        w.end_container()?; // SEQUENCE
+        w.end_container()?; // SET
+    }
+    w.end_container()?; // SEQUENCE(RDNSequence)
+    Ok(())
+}
+
+/// Matter epoch 秒 `matter_secs` を UTCTime / GeneralizedTime として符号化する。
+///
+/// RFC 5280 に従い 2050 年未満は UTCTime(`YYMMDDHHMMSSZ`)、以降は
+/// GeneralizedTime(`YYYYMMDDHHMMSSZ`)を用いる。
+fn encode_time(w: &mut DerWriter<'_>, matter_secs: u64) -> Result<()> {
+    let unix = MATTER_EPOCH_SECS + matter_secs;
+    let (year, month, day, hour, minute, second) = civil_from_unix(unix);
+
+    /// 2 桁ゼロ詰め 10 進を書く。
+    fn two(buf: &mut [u8], at: usize, v: u32) {
+        buf[at] = b'0' + (v / 10) as u8;
+        buf[at + 1] = b'0' + (v % 10) as u8;
+    }
+
+    if year >= 2050 {
+        // GeneralizedTime: YYYYMMDDHHMMSSZ(15 バイト)。
+        let mut b = [0u8; 15];
+        two(&mut b, 0, (year / 100) as u32);
+        two(&mut b, 2, (year % 100) as u32);
+        two(&mut b, 4, u32::from(month));
+        two(&mut b, 6, u32::from(day));
+        two(&mut b, 8, u32::from(hour));
+        two(&mut b, 10, u32::from(minute));
+        two(&mut b, 12, u32::from(second));
+        b[14] = b'Z';
+        w.time(0x18, &b)
+    } else {
+        // UTCTime: YYMMDDHHMMSSZ(13 バイト)。
+        let mut b = [0u8; 13];
+        two(&mut b, 0, (year % 100) as u32);
+        two(&mut b, 2, u32::from(month));
+        two(&mut b, 4, u32::from(day));
+        two(&mut b, 6, u32::from(hour));
+        two(&mut b, 8, u32::from(minute));
+        two(&mut b, 10, u32::from(second));
+        b[12] = b'Z';
+        w.time(0x17, &b)
+    }
+}
+
+/// Unix 秒 → (年, 月, 日, 時, 分, 秒)。閏年・グレゴリオ暦対応
+/// (Howard Hinnant の civil_from_days アルゴリズム)。
+fn civil_from_unix(secs: u64) -> (i64, u8, u8, u8, u8, u8) {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let hour = (rem / 3600) as u8;
+    let minute = ((rem % 3600) / 60) as u8;
+    let second = (rem % 60) as u8;
+
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u8; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u8; // [1, 12]
+    let year = y + i64::from(month <= 2);
+    (year, month, day, hour, minute, second)
+}
+
+/// 拡張リストを X.509 extensions(`[3] { SEQUENCE OF Extension }`)として符号化する。
+///
+/// 符号化順序は Matter TLV の正準順(basic-constraints, key-usage, ext-key-usage,
+/// subject-key-id, authority-key-id, future-extensions)に一致させる。
+fn encode_extensions(w: &mut DerWriter<'_>, ext: &Extensions<'_>) -> Result<()> {
+    w.start_ctx(3)?;
+    w.start_seq()?;
+
+    if let Some(bc) = ext.basic_constraints {
+        w.start_seq()?;
+        w.oid(&OID_BASIC_CONSTRAINTS)?;
+        w.boolean(true)?; // critical
+        w.start_octet_string()?;
+        w.start_seq()?;
+        if bc.is_ca {
+            w.boolean(true)?;
+        }
+        if let Some(p) = bc.path_len_constraint {
+            w.integer(&[p])?;
+        }
+        w.end_container()?; // SEQUENCE
+        w.end_container()?; // OCTET STRING
+        w.end_container()?; // Extension SEQUENCE
+    }
+
+    if let Some(ku) = ext.key_usage {
+        w.start_seq()?;
+        w.oid(&OID_KEY_USAGE)?;
+        w.boolean(true)?; // critical
+        w.start_octet_string()?;
+        // X.509 の BIT STRING は各バイト内でビット順が反転する。
+        let bits = [
+            reverse_byte((ku & 0xff) as u8),
+            reverse_byte((ku >> 8) as u8),
+        ];
+        w.bit_string(true, &bits)?;
+        w.end_container()?; // OCTET STRING
+        w.end_container()?; // Extension SEQUENCE
+    }
+
+    if let Some(raw) = ext.extended_key_usage {
+        w.start_seq()?;
+        w.oid(&OID_EXT_KEY_USAGE)?;
+        w.boolean(true)?; // critical
+        w.start_octet_string()?;
+        w.start_seq()?;
+        let mut r = TlvReader::new(raw);
+        r.read_next()?; // array 開始トークン(context tag 3)を消費。
+        loop {
+            let elem = r.read_next()?.ok_or(Error::Decode)?;
+            if elem.value == TlvValue::ContainerEnd {
+                break;
+            }
+            let purpose = match elem.value {
+                TlvValue::UnsignedInteger(v) => u8::try_from(v).map_err(|_| Error::Decode)?,
+                _ => return Err(Error::Decode),
+            };
+            w.oid(eku_oid(purpose)?)?;
+        }
+        w.end_container()?; // SEQUENCE
+        w.end_container()?; // OCTET STRING
+        w.end_container()?; // Extension SEQUENCE
+    }
+
+    if let Some(skid) = ext.subject_key_id {
+        w.start_seq()?;
+        w.oid(&OID_SUBJECT_KEY_ID)?;
+        // 非 critical。
+        w.start_octet_string()?;
+        w.octet_string(skid)?;
+        w.end_container()?; // OCTET STRING
+        w.end_container()?; // Extension SEQUENCE
+    }
+
+    if let Some(akid) = ext.authority_key_id {
+        w.start_seq()?;
+        w.oid(&OID_AUTHORITY_KEY_ID)?;
+        // 非 critical。
+        w.start_octet_string()?;
+        w.start_seq()?;
+        w.ctx_primitive(0, akid)?; // [0] keyIdentifier
+        w.end_container()?; // SEQUENCE
+        w.end_container()?; // OCTET STRING
+        w.end_container()?; // Extension SEQUENCE
+    }
+
+    if let Some(fe) = ext.future_extensions {
+        // future-extensions は DER 符号化済みの X.509 Extension をそのまま格納する。
+        w.raw(fe)?;
+    }
+
+    w.end_container()?; // SEQUENCE OF Extension
+    w.end_container()?; // [3]
+    Ok(())
+}
+
+/// extended-key-usage の purpose 値(1..=6)に対応する OID を返す。
+fn eku_oid(purpose: u8) -> Result<&'static [u8]> {
+    Ok(match purpose {
+        ext_key_usage::SERVER_AUTH => &OID_EKU_SERVER_AUTH,
+        ext_key_usage::CLIENT_AUTH => &OID_EKU_CLIENT_AUTH,
+        ext_key_usage::CODE_SIGNING => &OID_EKU_CODE_SIGNING,
+        ext_key_usage::EMAIL_PROTECTION => &OID_EKU_EMAIL_PROTECTION,
+        ext_key_usage::TIME_STAMPING => &OID_EKU_TIME_STAMPING,
+        ext_key_usage::OCSP_SIGNING => &OID_EKU_OCSP_SIGNING,
+        _ => return Err(Error::Decode),
+    })
+}
+
+/// バイト内のビット順を反転する(X.509 KeyUsage BIT STRING 用)。
+fn reverse_byte(byte: u8) -> u8 {
+    const LOOKUP: [u8; 16] = [
+        0x00, 0x08, 0x04, 0x0c, 0x02, 0x0a, 0x06, 0x0e, 0x01, 0x09, 0x05, 0x0d, 0x03, 0x0b, 0x07,
+        0x0f,
+    ];
+    (LOOKUP[(byte & 0x0f) as usize] << 4) | LOOKUP[(byte >> 4) as usize]
 }
 
 /// 拡張リスト要素(`&cert[..]` の部分スライス)をパースする。

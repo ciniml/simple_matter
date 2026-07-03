@@ -5,10 +5,16 @@
 //! 用い、全フィールド値を照合する。これらは Matter 仕様の実バイト列であり、
 //! パーサの正当性を検証するのに適する。
 //!
-//! 署名・チェーン検証系のテストは、本モジュールの署名スキーム(TBS = TLV prefix。
-//! モジュールドキュメント参照)に対して自己完結な証明書をテスト内で生成して検証する。
-//! rs-matter の埋め込み証明書は DER-TBS に対して署名されているため、本モジュールの
-//! TLV-TBS スキームでは署名照合できず、これらはパース照合にのみ用いる。
+//! 署名・チェーン検証系のテストは 2 系統ある:
+//!
+//! 1. **実 Matter 互換の証明**: 上記 rs-matter 由来の実証明書(chip-cert 生成の
+//!    NOC1 → ICAC1 → RCA1)チェーンに対し、DER-TBS 方式の [`MatterCert::verify_signature`]
+//!    と [`verify_chain`] が実際に通ることを確認する。これらの証明書の署名は X.509
+//!    DER の TBSCertificate に対して計算されており、本モジュールが仕様準拠であることの
+//!    直接の証拠になる。
+//! 2. **意味的な検証ロジック**: 有効期間・fabric-id 整合・authority-key-id 連鎖などの
+//!    否定系は、DER-TBS 方式で自己整合的に署名したテスト証明書を生成して確認する
+//!    (プレースホルダ署名で TLV を組み立て、パース後に DER TBS を再構築して署名し直す)。
 
 use super::*;
 
@@ -289,43 +295,54 @@ mod signed {
         akid: &[u8; 20],
         issuer_kp: &C::Keypair,
     ) -> usize {
-        let mut w = TlvWriter::new(out);
-        w.start_struct(&TlvTag::Anonymous).unwrap();
-        w.write_bytes(&cx(1), serial).unwrap(); // serial-num
-        w.write_u8(&cx(2), 1).unwrap(); // sig-algo = ECDSAWithSHA256
-        write_dn(&mut w, 3, issuer);
-        w.write_u32(&cx(4), not_before).unwrap();
-        w.write_u32(&cx(5), not_after).unwrap();
-        write_dn(&mut w, 6, subject);
-        w.write_u8(&cx(7), 1).unwrap(); // pubkey-algo
-        w.write_u8(&cx(8), 1).unwrap(); // curve-id
-        w.write_bytes(&cx(9), subject_pub).unwrap();
-        // extensions
-        w.start_list(&cx(10)).unwrap();
-        w.start_struct(&cx(1)).unwrap(); // basic-constraints
-        w.write_bool(&cx(1), is_ca).unwrap();
-        if let Some(p) = path_len {
-            w.write_u8(&cx(2), p).unwrap();
-        }
-        w.end_container().unwrap();
-        w.write_u16(&cx(2), key_usage_bits).unwrap(); // key-usage
-        if !eku.is_empty() {
-            w.start_array(&cx(3)).unwrap(); // extended-key-usage
-            for e in eku {
-                w.write_u8(&TlvTag::Anonymous, *e).unwrap();
+        // まずプレースホルダ署名(全 0)で TLV 証明書を組み立てる。
+        let len = {
+            let mut w = TlvWriter::new(out);
+            w.start_struct(&TlvTag::Anonymous).unwrap();
+            w.write_bytes(&cx(1), serial).unwrap(); // serial-num
+            w.write_u8(&cx(2), 1).unwrap(); // sig-algo = ECDSAWithSHA256
+            write_dn(&mut w, 3, issuer);
+            w.write_u32(&cx(4), not_before).unwrap();
+            w.write_u32(&cx(5), not_after).unwrap();
+            write_dn(&mut w, 6, subject);
+            w.write_u8(&cx(7), 1).unwrap(); // pubkey-algo
+            w.write_u8(&cx(8), 1).unwrap(); // curve-id
+            w.write_bytes(&cx(9), subject_pub).unwrap();
+            // extensions
+            w.start_list(&cx(10)).unwrap();
+            w.start_struct(&cx(1)).unwrap(); // basic-constraints
+            w.write_bool(&cx(1), is_ca).unwrap();
+            if let Some(p) = path_len {
+                w.write_u8(&cx(2), p).unwrap();
             }
             w.end_container().unwrap();
-        }
-        w.write_bytes(&cx(4), skid).unwrap(); // subject-key-id
-        w.write_bytes(&cx(5), akid).unwrap(); // authority-key-id
-        w.end_container().unwrap(); // extensions
+            w.write_u16(&cx(2), key_usage_bits).unwrap(); // key-usage
+            if !eku.is_empty() {
+                w.start_array(&cx(3)).unwrap(); // extended-key-usage
+                for e in eku {
+                    w.write_u8(&TlvTag::Anonymous, *e).unwrap();
+                }
+                w.end_container().unwrap();
+            }
+            w.write_bytes(&cx(4), skid).unwrap(); // subject-key-id
+            w.write_bytes(&cx(5), akid).unwrap(); // authority-key-id
+            w.end_container().unwrap(); // extensions
+            w.write_bytes(&cx(11), &[0u8; 64]).unwrap(); // signature(プレースホルダ)
+            w.end_container().unwrap(); // struct
+            w.len()
+        };
 
-        // 署名: TBS = ここまでの prefix。
+        // パースして DER TBSCertificate を再構築し、それに対して署名する。
+        let mut tbs = [0u8; super::MAX_TBS_DER_LEN];
+        let tbs_len = {
+            let cert = MatterCert::parse(&out[..len]).unwrap();
+            cert.to_be_signed(&mut tbs).unwrap()
+        };
         let mut sig = [0u8; 64];
-        issuer_kp.sign(w.written(), &mut sig).unwrap();
-        w.write_bytes(&cx(11), &sig).unwrap(); // signature
-        w.end_container().unwrap(); // struct
-        w.len()
+        issuer_kp.sign(&tbs[..tbs_len], &mut sig).unwrap();
+        // 署名フィールドの 64 バイトは、末尾の struct 終端(0x18)の直前に位置する。
+        out[len - 65..len - 1].copy_from_slice(&sig);
+        len
     }
 
     const FABRIC_ID: u64 = 0x1122_3344_5566_7788;
@@ -884,6 +901,76 @@ mod signed {
         let rcac = MatterCert::parse(&rcac_buf[..rcac_len]).unwrap();
         assert_eq!(
             verify_chain(&crypto, &noc, Some(&icac), &rcac, NOW),
+            Err(Error::CertInvalid)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 実 Matter 互換の証明: chip-cert 生成の実証明書チェーンの署名/チェーン検証
+    // -----------------------------------------------------------------------
+
+    /// NOC1 の not-before(0x2781_2280)< この時刻 < not-after(0x3a4d_2580)。
+    const REAL_NOW: u32 = 800_000_000;
+
+    #[test]
+    fn real_chain_signatures_verify() {
+        let crypto = backend();
+        let noc = MatterCert::parse(NOC1_SUCCESS).unwrap();
+        let icac = MatterCert::parse(ICAC1_SUCCESS).unwrap();
+        let rcac = MatterCert::parse(RCA1_SUCCESS).unwrap();
+        // 各リンクの署名を親の公開鍵(RCAC は自身)で検証する。
+        // 実証明書の署名は X.509 DER TBSCertificate に対して計算されており、
+        // これが通ることが実 Matter 互換の直接の証拠になる。
+        noc.verify_signature(&crypto, icac.public_key()).unwrap();
+        icac.verify_signature(&crypto, rcac.public_key()).unwrap();
+        rcac.verify_signature(&crypto, rcac.public_key()).unwrap();
+    }
+
+    #[test]
+    fn real_chain_verifies() {
+        let crypto = backend();
+        let noc = MatterCert::parse(NOC1_SUCCESS).unwrap();
+        let icac = MatterCert::parse(ICAC1_SUCCESS).unwrap();
+        let rcac = MatterCert::parse(RCA1_SUCCESS).unwrap();
+        verify_chain(&crypto, &noc, Some(&icac), &rcac, REAL_NOW).unwrap();
+    }
+
+    #[test]
+    fn real_chain_wrong_issuer_key_fails() {
+        let crypto = backend();
+        let noc = MatterCert::parse(NOC1_SUCCESS).unwrap();
+        let rcac = MatterCert::parse(RCA1_SUCCESS).unwrap();
+        // NOC は ICAC が発行しており、RCAC の公開鍵では署名検証に失敗する。
+        assert_eq!(
+            noc.verify_signature(&crypto, rcac.public_key()),
+            Err(Error::Crypto)
+        );
+    }
+
+    #[test]
+    fn real_noc_signature_tamper_fails() {
+        let crypto = backend();
+        let icac = MatterCert::parse(ICAC1_SUCCESS).unwrap();
+        let mut buf = [0u8; NOC1_SUCCESS.len()];
+        buf.copy_from_slice(NOC1_SUCCESS);
+        let n = buf.len();
+        buf[n - 2] ^= 0x01; // 署名の末尾バイトを反転。
+        let noc = MatterCert::parse(&buf).unwrap();
+        assert_eq!(
+            noc.verify_signature(&crypto, icac.public_key()),
+            Err(Error::Crypto)
+        );
+    }
+
+    #[test]
+    fn real_chain_expired_fails() {
+        let crypto = backend();
+        let noc = MatterCert::parse(NOC1_SUCCESS).unwrap();
+        let icac = MatterCert::parse(ICAC1_SUCCESS).unwrap();
+        let rcac = MatterCert::parse(RCA1_SUCCESS).unwrap();
+        // not-after(0x3a4d_2580)を超過した時刻。
+        assert_eq!(
+            verify_chain(&crypto, &noc, Some(&icac), &rcac, 0x3a4d_2580 + 1),
             Err(Error::CertInvalid)
         );
     }
