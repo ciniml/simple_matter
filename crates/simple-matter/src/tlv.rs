@@ -477,6 +477,16 @@ pub struct TlvWriter<'a> {
     depth: usize,
 }
 
+/// [`TlvWriter`] の書き込み位置スナップショット(巻き戻し用の不透明ハンドル)。
+///
+/// [`TlvWriter::checkpoint`] が返し、[`TlvWriter::rewind`] が受け取る。フィールドは
+/// 非公開で、位置の意味的解釈は行わせない。
+#[derive(Debug, Clone, Copy)]
+pub struct TlvCheckpoint {
+    pos: usize,
+    depth: usize,
+}
+
 impl<'a> TlvWriter<'a> {
     /// 出力先バッファを与えてライタを生成する。
     pub fn new(buf: &'a mut [u8]) -> Self {
@@ -501,6 +511,26 @@ impl<'a> TlvWriter<'a> {
     /// まだ何も書き込んでいなければ `true`。
     pub const fn is_empty(&self) -> bool {
         self.pos == 0
+    }
+
+    /// 現在の書き込み位置を不透明なチェックポイントとして取得する。
+    ///
+    /// [`TlvWriter::rewind`] と組み合わせて「試し書き→満杯なら巻き戻し」を実現する
+    /// (IM の ReportData チャンク境界判定、`docs/design/interaction-model.md` §5.4)。
+    pub const fn checkpoint(&self) -> TlvCheckpoint {
+        TlvCheckpoint {
+            pos: self.pos,
+            depth: self.depth,
+        }
+    }
+
+    /// [`TlvWriter::checkpoint`] で取得した位置まで書き込みを巻き戻す。
+    ///
+    /// チェックポイント以降に書いたバイトは論理的に破棄される(バッファ内容は上書き
+    /// されるまで残るが、[`TlvWriter::len`] 以降として扱われる)。コンテナ深さも復元する。
+    pub fn rewind(&mut self, cp: TlvCheckpoint) {
+        self.pos = cp.pos;
+        self.depth = cp.depth;
     }
 
     /// 生バイト列を末尾へ追記する。空きが足りなければ `Error::NoSpace`。

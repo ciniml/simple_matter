@@ -785,6 +785,162 @@ impl<'a> ReportDataRef<'a> {
 }
 
 // ==========================================================================
+// ReportData の逐次(チャンク)ビルダ(設計 §5.4)
+// ==========================================================================
+
+/// [`ReportChunkBuilder`] の末尾に確保するマージン(バイト)。
+///
+/// 配列クローズ + `MoreChunkedMessages` + `SuppressResponse` + InteractionModelRevision +
+/// 構造体クローズを必ず書き切れるよう、属性の試し書き上限をバッファ末尾からこの分だけ
+/// 手前に置く。
+const REPORT_TAIL_MARGIN: usize = 12;
+
+/// ReportData を **1 属性ずつ試し書きしながら**組み立てるビルダ(設計 §5.4)。
+///
+/// [`encode_report_data`] が「全レポートを 1 クロージャで書く」単発 API なのに対し、本ビルダは
+/// IM エンジンのチャンク化(1 メッセージに入らない Read/Subscribe プライミング応答を
+/// `MoreChunkedMessages=true` で分割送信する)に用いる。`try_push_*` は
+/// [`TlvWriter::checkpoint`]/[`TlvWriter::rewind`] で「入らなければ巻き戻す」ため、呼び出し側は
+/// 収まったかどうか(`bool`)だけを見てカーソルを進めるか打ち切るかを決められる。
+#[derive(Debug)]
+pub struct ReportChunkBuilder<'b> {
+    w: TlvWriter<'b>,
+    /// この位置を超える書き込みは「入らなかった」として巻き戻す(末尾マージン確保)。
+    limit: usize,
+    /// これまでに確定した AttributeReportIB 数。
+    count: usize,
+}
+
+impl<'b> ReportChunkBuilder<'b> {
+    /// ReportData の外枠(構造体 + 任意の SubscriptionId + AttributeReports 配列)を開く。
+    ///
+    /// `subscription_id` は購読レポートでのみ `Some`(プライミング/通常 Read は `None`)。
+    pub fn new(tx: &'b mut [u8], subscription_id: Option<u32>) -> Result<Self> {
+        let cap = tx.len();
+        let mut w = TlvWriter::new(tx);
+        w.start_struct(&TlvTag::Anonymous)?;
+        if let Some(id) = subscription_id {
+            w.write_u32(&TlvTag::ContextSpecific(0), id)?;
+        }
+        w.start_array(&TlvTag::ContextSpecific(1))?;
+        Ok(Self {
+            w,
+            limit: cap.saturating_sub(REPORT_TAIL_MARGIN),
+            count: 0,
+        })
+    }
+
+    /// これまでに確定したレポート数。
+    pub const fn count(&self) -> usize {
+        self.count
+    }
+
+    /// まだ 1 件もレポートを書いていなければ `true`。
+    pub const fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// AttributeDataIB を試し書きする。収まれば `Ok(true)`、収まらなければ巻き戻して `Ok(false)`。
+    ///
+    /// `value` は値要素を `tag`(context 2)で書くクロージャ。`value` が
+    /// [`Error::NoSpace`] を返した場合も「収まらなかった」として巻き戻す。
+    pub fn try_push_data(
+        &mut self,
+        data_version: Option<u32>,
+        path: &AttributePath,
+        value: impl FnOnce(&mut TlvWriter<'_>, &TlvTag) -> Result<()>,
+    ) -> Result<bool> {
+        let cp = self.w.checkpoint();
+        match write_attr_data_ib(&mut self.w, data_version, path, value) {
+            Ok(()) if self.w.len() <= self.limit => {
+                self.count += 1;
+                Ok(true)
+            }
+            Ok(()) => {
+                self.w.rewind(cp);
+                Ok(false)
+            }
+            Err(Error::NoSpace) => {
+                self.w.rewind(cp);
+                Ok(false)
+            }
+            Err(e) => {
+                self.w.rewind(cp);
+                Err(e)
+            }
+        }
+    }
+
+    /// AttributeStatusIB を試し書きする。収まれば `Ok(true)`、収まらなければ巻き戻して `Ok(false)`。
+    pub fn try_push_status(&mut self, path: &AttributePath, status: &StatusIB) -> Result<bool> {
+        let cp = self.w.checkpoint();
+        match write_attr_status_ib(&mut self.w, path, status) {
+            Ok(()) if self.w.len() <= self.limit => {
+                self.count += 1;
+                Ok(true)
+            }
+            Ok(()) => {
+                self.w.rewind(cp);
+                Ok(false)
+            }
+            Err(Error::NoSpace) => {
+                self.w.rewind(cp);
+                Ok(false)
+            }
+            Err(e) => {
+                self.w.rewind(cp);
+                Err(e)
+            }
+        }
+    }
+
+    /// 配列と構造体を閉じ、`MoreChunkedMessages`/`SuppressResponse`/InteractionModelRevision を
+    /// 書いて確定バイト長を返す。
+    pub fn finish(mut self, more_chunks: bool, suppress_response: bool) -> Result<usize> {
+        self.w.end_container()?; // AttributeReports 配列
+        if more_chunks {
+            self.w.write_bool(&TlvTag::ContextSpecific(3), true)?;
+        }
+        if suppress_response {
+            self.w.write_bool(&TlvTag::ContextSpecific(4), true)?;
+        }
+        end_msg(&mut self.w)
+    }
+}
+
+/// AttributeReportIB(データ)を書く(`{ 1: { 0?: dataVer, 1: path, 2: value } }`)。
+fn write_attr_data_ib(
+    w: &mut TlvWriter<'_>,
+    data_version: Option<u32>,
+    path: &AttributePath,
+    value: impl FnOnce(&mut TlvWriter<'_>, &TlvTag) -> Result<()>,
+) -> Result<()> {
+    w.start_struct(&TlvTag::Anonymous)?;
+    w.start_struct(&TlvTag::ContextSpecific(1))?;
+    if let Some(dv) = data_version {
+        w.write_u32(&TlvTag::ContextSpecific(0), dv)?;
+    }
+    path.encode(w, &TlvTag::ContextSpecific(1))?;
+    value(w, &TlvTag::ContextSpecific(2))?;
+    w.end_container()?;
+    w.end_container()
+}
+
+/// AttributeReportIB(ステータス)を書く(`{ 0: { 0: path, 1: status } }`)。
+fn write_attr_status_ib(
+    w: &mut TlvWriter<'_>,
+    path: &AttributePath,
+    status: &StatusIB,
+) -> Result<()> {
+    w.start_struct(&TlvTag::Anonymous)?;
+    w.start_struct(&TlvTag::ContextSpecific(0))?;
+    path.encode(w, &TlvTag::ContextSpecific(0))?;
+    status.encode(w, &TlvTag::ContextSpecific(1))?;
+    w.end_container()?;
+    w.end_container()
+}
+
+// ==========================================================================
 // WriteRequest / WriteResponse(OpCode 0x06 / 0x07)
 // ==========================================================================
 

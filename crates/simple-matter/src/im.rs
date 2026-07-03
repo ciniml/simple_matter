@@ -15,4 +15,5 @@
 //! ([`wire::EndpointId`] 等)は設計 §7.3 に従い [`crate::dm::meta`] を正典とし、`wire` からは
 //! 再エクスポートする(dm 層実装により移設済み)。
 
+pub mod engine;
 pub mod wire;
