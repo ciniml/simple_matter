@@ -12,5 +12,6 @@
 pub mod crypto;
 pub mod error;
 pub mod tlv;
+pub mod transport;
 
 pub use error::Error;
