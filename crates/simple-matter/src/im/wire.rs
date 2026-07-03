@@ -107,28 +107,12 @@ impl ImOpCode {
 }
 
 // ==========================================================================
-// ID 新型(暫定。設計上は dm::meta。dm 実装時に移設予定)
+// ID 新型(正典は dm::meta。ここから再エクスポートする)
 // ==========================================================================
 
-/// エンドポイント ID。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct EndpointId(pub u16);
-
-/// クラスタ ID。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct ClusterId(pub u32);
-
-/// 属性 ID。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct AttributeId(pub u32);
-
-/// コマンド ID。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct CommandId(pub u32);
-
-/// イベント ID(型のみ。codec は初期スコープ外)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct EventId(pub u32);
+// 設計 §7.3 に従い ID 新型は `dm::meta` を正典とし、`im::wire` は語彙の互換のため
+// 再エクスポートする(chip の `protocols/interaction_model` = 定数/語彙のみ、を踏襲)。
+pub use crate::dm::meta::{AttributeId, ClusterId, CommandId, EndpointId, EventId};
 
 // ==========================================================================
 // IM Status コード(Matter Core Spec §10.7 / cluster Status Codes)
