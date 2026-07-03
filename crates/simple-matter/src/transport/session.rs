@@ -563,6 +563,28 @@ impl<const SESSIONS: usize> SessionManager<SESSIONS> {
         Ok(())
     }
 
+    /// PASE セッションを確定した fabric へ紐付ける(`docs/design/interaction-model.md` §9.4)。
+    ///
+    /// Operational Credentials の AddNOC 成功時に、`SessionMode::Pase { fabric_idx: 0 }`
+    /// の未確定 PASE セッションを採番済み fabric インデックスへ 1 度だけ昇格する。
+    /// これは sc の `commit`(予約→確立)と対称の 1 点変更で、IM が
+    /// [`SessionManager`] を可変に触る唯一の箇所である(設計 §12 論点 5)。
+    ///
+    /// `id` が存在しなければ [`Error::NotFound`]、PASE でなければ [`Error::InvalidState`]。
+    pub fn promote_pase_fabric(&mut self, id: SessionId, fabric_idx: NonZeroU8) -> Result<()> {
+        let i = self.index_of(id).ok_or(Error::NotFound)?;
+        let s = &mut self.sessions[i];
+        match s.mode {
+            SessionMode::Pase { .. } => {
+                s.mode = SessionMode::Pase {
+                    fabric_idx: fabric_idx.get(),
+                };
+                Ok(())
+            }
+            _ => Err(Error::InvalidState),
+        }
+    }
+
     /// セッションを削除して返す。存在しなければ `None`。
     pub fn remove(&mut self, id: SessionId) -> Option<Session> {
         let i = self.index_of(id)?;

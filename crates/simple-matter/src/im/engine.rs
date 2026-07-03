@@ -42,10 +42,11 @@ use crate::dm::{read_global_attribute, DataModel};
 use crate::error::{Error, Result};
 use crate::exchange::{ExchangeId, HandlerAction, ProtocolHandler, RxMessage};
 use crate::im::wire::{
-    encode_invoke_response, encode_write_response, AttributeDataRef, AttributePath, CommandDataRef,
-    ConcreteAttrPath, ImOpCode, ImStatus, InvokeRequestRef, InvokeResponseHeader, ReadRequestRef,
-    ReportChunkBuilder, StatusIB, StatusResponse, SubscribeRequestRef, SubscribeResponse,
-    TimedRequest, WriteRequestRef, PROTO_ID_INTERACTION_MODEL,
+    encode_invoke_response, encode_write_response, transcribe, AttributeDataRef, AttributePath,
+    CmdRespWriter, CommandDataRef, CommandPath, ConcreteAttrPath, ImOpCode, ImStatus,
+    InvokeRequestRef, InvokeResponseHeader, ReadRequestRef, ReportChunkBuilder, StatusIB,
+    StatusResponse, SubscribeRequestRef, SubscribeResponse, TimedRequest, WriteRequestRef,
+    PROTO_ID_INTERACTION_MODEL,
 };
 use crate::tlv::{TlvReader, TlvWriter};
 use crate::transport::session::fixed::FixedVec;
@@ -58,6 +59,12 @@ const READ_TXN_TIMEOUT_MS: u64 = 30_000;
 
 /// dirty 掃引で 1 回に走査する (endpoint, cluster) の上限。
 const MAX_SWEEP: usize = 64;
+
+/// Invoke の生成レスポンスフィールドを一時構築するスクラッチバッファ長。
+///
+/// Operational Credentials の CSRResponse(NOCSRElements = CSR DER + nonce + 署名)が
+/// 最大で、これに収まる大きさとする。
+const INVOKE_SCRATCH: usize = 512;
 
 /// PASE セッションからアクセス可能なコミッショニング必須クラスタか(設計 §10.1)。
 const fn is_commissioning_cluster(cl: ClusterId) -> bool {
@@ -98,13 +105,19 @@ fn status_response(tx: &mut [u8], status: ImStatus) -> Result<HandlerAction> {
 fn access_from_session<const S: usize>(
     sessions: &SessionManager<S>,
     session: SessionId,
+    now_ms: u64,
 ) -> Result<AccessContext> {
     let s = sessions.get(session).ok_or(Error::InvalidState)?;
-    let acc = match s.mode() {
+    let challenge = s.att_challenge().copied().unwrap_or([0u8; 16]);
+    let base = match s.mode() {
         SessionMode::PlainText => return Err(Error::InvalidState),
-        SessionMode::Pase { .. } => {
-            AccessContext::new(SessionKind::Pase, None, 0, Privilege::Administer)
-        }
+        // PASE は原則 fabric 未確定(None)だが、AddNOC で昇格済みなら確定 fabric を反映する。
+        SessionMode::Pase { fabric_idx } => AccessContext::new(
+            SessionKind::Pase,
+            NonZeroU8::new(fabric_idx),
+            0,
+            Privilege::Administer,
+        ),
         SessionMode::Case { fabric_idx } => AccessContext::new(
             SessionKind::Case,
             Some(fabric_idx),
@@ -112,7 +125,7 @@ fn access_from_session<const S: usize>(
             Privilege::Administer,
         ),
     };
-    Ok(acc)
+    Ok(base.with_env(now_ms, challenge))
 }
 
 /// 具象パスの存在確認。存在すれば `None`、無ければ適切な IM Status(設計 §5.2)。
@@ -674,11 +687,12 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
     // Invoke(§5.5/§9)
     // ----------------------------------------------------------------------
 
-    fn invoke(
+    fn invoke<const SN: usize>(
         &mut self,
         rx: &RxMessage<'_>,
         tx: &mut [u8],
         acc: &AccessContext,
+        sessions: &mut SessionManager<SN>,
         now_ms: u64,
     ) -> Result<HandlerAction> {
         let req = InvokeRequestRef::new(rx.payload)?;
@@ -688,28 +702,45 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
             return status_response(tx, st);
         }
 
+        let session = rx.exchange.session();
+        let header = InvokeResponseHeader {
+            suppress_response: false,
+            more_chunks: false,
+        };
+        let mut promote: Option<NonZeroU8> = None;
+
         if suppress {
+            // 応答は送らないが副作用(および AddNOC の fabric 昇格)は適用する。
+            // `tx` をスクラッチとして使い、生成結果は破棄する。
             let dm = &mut self.dm;
-            for item in req.invoke_requests()? {
-                let item = item?;
-                let _ = invoke_one(dm, &item, acc);
+            let _ = encode_invoke_response(tx, header, |cw| {
+                for item in req.invoke_requests()? {
+                    let item = item?;
+                    if let Some(p) = invoke_one(dm, &item, acc, cw)? {
+                        promote = Some(p);
+                    }
+                }
+                Ok(())
+            });
+            if let Some(p) = promote {
+                let _ = sessions.promote_pase_fabric(session, p);
             }
             return Ok(HandlerAction::None);
         }
 
         let dm = &mut self.dm;
-        let header = InvokeResponseHeader {
-            suppress_response: false,
-            more_chunks: false,
-        };
         let len = encode_invoke_response(tx, header, |cw| {
             for item in req.invoke_requests()? {
                 let item = item?;
-                let status = invoke_one(dm, &item, acc);
-                cw.push_status(&item.path, &StatusIB::simple(status), item.command_ref)?;
+                if let Some(p) = invoke_one(dm, &item, acc, cw)? {
+                    promote = Some(p);
+                }
             }
             Ok(())
         })?;
+        if let Some(p) = promote {
+            let _ = sessions.promote_pase_fabric(session, p);
+        }
         Ok(close(ImOpCode::InvokeResponse, true, len))
     }
 
@@ -1033,32 +1064,78 @@ fn write_one<D: DataModel + ?Sized>(
     }
 }
 
-/// 1 つの CommandDataIB を起動し、結果ステータスを返す(設計 §9)。
+/// 1 つの CommandDataIB を起動し、応答(生成レスポンス or StatusIB)を `cw` に書く(設計 §9)。
 ///
-/// 生成レスポンス(応答コマンド)は初期スコープのクラスタでは使わないため、status のみ返す。
+/// クラスタが [`CmdResponder::set_response`](crate::dm::codec::CmdResponder::set_response) で
+/// 生成レスポンスを宣言した場合、そのフィールド(スクラッチ上の匿名構造体)を InvokeResponseIB の
+/// CommandDataIB へ転写する。宣言が無ければ結果ステータスを CommandStatusIB として書く。
+/// 返り値はクラスタが要求した fabric 昇格(AddNOC 用、設計 §9.4)。
 fn invoke_one<D: DataModel + ?Sized>(
     dm: &mut D,
     item: &CommandDataRef<'_>,
     acc: &AccessContext,
-) -> ImStatus {
+    cw: &mut CmdRespWriter<'_, '_>,
+) -> Result<Option<NonZeroU8>> {
     let path = item.path;
     if !dm.endpoints().iter().any(|e| e.id == path.endpoint) {
-        return ImStatus::UnsupportedEndpoint;
+        cw.push_status(
+            &path,
+            &StatusIB::simple(ImStatus::UnsupportedEndpoint),
+            item.command_ref,
+        )?;
+        return Ok(None);
     }
     if acc.kind == SessionKind::Pase && !is_commissioning_cluster(path.cluster) {
-        return ImStatus::UnsupportedAccess;
+        cw.push_status(
+            &path,
+            &StatusIB::simple(ImStatus::UnsupportedAccess),
+            item.command_ref,
+        )?;
+        return Ok(None);
     }
     let Some(cluster) = dm.cluster_mut(path.endpoint, path.cluster) else {
-        return ImStatus::UnsupportedCluster;
+        cw.push_status(
+            &path,
+            &StatusIB::simple(ImStatus::UnsupportedCluster),
+            item.command_ref,
+        )?;
+        return Ok(None);
     };
+
     let mut fr = TlvReader::new(item.fields.unwrap_or(&[]));
-    let mut scratch = [0u8; 64];
-    let mut sw = TlvWriter::new(&mut scratch);
-    let mut resp = CmdResponder::new(&mut sw);
-    match cluster.invoke_command(path.command, &mut fr, &mut resp, acc) {
-        Ok(()) => ImStatus::Success,
-        Err(s) => s,
+    let mut scratch = [0u8; INVOKE_SCRATCH];
+    // resp/sw の借用をブロックで閉じ、確定後にスクラッチを読めるようにする。
+    let (result, response_cmd, promote, scratch_len) = {
+        let mut sw = TlvWriter::new(&mut scratch);
+        let (result, response_cmd, promote) = {
+            let mut resp = CmdResponder::new(&mut sw);
+            let result = cluster.invoke_command(path.command, &mut fr, &mut resp, acc);
+            (result, resp.response_command(), resp.requested_promotion())
+        };
+        let scratch_len = sw.len();
+        (result, response_cmd, promote, scratch_len)
+    };
+
+    match result {
+        Ok(()) => {
+            if let Some(rid) = response_cmd {
+                let rpath = CommandPath::new(path.endpoint, path.cluster, rid);
+                cw.push_command(&rpath, item.command_ref, |w, tag| {
+                    transcribe(&scratch[..scratch_len], w, tag)
+                })?;
+            } else {
+                cw.push_status(
+                    &path,
+                    &StatusIB::simple(ImStatus::Success),
+                    item.command_ref,
+                )?;
+            }
+        }
+        Err(s) => {
+            cw.push_status(&path, &StatusIB::simple(s), item.command_ref)?;
+        }
     }
+    Ok(promote)
 }
 
 impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize> ProtocolHandler
@@ -1073,7 +1150,7 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize> Pr
         sessions: &mut SessionManager<SN>,
         now_ms: u64,
     ) -> Result<HandlerAction> {
-        let acc = match access_from_session(sessions, rx.exchange.session()) {
+        let acc = match access_from_session(sessions, rx.exchange.session(), now_ms) {
             Ok(a) => a,
             // 未認証/PlainText 等はサイレントドロップ(panic しない)。
             Err(_) => return Ok(HandlerAction::None),
@@ -1082,7 +1159,7 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize> Pr
             ImOpCode::ReadRequest => self.read_open(rx, tx, &acc, now_ms),
             ImOpCode::SubscribeRequest => self.subscribe_open(rx, tx, &acc, now_ms),
             ImOpCode::WriteRequest => self.write(rx, tx, &acc, now_ms),
-            ImOpCode::InvokeRequest => self.invoke(rx, tx, &acc, now_ms),
+            ImOpCode::InvokeRequest => self.invoke(rx, tx, &acc, sessions, now_ms),
             ImOpCode::TimedRequest => self.timed_open(rx, tx, now_ms),
             ImOpCode::StatusResponse => self.on_status(rx, tx, now_ms),
             // ReportData/SubscribeResponse/WriteResponse/InvokeResponse は client→device では不正。

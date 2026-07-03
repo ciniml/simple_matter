@@ -42,7 +42,7 @@
 //! (rs-matter `MAX_CERT_ASN1_LEN` と同値)であり、署名を含まない TBS はこれを
 //! 下回る。
 
-use crate::crypto::{Crypto, P256PublicKey, P256_PUBLIC_KEY_LEN, P256_SIGNATURE_LEN};
+use crate::crypto::{Crypto, P256Keypair, P256PublicKey, P256_PUBLIC_KEY_LEN, P256_SIGNATURE_LEN};
 use crate::error::{Error, Result};
 use crate::tlv::{ContainerType, TlvReader, TlvTag, TlvValue};
 
@@ -1290,6 +1290,101 @@ fn verify_link<C: Crypto>(
         return Err(Error::CertInvalid);
     }
     child.verify_signature(crypto, parent.public_key)
+}
+
+// ---------------------------------------------------------------------------
+// PKCS#10 CSR(NOCSR)構築
+// ---------------------------------------------------------------------------
+
+/// CSR DER の最大バイト数(P-256 の空 subject CSR は約 250 バイト)。
+pub const MAX_CSR_DER_LEN: usize = 320;
+
+/// 運用鍵ペア `keypair` に対する PKCS#10 CertificationRequest(CSR)を DER で `out` に
+/// 構築し、書き込んだバイト数を返す。
+///
+/// Matter の CSRRequest(Core Spec §11.17.5.6)が返す NOCSRElements の `csr` フィールドは、
+/// 新規に生成した運用鍵ペアの公開鍵を含む PKCS#10 CSR(RFC 2986)で、その運用秘密鍵で
+/// 自己署名される(所有証明)。subject は空 Name、attributes は空とする(chip
+/// `NewNodeOperationalX509Cert` / rs-matter の CSR 構築と同様、運用 CSR に DN は不要)。
+///
+/// 署名は ECDSA-with-SHA256 で、生 `r||s`(64 バイト)を DER `SEQUENCE { INTEGER r,
+/// INTEGER s }` へ変換して BIT STRING に格納する。`out` は [`MAX_CSR_DER_LEN`] 以上が望ましい。
+/// 容量不足は [`Error::NoSpace`]。
+pub fn write_csr<K: P256Keypair>(keypair: &K, out: &mut [u8]) -> Result<usize> {
+    let pubkey = keypair.public_key().to_bytes();
+
+    // 1. CertificationRequestInfo を独立バッファへ DER 化する(署名対象)。
+    let mut cri = [0u8; 220];
+    let cri_len = {
+        let mut w = DerWriter::new(&mut cri);
+        write_cert_req_info(&mut w, &pubkey)?;
+        w.len()
+    };
+
+    // 2. 運用秘密鍵で署名する(内部で SHA-256)。
+    let mut raw_sig = [0u8; P256_SIGNATURE_LEN];
+    keypair.sign(&cri[..cri_len], &mut raw_sig)?;
+
+    // 3. 生 r||s を DER ECDSA-Sig-Value に変換する。
+    let mut der_sig = [0u8; 80];
+    let der_sig_len = ecdsa_raw_to_der(&raw_sig, &mut der_sig)?;
+
+    // 4. CertificationRequest 全体を組む。
+    let mut w = DerWriter::new(out);
+    w.start_seq()?; // CertificationRequest
+    w.raw(&cri[..cri_len])?; // certificationRequestInfo
+    w.start_seq()?; // signatureAlgorithm
+    w.oid(&OID_ECDSA_WITH_SHA256)?;
+    w.end_container()?;
+    w.bit_string(false, &der_sig[..der_sig_len])?; // signature
+    w.end_container()?;
+    Ok(w.len())
+}
+
+/// CertificationRequestInfo(空 subject / 空 attributes / EC P-256 公開鍵)を DER 化する。
+fn write_cert_req_info(w: &mut DerWriter<'_>, pubkey: &[u8; P256_PUBLIC_KEY_LEN]) -> Result<()> {
+    w.start_seq()?; // CertificationRequestInfo
+    w.integer(&[0x00])?; // version = 0
+    w.start_seq()?; // subject = 空 RDNSequence
+    w.end_container()?;
+    w.start_seq()?; // subjectPKInfo
+    w.start_seq()?; // algorithm
+    w.oid(&OID_EC_PUBLIC_KEY)?;
+    w.oid(&OID_PRIME256V1)?;
+    w.end_container()?;
+    w.bit_string(false, pubkey)?; // subjectPublicKey
+    w.end_container()?;
+    w.start_ctx(0)?; // attributes [0] = 空
+    w.end_container()?;
+    w.end_container()?;
+    Ok(())
+}
+
+/// 生 ECDSA 署名 `r||s`(64 バイト)を DER `SEQUENCE { INTEGER r, INTEGER s }` へ変換する。
+fn ecdsa_raw_to_der(raw: &[u8; P256_SIGNATURE_LEN], out: &mut [u8]) -> Result<usize> {
+    let mut w = DerWriter::new(out);
+    w.start_seq()?;
+    der_uint(&mut w, &raw[..32])?;
+    der_uint(&mut w, &raw[32..])?;
+    w.end_container()?;
+    Ok(w.len())
+}
+
+/// ビッグエンディアン整数 `be` を DER INTEGER として書く(先頭 0 除去 + 符号ビット対策)。
+fn der_uint(w: &mut DerWriter<'_>, be: &[u8]) -> Result<()> {
+    let mut i = 0;
+    while i + 1 < be.len() && be[i] == 0 {
+        i += 1;
+    }
+    let v = &be[i..];
+    if v[0] & 0x80 != 0 {
+        // 最上位ビットが立つと負とみなされるため 0x00 を前置する。
+        let mut tmp = [0u8; 33];
+        tmp[1..1 + v.len()].copy_from_slice(v);
+        w.integer(&tmp[..1 + v.len()])
+    } else {
+        w.integer(v)
+    }
 }
 
 #[cfg(test)]

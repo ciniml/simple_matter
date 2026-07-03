@@ -109,6 +109,11 @@ impl<'w, 'b> AttrEncoder<'w, 'b> {
         Ok(())
     }
 
+    /// `i32` を書く。
+    pub fn write_i32(&mut self, v: i32) -> Result<(), ImStatus> {
+        self.write_i64(v as i64)
+    }
+
     /// 配列(TLV array)属性を書く。`f` に [`ArrayEncoder`] を渡して要素を積む。
     pub fn write_array<F>(&mut self, f: F) -> Result<(), ImStatus>
     where
@@ -120,6 +125,25 @@ impl<'w, 'b> AttrEncoder<'w, 'b> {
                 writer: self.writer,
             };
             f(&mut ae)?;
+        }
+        self.writer.end_container().map_err(map_err)?;
+        self.wrote = true;
+        Ok(())
+    }
+
+    /// 構造体(TLV structure)属性を書く。`f` に [`StructEncoder`] を渡してフィールドを積む。
+    ///
+    /// General Commissioning の BasicCommissioningInfo など、単一構造体値の属性に使う。
+    pub fn write_struct<F>(&mut self, f: F) -> Result<(), ImStatus>
+    where
+        F: FnOnce(&mut StructEncoder<'_, 'b>) -> Result<(), ImStatus>,
+    {
+        self.writer.start_struct(&self.tag).map_err(map_err)?;
+        {
+            let mut se = StructEncoder {
+                writer: self.writer,
+            };
+            f(&mut se)?;
         }
         self.writer.end_container().map_err(map_err)?;
         self.wrote = true;
@@ -148,6 +172,13 @@ impl<'b> ArrayEncoder<'_, 'b> {
             .map_err(map_err)
     }
 
+    /// バイト列要素を追加する(TrustedRootCertificates など octstr の配列)。
+    pub fn push_bytes(&mut self, v: &[u8]) -> Result<(), ImStatus> {
+        self.writer
+            .write_bytes(&TlvTag::Anonymous, v)
+            .map_err(map_err)
+    }
+
     /// 匿名構造体要素を追加する。`f` に [`StructEncoder`] を渡してフィールドを書く。
     pub fn push_struct<F>(&mut self, f: F) -> Result<(), ImStatus>
     where
@@ -173,6 +204,13 @@ pub struct StructEncoder<'w, 'b> {
 }
 
 impl StructEncoder<'_, '_> {
+    /// context タグ `ctx` の `u8` フィールドを書く。
+    pub fn field_u8(&mut self, ctx: u8, v: u8) -> Result<(), ImStatus> {
+        self.writer
+            .write_u8(&TlvTag::ContextSpecific(ctx), v)
+            .map_err(map_err)
+    }
+
     /// context タグ `ctx` の `u16` フィールドを書く。
     pub fn field_u16(&mut self, ctx: u8, v: u16) -> Result<(), ImStatus> {
         self.writer
@@ -186,6 +224,41 @@ impl StructEncoder<'_, '_> {
             .write_u32(&TlvTag::ContextSpecific(ctx), v)
             .map_err(map_err)
     }
+
+    /// context タグ `ctx` の `u64` フィールドを書く。
+    pub fn field_u64(&mut self, ctx: u8, v: u64) -> Result<(), ImStatus> {
+        self.writer
+            .write_u64(&TlvTag::ContextSpecific(ctx), v)
+            .map_err(map_err)
+    }
+
+    /// context タグ `ctx` の真偽値フィールドを書く。
+    pub fn field_bool(&mut self, ctx: u8, v: bool) -> Result<(), ImStatus> {
+        self.writer
+            .write_bool(&TlvTag::ContextSpecific(ctx), v)
+            .map_err(map_err)
+    }
+
+    /// context タグ `ctx` のバイト列(octstr)フィールドを書く。
+    pub fn field_bytes(&mut self, ctx: u8, v: &[u8]) -> Result<(), ImStatus> {
+        self.writer
+            .write_bytes(&TlvTag::ContextSpecific(ctx), v)
+            .map_err(map_err)
+    }
+
+    /// context タグ `ctx` の UTF-8 文字列フィールドを書く。
+    pub fn field_str(&mut self, ctx: u8, v: &str) -> Result<(), ImStatus> {
+        self.writer
+            .write_utf8(&TlvTag::ContextSpecific(ctx), v)
+            .map_err(map_err)
+    }
+
+    /// context タグ `ctx` の null フィールドを書く。
+    pub fn field_null(&mut self, ctx: u8) -> Result<(), ImStatus> {
+        self.writer
+            .write_null(&TlvTag::ContextSpecific(ctx))
+            .map_err(map_err)
+    }
 }
 
 /// Invoke の生成レスポンスを書くレスポンダ(設計 §7.2)。
@@ -197,6 +270,7 @@ impl StructEncoder<'_, '_> {
 pub struct CmdResponder<'w, 'b> {
     writer: &'w mut TlvWriter<'b>,
     response: Option<CommandId>,
+    promote_fabric: Option<core::num::NonZeroU8>,
 }
 
 impl<'w, 'b> CmdResponder<'w, 'b> {
@@ -205,10 +279,15 @@ impl<'w, 'b> CmdResponder<'w, 'b> {
         Self {
             writer,
             response: None,
+            promote_fabric: None,
         }
     }
 
     /// 生成レスポンスのコマンド ID を宣言する。
+    ///
+    /// クラスタは本メソッドで応答コマンド ID を宣言し、その**フィールドを匿名構造体
+    /// 1 要素**として [`CmdResponder::writer`] に書く。IM エンジンは書かれた要素を
+    /// InvokeResponseIB の CommandDataIB フィールドへ転写する。
     pub fn set_response(&mut self, id: CommandId) {
         self.response = Some(id);
     }
@@ -216,6 +295,19 @@ impl<'w, 'b> CmdResponder<'w, 'b> {
     /// 宣言済みの生成レスポンスコマンド ID(あれば)。
     pub const fn response_command(&self) -> Option<CommandId> {
         self.response
+    }
+
+    /// AddNOC 成功時に、呼び出し元 PASE セッションを確定 fabric へ昇格するよう要求する
+    /// (`docs/design/interaction-model.md` §9.4)。IM エンジンが invoke 後に
+    /// [`SessionManager::promote_pase_fabric`](crate::transport::session::SessionManager::promote_pase_fabric)
+    /// を呼ぶ。
+    pub fn request_fabric_promotion(&mut self, fabric_idx: core::num::NonZeroU8) {
+        self.promote_fabric = Some(fabric_idx);
+    }
+
+    /// 要求された fabric 昇格(あれば)。
+    pub const fn requested_promotion(&self) -> Option<core::num::NonZeroU8> {
+        self.promote_fabric
     }
 
     /// レスポンスフィールドを書くための下位 [`TlvWriter`] を返す。

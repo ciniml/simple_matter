@@ -103,10 +103,24 @@ pub struct AccessContext {
     pub subject: u64,
     /// このアクセスに付与された権限。
     pub privilege: Privilege,
+    /// このアクセスの発生時刻(注入された単調増加ミリ秒)。
+    ///
+    /// General Commissioning の fail-safe 期限計算や Operational Credentials の
+    /// 証明書検証時刻(Matter epoch 秒 = `now_ms / 1000`)に用いる
+    /// (`docs/design/interaction-model.md` §1「期限(now_ms 注入)」)。
+    pub now_ms: u64,
+    /// セッションのアテステーションチャレンジ(暗号セッションのみ有効、16 バイト)。
+    ///
+    /// Operational Credentials の AttestationRequest / CSRRequest 応答署名は
+    /// `sign(elements || attestationChallenge)` を計算するため、セッションから
+    /// 注入する(Matter Core Spec §11.17.5)。PlainText では全 0。
+    pub att_challenge: [u8; 16],
 }
 
 impl AccessContext {
-    /// 新しい [`AccessContext`] を作る。
+    /// 新しい [`AccessContext`] を作る(`now_ms`/`att_challenge` はゼロ既定)。
+    ///
+    /// セッション由来の環境値を伴う場合は [`AccessContext::with_env`] で上書きする。
     pub const fn new(
         kind: SessionKind,
         fabric_idx: Option<core::num::NonZeroU8>,
@@ -118,7 +132,16 @@ impl AccessContext {
             fabric_idx,
             subject,
             privilege,
+            now_ms: 0,
+            att_challenge: [0u8; 16],
         }
+    }
+
+    /// 時刻とアテステーションチャレンジを注入した複製を返す。
+    pub const fn with_env(mut self, now_ms: u64, att_challenge: [u8; 16]) -> Self {
+        self.now_ms = now_ms;
+        self.att_challenge = att_challenge;
+        self
     }
 
     /// 権限が `required` 以上あれば `true`。
