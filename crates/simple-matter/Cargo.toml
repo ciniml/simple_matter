@@ -1,14 +1,30 @@
 [package]
 name = "simple-matter"
-description = "Small-footprint, heapless (no_std / no alloc) Matter device-side protocol implementation"
+description = "Small-footprint no_std Matter device-side protocol implementation"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# RustCrypto バックエンド。すべて default-features = false で alloc/std を強制しない。
+# 定常データパス(AES-CCM / SHA / HMAC / HKDF)はこれらの API のみでヒープ確保しない。
+sha2 = { version = "0.10", default-features = false, optional = true }
+hmac = { version = "0.12", default-features = false, optional = true }
+hkdf = { version = "0.12", default-features = false, optional = true }
+aes = { version = "0.8", default-features = false, optional = true }
+ccm = { version = "0.5", default-features = false, optional = true }
+# ecdsa / ecdh / arithmetic のみを有効化(pem/pkcs8/alloc/std は無効のまま)。
+p256 = { version = "0.13", default-features = false, features = [
+    "ecdsa",
+    "ecdh",
+    "arithmetic",
+], optional = true }
 
 [features]
-default = []
+default = ["rustcrypto"]
 # 低頻度パス(初期化・コミッショニング時等)でのヒープ利用を有効化する。
 # 定常データパスでは alloc 有効時もヒープ確保しない(docs/ARCHITECTURE.md 参照)。
 alloc = []
+# RustCrypto 系クレートによる暗号バックエンドを有効化する。
+# trait 定義自体は依存ゼロで、この feature 無効でも常時コンパイル可能。
+rustcrypto = ["dep:sha2", "dep:hmac", "dep:hkdf", "dep:aes", "dep:ccm", "dep:p256"]
