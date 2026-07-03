@@ -1,0 +1,25 @@
+[package]
+name = "bloat-check"
+description = "フットプリント計測: DefaultStack/MinimalStack の RAM(size_of)と MCU flash セクションサイズ"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# 依存はコアクレート 1 本のみ(外部依存ゼロ)。ランタイム crate(cortex-m-rt 等)や
+# HAL は持ち込まない(docs/ARCHITECTURE.md 設計原則 10 / 本計測のスコープ)。
+[dependencies]
+simple-matter = { path = "../simple-matter", default-features = false, features = [
+    "rustcrypto",
+] }
+
+# ホスト実行の RAM 計測バイナリ(std)。
+[[bin]]
+name = "ram-report"
+path = "src/main.rs"
+
+# MCU クロスビルドの flash 計測バイナリ(no_std / no_main)。
+# ホストではビルドしない前提(cargo build --bin flash-probe --target <MCU> --release)。
+[[bin]]
+name = "flash-probe"
+path = "src/bin/flash_probe.rs"

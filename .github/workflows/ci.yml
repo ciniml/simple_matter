@@ -16,14 +16,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-          targets: thumbv6m-none-eabi, riscv32imc-unknown-none-elf
+          targets: thumbv6m-none-eabi, riscv32imc-unknown-none-elf, thumbv7em-none-eabihf
       - name: Format
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test (host)
         run: cargo test --all-features
       - name: Check no_std (Cortex-M0)
         run: cargo check --all-features --target thumbv6m-none-eabi
       - name: Check no_std (RISC-V)
         run: cargo check --all-features --target riscv32imc-unknown-none-elf
+      # フットプリント計測(docs/ARCHITECTURE.md 設計原則 10)。
+      - name: Bloat-check RAM report (host)
+        run: cargo run -p bloat-check --bin ram-report --release
+      - name: Bloat-check flash size (Cortex-M4F)
+        run: |
+          cargo build -p bloat-check --bin flash-probe --release --target thumbv7em-none-eabihf
+          size -A target/thumbv7em-none-eabihf/release/flash-probe
