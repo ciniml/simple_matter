@@ -32,6 +32,16 @@ pub const MAX_RX_PACKET_SIZE: usize = 1583;
 /// IPv6 ヘッダ 40 バイトと UDP ヘッダ 8 バイトを最小 MTU 1280 から控除した TX 側の上限。
 pub const MAX_TX_PACKET_SIZE: usize = 1280 - 40 - 8;
 
+/// BTP(BLE)接続を識別する不透明ハンドル。
+///
+/// 6 バイト MAC ではなく、統合層が採番する接続 index。device 側は GATT 接続ごと、
+/// controller 側は接続先ごとに 1 つ割り当てる。`PeerAddr` を `Copy` かつ固定サイズに
+/// 保つため、プライバシー変化する MAC を持ち回らず小さなハンドルで照合する
+/// (`docs/design/ble-btp.md` §3.1)。
+#[cfg(feature = "ble")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BtpConnId(pub u8);
+
 /// Matter メッセージの宛先。
 ///
 /// 現状は UDP のみだが、シグネチャを変えずに BTP / TCP へ拡張できるよう enum で包む。
@@ -39,16 +49,20 @@ pub const MAX_TX_PACKET_SIZE: usize = 1280 - 40 - 8;
 pub enum PeerAddr {
     /// UDP ソケットアドレス(IPv4 / IPv6)。
     Udp(SocketAddr),
+    /// BTP(BLE)接続ハンドル(`feature = "ble"` 時のみ)。
+    #[cfg(feature = "ble")]
+    Ble(BtpConnId),
 }
 
 impl PeerAddr {
     /// 保持しているソケットアドレスを返す。
     ///
-    /// UDP 以外のトランスポートを足した場合は `None` を返す variant が増える想定だが、
-    /// 現状は常に `Some`。
+    /// UDP 以外のトランスポート(BTP)では `None` を返す。
     pub const fn socket_addr(self) -> Option<SocketAddr> {
         match self {
             PeerAddr::Udp(addr) => Some(addr),
+            #[cfg(feature = "ble")]
+            PeerAddr::Ble(_) => None,
         }
     }
 
@@ -56,10 +70,13 @@ impl PeerAddr {
     ///
     /// dual-stack ソケットは IPv4 のピアを IPv4-mapped IPv6(`::ffff:a.b.c.d`)で
     /// 報告することがある。照合の**比較時のみ**この正規化を通すことで、格納した
-    /// アドレス(返信の宛先に使う生アドレス)を壊さずに一致判定できる。
+    /// アドレス(返信の宛先に使う生アドレス)を壊さずに一致判定できる。BTP は
+    /// 不透明ハンドルなので素通しする(正規化は UDP のみ)。
     pub fn canonical(self) -> Self {
         match self {
             PeerAddr::Udp(addr) => PeerAddr::Udp(canonical_socket_addr(addr)),
+            #[cfg(feature = "ble")]
+            PeerAddr::Ble(_) => self,
         }
     }
 }

@@ -348,6 +348,14 @@ impl<
         if len > self.resp.len() {
             return None;
         }
+        // BTP セッションでは reliable → unreliable へ格下げ(R フラグなし・再送スロット
+        // 非登録)。信頼性は下位の BTP が担う(`docs/design/ble-btp.md` §3.3)。
+        let reliable = reliable
+            && self
+                .sessions
+                .get(ex.session())
+                .map(|s| s.allows_mrp())
+                .unwrap_or(true);
         let msg = Outgoing {
             proto_id,
             opcode,

@@ -509,9 +509,16 @@ impl<H, const EXCHANGES: usize> ExchangeManager<H, EXCHANGES> {
         let phdr = decoded.header;
         let session = decoded.session;
 
-        // リプレイ窓で弾かれた重複。信頼メッセージなら再 ACK を武装する。
+        // このセッションが MRP を使うか(BTP セッションでは常に false)。false のときは
+        // 受信 R/A を無視し、standalone ACK も再 ACK も武装しない。信頼性は下位の BTP
+        // (seq/ack/window)が保証するため(`docs/design/ble-btp.md` §3.3、chip の
+        // `adjust_reliability` の写像)。
+        let allows_mrp = sessions.get(session).map(|s| s.allows_mrp()).unwrap_or(true);
+
+        // リプレイ窓で弾かれた重複。信頼メッセージなら再 ACK を武装する
+        // (MRP 有効セッションのみ)。
         if decoded.duplicate {
-            if phdr.is_reliable() {
+            if allows_mrp && phdr.is_reliable() {
                 if let Some(i) = self.match_index(session, phdr.exch_id, phdr.is_initiator()) {
                     self.exchanges[i].mrp.rearm_ack(decoded.msg_ctr, now_ms);
                 }
@@ -538,13 +545,18 @@ impl<H, const EXCHANGES: usize> ExchangeManager<H, EXCHANGES> {
         let handle = self.exchanges[idx].id();
         let role = self.exchanges[idx].role;
 
-        // MRP: piggyback ACK 処理 + standalone ACK 武装。
-        let outcome = self.exchanges[idx].mrp.post_recv(
-            phdr.ack(),
-            phdr.is_reliable(),
-            decoded.msg_ctr,
-            now_ms,
-        );
+        // MRP: piggyback ACK 処理 + standalone ACK 武装。BTP セッションでは受信 R/A を
+        // 無視して post_recv を武装しない(rx_ack=None・rx_reliable=false)。これで再送も
+        // standalone ACK も一切発生しない。
+        let (rx_ack, rx_reliable) = if allows_mrp {
+            (phdr.ack(), phdr.is_reliable())
+        } else {
+            (None, false)
+        };
+        let outcome =
+            self.exchanges[idx]
+                .mrp
+                .post_recv(rx_ack, rx_reliable, decoded.msg_ctr, now_ms);
 
         let mut report = RecvReport {
             exchange: Some(handle),
@@ -1152,6 +1164,54 @@ mod tests {
             .unwrap();
         assert_eq!(dst, peer);
         assert!(!w.as_slice().is_empty());
+    }
+
+    /// BTP(BLE)セッションでは受信 R フラグを無視し standalone ACK を武装しない(§3.3)。
+    /// 同一入力でも UDP セッションなら ACK が武装される(`recv_encrypted_reliable_arms_standalone_ack`)
+    /// のと対になる。
+    #[cfg(feature = "ble")]
+    #[test]
+    fn recv_reliable_on_ble_session_suppresses_standalone_ack() {
+        use crate::transport::net::BtpConnId;
+        let mut sessions: SessionManager<2> = SessionManager::new();
+        let peer = PeerAddr::Ble(BtpConnId(1));
+        let key = [0x11u8; 16];
+        let sid_val = encrypted_session(&mut sessions, peer, key);
+        let wire_sid = sessions.get(sid_val).unwrap().local_session_id();
+        let peer_node = 0x5555_6666_7777_8888u64;
+        let mut mgr: ExchangeManager<RecordingDispatcher, 4> = null_mgr();
+
+        let mut wire = [0u8; 256];
+        let m = Incoming {
+            key: Some((key, peer_node)),
+            wire_session_id: wire_sid,
+            ctr: 5,
+            exch_id: 0x70,
+            proto_id: 0x0001,
+            reliable: true,
+            ack_ctr: None,
+            initiator: true,
+        };
+        let n = build_incoming(&crypto(), &m, &mut wire);
+        let report = mgr
+            .recv(
+                &mut sessions,
+                &crypto(),
+                peer,
+                1000,
+                &mut wire[..n],
+                &mut [0u8; 512],
+            )
+            .unwrap();
+        // ディスパッチはされるが、MRP は一切武装されない。
+        assert!(report.dispatched);
+        assert_eq!(
+            mgr.poll(1_000_000, 0),
+            PollAction::Idle {
+                next_deadline: None
+            },
+            "BTP セッションでは standalone ACK が武装されない"
+        );
     }
 
     #[test]

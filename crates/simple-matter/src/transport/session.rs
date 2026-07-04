@@ -241,6 +241,21 @@ impl Session {
         self.mode.is_encrypted()
     }
 
+    /// このセッションで MRP(R/A フラグ・再送・standalone ACK)を使うべきか。
+    ///
+    /// UDP のみ `true`。BTP は seq/ack/window による信頼トランスポートなので `false`
+    /// (二重信頼を避ける)。chip の `Session::AllowsMRP()` の写像で、`peer_addr` から
+    /// 分岐する(暗号種別に依らず unsecured/PASE/CASE すべてに一様に効く)。
+    /// `feature = "ble"` 無効時は `PeerAddr` が UDP のみ = 常に `true` で、既存挙動と
+    /// 完全一致する(`docs/design/ble-btp.md` §3.2)。
+    pub const fn allows_mrp(&self) -> bool {
+        match self.peer_addr {
+            PeerAddr::Udp(_) => true,
+            #[cfg(feature = "ble")]
+            PeerAddr::Ble(_) => false,
+        }
+    }
+
     /// 復号鍵を返す。PlainText では `None`(= [`SecureCodec`] が復号スキップ)。
     ///
     /// [`SecureCodec`](super::secure::SecureCodec) に渡す唯一の鍵取得点で、未確立
@@ -1053,6 +1068,25 @@ mod tests {
         let n3 = build(6, &mut wire3);
         let mut pb3 = ParseBuf::new(&mut wire3[..n3]);
         assert!(mgr.decode_rx(&crypto(), peer, 12, &mut pb3).is_ok());
+    }
+
+    /// UDP セッションは MRP を許可し、BTP(BLE)セッションは許可しない(§3.2)。
+    #[cfg(feature = "ble")]
+    #[test]
+    fn allows_mrp_is_true_for_udp_false_for_ble() {
+        use crate::transport::net::BtpConnId;
+        let mut mgr: SessionManager<2> = SessionManager::new();
+        // UDP unsecured。
+        let udp = mgr
+            .insert(SessionInit::plaintext(addr(5540), 0, 0), 0)
+            .unwrap();
+        assert!(mgr.get(udp).unwrap().allows_mrp());
+        // BTP unsecured。
+        let ble_peer = PeerAddr::Ble(BtpConnId(3));
+        let ble = mgr
+            .insert(SessionInit::plaintext(ble_peer, 0, 0), 0)
+            .unwrap();
+        assert!(!mgr.get(ble).unwrap().allows_mrp());
     }
 
     #[test]

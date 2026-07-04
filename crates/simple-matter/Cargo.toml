@@ -50,6 +50,11 @@ rustcrypto = [
 # 依存クレート追加なし・default 無効。デバイス(responder)専用ビルドのフットプリントに
 # 影響しない(docs/design/controller.md §2.3)。
 controller = []
+# BLE(BTP)トランスポートを有効化する additive feature。sans-IO no_std の BTP コア
+# (src/btp/)と PeerAddr::Ble variant を追加する。依存クレート追加なし・default 無効。
+# 無効時は PeerAddr が UDP のみ = MRP 挙動もフットプリントも既存と完全一致する
+# (docs/design/ble-btp.md §3・§7)。
+ble = []
 
 # examples/commissioner は controller feature 必須(ControllerStack / Commissioner /
 # MdnsClient を使う)。required-features で feature 無効時のビルドから除外する。

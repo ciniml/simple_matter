@@ -541,6 +541,29 @@ impl<
             opcode,
             payload: &self.resp[..len],
         };
+        // BTP セッションでは信頼送信を格下げする(R フラグなし・再送スロット非登録)。
+        // start_pase / start_case の第 1 メッセージも BLE 上では BTP に信頼性を委ねる
+        // (`docs/design/ble-btp.md` §3.3)。
+        let allows_mrp = self
+            .sessions
+            .get(ex.session())
+            .map(|s| s.allows_mrp())
+            .unwrap_or(true);
+        if !allows_mrp {
+            let headroom = PacketHeader::MAX_LEN + PayloadHeader::MAX_LEN;
+            let (addr, start, end) = {
+                let mut wb = WriteBuf::new(tx_out, headroom)?;
+                let addr =
+                    self.mgr
+                        .send_unreliable(&mut self.sessions, self.crypto, ex, &msg, &mut wb, now_ms)?;
+                (addr, wb.start(), wb.end())
+            };
+            tx_out.copy_within(start..end, 0);
+            return Ok(SendDirective {
+                addr,
+                len: end - start,
+            });
+        }
         let sent = self.mgr.send_reliable(
             &mut self.sessions,
             self.crypto,
@@ -578,6 +601,14 @@ impl<
         if len > self.resp.len() {
             return None;
         }
+        // BTP セッションでは reliable → unreliable へ格下げ(R フラグなし・再送スロット
+        // 非登録)。信頼性は下位の BTP が担う(`docs/design/ble-btp.md` §3.3)。
+        let reliable = reliable
+            && self
+                .sessions
+                .get(ex.session())
+                .map(|s| s.allows_mrp())
+                .unwrap_or(true);
         let msg = Outgoing {
             proto_id,
             opcode,

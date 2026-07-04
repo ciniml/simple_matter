@@ -1398,4 +1398,58 @@ mod controller_e2e {
         }
         assert!(found_true, "controller reads back OnOff = true over CASE");
     }
+
+    /// 送信ファネルの MRP 格下げ(§3.3)を公開 API で観測する。BTP(BLE)ピアへの
+    /// `start_pase` は第 1 メッセージを unreliable に格下げして再送スロットを登録しない
+    /// (= MRP deadline が立たない)。同一呼び出しでも UDP ピアなら信頼送信で再送
+    /// deadline が立つ。これで「格下げ + 再送非登録」を確認する。
+    #[cfg(feature = "ble")]
+    #[test]
+    fn start_pase_downgrades_reliability_on_ble() {
+        use crate::transport::net::BtpConnId;
+
+        let crypto = RustCrypto::new(SeqRng(0xB1E0_0001_2222_3333));
+        let ca = Ca::<Crb>::generate(
+            &crypto,
+            &mut SeqRng(0xCA00_0002),
+            FABRIC_ID,
+            COMM_NODE,
+            0xFFF1,
+            0,
+        )
+        .expect("Ca::generate");
+
+        // UDP: 信頼送信 → MRP 再送 deadline が立つ。
+        {
+            let ctrl_creds = ControllerCreds::new(&ca, &crypto, 0);
+            let sc_init = ScInitiator::new(&crypto, SeqRng(0x1C00_0002), ctrl_creds);
+            let mut ctrl: Ctrl = ControllerStack::new(&crypto, sc_init, ImClient::new());
+            let mut tx = [0u8; 1700];
+            let dir = ctrl
+                .start_pase(peer(), PASSCODE, NOW, &mut tx)
+                .expect("start_pase udp");
+            assert_eq!(dir.addr, peer());
+            assert!(
+                ctrl.next_deadline(NOW).is_some(),
+                "UDP は信頼送信で再送 deadline が立つ"
+            );
+        }
+
+        // BLE: unreliable へ格下げ → 再送スロット非登録 → MRP deadline なし。
+        {
+            let ble = PeerAddr::Ble(BtpConnId(7));
+            let ctrl_creds = ControllerCreds::new(&ca, &crypto, 0);
+            let sc_init = ScInitiator::new(&crypto, SeqRng(0x1C00_0003), ctrl_creds);
+            let mut ctrl: Ctrl = ControllerStack::new(&crypto, sc_init, ImClient::new());
+            let mut tx = [0u8; 1700];
+            let dir = ctrl
+                .start_pase(ble, PASSCODE, NOW, &mut tx)
+                .expect("start_pase ble");
+            assert_eq!(dir.addr, ble);
+            assert!(
+                ctrl.next_deadline(NOW).is_none(),
+                "BTP は unreliable 格下げで再送 deadline が立たない"
+            );
+        }
+    }
 }
