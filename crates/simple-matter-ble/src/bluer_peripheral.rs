@@ -24,9 +24,8 @@ use std::sync::Arc;
 
 use bluer::adv::{Advertisement, AdvertisementHandle};
 use bluer::gatt::local::{
-    Application, ApplicationHandle, Characteristic, CharacteristicNotify,
-    CharacteristicNotifyMethod, CharacteristicNotifier, CharacteristicWrite,
-    CharacteristicWriteMethod, Service,
+    Application, ApplicationHandle, Characteristic, CharacteristicNotifier, CharacteristicNotify,
+    CharacteristicNotifyMethod, CharacteristicWrite, CharacteristicWriteMethod, Service,
 };
 use bluer::{Adapter, Address, Session, Uuid};
 use futures::StreamExt;
@@ -44,7 +43,11 @@ use crate::uuid_u128;
 /// bluer 内部タスクから届く GATT 生イベント。
 enum RawEvent {
     /// C1 への write(上り BTP フラグメント)。`mtu` は交渉済み ATT_MTU。
-    C1Write { addr: Address, mtu: u16, data: Vec<u8> },
+    C1Write {
+        addr: Address,
+        mtu: u16,
+        data: Vec<u8>,
+    },
     /// central が C2 を subscribe した(以降 indicate 可能)。subscribe コールバックからは
     /// 対向アドレスが取れないため addr は持たない(接続確立は C1 write / 監視で解決)。
     C2Subscribed,
@@ -211,7 +214,11 @@ impl GattPeripheral for BluerPeripheral {
             }],
             ..Default::default()
         };
-        let app_handle = self.adapter.serve_gatt_application(app).await.map_err(map_bluer)?;
+        let app_handle = self
+            .adapter
+            .serve_gatt_application(app)
+            .await
+            .map_err(map_bluer)?;
         self.app_handle = Some(app_handle);
 
         // --- 0xFFF6 service data の commissionable 広告 ---
@@ -252,7 +259,8 @@ impl GattPeripheral for BluerPeripheral {
                     let n = data.len();
                     let dst = buf.get_mut(..n).ok_or(Error::NoSpace)?;
                     dst.copy_from_slice(&data);
-                    self.pending.push_back(PeripheralEvent::C1Write { conn, len: n });
+                    self.pending
+                        .push_back(PeripheralEvent::C1Write { conn, len: n });
                 }
                 RawEvent::C2Subscribed => {
                     // subscribe 単独では対向アドレス・MTU が不明(MTU は後続の C1 write で

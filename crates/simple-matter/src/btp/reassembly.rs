@@ -57,12 +57,7 @@ impl Reassembler {
     /// - payload 累積が全長を超えたら [`Error::Decode`](溢れ打ち切り)。
     /// - Ending で `filled != expected` なら [`Error::Decode`](msglen 検証失敗)。
     /// - 全長が RX バッファを超えたら [`Error::NoSpace`]。
-    pub fn push(
-        &mut self,
-        flags: HeaderFlags,
-        msg_len: Option<u16>,
-        payload: &[u8],
-    ) -> Result<()> {
+    pub fn push(&mut self, flags: HeaderFlags, msg_len: Option<u16>, payload: &[u8]) -> Result<()> {
         let beginning = flags.contains(HeaderFlags::BEGINNING);
         let ending = flags.contains(HeaderFlags::ENDING);
 

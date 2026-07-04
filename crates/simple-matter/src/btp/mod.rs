@@ -148,7 +148,10 @@ impl<const WINDOW: usize> Btp<WINDOW> {
             return Err(Error::InvalidState);
         }
         // central は自分の ATT_MTU を提示する(不明なら下限を提示)。
-        let req = HandshakeReq::v4(mtu.unwrap_or(handshake::BTP_MIN_ATT_MTU), Self::local_window_cap());
+        let req = HandshakeReq::v4(
+            mtu.unwrap_or(handshake::BTP_MIN_ATT_MTU),
+            Self::local_window_cap(),
+        );
         let n = req.encode(out)?;
         self.phase = Phase::Handshaking;
         self.last_activity_ms = now_ms;
@@ -329,7 +332,9 @@ impl<const WINDOW: usize> Btp<WINDOW> {
         merge(self.recv.ack_deadline());
         if matches!(self.phase, Phase::Established) {
             // idle タイムアウト。
-            merge(Some(self.last_activity_ms.saturating_add(BTP_IDLE_TIMEOUT_MS)));
+            merge(Some(
+                self.last_activity_ms.saturating_add(BTP_IDLE_TIMEOUT_MS),
+            ));
             // 未 ACK の liveness タイムアウト。
             if self.send.unacked() > 0 {
                 if let Some(t) = self.send.last_tx_ms() {

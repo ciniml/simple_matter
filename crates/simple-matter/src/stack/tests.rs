@@ -1679,7 +1679,8 @@ mod controller_e2e {
         let mut ctrl: Ctrl = ControllerStack::new(&crypto, sc_init, ImClient::new());
 
         let mut comm = Commissioner::new(&ca, &crypto, AttestationPolicy::Skip);
-        comm.commission(dev_addr, PASSCODE, DEVICE_NODE, NOW).unwrap();
+        comm.commission(dev_addr, PASSCODE, DEVICE_NODE, NOW)
+            .unwrap();
 
         // --- BTP handshake(central ⇔ peripheral)---
         let mut btp_c = Btp::<6>::new(BtpRole::Central);
@@ -1693,7 +1694,10 @@ mod controller_e2e {
         }
         assert!(btp_c.is_established() && btp_p.is_established());
         let frag_size = btp_c.fragment_size();
-        assert_eq!(frag_size, 61, "small MTU(64)で fragment=clamp(64-3,6,244)=61 に交渉");
+        assert_eq!(
+            frag_size, 61,
+            "small MTU(64)で fragment=clamp(64-3,6,244)=61 に交渉"
+        );
 
         let mut stats = BleStats {
             frag_size,
@@ -1790,7 +1794,10 @@ mod controller_e2e {
             other => panic!("expected InvokeDone, got {other:?}"),
         }
         // (a) On/Off 属性反映。
-        assert!(dev.device().onoff.is_on(), "device OnOff attribute now true");
+        assert!(
+            dev.device().onoff.is_on(),
+            "device OnOff attribute now true"
+        );
 
         // --- 運用 API: CASE 上で OnOff を Read 読み戻し(BTP 経由)---
         let dir = ctrl
@@ -1832,7 +1839,10 @@ mod controller_e2e {
                 }
             }
         }
-        assert!(found_true, "controller reads back OnOff = true over CASE/BLE");
+        assert!(
+            found_true,
+            "controller reads back OnOff = true over CASE/BLE"
+        );
 
         // (b) BTP 上の Matter メッセージで R フラグが立たなかった(検査が実際に走った)。
         assert!(

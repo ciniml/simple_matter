@@ -99,9 +99,7 @@ impl HandshakeReq {
 
     /// 9 バイトの Request を `out` に書き、長さを返す。
     pub fn encode(&self, out: &mut [u8]) -> Result<usize> {
-        let buf = out
-            .get_mut(..BTP_HANDSHAKE_REQ_LEN)
-            .ok_or(Error::NoSpace)?;
+        let buf = out.get_mut(..BTP_HANDSHAKE_REQ_LEN).ok_or(Error::NoSpace)?;
         buf[0..2].copy_from_slice(&BTP_MAGIC);
         buf[2..6].copy_from_slice(&self.versions.to_le_bytes());
         buf[6..8].copy_from_slice(&self.mtu.to_le_bytes());

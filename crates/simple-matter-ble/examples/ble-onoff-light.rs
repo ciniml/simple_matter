@@ -417,9 +417,18 @@ async fn main() -> std::result::Result<(), String> {
                     let now = now_ms(&start);
                     let dir = stack.handle_rx(&mut udp_rx[..n], PeerAddr::Udp(src), now, &mut txd);
                     if let Some(d) = dir {
-                        route_send(d, &txd[..d.len], &mut gatt, &mut btp, mtu, subscribed, &udp, now)
-                            .await
-                            .map_err(|e| format!("route_send(udp): {e:?}"))?;
+                        route_send(
+                            d,
+                            &txd[..d.len],
+                            &mut gatt,
+                            &mut btp,
+                            mtu,
+                            subscribed,
+                            &udp,
+                            now,
+                        )
+                        .await
+                        .map_err(|e| format!("route_send(udp): {e:?}"))?;
                     }
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
@@ -432,9 +441,18 @@ async fn main() -> std::result::Result<(), String> {
         // --- 時間駆動の送出 + 閉じた exchange の回収(§11-4、毎イテレーション必須)---
         let now = now_ms(&start);
         while let Some(d) = stack.poll(now, &mut txd) {
-            route_send(d, &txd[..d.len], &mut gatt, &mut btp, mtu, subscribed, &udp, now)
-                .await
-                .map_err(|e| format!("route_send(poll): {e:?}"))?;
+            route_send(
+                d,
+                &txd[..d.len],
+                &mut gatt,
+                &mut btp,
+                mtu,
+                subscribed,
+                &udp,
+                now,
+            )
+            .await
+            .map_err(|e| format!("route_send(poll): {e:?}"))?;
         }
 
         // --- fabric が増減したら operational 広告に反映して再 announce ---

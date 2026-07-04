@@ -553,9 +553,14 @@ impl<
             let headroom = PacketHeader::MAX_LEN + PayloadHeader::MAX_LEN;
             let (addr, start, end) = {
                 let mut wb = WriteBuf::new(tx_out, headroom)?;
-                let addr =
-                    self.mgr
-                        .send_unreliable(&mut self.sessions, self.crypto, ex, &msg, &mut wb, now_ms)?;
+                let addr = self.mgr.send_unreliable(
+                    &mut self.sessions,
+                    self.crypto,
+                    ex,
+                    &msg,
+                    &mut wb,
+                    now_ms,
+                )?;
                 (addr, wb.start(), wb.end())
             };
             tx_out.copy_within(start..end, 0);

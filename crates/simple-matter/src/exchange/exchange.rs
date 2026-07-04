@@ -513,7 +513,10 @@ impl<H, const EXCHANGES: usize> ExchangeManager<H, EXCHANGES> {
         // 受信 R/A を無視し、standalone ACK も再 ACK も武装しない。信頼性は下位の BTP
         // (seq/ack/window)が保証するため(`docs/design/ble-btp.md` §3.3、chip の
         // `adjust_reliability` の写像)。
-        let allows_mrp = sessions.get(session).map(|s| s.allows_mrp()).unwrap_or(true);
+        let allows_mrp = sessions
+            .get(session)
+            .map(|s| s.allows_mrp())
+            .unwrap_or(true);
 
         // リプレイ窓で弾かれた重複。信頼メッセージなら再 ACK を武装する
         // (MRP 有効セッションのみ)。

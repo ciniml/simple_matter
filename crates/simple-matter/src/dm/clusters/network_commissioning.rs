@@ -248,10 +248,7 @@ impl NetworkCommissioningWifi {
     }
 
     /// ConnectNetworkResponse(0x07): `{ 0: networkingStatus, 2: errorValue(null) }`。
-    fn write_connect_response(
-        resp: &mut CmdResponder<'_, '_>,
-        status: u8,
-    ) -> Result<(), ImStatus> {
+    fn write_connect_response(resp: &mut CmdResponder<'_, '_>, status: u8) -> Result<(), ImStatus> {
         let w = open_response(resp, 0x07)?;
         w.write_u8(&TlvTag::ContextSpecific(0), status)
             .map_err(map_tlv)?;
@@ -473,8 +470,14 @@ mod wifi_tests {
         // AddOrUpdateWiFiNetwork → NetworkConfigResponse(0x05), status Success, networkIndex 0.
         let (rid, out, len) = invoke(&mut net, 0x02, b"TESTSSID");
         assert_eq!(rid, 0x05);
-        assert_eq!(resp_field(&out[..len], 0).unwrap().as_unsigned().unwrap(), 0);
-        assert_eq!(resp_field(&out[..len], 2).unwrap().as_unsigned().unwrap(), 0);
+        assert_eq!(
+            resp_field(&out[..len], 0).unwrap().as_unsigned().unwrap(),
+            0
+        );
+        assert_eq!(
+            resp_field(&out[..len], 2).unwrap().as_unsigned().unwrap(),
+            0
+        );
 
         // Networks 属性: SSID 1 エントリ、connected=false(未接続)。
         let mut buf = [0u8; 64];
@@ -505,7 +508,10 @@ mod wifi_tests {
         // ConnectNetwork → ConnectNetworkResponse(0x07), status Success, errorValue null。
         let (rid, out, len) = invoke(&mut net, 0x06, b"TESTSSID");
         assert_eq!(rid, 0x07);
-        assert_eq!(resp_field(&out[..len], 0).unwrap().as_unsigned().unwrap(), 0);
+        assert_eq!(
+            resp_field(&out[..len], 0).unwrap().as_unsigned().unwrap(),
+            0
+        );
         assert!(matches!(resp_field(&out[..len], 2), Some(TlvValue::Null)));
 
         // 接続後は Networks[].connected=true。

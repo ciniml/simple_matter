@@ -32,10 +32,10 @@ use simple_matter::crypto::rustcrypto::RustCrypto;
 use simple_matter::crypto::Rng;
 use simple_matter::dm::meta::{ClusterId, CommandId, EndpointId};
 use simple_matter::error::Result as MResult;
+use simple_matter::im::client::ImClient;
 use simple_matter::im::wire::CommandPath;
 use simple_matter::im::ImEvent;
 use simple_matter::sc::initiator::ScInitiator;
-use simple_matter::im::client::ImClient;
 use simple_matter::transport::net::{BtpConnId, PeerAddr, MAX_RX_PACKET_SIZE};
 use simple_matter::transport::session::SessionId;
 
@@ -206,7 +206,9 @@ async fn run(passcode: u32, discriminator: Option<u16>) -> Result<(), String> {
     println!("[ble] adapter: {}", gatt.adapter_info().await);
     println!(
         "[ble] scanning for 0xFFF6 commissionable (discriminator={})...",
-        discriminator.map(|d| d.to_string()).unwrap_or_else(|| "any".into())
+        discriminator
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "any".into())
     );
 
     let target = gatt

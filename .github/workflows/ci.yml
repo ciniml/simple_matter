@@ -23,10 +23,13 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test (host)
         run: cargo test --all-features
+      # no_std クロスチェックはコアクレートのみ(simple-matter-ble は std/tokio 前提の
+      # PC バックエンドなのでワークスペース一括では通らない)。RISC-V は ESP32-C3 移植の
+      # 前提ゲート E0(docs/design/port-esp32-device.md §8)。
       - name: Check no_std (Cortex-M0)
-        run: cargo check --all-features --target thumbv6m-none-eabi
-      - name: Check no_std (RISC-V)
-        run: cargo check --all-features --target riscv32imc-unknown-none-elf
+        run: cargo check -p simple-matter --all-features --target thumbv6m-none-eabi
+      - name: Check no_std (RISC-V / ESP32-C3 gate)
+        run: cargo check -p simple-matter --all-features --target riscv32imc-unknown-none-elf
       # controller feature を無効化した最小構成でもビルドが通ること(feature gating の健全性)。
       - name: Check no-default-features
         run: cargo check -p simple-matter --no-default-features
@@ -51,3 +54,20 @@ jobs:
           DELTA=$(( CTL - BASE )); DELTA=${DELTA#-}
           echo "device build: $BASE B / with controller feature: $CTL B (delta $DELTA B)"
           test "$DELTA" -le 128 && echo "footprint invariant within codegen-noise threshold"
+
+  # コミッショナーの Windows 対応 W0(docs/design/port-windows-commissioner.md §5)。
+  # ビルド健全性のみを検証する(BLE 実機テストは手動)。device feature(bluer)は
+  # Linux 専用の target 依存なので、Windows では lib から cfg で消える。
+  windows-commissioner:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Check simple-matter-ble (all features; bluer is cfg'd out)
+        run: cargo check -p simple-matter-ble --all-features
+      - name: Check ble-commissioner example
+        run: cargo check -p simple-matter-ble --features commissioner --examples
+      - name: Clippy (commissioner)
+        run: cargo clippy -p simple-matter-ble --features commissioner -- -D warnings

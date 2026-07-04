@@ -200,11 +200,7 @@ impl RecvWindow {
 
     /// standalone ACK を今送るべきなら `true`(保留があり期限到達)。
     pub fn ack_due(&self, now_ms: u64) -> bool {
-        self.pending_ack
-            && self
-                .ack_deadline_ms
-                .map(|d| now_ms >= d)
-                .unwrap_or(false)
+        self.pending_ack && self.ack_deadline_ms.map(|d| now_ms >= d).unwrap_or(false)
     }
 
     /// ACK 保留中なら `true`。

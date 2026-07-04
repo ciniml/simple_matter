@@ -176,7 +176,10 @@ fn reassembler_rejects_overflow_and_orphan_continuation() {
     // Beginning なしの継続は不正状態。
     let mut r2 = Reassembler::new();
     let cont = HeaderFlags::from_bits(HeaderFlags::CONTINUING);
-    assert_eq!(r2.push(cont, None, &[0; 3]), Err(crate::Error::InvalidState));
+    assert_eq!(
+        r2.push(cont, None, &[0; 3]),
+        Err(crate::Error::InvalidState)
+    );
 }
 
 #[test]
@@ -350,9 +353,7 @@ fn adv_data_service_data_round_trips() {
 
 #[test]
 fn gatt_traits_are_implementable_and_have_blanket_impls() {
-    use super::gatt::{
-        GattCentral, GattPeripheral, PeripheralEvent, ScanFilter, ScanResult,
-    };
+    use super::gatt::{GattCentral, GattPeripheral, PeripheralEvent, ScanFilter, ScanResult};
     use crate::transport::net::BtpConnId;
 
     /// メモリ内テスト実装(async 本体は自明。ポーリングされない型レベル確認用)。
