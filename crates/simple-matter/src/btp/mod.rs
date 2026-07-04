@@ -88,13 +88,15 @@ pub struct Btp<const WINDOW: usize = 6> {
 impl<const WINDOW: usize> Btp<WINDOW> {
     /// role 指定で新しい BTP を生成する。
     ///
-    /// seq 初期値は仕様どおり role で分岐する(§2.4):
-    /// central は `tx=1, rx=0`、peripheral は `tx=0, rx=1`。
+    /// seq は両 role とも 0 起点。role 非対称は「handshake 応答が peripheral→central
+    /// 方向の暗黙の seq 0 を消費する」ことで生じる(chip `BLEEndPoint::Init` の
+    /// `expectInitialAck = (role == Peripheral)` と等価。chip-tool 実機で裏取り):
+    /// peripheral は応答送出時に tx seq 0 を消費して未 ACK に計上し(central が
+    /// ack=0 を返す)、central は応答受理時に rx seq 0 を消費して ACK を武装する。
+    /// 結果、データフラグメントは central→peripheral が seq 0 から、
+    /// peripheral→central が seq 1 から始まる。
     pub const fn new(role: BtpRole) -> Self {
-        let (tx_seq, rx_seq) = match role {
-            BtpRole::Central => (1u8, 0u8),
-            BtpRole::Peripheral => (0u8, 1u8),
-        };
+        let (tx_seq, rx_seq) = (0u8, 0u8);
         Self {
             role,
             phase: Phase::Idle,
@@ -160,7 +162,7 @@ impl<const WINDOW: usize> Btp<WINDOW> {
         if is_handshake(frag) {
             match self.role {
                 BtpRole::Peripheral => self.on_handshake_req(frag, mtu)?,
-                BtpRole::Central => self.on_handshake_resp(frag)?,
+                BtpRole::Central => self.on_handshake_resp(frag, now_ms)?,
             }
             self.last_activity_ms = now_ms;
             return Ok(());
@@ -212,6 +214,11 @@ impl<const WINDOW: usize> Btp<WINDOW> {
             let n = resp.encode(out)?;
             self.resp_pending = false;
             self.phase = Phase::Established;
+            // handshake 応答は peripheral→central 方向の暗黙の seq 0 を消費する
+            // (ワイヤ上に seq フィールドは持たないが、central は ack=0 でこれを ACK
+            // してくる)。未 ACK に計上し、central の最初のデータ/ACK で解消される。
+            let seq = self.send.take_data_seq(now_ms);
+            debug_assert_eq!(seq, 0);
             self.last_activity_ms = now_ms;
             return Ok(n);
         }
@@ -352,10 +359,8 @@ impl<const WINDOW: usize> Btp<WINDOW> {
 
     /// セッションを初期状態へ戻す(切断時)。
     pub fn reset(&mut self) {
-        let (tx_seq, rx_seq) = match self.role {
-            BtpRole::Central => (1u8, 0u8),
-            BtpRole::Peripheral => (0u8, 1u8),
-        };
+        // seq は両 role とも 0 起点(`Btp::new` のドキュメント参照)。
+        let (tx_seq, rx_seq) = (0u8, 0u8);
         self.phase = Phase::Idle;
         self.fragment = 0;
         self.window_size = 0;
@@ -377,9 +382,12 @@ impl<const WINDOW: usize> Btp<WINDOW> {
             return Err(Error::InvalidState);
         }
         // フラグメントは、自機 ATT_MTU(既知なら)と相手提示 MTU の小さい方から算出。
-        let att_mtu = match mtu {
-            Some(m) => m.min(req.mtu),
-            None => req.mtu,
+        // 相手提示 0 は「MTU 不明」の意(chip-tool は central 側で MTU を知らないとき
+        // 0 を送る)なので、min には含めず自機側の知識のみを使う。
+        let att_mtu = match (mtu, req.mtu) {
+            (Some(m), 0) => m,
+            (Some(m), r) => m.min(r),
+            (None, r) => r,
         };
         let fragment = if att_mtu == 0 {
             fragment_size(None)
@@ -393,7 +401,7 @@ impl<const WINDOW: usize> Btp<WINDOW> {
     }
 
     /// central: handshake response を処理し確立する。
-    fn on_handshake_resp(&mut self, frag: &[u8]) -> Result<()> {
+    fn on_handshake_resp(&mut self, frag: &[u8], now_ms: u64) -> Result<()> {
         if self.role != BtpRole::Central || self.phase != Phase::Handshaking {
             return Err(Error::InvalidState);
         }
@@ -405,6 +413,10 @@ impl<const WINDOW: usize> Btp<WINDOW> {
         let window = resp.window.min(Self::local_window_cap()).max(1);
         self.negotiate(fragment, window);
         self.phase = Phase::Established;
+        // handshake 応答は peripheral→central 方向の暗黙の seq 0(`Btp::new` 参照)。
+        // rx 期待値を進め、ack=0 を武装する(chip の peripheral はこの ACK を待つ)。
+        self.recv.accept_seq(0)?;
+        self.recv.arm_ack(now_ms);
         Ok(())
     }
 

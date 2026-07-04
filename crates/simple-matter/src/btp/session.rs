@@ -30,7 +30,7 @@ pub struct SendWindow {
 }
 
 impl SendWindow {
-    /// role 依存の初期 seq で生成する(central tx=1 / peripheral tx=0)。
+    /// 初期 seq(両 role とも 0。`Btp::new` のドキュメント参照)で生成する。
     pub const fn new(initial_seq: u8) -> Self {
         Self {
             window_size: 0,
@@ -87,17 +87,20 @@ impl SendWindow {
 
     /// 受信 ACK 値 `ack` で未 ACK 区間を前進させる。
     ///
-    /// `ack` は未 ACK 区間 `[oldest_unacked, next_seq)` 内でなければ [`Error::InvalidState`]
-    /// (未送分や既 ACK 済みへの ACK = プロトコル違反)。
+    /// `ack` が未 ACK 区間 `[oldest_unacked, oldest+unacked)` の外なら**黙って無視**する。
+    /// 本実装は standalone ACK を未 ACK に計上しない(`take_ack_seq`)が、chip は仕様
+    /// どおり standalone ACK の seq にも ACK を返してくるため(chip-lighting-app 実機で
+    /// 裏取り)、区間外 ACK をエラーにすると相互運用が壊れる。副作用として「未送 seq への
+    /// ACK」というプロトコル違反も検出できなくなるが、寛容側に倒す。
     pub fn on_ack(&mut self, ack: u8) -> Result<()> {
         if self.unacked == 0 {
-            return Err(Error::InvalidState);
+            return Ok(());
         }
         // oldest からの距離(0..=255)。ack が区間内なら距離 < unacked。
         let dist = (ack as u16).wrapping_sub(self.oldest_unacked as u16) & 0xFF;
         let acked = dist + 1;
         if acked > self.unacked as u16 {
-            return Err(Error::InvalidState);
+            return Ok(());
         }
         self.unacked -= acked as u8;
         self.oldest_unacked = ack.wrapping_add(1);
@@ -135,7 +138,7 @@ pub struct RecvWindow {
 }
 
 impl RecvWindow {
-    /// role 依存の初期 seq で生成する(central rx=0 / peripheral rx=1)。
+    /// 初期 seq(両 role とも 0。`Btp::new` のドキュメント参照)で生成する。
     pub const fn new(initial_seq: u8) -> Self {
         Self {
             window_size: 0,

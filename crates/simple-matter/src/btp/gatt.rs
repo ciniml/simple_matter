@@ -240,11 +240,23 @@ pub trait GattCentral {
     /// [`ScanResult`] を見て行ってもよい(sans-IO 寄り)。
     async fn scan(&mut self, filter: ScanFilter) -> Result<ScanResult<Self::PeerHandle>>;
 
-    /// スキャンで見つけた相手へ接続し、C2 を subscribe して接続ハンドルと ATT_MTU を得る。
+    /// スキャンで見つけた相手へ接続し、接続ハンドルと ATT_MTU を得る。
+    ///
+    /// C2 の subscribe は行わない。BTP の確立順序は
+    /// 「handshake request の C1 write → C2 subscribe → 応答 indication 受信」であり
+    /// (chip の peripheral は最初の C1 write で endpoint を作り、subscribe を契機に
+    /// 応答を送る。逆順だと subscribe が捨てられ handshake がタイムアウトする。
+    /// chip-lighting-app 実機で裏取り)、subscribe は
+    /// [`GattCentral::subscribe_c2`] で明示的に行う。
     async fn connect(
         &mut self,
         target: &ScanResult<Self::PeerHandle>,
     ) -> Result<(BtpConnId, Option<u16>)>;
+
+    /// C2 を subscribe する(以降 [`GattCentral::next_indication`] で下りを受けられる)。
+    ///
+    /// handshake request を C1 に書いた**後**に呼ぶこと(上記の確立順序)。
+    async fn subscribe_c2(&mut self, conn: BtpConnId) -> Result<()>;
 
     /// C1 write で 1 BTP フラグメント(handshake req・上りセグメント)を送る。
     async fn write_c1(&mut self, conn: BtpConnId, frag: &[u8]) -> Result<()>;
@@ -308,6 +320,9 @@ impl<T: GattCentral + ?Sized> GattCentral for &mut T {
         target: &ScanResult<Self::PeerHandle>,
     ) -> Result<(BtpConnId, Option<u16>)> {
         (**self).connect(target).await
+    }
+    async fn subscribe_c2(&mut self, conn: BtpConnId) -> Result<()> {
+        (**self).subscribe_c2(conn).await
     }
     async fn write_c1(&mut self, conn: BtpConnId, frag: &[u8]) -> Result<()> {
         (**self).write_c1(conn, frag).await

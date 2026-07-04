@@ -225,13 +225,16 @@ async fn run(passcode: u32, discriminator: Option<u16>) -> Result<(), String> {
         .connect(&target)
         .await
         .map_err(|e| format!("connect: {e:?}"))?;
-    println!("[ble] connected + subscribed C2 (conn={} att_mtu={mtu:?})", conn.0);
+    println!("[ble] connected (conn={} att_mtu={mtu:?})", conn.0);
 
     let peer = PeerAddr::Ble(conn);
     let start = Instant::now();
     let now_ms = |start: &Instant| start.elapsed().as_millis() as u64;
 
     // --- BTP handshake(central)---
+    // BTP の確立順序: handshake request の C1 write → C2 subscribe → 応答 indication。
+    // chip の peripheral は最初の C1 write で endpoint を作り subscribe を契機に応答を
+    // 送るため、この順序でないと handshake がタイムアウトする(GattCentral の doc 参照)。
     let mut btp = Btp::<6>::new(BtpRole::Central);
     let mut frag = [0u8; 512];
     {
@@ -242,6 +245,9 @@ async fn run(passcode: u32, discriminator: Option<u16>) -> Result<(), String> {
         gatt.write_c1(conn, &frag[..n])
             .await
             .map_err(|e| format!("write_c1(handshake): {e:?}"))?;
+        gatt.subscribe_c2(conn)
+            .await
+            .map_err(|e| format!("subscribe_c2: {e:?}"))?;
         while !btp.is_established() {
             if start.elapsed() > OVERALL_TIMEOUT {
                 return Err("BTP handshake timed out".into());

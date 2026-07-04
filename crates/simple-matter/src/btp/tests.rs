@@ -212,9 +212,11 @@ fn out_of_order_seq_is_rejected() {
     c.send(b"data", 0).unwrap();
     let mut buf = [0u8; 300];
     let n = c.process_outgoing(&mut buf, MTU, 0).unwrap();
-    // seq バイトを壊す(先頭 = flags, 次 = seq。ACK なし・Beginning なので [flags, seq, len_lo, len_hi, ...])。
-    // flags により seq の位置が決まる。ここでは ack なし・beginning なので seq は index 1。
-    buf[1] = buf[1].wrapping_add(5);
+    // seq バイトを壊す。ヘッダは [flags, (ack), seq, ...] で、ACK ビット(0x08)の有無で
+    // seq の位置が変わる(central の最初のデータは handshake 応答への ack=0 を piggyback
+    // するため通常 ACK 付き)。
+    let seq_idx = 1 + usize::from(buf[0] & 0x08 != 0);
+    buf[seq_idx] = buf[seq_idx].wrapping_add(5);
     assert_eq!(
         p.process_incoming(&buf[..n], MTU, 0),
         Err(crate::Error::InvalidState)
@@ -393,6 +395,9 @@ fn gatt_traits_are_implementable_and_have_blanket_impls() {
         ) -> crate::error::Result<(BtpConnId, Option<u16>)> {
             Ok((BtpConnId(0), Some(247)))
         }
+        async fn subscribe_c2(&mut self, _conn: BtpConnId) -> crate::error::Result<()> {
+            Ok(())
+        }
         async fn write_c1(&mut self, _conn: BtpConnId, _frag: &[u8]) -> crate::error::Result<()> {
             Ok(())
         }
@@ -470,4 +475,36 @@ fn large_message_spanning_more_than_window_fragments() {
         p.recv().expect("reassembled 500B across window boundary"),
         &msg[..]
     );
+}
+
+// ==========================================================================
+// chip 互換の seq 規約(handshake 応答 = 暗黙の peripheral seq 0)
+// ==========================================================================
+
+/// chip-tool 実機で裏取りした seq 規約の固定化(2026-07-05):
+/// handshake 応答は peripheral→central 方向の暗黙の seq 0 を消費するため、
+/// central の最初のデータフラグメントは seq=0 + ack=0(応答への piggyback ACK)、
+/// peripheral の最初のデータフラグメントは seq=1 になる。
+#[test]
+fn chip_compatible_initial_seq_and_resp_ack() {
+    let (mut c, mut p) = establish::<6>(MTU);
+    let mut buf = [0u8; 300];
+
+    // central 最初のデータ: flags=Beginning|Ending|ACK, ack=0, seq=0(chip-tool 実ワイヤと一致)。
+    c.send(b"hello", 10).unwrap();
+    let n = c.process_outgoing(&mut buf, MTU, 10).unwrap();
+    assert_eq!(buf[0], 0x01 | 0x04 | 0x08, "Beginning|Ending|ACK");
+    assert_eq!(buf[1], 0, "ack=0(handshake 応答の暗黙 seq 0 への ACK)");
+    assert_eq!(buf[2], 0, "central の最初のデータ seq は 0");
+    p.process_incoming(&buf[..n], MTU, 10).unwrap();
+    assert_eq!(p.recv().expect("SDU"), b"hello");
+
+    // peripheral 最初のデータ: seq=1(seq 0 は handshake 応答が消費済み)。
+    p.send(b"world", 20).unwrap();
+    let n = p.process_outgoing(&mut buf, MTU, 20).unwrap();
+    let has_ack = buf[0] & 0x08 != 0;
+    let seq = if has_ack { buf[2] } else { buf[1] };
+    assert_eq!(seq, 1, "peripheral の最初のデータ seq は 1");
+    c.process_incoming(&buf[..n], MTU, 20).unwrap();
+    assert_eq!(c.recv().expect("SDU"), b"world");
 }

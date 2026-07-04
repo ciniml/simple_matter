@@ -238,6 +238,11 @@ async fn main() -> std::result::Result<(), String> {
     let mut btp = Btp::<6>::new(BtpRole::Peripheral);
     let mut conn: Option<BtpConnId> = None;
     let mut mtu: Option<u16> = None;
+    // chip-tool は handshake req の C1 write を C2 subscribe より先に行う。
+    // subscribe 前の indicate は BlueZ がエラーにするため、subscribe 済みになるまで
+    // 送出(flush_out)を保留する。BTP エンジン側が出力を保持しているので、
+    // C2Subscribed 時の flush でまとめて排出される。
+    let mut subscribed = false;
 
     println!("simple-matter BLE On/Off light advertising (0xFFF6 service data)");
     println!("  passcode: {PASSCODE}  discriminator: {DISCRIMINATOR}");
@@ -273,10 +278,12 @@ async fn main() -> std::result::Result<(), String> {
                         println!("[ble] connected: conn={} att_mtu={att_mtu:?}", c.0);
                         conn = Some(c);
                         mtu = att_mtu;
+                        subscribed = false;
                         btp.reset();
                     }
                     PeripheralEvent::C2Subscribed { conn: c } => {
                         conn = Some(c);
+                        subscribed = true;
                         // handshake resp / 保留中フラグメントを排出。
                         flush_out(&mut gatt, &mut btp, c, mtu, now)
                             .await
@@ -287,9 +294,11 @@ async fn main() -> std::result::Result<(), String> {
                         trace("rx", &buf[..len]);
                         btp.process_incoming(&buf[..len], mtu, now)
                             .map_err(|e| format!("process_incoming: {e:?}"))?;
-                        flush_out(&mut gatt, &mut btp, c, mtu, now)
-                            .await
-                            .map_err(|e| format!("flush(c1): {e:?}"))?;
+                        if subscribed {
+                            flush_out(&mut gatt, &mut btp, c, mtu, now)
+                                .await
+                                .map_err(|e| format!("flush(c1): {e:?}"))?;
+                        }
                         // 再組立できた Matter メッセージを stack へ渡し、応答を BTP に載せる。
                         while let Some(slen) = take_sdu(&mut btp, &mut sdu) {
                             let dir =
@@ -298,21 +307,24 @@ async fn main() -> std::result::Result<(), String> {
                                 btp.send(&txd[..d.len], now)
                                     .map_err(|e| format!("btp.send: {e:?}"))?;
                             }
-                            flush_out(&mut gatt, &mut btp, c, mtu, now)
-                                .await
-                                .map_err(|e| format!("flush(rx): {e:?}"))?;
+                            if subscribed {
+                                flush_out(&mut gatt, &mut btp, c, mtu, now)
+                                    .await
+                                    .map_err(|e| format!("flush(rx): {e:?}"))?;
+                            }
                         }
                     }
                     PeripheralEvent::Disconnected { conn: c } => {
                         println!("[ble] disconnected: conn={}", c.0);
                         conn = None;
+                        subscribed = false;
                         btp.reset();
                     }
                 }
             }
             _ = tokio::time::sleep(sleep) => {
                 let now = now_ms(&start);
-                if let Some(c) = conn {
+                if let (Some(c), true) = (conn, subscribed) {
                     // BTP 自身の遅延 ACK / idle 送出を排出。
                     flush_out(&mut gatt, &mut btp, c, mtu, now)
                         .await
@@ -327,7 +339,7 @@ async fn main() -> std::result::Result<(), String> {
         // exchange プールが枯渇し AddNOC 以降が NoSpace で黙って落ちる(実 BLE で実証)。
         let now = now_ms(&start);
         while let Some(d) = stack.poll(now, &mut txd) {
-            if let Some(c) = conn {
+            if let (Some(c), true) = (conn, subscribed) {
                 btp.send(&txd[..d.len], now)
                     .map_err(|e| format!("btp.send(poll): {e:?}"))?;
                 flush_out(&mut gatt, &mut btp, c, mtu, now)

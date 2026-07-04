@@ -48,7 +48,7 @@ const SCAN_POLL: Duration = Duration::from_millis(200);
 struct ConnState {
     peripheral: Peripheral,
     c1: Characteristic,
-    c2_uuid: Uuid,
+    c2: Characteristic,
     notifications: Pin<Box<dyn Stream<Item = ValueNotification> + Send>>,
 }
 
@@ -192,8 +192,8 @@ impl GattCentral for BtleplugCentral {
             .ok_or(Error::NotFound)?;
 
         // notifications ストリームを subscribe より前に取得しておく(接続をまたいで有効)。
+        // subscribe 自体は行わない(BTP の確立順序: handshake C1 write → subscribe_c2)。
         let notifications = peripheral.notifications().await.map_err(map_btle)?;
-        peripheral.subscribe(&c2).await.map_err(map_btle)?;
 
         let id = self.alloc_conn();
         self.conns.insert(
@@ -201,12 +201,18 @@ impl GattCentral for BtleplugCentral {
             ConnState {
                 peripheral,
                 c1,
-                c2_uuid: c2.uuid,
+                c2,
                 notifications,
             },
         );
         // btleplug は ATT_MTU を公開しないため None(BTP は既定フラグメントで handshake)。
         Ok((id, None))
+    }
+
+    async fn subscribe_c2(&mut self, conn: BtpConnId) -> Result<()> {
+        let st = self.conns.get(&conn.0).ok_or(Error::NotFound)?;
+        st.peripheral.subscribe(&st.c2).await.map_err(map_btle)?;
+        Ok(())
     }
 
     async fn write_c1(&mut self, conn: BtpConnId, frag: &[u8]) -> Result<()> {
@@ -222,7 +228,7 @@ impl GattCentral for BtleplugCentral {
         let st = self.conns.get_mut(&conn.0).ok_or(Error::NotFound)?;
         loop {
             let n = st.notifications.next().await.ok_or(Error::InvalidState)?;
-            if n.uuid != st.c2_uuid {
+            if n.uuid != st.c2.uuid {
                 continue; // C2 以外の通知は無視。
             }
             let len = n.value.len();
