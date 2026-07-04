@@ -27,6 +27,9 @@ jobs:
         run: cargo check --all-features --target thumbv6m-none-eabi
       - name: Check no_std (RISC-V)
         run: cargo check --all-features --target riscv32imc-unknown-none-elf
+      # controller feature を無効化した最小構成でもビルドが通ること(feature gating の健全性)。
+      - name: Check no-default-features
+        run: cargo check -p simple-matter --no-default-features
       # フットプリント計測(docs/ARCHITECTURE.md 設計原則 10)。
       - name: Bloat-check RAM report (host)
         run: cargo run -p bloat-check --bin ram-report --release
@@ -34,3 +37,15 @@ jobs:
         run: |
           cargo build -p bloat-check --bin flash-probe --release --target thumbv7em-none-eabihf
           size -A target/thumbv7em-none-eabihf/release/flash-probe
+      # controller feature 有効化がデバイス(responder)専用ビルドのフットプリントに影響しない
+      # ことを機械検証する(docs/design/controller.md §2.3)。flash-probe を feature なし/ありで
+      # 2 回ビルドし、全セクションのサイズ(section 名 + size 列)が完全一致することを diff で
+      # 要求する。1 バイトでも差が出れば「デバイスパスに controller コードが波及した」検知になる。
+      - name: Bloat-check controller-feature footprint invariance
+        run: |
+          cargo build -p bloat-check --bin flash-probe --release --target thumbv7em-none-eabihf
+          size -A target/thumbv7em-none-eabihf/release/flash-probe | awk '{print $1, $2}' > /tmp/size-base.txt
+          cargo build -p bloat-check --bin flash-probe --release --target thumbv7em-none-eabihf --features simple-matter/controller
+          size -A target/thumbv7em-none-eabihf/release/flash-probe | awk '{print $1, $2}' > /tmp/size-ctl.txt
+          diff /tmp/size-base.txt /tmp/size-ctl.txt \
+            && echo "footprint invariant: controller feature does not change the device build"

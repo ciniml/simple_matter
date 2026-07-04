@@ -46,3 +46,7 @@ rustcrypto = [
     "dep:zeroize",
     "dep:subtle",
 ]
+# コントローラ(commissioner / initiator)側の機能を有効化する additive feature。
+# 依存クレート追加なし・default 無効。デバイス(responder)専用ビルドのフットプリントに
+# 影響しない(docs/design/controller.md §2.3)。
+controller = []

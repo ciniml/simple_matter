@@ -109,8 +109,19 @@ pub mod handshake;
 #[cfg(feature = "rustcrypto")]
 pub mod pase;
 
+/// SC initiator(コントローラ側 PASE / CASE)ハンドラ。
+///
+/// `controller` feature が有効なときのみコンパイルされる(`docs/design/controller.md` §2.3)。
+/// crypto プリミティブに依存するため `rustcrypto` も必要(通常 `controller` は crypto
+/// バックエンドの上で使うため同時に有効化される)。
+#[cfg(all(feature = "controller", feature = "rustcrypto"))]
+pub mod initiator;
+
 #[cfg(feature = "rustcrypto")]
 pub use responder::{PaseConfig, SecureChannel};
+
+#[cfg(all(feature = "controller", feature = "rustcrypto"))]
+pub use initiator::{HandshakeKindTag, ScEvent, ScFailReason, ScInitiator};
 
 #[cfg(test)]
 mod tests {
