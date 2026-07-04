@@ -1,0 +1,19 @@
+# ESP32-C6 は RISC-V(RV32IMAC)。upstream stable Rust のターゲットで完結し、
+# Xtensa(espup)を要さない(port-esp32-device.md §0-2, ユーザ指定で C3→C6)。
+[build]
+target = "riscv32imac-unknown-none-elf"
+
+[target.riscv32imac-unknown-none-elf]
+# esp-hal の rt(build.rs)が OUT_DIR に配置する linkall.x(→ memory.x / esp32c6.x /
+# hal-defaults.x を INCLUDE)をリンクする。
+# force-frame-pointers は esp-backtrace が RISC-V で必須(esp-backtrace README)。
+rustflags = [
+    "-C", "link-arg=-Tlinkall.x",
+    "-C", "force-frame-pointers",
+]
+# 実機書き込み: `cargo run --release` で espflash が flash + monitor する。
+runner = "espflash flash --monitor"
+
+[env]
+# esp-println / log のデフォルトログレベル。
+ESP_LOG = "info"

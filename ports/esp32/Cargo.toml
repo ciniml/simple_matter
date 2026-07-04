@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["esp32c6-firmware"]
+
+# esp 系依存(esp-hal / esp-println / esp-backtrace)はビルドターゲットが
+# riscv32imac-unknown-none-elf 固定で、ホスト側 workspace(ルート)の依存解決や
+# lock と衝突しやすい。docs/design/port-esp32-device.md §7 / R4 に従い、ルート
+# workspace とは別 workspace として lock を分離する(ルートの members には入れない)。
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

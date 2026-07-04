@@ -1,0 +1,5 @@
+# ESP32-C6 は RISC-V ターゲットのため upstream の stable Rust で足りる
+# (Xtensa の espup ツールチェーンは不要)。riscv32imac-unknown-none-elf を追加する。
+[toolchain]
+channel = "stable"
+targets = ["riscv32imac-unknown-none-elf"]

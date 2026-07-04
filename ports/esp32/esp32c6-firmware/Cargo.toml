@@ -1,0 +1,22 @@
+[package]
+name = "esp32c6-firmware"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+esp-hal = { version = "1.1.1", features = ["esp32c6", "unstable"] }
+esp-println = { version = "0.17.0", features = ["esp32c6"] }
+esp-backtrace = { version = "0.19.0", features = [
+    "esp32c6",
+    "println",
+    "panic-handler",
+] }
+
+# コア。デバイス(responder)向けの最小構成。default-features = false で std を排し、
+# rustcrypto(暗号バックエンド)と ble(BTP トランスポート)のみを有効化する。
+simple-matter = { path = "../../../crates/simple-matter", default-features = false, features = [
+    "rustcrypto",
+    "ble",
+] }
