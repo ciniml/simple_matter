@@ -76,11 +76,37 @@ SM_BLE_ADAPTER=hci0 cargo run -p simple-matter-ble --features commissioner \
 
 既存の connectedhomeip 相互運用実績(UDP)に BLE を接続する。
 
-- **本デバイス(bluer)⇔ chip-tool**: `ble-onoff-light` を広告させ、chip-tool の BLE
-  ペアリング経路で commission する。PASE-only を見るなら
-  `chip-tool pairing ble-<transport> <node-id> <passcode> <discriminator>`(実 NW join を伴う
-  `ble-wifi` / `ble-thread` は NetworkCommissioning 実 join が将来スコープのため、まずは
-  0xFFF6 広告 → BTP handshake → PASE → CASE → CommissioningComplete が通ることを確認する)。
+- **本デバイス(bluer)⇔ chip-tool の BLE→Wi-Fi フルコミッショニング(実測済み、2026-07-05)**:
+  `ble-onoff-light` は **BLE + UDP + mDNS を併走**する dual-transport example。chip-tool の
+  `pairing ble-wifi` 経路で **フルパス**(PASE over BLE → CSR/AddNOC → AddOrUpdateWiFiNetwork →
+  ConnectNetwork → operational mDNS 発見 → CASE over UDP → CommissioningComplete)が通る。
+
+  1. デバイス起動(peripheral = hci1):
+     ```sh
+     SM_BLE_ADAPTER=hci1 cargo run --release -p simple-matter-ble --features device --example ble-onoff-light
+     ```
+     起動ログに `BLE: 0xFFF6 ... | UDP: 0.0.0.0:5540` と `mDNS advertising ... (A record: <ip>)` が出る。
+  2. chip-tool でコミッショニング(central = hci0 → `--ble-controller 0`):
+     ```sh
+     chip-tool pairing ble-wifi 1 TESTSSID testpass 20202021 3840 \
+         --ble-controller 0 --bypass-attestation-verifier true
+     ```
+     成功すると `Device commissioning completed with success` で終わる。SSID/パスワードは
+     **シミュレーション**で、実際の Wi-Fi join は行わない(この PC は既に IP 到達可能)。
+     NetworkCommissioning は Wi-Fi feature(`NetworkCommissioningWifi`)を提示し、
+     AddOrUpdateWiFiNetwork / ConnectNetwork に即 Success を返すことで、chip-tool の
+     「BLE 経由 commissionee は Wi-Fi/Thread が必要」というポリシを満たす。
+  3. 操作を確認(運用 CASE over UDP):
+     ```sh
+     chip-tool onoff toggle 1 1
+     ```
+     デバイス stdout に `[onoff] light is now ON/OFF` が出れば属性反映まで通っている。
+  - **前提**: chip-tool(central)とデバイス(peripheral)が別アダプタ、かつ同一 LAN(mDNS/UDP 到達可能)。
+  - **後片付け(再現性)**: `chip-tool pairing unpair 1`(効かないことがある)か、
+    `rm -f ~/snap/chip-tool/common/chip_tool_kvs` で commissioner のフabリックを掃除する。
+    BlueZ に亡霊接続が残ったら `bluetoothctl remove <MAC>`。
+  - PASE-only だけ見たい場合は `chip-tool pairing code-paseonly 1 <manual-code>
+    --use-only-onnetwork-discovery false --ble-controller 0`。
 - **本コントローラ(btleplug)⇔ chip サンプルデバイス**: `chip-lighting-app` を
   `--discriminator 3840 --passcode 20202021` 等で BLE 広告させ、`ble-commissioner` で
   commission する。

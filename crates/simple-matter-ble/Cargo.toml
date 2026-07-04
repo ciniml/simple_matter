@@ -27,6 +27,11 @@ futures = "0.3"
 # tokio 前提のため **このクレート内でのみ** tokio を使う(設計 doc §6.1)。
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 
+[dev-dependencies]
+# examples/ble-onoff-light の mDNS ソケット用(SO_REUSEPORT で avahi と共存)。
+# BLE と UDP + 運用 mDNS を併走させる dual-transport 版で使う。
+socket2 = { version = "0.5", features = ["all"] }
+
 [features]
 # GattPeripheral(BlueZ / bluer)。Linux 専用。
 device = ["dep:bluer"]

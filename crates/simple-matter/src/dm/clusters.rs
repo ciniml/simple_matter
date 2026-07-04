@@ -14,7 +14,7 @@ pub mod operational_credentials;
 pub use basic_information::{BasicInfoConfig, BasicInformationCluster};
 pub use descriptor::DescriptorCluster;
 pub use general_commissioning::{FailSafe, GeneralCommissioning};
-pub use network_commissioning::NetworkCommissioning;
+pub use network_commissioning::{NetworkCommissioning, NetworkCommissioningWifi};
 pub use on_off::OnOffCluster;
 pub use operational_credentials::{DacProvider, OpCredsCluster, TestDacProvider};
 
