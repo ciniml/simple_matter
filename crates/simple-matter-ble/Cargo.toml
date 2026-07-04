@@ -1,0 +1,42 @@
+[package]
+name = "simple-matter-ble"
+description = "PC BLE backends (bluer device / btleplug commissioner) for simple-matter BTP"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# コア。BTP 状態機械(Btp<WINDOW>)・GATT trait・AdvData を features=["ble"] で使う。
+# commissioner feature では controller 側 API(ControllerStack / Commissioner)も要る。
+simple-matter = { path = "../simple-matter", features = ["ble"] }
+
+# device 側 GATT peripheral は BlueZ(bluer)で実装する。btleplug は central 専用のため
+# peripheral には使えない(設計 doc §6.1)。bluer は Linux 専用。
+bluer = { version = "0.17", optional = true, features = ["bluetoothd"] }
+
+# controller 側 GATT central は btleplug で実装する。
+btleplug = { version = "0.11", optional = true }
+# btleplug の UUID 型。Matter service/C1/C2 の 128bit UUID 照合・指定に使う。
+uuid = { version = "1", optional = true }
+# bluer / btleplug のイベント・通知ストリーム(Stream trait)を受けるため。両バックエンド
+# 共通で使うので常時依存にする(このクレートは std 専用でフットプリント制約はない)。
+futures = "0.3"
+
+# PC ホストの executor。コア(simple-matter)は executor 非依存だが、bluer/btleplug は
+# tokio 前提のため **このクレート内でのみ** tokio を使う(設計 doc §6.1)。
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+[features]
+# GattPeripheral(BlueZ / bluer)。Linux 専用。
+device = ["dep:bluer"]
+# GattCentral(btleplug)+ コア controller 機能。
+commissioner = ["dep:btleplug", "dep:uuid", "simple-matter/controller"]
+
+[[example]]
+name = "ble-onoff-light"
+required-features = ["device"]
+
+[[example]]
+name = "ble-commissioner"
+required-features = ["commissioner"]
