@@ -113,6 +113,41 @@ SM_BLE_ADAPTER=hci0 cargo run -p simple-matter-ble --features commissioner \
 - 突き合わせ観点: Wireshark(Matter dissector + BTP dissector)で handshake バイト列・
   discriminator・PASE session parameters・Sigma1 destination-id を chip 側キャプチャと比較する。
 
+## Windows での commissioner(W1 スモーク、port-windows-commissioner.md §5)
+
+`commissioner` feature(btleplug/WinRT)は Windows でビルド・実行できる(`device` は
+Linux 専用)。W1 の目的は設計 doc のリスク 3 点の実機確認:
+
+1. **R1: スキャンで 0xFFF6 service data が取れるか** — `[ble] found device:
+   discriminator=...` が出れば OK。スキャン 30 秒でタイムアウトするなら service data が
+   取れていない可能性が高い(→ 設計 doc §2.1)。
+2. **R2: subscribe 前の C1 write(handshake)が通るか** — `[btp] established:
+   fragment=... window=...` まで出れば OK。`write_c1(handshake)` でエラーになるなら §2.2。
+3. R4 の切り分け用に `SM_BTP_TRACE=1` でフラグメントトレースを見る。
+
+手順(対向は Linux 機の `ble-onoff-light`(実績構成)を推奨):
+
+```powershell
+# Windows 上でネイティブビルドする場合(Rust + VS Build Tools):
+cargo build --release -p simple-matter-ble --features commissioner --example ble-commissioner
+# 実行(BLE アダプタ有効・Bluetooth ON):
+$env:SM_BTP_TRACE = "1"
+.\target\x86_64-pc-windows-msvc\release\examples\ble-commissioner.exe 20202021 3840
+```
+
+Linux からのクロスビルドも可能(cargo-xwin 使用、実測済み):
+
+```sh
+XWIN_ACCEPT_LICENSE=1 cargo xwin build --release --target x86_64-pc-windows-msvc \
+    -p simple-matter-ble --features commissioner --example ble-commissioner
+# → target/x86_64-pc-windows-msvc/release/examples/ble-commissioner.exe を Windows 機へコピー
+```
+
+- `SM_BLE_ADAPTER` は WinRT では未対応(btleplug は既定アダプタを使う。指定しても
+  `adapter_info()` 前方一致で解決できなければ NotFound になるので未設定で使う)。
+- うまく動かないときは Windows 設定 → Bluetooth からペアリング済みデバイスの残骸を
+  削除(BlueZ の `bluetoothctl remove` 相当、設計 doc R4)。
+
 ## 設計上の注意
 
 - **同時接続は 1**(初期スコープ、設計 doc §11-2)。`BtpConnId` は単一接続に採番する。
