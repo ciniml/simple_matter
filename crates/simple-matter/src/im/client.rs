@@ -149,6 +149,11 @@ impl<const RESULT: usize> ImClient<RESULT> {
         self.txn.is_some()
     }
 
+    /// 進行中トランザクションが使用中の exchange を返す(統合層の exchange 回収判定用)。
+    pub fn active_exchange(&self) -> Option<ExchangeId> {
+        self.txn.as_ref().map(|t| t.exchange)
+    }
+
     /// 完了/失敗イベントを 1 件取り出す(§4.4)。
     pub fn take_event(&mut self) -> Option<ImEvent> {
         self.event.take()

@@ -50,6 +50,13 @@ use self::der::DerWriter;
 
 mod der;
 
+/// 運用証明書の発行(CA)と CSR 解析。`controller` feature 有効時のみ。
+#[cfg(feature = "controller")]
+pub mod issue;
+
+#[cfg(feature = "controller")]
+pub use issue::{parse_csr, write_matter_cert, DnAttr, MatterCertSpec, NOC_EKU};
+
 /// Matter epoch(2000-01-01T00:00:00Z)の Unix タイムスタンプ(秒)。
 ///
 /// Matter 証明書の validity は Matter epoch 秒で表現される。DER の UTCTime/

@@ -152,6 +152,11 @@ impl<'c, C: Crypto, R: Rng, F> ScInitiator<'c, C, R, F> {
         self.hs.is_some()
     }
 
+    /// 進行中ハンドシェイクが使用中の exchange を返す(統合層の exchange 回収判定用)。
+    pub fn active_exchange(&self) -> Option<ExchangeId> {
+        self.hs.as_ref().map(|h| h.exchange)
+    }
+
     /// 完了/失敗イベントを 1 件取り出す(§3.5)。
     pub fn take_event(&mut self) -> Option<ScEvent> {
         self.event.take()

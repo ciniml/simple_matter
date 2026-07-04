@@ -1173,3 +1173,229 @@ fn onoff_light_end_to_end() {
         AttributeReportRef::Status(_) => panic!("expected OnOff data report"),
     }
 }
+
+// ==========================================================================
+// (ピース D)コントローラ縦通し: ControllerStack + Commissioner でフルコミッショニング
+//
+// `docs/design/controller.md` §9.1。上の `onoff_light_end_to_end` は client 役を手書き
+// (build_msg/decode_resp/pase_invoke/write_cert/case:: 直叩き)で組むが、本テストは
+// `ControllerStack` + `Commissioner` + `Ca` を用い、**手書きロジックなし**で
+// PASE → ArmFailSafe → CSR → AddTrustedRoot → AddNOC → CASE → CommissioningComplete →
+// CASE 上 OnOff invoke → Read 読み戻し を完走させる。デバイス側は同じ `build_device` を再利用。
+// ==========================================================================
+
+#[cfg(feature = "controller")]
+mod controller_e2e {
+    use super::*;
+
+    use crate::controller::ca::Ca;
+    use crate::controller::{
+        AttestationPolicy, Commissioner, ControllerCreds, ControllerStack, Phase,
+    };
+    use crate::im::client::ImClient;
+    use crate::im::wire::ImStatus;
+    use crate::im::ImEvent;
+    use crate::sc::initiator::ScInitiator;
+
+    /// コントローラスタック(SESSIONS=4 EXCHANGES=6 TX=3 RESULT=1280)。exchange は完了ごとに
+    /// 回収されるが、往復の余裕を持たせる。
+    type Ctrl<'s> = ControllerStack<'s, Crb, SeqRng, ControllerCreds<'s, Crb>, 4, 6, 3, 1280>;
+
+    /// デバイスから見たコントローラのアドレス(ping-pong の from アドレス)。
+    fn ctrl_addr() -> PeerAddr {
+        PeerAddr::Udp(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
+            5540,
+        ))
+    }
+
+    /// 1 パケットを宛先の handle_rx に渡し、応答が続く限り相互に ping-pong する。
+    ///
+    /// `to_device=true` は controller→device の向き。応答が `None`(終端)になったら戻る。
+    fn ping_pong(
+        ctrl: &mut Ctrl<'_>,
+        dev: &mut TestStack<'_>,
+        now: u64,
+        first: &[u8],
+        mut to_device: bool,
+    ) {
+        let mut buf = [0u8; 1700];
+        let mut len = first.len();
+        buf[..len].copy_from_slice(first);
+        let mut txc = [0u8; 1700];
+        let mut txd = [0u8; 1700];
+        for _ in 0..32 {
+            let dir = if to_device {
+                dev.handle_rx(&mut buf[..len], ctrl_addr(), now, &mut txd)
+            } else {
+                ctrl.handle_rx(&mut buf[..len], peer(), now, &mut txc)
+            };
+            match dir {
+                Some(d) => {
+                    let src = if to_device { &txd } else { &txc };
+                    buf[..d.len].copy_from_slice(&src[..d.len]);
+                    len = d.len;
+                    to_device = !to_device;
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// 時間を進めながら両スタックを poll し、standalone ACK / 再送を流し切って静穏化する。
+    fn flush(ctrl: &mut Ctrl<'_>, dev: &mut TestStack<'_>, base_now: u64) {
+        let mut now = base_now;
+        for _ in 0..16 {
+            now += 400;
+            let mut progressed = false;
+            let mut tx = [0u8; 1700];
+            while let Some(d) = ctrl.poll(now, &mut tx) {
+                let mut b = [0u8; 1700];
+                b[..d.len].copy_from_slice(&tx[..d.len]);
+                ping_pong(ctrl, dev, now, &b[..d.len], true);
+                progressed = true;
+            }
+            while let Some(d) = dev.poll(now, &mut tx) {
+                let mut b = [0u8; 1700];
+                b[..d.len].copy_from_slice(&tx[..d.len]);
+                ping_pong(ctrl, dev, now, &b[..d.len], false);
+                progressed = true;
+            }
+            let quiescent = ctrl.next_deadline(now).is_none() && dev.next_deadline(now).is_none();
+            if !progressed && quiescent {
+                break;
+            }
+        }
+    }
+
+    /// controller 発の 1 送信(`dir` のバイト列は `tx`)を device へ届け、応答を往復し、ACK を流す。
+    fn deliver_and_settle(
+        ctrl: &mut Ctrl<'_>,
+        dev: &mut TestStack<'_>,
+        now: u64,
+        tx: &[u8],
+        len: usize,
+    ) {
+        ping_pong(ctrl, dev, now, &tx[..len], true);
+        flush(ctrl, dev, now);
+    }
+
+    #[test]
+    fn controller_end_to_end() {
+        let crypto = RustCrypto::new(SeqRng(0xC0FF_EE00_1234_5678));
+        let fabrics: RefCell<FabricTable<Crb, 5>> = RefCell::new(FabricTable::new());
+
+        // --- デバイス(responder)側: 既存 onoff-light 構成を再利用 ---
+        let config = PaseConfig::from_passcode(PASSCODE, &SALT, ITERATIONS).unwrap();
+        let dev_creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
+        let sc = SecureChannel::new(&crypto, SeqRng(0x5C00_0001), config, dev_creds);
+        let im = InteractionModel::new(build_device(&fabrics));
+        let mut dev: TestStack = MatterStack::new(&crypto, sc, im);
+
+        // --- コントローラ(initiator)側 ---
+        let ca = Ca::<Crb>::generate(
+            &crypto,
+            &mut SeqRng(0xCA00_0001),
+            FABRIC_ID,
+            COMM_NODE,
+            0xFFF1,
+            0,
+        )
+        .expect("Ca::generate");
+        let ctrl_creds = ControllerCreds::new(&ca, &crypto, 0);
+        let sc_init = ScInitiator::new(&crypto, SeqRng(0x1C00_0001), ctrl_creds);
+        let im_client = ImClient::new();
+        let mut ctrl: Ctrl = ControllerStack::new(&crypto, sc_init, im_client);
+
+        let mut comm = Commissioner::new(&ca, &crypto, AttestationPolicy::Skip);
+        comm.commission(peer(), PASSCODE, DEVICE_NODE, NOW).unwrap();
+
+        // --- コミッショニングを Mealy 機械で駆動 ---
+        let mut tx = [0u8; 1700];
+        let mut final_phase = comm.phase();
+        for _ in 0..60 {
+            let out = comm.drive(&mut ctrl, NOW, &mut tx);
+            final_phase = out.phase;
+            if let Some(d) = out.send {
+                deliver_and_settle(&mut ctrl, &mut dev, NOW, &tx, d.len);
+            }
+            match out.phase {
+                Phase::Done { .. } | Phase::Failed { .. } => break,
+                _ => {}
+            }
+        }
+
+        let case_session = match final_phase {
+            Phase::Done { session } => session,
+            other => panic!("commissioning did not complete: {other:?}"),
+        };
+
+        // デバイス側に fabric が生えていること。
+        assert_eq!(fabrics.borrow().len(), 1, "device fabric added");
+        {
+            let g = fabrics.borrow();
+            let fe = g.get(NonZeroU8::new(1).unwrap()).unwrap();
+            assert_eq!(fe.node_id(), DEVICE_NODE);
+            assert_eq!(fe.fabric_id(), FABRIC_ID);
+        }
+        // fail-safe は CommissioningComplete で解除済み。
+        assert!(!dev.device().gc.fail_safe().is_armed());
+
+        // --- 運用 API: CASE 上で OnOff On を invoke ---
+        assert!(!dev.device().onoff.is_on());
+        let dir = ctrl
+            .start_invoke(
+                case_session,
+                CommandPath::new(EndpointId(1), ClusterId(0x0006), CommandId(0x01)),
+                |w, t| {
+                    w.start_struct(t)?;
+                    w.end_container()
+                },
+                NOW,
+                &mut tx,
+            )
+            .expect("start OnOff invoke");
+        deliver_and_settle(&mut ctrl, &mut dev, NOW, &tx, dir.len);
+        match ctrl.im_take_event() {
+            Some(ImEvent::InvokeDone { status }) => {
+                assert_eq!(status, ImStatus::Success, "OnOff On over CASE");
+            }
+            other => panic!("expected InvokeDone, got {other:?}"),
+        }
+        assert!(
+            dev.device().onoff.is_on(),
+            "device OnOff attribute is now true"
+        );
+
+        // --- 運用 API: CASE 上で OnOff を Read 読み戻し ---
+        let dir = ctrl
+            .start_read(
+                case_session,
+                &[AttributePath::concrete(
+                    EndpointId(1),
+                    ClusterId(0x0006),
+                    AttributeId(0x0000),
+                )],
+                NOW,
+                &mut tx,
+            )
+            .expect("start OnOff read");
+        deliver_and_settle(&mut ctrl, &mut dev, NOW, &tx, dir.len);
+        assert_eq!(ctrl.im_take_event(), Some(ImEvent::ReadDone));
+        let mut found_true = false;
+        for report in ctrl.read_reports() {
+            if let Ok(AttributeReportRef::Data(d)) = report {
+                if d.path.to_concrete().map(|c| c.attribute.0) == Some(0x0000) {
+                    let mut v = d.value();
+                    if matches!(
+                        v.read_next().ok().flatten().map(|e| e.value),
+                        Some(TlvValue::Boolean(true))
+                    ) {
+                        found_true = true;
+                    }
+                }
+            }
+        }
+        assert!(found_true, "controller reads back OnOff = true over CASE");
+    }
+}

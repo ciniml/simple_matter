@@ -11,6 +11,12 @@
 
 pub mod buf;
 pub mod cert;
+/// コントローラ(commissioner)側の統合層。`controller` + `rustcrypto` feature 有効時のみ。
+///
+/// `docs/design/controller.md` ピース D。デバイス(responder)専用ビルドには一切
+/// コンパイルされない(フットプリント不変、設計 §2.3)。
+#[cfg(all(feature = "controller", feature = "rustcrypto"))]
+pub mod controller;
 pub mod crypto;
 pub mod discovery;
 pub mod dm;
