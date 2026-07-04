@@ -340,6 +340,87 @@ fn adv_data_service_data_round_trips() {
     assert!(!parsed.ext_announcement);
 }
 
+// ==========================================================================
+// GATT trait(§5):メモリ内実装が trait を満たし、&mut T ブランケットも成立する
+// ことを型レベルで確認する(async trait を回すのは E2E で BTP 直結ポンプに任せ、
+// ここは実装可能性 + blanket impl のコンパイル確認に絞る。詳細は本コミットの報告参照)。
+// ==========================================================================
+
+#[test]
+fn gatt_traits_are_implementable_and_have_blanket_impls() {
+    use super::gatt::{
+        GattCentral, GattPeripheral, PeripheralEvent, ScanFilter, ScanResult,
+    };
+    use crate::transport::net::BtpConnId;
+
+    /// メモリ内テスト実装(async 本体は自明。ポーリングされない型レベル確認用)。
+    struct MemPeripheral;
+    impl GattPeripheral for MemPeripheral {
+        async fn start_advertising(&mut self, _adv: &gatt::AdvData) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn stop_advertising(&mut self) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn next_event(&mut self, _buf: &mut [u8]) -> crate::error::Result<PeripheralEvent> {
+            Ok(PeripheralEvent::Connected {
+                conn: BtpConnId(0),
+                att_mtu: None,
+            })
+        }
+        async fn indicate(&mut self, _conn: BtpConnId, _frag: &[u8]) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn disconnect(&mut self, _conn: BtpConnId) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct MemCentral;
+    impl GattCentral for MemCentral {
+        type PeerHandle = ();
+        async fn scan(&mut self, _filter: ScanFilter) -> crate::error::Result<ScanResult<()>> {
+            Ok(ScanResult {
+                discriminator: 0xABC,
+                vendor_id: 0xFFF1,
+                product_id: 0x8000,
+                handle: (),
+            })
+        }
+        async fn connect(
+            &mut self,
+            _target: &ScanResult<()>,
+        ) -> crate::error::Result<(BtpConnId, Option<u16>)> {
+            Ok((BtpConnId(0), Some(247)))
+        }
+        async fn write_c1(&mut self, _conn: BtpConnId, _frag: &[u8]) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn next_indication(
+            &mut self,
+            _conn: BtpConnId,
+            _buf: &mut [u8],
+        ) -> crate::error::Result<usize> {
+            Ok(0)
+        }
+        async fn disconnect(&mut self, _conn: BtpConnId) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn assert_peripheral<P: GattPeripheral>(_: P) {}
+    fn assert_central<C: GattCentral>(_: C) {}
+
+    // 具象実装が trait を満たす。
+    assert_peripheral(MemPeripheral);
+    assert_central(MemCentral);
+    // `&mut T` ブランケット実装も trait を満たす(合成に使える)。
+    let mut p = MemPeripheral;
+    let mut c = MemCentral;
+    assert_peripheral(&mut p);
+    assert_central(&mut c);
+}
+
 #[test]
 fn adv_data_full_advertisement_layout() {
     let adv = gatt::AdvData {
@@ -358,4 +439,35 @@ fn adv_data_full_advertisement_layout() {
     assert_eq!(&out[3..7], &[0x0B, 0x16, 0xF6, 0xFF]);
     // discriminator(下位 12bit)LE。
     assert_eq!(u16::from_le_bytes([out[8], out[9]]) & 0x0FFF, 0xABC);
+}
+
+#[test]
+fn large_message_spanning_more_than_window_fragments() {
+    // window(6)を超えるフラグメント数のメッセージが、途中 ACK を挟んで再組立される
+    // ことを確認する(E2E の AddNOC 等が踏む regime)。fragment=61, 500B ≈ 9 フラグメント。
+    // さらに逆方向 1 通で受信側に piggyback ACK を owe させ、先頭フラグメントが ACK を
+    // 運ぶ経路も同時に踏む。
+    let (mut c, mut p) = establish::<6>(Some(64));
+    assert_eq!(c.fragment_size(), 61);
+
+    // 逆方向: p→c 小メッセージ。c は受信し ACK を保留する。
+    p.send(b"reverse", 0).unwrap();
+    let mut buf = [0u8; 300];
+    loop {
+        let n = p.process_outgoing(&mut buf, Some(64), 0).unwrap();
+        if n == 0 {
+            break;
+        }
+        c.process_incoming(&buf[..n], Some(64), 0).unwrap();
+    }
+    assert_eq!(c.recv().unwrap(), b"reverse");
+
+    // c は今 p への ACK を保留中。window 超えの大メッセージを送る。
+    let msg: [u8; 500] = core::array::from_fn(|i| (i * 7 + 3) as u8);
+    c.send(&msg, 0).unwrap();
+    settle(&mut c, &mut p, Some(64), 0);
+    assert_eq!(
+        p.recv().expect("reassembled 500B across window boundary"),
+        &msg[..]
+    );
 }

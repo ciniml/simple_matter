@@ -9,10 +9,11 @@
 //! [`Btp::process_incoming`](受信 1 フラグメント投入)/ [`Btp::process_outgoing`]
 //! (送出 1 フラグメント取り出し)を C1 write / C2 indicate に配線するだけでよい。
 //!
-//! # 責務外(P2 スコープ)
+//! # 責務外
 //!
-//! - BLE 無線・GATT trait は [`gatt`] に UUID / [`AdvData`](gatt::AdvData) のみ置き、trait
-//!   本体は P3。
+//! - BLE 無線・GATT I/O は [`gatt`] の抽象 trait([`GattPeripheral`](gatt::GattPeripheral) /
+//!   [`GattCentral`](gatt::GattCentral))へ逃がす。BTP コアは trait を呼ばず、バイト列
+//!   in/out のみを扱う。
 //! - フラグメント単位の再送は持たない(下位 GATT が信頼配送する)。未 ACK の放置は
 //!   liveness タイムアウト([`Btp::is_timed_out`])で検知する。
 //!

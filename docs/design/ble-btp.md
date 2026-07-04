@@ -691,6 +691,11 @@ P3 まででロジックは全証明でき、P4/P5 は実機・相互運用の�
 4. **standalone ACK / idle keep-alive の駆動**。MatterStack の poll とは別系統の
    `Btp::next_deadline` を統合層が min に取る前提。単一 select ループでの取り回し(§6.2)を
    実機タスク構成でどう固めるか(executor 非依存のまま両対応)。
+   **P3 での確定事項**: BTP 経由でも統合層は両スタックの `poll()` を必ず定期的に呼ぶこと。
+   閉じた exchange の回収は `ExchangeManager::poll` の quiescent sweep でのみ行われ、
+   BLE では MRP が無効なため poll を怠ると exchange プールが数往復で `NoSpace` 枯渇する
+   (`stack/tests.rs` の BLE E2E ポンプで実証)。§6.2 の pump 実装は
+   `min(stack.next_deadline, btp.next_deadline)` 待ちに加えイテレーション毎の poll を要する。
 5. **単一アダプタでの peripheral/central 同時**(§9.2)。BlueZ 上での hci 競合の実挙動確認。
    CI 相当の自動実機テストは 2 アダプタ前提にするか。
 6. **crate 分割の粒度**(§6.1)。bluer と btleplug を 1 crate feature 同居のままにするか、

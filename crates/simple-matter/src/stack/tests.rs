@@ -1452,4 +1452,401 @@ mod controller_e2e {
             );
         }
     }
+
+    // ======================================================================
+    // BLE ループバック全経路 E2E(§9.1 段階1)
+    //
+    // `controller_end_to_end`(UDP 直結ポンプ)の BLE 版。デバイス側 MatterStack +
+    // Btp<6>(Peripheral)⇔ コントローラ側 ControllerStack + Commissioner + Btp<6>
+    // (Central)を、**フラグメントレベルのメモリ内ループバック**(相互の
+    // `process_incoming` へ直接渡す)で接続し、PASE → ArmFailSafe → CSR →
+    // AddTrustedRoot → AddNOC → CASE → CommissioningComplete → On/Off Toggle を
+    // `PeerAddr::Ble` で通す。小さい ATT_MTU で複数フラグメント経路を必ず踏み、時間は
+    // `now_ms` 注入で決定的。
+    //
+    // # なぜ trait 経由でなく BTP 直結ポンプか
+    //
+    // `GattPeripheral`/`GattCentral` は async trait で、テストで回すには executor が要る
+    // (コアクレートは executor 非依存でテスト用 block_on も持たない)。設計 doc §9.1 が
+    // 求める検証対象は **BTP + PASE + コミッショニング全経路のロジック**であり、これは
+    // sans-IO の `Btp` を直結ポンプで駆動すれば無線・executor なしに決定的に証明できる。
+    // trait 自体の実装可能性 + `&mut T` ブランケットは `btp/tests.rs` の
+    // `gatt_traits_are_implementable_and_have_blanket_impls`(型レベル)で担保する。
+    // ======================================================================
+
+    #[cfg(feature = "ble")]
+    use crate::btp::Btp;
+
+    #[cfg(feature = "ble")]
+    struct BleStats {
+        /// 交渉済みフラグメント payload サイズ。
+        frag_size: usize,
+        /// 少なくとも 1 メッセージがフラグメント境界を跨いでセグメント化されたか。
+        multi_fragment_seen: bool,
+        /// R/A フラグをワイヤ検査した unsecured メッセージ数(検査が実際に走った証拠)。
+        unsecured_checked: usize,
+    }
+
+    /// BTP が運ぶ 1 SDU(Matter datagram)を検査し、unsecured(session_id==0)なら
+    /// 平文の PayloadHeader を読んで R(RELIABLE)/A(ACK)フラグが立っていないことを
+    /// 確認する(§2.7)。暗号化メッセージはワイヤから exchange flags を読めないため、
+    /// そちらは呼び出し側の「MRP deadline が立たない」アサートで担保する。
+    #[cfg(feature = "ble")]
+    fn assert_no_mrp_flags(sdu: &[u8], stats: &mut BleStats) {
+        let mut copy = [0u8; 1600];
+        copy[..sdu.len()].copy_from_slice(sdu);
+        let mut pb = ParseBuf::new(&mut copy[..sdu.len()]);
+        let pkt = PacketHeader::decode(&mut pb).expect("decode packet header");
+        if pkt.session_id == 0 {
+            let ph = PayloadHeader::decode(&mut pb).expect("decode payload header");
+            assert!(
+                !ph.exch_flags.contains(ExchFlags::RELIABLE),
+                "R フラグが BTP 上の Matter メッセージに立っている"
+            );
+            assert!(
+                !ph.exch_flags.contains(ExchFlags::ACK),
+                "A フラグが BTP 上の Matter メッセージに立っている"
+            );
+            stats.unsecured_checked += 1;
+        }
+    }
+
+    /// 再組立済み 1 SDU を `out` にコピーして長さを返す(`Btp::recv` の借用を切るため)。
+    #[cfg(feature = "ble")]
+    fn copy_sdu(btp: &mut Btp<6>, out: &mut [u8]) -> Option<usize> {
+        let sdu = btp.recv()?;
+        let n = sdu.len();
+        out[..n].copy_from_slice(sdu);
+        Some(n)
+    }
+
+    /// スタックの応答 SDU を BTP 送信キューに載せる。フラグメント境界超過なら記録する。
+    #[cfg(feature = "ble")]
+    fn load_ble(btp: &mut Btp<6>, sdu: &[u8], now: u64, stats: &mut BleStats) {
+        if sdu.len() > stats.frag_size {
+            // 単一フラグメント payload 上限(< frag_size)を超える = 必ず複数フラグメント。
+            stats.multi_fragment_seen = true;
+        }
+        btp.send(sdu, now).expect("btp.send");
+    }
+
+    /// BTP ループバックを回し切る:フラグメントを相互配送 → 再組立 SDU を対応スタックの
+    /// `handle_rx` へ → 応答を再び BTP へ、を静穏化するまで反復する。各反復で両スタックを
+    /// `poll` して **終端済み交換を回収**する(BTP では poll は送出を生まないが、交換プール
+    /// 枯渇を防ぐために必須)。window ブロック解消のため停滞時のみ遅延 ACK 期限まで単調に
+    /// 時刻を進める。各 `handle_rx` 後に **MRP deadline が立たないこと**(§3.3)を検証する。
+    #[cfg(feature = "ble")]
+    #[allow(clippy::too_many_arguments)]
+    fn pump_ble(
+        btp_c: &mut Btp<6>,
+        btp_p: &mut Btp<6>,
+        ctrl: &mut Ctrl<'_>,
+        dev: &mut TestStack<'_>,
+        dev_src: PeerAddr,
+        ctrl_src: PeerAddr,
+        mtu: Option<u16>,
+        now: &mut u64,
+        stats: &mut BleStats,
+    ) {
+        let mut frag = [0u8; 300];
+        let mut sdu = [0u8; 1600];
+        let mut txd = [0u8; 1700];
+        let mut txc = [0u8; 1700];
+        for _ in 0..8192 {
+            let mut progressed = false;
+
+            // controller → device フラグメント(1 本)。
+            let n = btp_c.process_outgoing(&mut frag, mtu, *now).unwrap();
+            if n > 0 {
+                btp_p.process_incoming(&frag[..n], mtu, *now).unwrap();
+                progressed = true;
+            }
+            // device → controller フラグメント(1 本)。
+            let n = btp_p.process_outgoing(&mut frag, mtu, *now).unwrap();
+            if n > 0 {
+                btp_c.process_incoming(&frag[..n], mtu, *now).unwrap();
+                progressed = true;
+            }
+
+            // device が 1 メッセージを再組立 → dev.handle_rx(応答を BTP へ)。
+            // can_send() の間だけ引き取る(応答を同じ BTP に載せられる時のみ消費)。
+            if btp_p.can_send() {
+                if let Some(len) = copy_sdu(btp_p, &mut sdu) {
+                    assert_no_mrp_flags(&sdu[..len], stats);
+                    let dir = dev.handle_rx(&mut sdu[..len], dev_src, *now, &mut txd);
+                    assert!(
+                        dev.next_deadline(*now).is_none(),
+                        "device に MRP deadline が立った(BTP では格下げされるはず)"
+                    );
+                    if let Some(d) = dir {
+                        load_ble(btp_p, &txd[..d.len], *now, stats);
+                    }
+                    progressed = true;
+                }
+            }
+            // controller が 1 メッセージを再組立 → ctrl.handle_rx(応答を BTP へ)。
+            if btp_c.can_send() {
+                if let Some(len) = copy_sdu(btp_c, &mut sdu) {
+                    assert_no_mrp_flags(&sdu[..len], stats);
+                    let dir = ctrl.handle_rx(&mut sdu[..len], ctrl_src, *now, &mut txc);
+                    assert!(
+                        ctrl.next_deadline(*now).is_none(),
+                        "controller に MRP deadline が立った(BTP では格下げされるはず)"
+                    );
+                    if let Some(d) = dir {
+                        load_ble(btp_c, &txc[..d.len], *now, stats);
+                    }
+                    progressed = true;
+                }
+            }
+
+            // MRP poll: BTP セッションでは再送/standalone ACK は生じないが、`poll` は
+            // **終端済み(closing)交換の回収**を兼ねる(プール枯渇防止)。UDP 版 flush が
+            // poll を回すのと同じ理由で、BTP でも各スタックを poll して交換を解放する。
+            // 万一 poll が送出を返しても BTP に載せる(防御)。
+            if btp_p.can_send() {
+                if let Some(d) = dev.poll(*now, &mut txd) {
+                    load_ble(btp_p, &txd[..d.len], *now, stats);
+                    progressed = true;
+                }
+            }
+            if btp_c.can_send() {
+                if let Some(d) = ctrl.poll(*now, &mut txc) {
+                    load_ble(btp_c, &txc[..d.len], *now, stats);
+                    progressed = true;
+                }
+            }
+
+            if !progressed {
+                // 停滞。送信ブロック(window 満杯で次フラグメントを出せない)を解くための
+                // 遅延 ACK 期限まで **単調に** 時刻を進める。ブロックしていない(= 純粋に
+                // idle/liveness deadline が残るだけ)なら静穏として終了する。時刻を idle まで
+                // 膨らませないことで、両スタックの時間軸を単調・現実的に保つ(fail-safe や
+                // セッションの時刻依存挙動を壊さない)。
+                let blocked = !btp_c.can_send() || !btp_p.can_send();
+                if !blocked {
+                    break;
+                }
+                let dl = match (btp_c.next_deadline(), btp_p.next_deadline()) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, None) => a,
+                    (None, b) => b,
+                };
+                match dl {
+                    Some(t) if t > *now => *now = t,
+                    _ => break,
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "ble")]
+    #[test]
+    fn controller_end_to_end_over_ble() {
+        use crate::btp::BtpRole;
+        use crate::transport::net::BtpConnId;
+
+        // 小さい ATT_MTU → fragment = clamp(64-3,6,244) = 61。大きめのコミッショニング
+        // メッセージ(証明書・Sigma2 等)が必ず複数フラグメントに割れる。
+        const MTU: Option<u16> = Some(64);
+        // controller が見るデバイスアドレス(= commission 先、= ctrl.handle_rx の source)。
+        let dev_addr = PeerAddr::Ble(BtpConnId(1));
+        // device が見るコントローラアドレス(= dev.handle_rx の source)。
+        let ctrl_src_addr = PeerAddr::Ble(BtpConnId(1));
+
+        let crypto = RustCrypto::new(SeqRng(0xC0FF_EE00_1234_5678));
+        let fabrics: RefCell<FabricTable<Crb, 5>> = RefCell::new(FabricTable::new());
+
+        // --- デバイス(responder / BTP peripheral)---
+        let config = PaseConfig::from_passcode(PASSCODE, &SALT, ITERATIONS).unwrap();
+        let dev_creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
+        let sc = SecureChannel::new(&crypto, SeqRng(0x5C00_0001), config, dev_creds);
+        let im = InteractionModel::new(build_device(&fabrics));
+        let mut dev: TestStack = MatterStack::new(&crypto, sc, im);
+
+        // --- コントローラ(initiator / BTP central)---
+        let ca = Ca::<Crb>::generate(
+            &crypto,
+            &mut SeqRng(0xCA00_0001),
+            FABRIC_ID,
+            COMM_NODE,
+            0xFFF1,
+            0,
+        )
+        .expect("Ca::generate");
+        let ctrl_creds = ControllerCreds::new(&ca, &crypto, 0);
+        let sc_init = ScInitiator::new(&crypto, SeqRng(0x1C00_0001), ctrl_creds);
+        let mut ctrl: Ctrl = ControllerStack::new(&crypto, sc_init, ImClient::new());
+
+        let mut comm = Commissioner::new(&ca, &crypto, AttestationPolicy::Skip);
+        comm.commission(dev_addr, PASSCODE, DEVICE_NODE, NOW).unwrap();
+
+        // --- BTP handshake(central ⇔ peripheral)---
+        let mut btp_c = Btp::<6>::new(BtpRole::Central);
+        let mut btp_p = Btp::<6>::new(BtpRole::Peripheral);
+        {
+            let mut f = [0u8; 128];
+            let n = btp_c.start_handshake(&mut f, MTU, NOW).unwrap();
+            btp_p.process_incoming(&f[..n], MTU, NOW).unwrap();
+            let n = btp_p.process_outgoing(&mut f, MTU, NOW).unwrap();
+            btp_c.process_incoming(&f[..n], MTU, NOW).unwrap();
+        }
+        assert!(btp_c.is_established() && btp_p.is_established());
+        let frag_size = btp_c.fragment_size();
+        assert_eq!(frag_size, 61, "small MTU(64)で fragment=clamp(64-3,6,244)=61 に交渉");
+
+        let mut stats = BleStats {
+            frag_size,
+            multi_fragment_seen: false,
+            unsecured_checked: 0,
+        };
+
+        // --- コミッショニングを Mealy 機械で駆動(送信は BTP ループバック経由)---
+        // clock は両スタック共通の**単調増加**する仮想時刻。pump が window ブロック解消の
+        // ため遅延 ACK 期限まで進めることはあるが、決して巻き戻さない。
+        let mut clock = NOW;
+        let mut tx = [0u8; 1700];
+        let mut final_phase = comm.phase();
+        for _ in 0..60 {
+            let out = comm.drive(&mut ctrl, clock, &mut tx);
+            final_phase = out.phase;
+            if let Some(d) = out.send {
+                assert!(
+                    matches!(d.addr, PeerAddr::Ble(_)),
+                    "commission 送信先は BLE アドレス"
+                );
+                assert!(
+                    ctrl.next_deadline(clock).is_none(),
+                    "controller 送信直後に MRP deadline なし(BTP 格下げ)"
+                );
+                load_ble(&mut btp_c, &tx[..d.len], clock, &mut stats);
+                pump_ble(
+                    &mut btp_c,
+                    &mut btp_p,
+                    &mut ctrl,
+                    &mut dev,
+                    ctrl_src_addr,
+                    dev_addr,
+                    MTU,
+                    &mut clock,
+                    &mut stats,
+                );
+            }
+            match out.phase {
+                Phase::Done { .. } | Phase::Failed { .. } => break,
+                _ => {}
+            }
+        }
+
+        let case_session = match final_phase {
+            Phase::Done { session } => session,
+            other => panic!("commissioning did not complete over BLE: {other:?}"),
+        };
+
+        // (a) コミッショニング完走: デバイス fabric が生え、fail-safe は解除済み。
+        assert_eq!(fabrics.borrow().len(), 1, "device fabric added over BLE");
+        {
+            let g = fabrics.borrow();
+            let fe = g.get(NonZeroU8::new(1).unwrap()).unwrap();
+            assert_eq!(fe.node_id(), DEVICE_NODE);
+            assert_eq!(fe.fabric_id(), FABRIC_ID);
+        }
+        assert!(!dev.device().gc.fail_safe().is_armed());
+
+        // --- 運用 API: CASE 上で OnOff On を invoke(BTP 経由)---
+        assert!(!dev.device().onoff.is_on());
+        let dir = ctrl
+            .start_invoke(
+                case_session,
+                CommandPath::new(EndpointId(1), ClusterId(0x0006), CommandId(0x01)),
+                |w, t| {
+                    w.start_struct(t)?;
+                    w.end_container()
+                },
+                clock,
+                &mut tx,
+            )
+            .expect("start OnOff invoke");
+        assert!(
+            ctrl.next_deadline(clock).is_none(),
+            "invoke 送信直後に MRP deadline なし(BTP 格下げ)"
+        );
+        load_ble(&mut btp_c, &tx[..dir.len], clock, &mut stats);
+        pump_ble(
+            &mut btp_c,
+            &mut btp_p,
+            &mut ctrl,
+            &mut dev,
+            ctrl_src_addr,
+            dev_addr,
+            MTU,
+            &mut clock,
+            &mut stats,
+        );
+        match ctrl.im_take_event() {
+            Some(ImEvent::InvokeDone { status }) => {
+                assert_eq!(status, ImStatus::Success, "OnOff On over CASE/BLE");
+            }
+            other => panic!("expected InvokeDone, got {other:?}"),
+        }
+        // (a) On/Off 属性反映。
+        assert!(dev.device().onoff.is_on(), "device OnOff attribute now true");
+
+        // --- 運用 API: CASE 上で OnOff を Read 読み戻し(BTP 経由)---
+        let dir = ctrl
+            .start_read(
+                case_session,
+                &[AttributePath::concrete(
+                    EndpointId(1),
+                    ClusterId(0x0006),
+                    AttributeId(0x0000),
+                )],
+                clock,
+                &mut tx,
+            )
+            .expect("start OnOff read");
+        load_ble(&mut btp_c, &tx[..dir.len], clock, &mut stats);
+        pump_ble(
+            &mut btp_c,
+            &mut btp_p,
+            &mut ctrl,
+            &mut dev,
+            ctrl_src_addr,
+            dev_addr,
+            MTU,
+            &mut clock,
+            &mut stats,
+        );
+        assert_eq!(ctrl.im_take_event(), Some(ImEvent::ReadDone));
+        let mut found_true = false;
+        for report in ctrl.read_reports() {
+            if let Ok(AttributeReportRef::Data(d)) = report {
+                if d.path.to_concrete().map(|c| c.attribute.0) == Some(0x0000) {
+                    let mut v = d.value();
+                    if matches!(
+                        v.read_next().ok().flatten().map(|e| e.value),
+                        Some(TlvValue::Boolean(true))
+                    ) {
+                        found_true = true;
+                    }
+                }
+            }
+        }
+        assert!(found_true, "controller reads back OnOff = true over CASE/BLE");
+
+        // (b) BTP 上の Matter メッセージで R フラグが立たなかった(検査が実際に走った)。
+        assert!(
+            stats.unsecured_checked >= 3,
+            "unsecured メッセージの R/A フラグ検査が走っていない(={}件)",
+            stats.unsecured_checked
+        );
+        // (c) 両スタックとも MRP 再送 deadline なしで終端。
+        assert!(ctrl.next_deadline(clock).is_none());
+        assert!(dev.next_deadline(clock).is_none());
+        // (d) 少なくとも 1 メッセージが複数フラグメントにセグメント化された。
+        assert!(
+            stats.multi_fragment_seen,
+            "全メッセージが単一フラグメントに収まった(セグメント化経路を踏んでいない)"
+        );
+    }
 }
