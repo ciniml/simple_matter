@@ -65,9 +65,30 @@ pub struct BtleplugCentral {
 impl BtleplugCentral {
     /// btleplug の最初の adapter を掴んで生成する。
     pub async fn new() -> Result<Self> {
+        Self::with_adapter(None).await
+    }
+
+    /// アダプタ名(例: `"hci1"`。`adapter_info()` の前方一致)を指定して生成する。
+    ///
+    /// 同一 PC で peripheral(bluer)と central(btleplug)を別アダプタに
+    /// 割り当てる 2 アダプタ構成(設計 doc §9.2)のための選択肢。`None` は最初の adapter。
+    pub async fn with_adapter(name: Option<&str>) -> Result<Self> {
         let manager = Manager::new().await.map_err(map_btle)?;
         let adapters = manager.adapters().await.map_err(map_btle)?;
-        let adapter = adapters.into_iter().next().ok_or(Error::NotFound)?;
+        let adapter = match name {
+            None => adapters.into_iter().next().ok_or(Error::NotFound)?,
+            Some(n) => {
+                let mut found = None;
+                for a in adapters {
+                    let info = a.adapter_info().await.map_err(map_btle)?;
+                    if info.starts_with(n) {
+                        found = Some(a);
+                        break;
+                    }
+                }
+                found.ok_or(Error::NotFound)?
+            }
+        };
         Ok(Self {
             adapter,
             conns: HashMap::new(),

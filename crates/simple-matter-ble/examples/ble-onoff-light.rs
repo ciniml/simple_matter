@@ -177,6 +177,14 @@ fn build_light(fabrics: &RefCell<FabricTable<Backend, NF>>) -> Light<'_> {
     }
 }
 
+/// `SM_BTP_TRACE=1` でフラグメントの先頭バイト(flags/ack/seq)をトレースする。
+fn trace(dir: &str, frag: &[u8]) {
+    if std::env::var_os("SM_BTP_TRACE").is_some() {
+        let h: Vec<String> = frag.iter().take(5).map(|b| format!("{b:02x}")).collect();
+        eprintln!("[btp {dir}] len={} {}", frag.len(), h.join(" "));
+    }
+}
+
 /// BTP が吐く下りフラグメントを尽きるまで C2 indication で送出する。
 async fn flush_out(
     gatt: &mut BluerPeripheral,
@@ -191,6 +199,7 @@ async fn flush_out(
         if n == 0 {
             break;
         }
+        trace("tx", &out[..n]);
         gatt.indicate(conn, &out[..n]).await?;
     }
     Ok(())
@@ -208,9 +217,11 @@ async fn main() -> std::result::Result<(), String> {
     let mut stack: DefaultStack<Backend, DemoRng, Light> = MatterStack::new(&crypto, sc, im);
 
     // --- BLE バックエンド + BTP(peripheral)---
-    let mut gatt = BluerPeripheral::new()
+    // SM_BLE_ADAPTER=hci0 等でアダプタを指定できる(2 アダプタ構成用)。未指定は default。
+    let adapter_name = std::env::var("SM_BLE_ADAPTER").ok();
+    let mut gatt = BluerPeripheral::with_adapter(adapter_name.as_deref())
         .await
-        .map_err(|e| format!("BluerPeripheral::new: {e:?}"))?;
+        .map_err(|e| format!("BluerPeripheral::with_adapter: {e:?}"))?;
     println!("[ble] using adapter {}", gatt.adapter_name());
 
     let adv = AdvData {
@@ -273,6 +284,7 @@ async fn main() -> std::result::Result<(), String> {
                     }
                     PeripheralEvent::C1Write { conn: c, len } => {
                         conn = Some(c);
+                        trace("rx", &buf[..len]);
                         btp.process_incoming(&buf[..len], mtu, now)
                             .map_err(|e| format!("process_incoming: {e:?}"))?;
                         flush_out(&mut gatt, &mut btp, c, mtu, now)
@@ -300,23 +312,27 @@ async fn main() -> std::result::Result<(), String> {
             }
             _ = tokio::time::sleep(sleep) => {
                 let now = now_ms(&start);
-                // 時間駆動の送出(購読レポート等)。BTP では MRP 再送/standalone ACK は
-                // 生じないが、poll は閉じた exchange の回収を兼ねるため必ず回す(§11-4)。
-                while let Some(d) = stack.poll(now, &mut txd) {
-                    if let Some(c) = conn {
-                        btp.send(&txd[..d.len], now)
-                            .map_err(|e| format!("btp.send(poll): {e:?}"))?;
-                        flush_out(&mut gatt, &mut btp, c, mtu, now)
-                            .await
-                            .map_err(|e| format!("flush(poll): {e:?}"))?;
-                    }
-                }
                 if let Some(c) = conn {
                     // BTP 自身の遅延 ACK / idle 送出を排出。
                     flush_out(&mut gatt, &mut btp, c, mtu, now)
                         .await
                         .map_err(|e| format!("flush(timer): {e:?}"))?;
                 }
+            }
+        }
+
+        // 時間駆動の送出(購読レポート等)と、閉じた exchange の回収(§11-4)。
+        // sleep 分岐だけでなく**毎イテレーション**回す。コミッショニング中は GATT
+        // イベントが連続して sleep 分岐に落ちないため、ここで回収しないと
+        // exchange プールが枯渇し AddNOC 以降が NoSpace で黙って落ちる(実 BLE で実証)。
+        let now = now_ms(&start);
+        while let Some(d) = stack.poll(now, &mut txd) {
+            if let Some(c) = conn {
+                btp.send(&txd[..d.len], now)
+                    .map_err(|e| format!("btp.send(poll): {e:?}"))?;
+                flush_out(&mut gatt, &mut btp, c, mtu, now)
+                    .await
+                    .map_err(|e| format!("flush(poll): {e:?}"))?;
             }
         }
     }

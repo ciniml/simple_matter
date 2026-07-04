@@ -79,8 +79,19 @@ pub struct BluerPeripheral {
 impl BluerPeripheral {
     /// BlueZ の default adapter を掴んで生成し、電源を投入する。
     pub async fn new() -> Result<Self> {
+        Self::with_adapter(None).await
+    }
+
+    /// アダプタ名(例: `"hci0"`)を指定して生成し、電源を投入する。
+    ///
+    /// 同一 PC で peripheral(bluer)と central(btleplug)を別アダプタに
+    /// 割り当てる 2 アダプタ構成(設計 doc §9.2)のための選択肢。`None` は default。
+    pub async fn with_adapter(name: Option<&str>) -> Result<Self> {
         let session = Session::new().await.map_err(map_bluer)?;
-        let adapter = session.default_adapter().await.map_err(map_bluer)?;
+        let adapter = match name {
+            Some(n) => session.adapter(n).map_err(map_bluer)?,
+            None => session.default_adapter().await.map_err(map_bluer)?,
+        };
         adapter.set_powered(true).await.map_err(map_bluer)?;
         let (raw_tx, raw_rx) = mpsc::unbounded_channel();
         Ok(Self {

@@ -81,6 +81,14 @@ impl Rng for DemoRng {
     }
 }
 
+/// `SM_BTP_TRACE=1` でフラグメントの先頭バイト(flags/ack/seq)をトレースする。
+fn trace(dir: &str, frag: &[u8]) {
+    if std::env::var_os("SM_BTP_TRACE").is_some() {
+        let h: Vec<String> = frag.iter().take(5).map(|b| format!("{b:02x}")).collect();
+        eprintln!("[btp {dir}] len={} {}", frag.len(), h.join(" "));
+    }
+}
+
 /// BTP が吐く上りフラグメントを尽きるまで C1 write で送出する。
 async fn flush_c1(
     gatt: &mut BtleplugCentral,
@@ -95,6 +103,7 @@ async fn flush_c1(
         if n == 0 {
             break;
         }
+        trace("tx", &out[..n]);
         gatt.write_c1(conn, &out[..n]).await?;
     }
     Ok(())
@@ -189,9 +198,11 @@ async fn run(passcode: u32, discriminator: Option<u16>) -> Result<(), String> {
     let mut comm = Commissioner::new(&ca, &crypto, AttestationPolicy::Skip);
 
     // --- BLE スキャン & 接続 ---
-    let mut gatt = BtleplugCentral::new()
+    // SM_BLE_ADAPTER=hci1 等でアダプタを指定できる(2 アダプタ構成用)。未指定は最初の adapter。
+    let adapter_name = std::env::var("SM_BLE_ADAPTER").ok();
+    let mut gatt = BtleplugCentral::with_adapter(adapter_name.as_deref())
         .await
-        .map_err(|e| format!("BtleplugCentral::new: {e:?} (BlueZ 稼働と権限を確認)"))?;
+        .map_err(|e| format!("BtleplugCentral::with_adapter: {e:?} (BlueZ 稼働と権限を確認)"))?;
     println!("[ble] adapter: {}", gatt.adapter_info().await);
     println!(
         "[ble] scanning for 0xFFF6 commissionable (discriminator={})...",
@@ -239,6 +250,7 @@ async fn run(passcode: u32, discriminator: Option<u16>) -> Result<(), String> {
                 .next_indication(conn, &mut frag)
                 .await
                 .map_err(|e| format!("next_indication(handshake): {e:?}"))?;
+            trace("rx", &frag[..n]);
             btp.process_incoming(&frag[..n], mtu, now_ms(&start))
                 .map_err(|e| format!("process_incoming(handshake): {e:?}"))?;
         }
@@ -301,6 +313,7 @@ async fn run(passcode: u32, discriminator: Option<u16>) -> Result<(), String> {
             r = gatt.next_indication(conn, &mut frag) => {
                 let n = r.map_err(|e| format!("next_indication: {e:?}"))?;
                 let now = now_ms(&start);
+                trace("rx", &frag[..n]);
                 btp.process_incoming(&frag[..n], mtu, now)
                     .map_err(|e| format!("process_incoming: {e:?}"))?;
                 flush_c1(&mut gatt, &mut btp, conn, mtu, now)
@@ -370,6 +383,7 @@ async fn run(passcode: u32, discriminator: Option<u16>) -> Result<(), String> {
             r = gatt.next_indication(conn, &mut frag) => {
                 let n = r.map_err(|e| format!("next_indication(toggle): {e:?}"))?;
                 let now = now_ms(&start);
+                trace("rx", &frag[..n]);
                 btp.process_incoming(&frag[..n], mtu, now)
                     .map_err(|e| format!("process_incoming(toggle): {e:?}"))?;
                 flush_c1(&mut gatt, &mut btp, conn, mtu, now)

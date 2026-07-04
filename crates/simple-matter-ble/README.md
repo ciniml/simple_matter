@@ -41,19 +41,22 @@ cargo clippy -p simple-matter-ble --all-features -- -D warnings
 - **単一アダプタでの同時起動**: BlueZ は同一アダプタで peripheral / central を同時に持てるため
   原理的には 1 台で可能だが、bluer と btleplug が同じ hci を奪い合う実運用リスクがあるため
   **追試扱い**。まずは 2 アダプタ構成を推奨する。
+- **アダプタの指定**: 環境変数 `SM_BLE_ADAPTER` にアダプタ名(`hci0` 等)を渡す。
+  device 側は BlueZ のアダプタ名そのもの、commissioner 側は btleplug の
+  `adapter_info()` への前方一致。未指定は default(device)/最初の adapter(commissioner)。
 
-### 実行(2 本のプロセス)
+### 実行(2 本のプロセス、同一 PC・2 アダプタ構成で動作確認済み)
 
 デバイス(advertise 側)を先に起動する:
 
 ```sh
-cargo run -p simple-matter-ble --features device --example ble-onoff-light
+SM_BLE_ADAPTER=hci1 cargo run -p simple-matter-ble --features device --example ble-onoff-light
 ```
 
 別ホスト/別アダプタでコミッショナを起動する(passcode と discriminator を渡す):
 
 ```sh
-cargo run -p simple-matter-ble --features commissioner \
+SM_BLE_ADAPTER=hci0 cargo run -p simple-matter-ble --features commissioner \
     --example ble-commissioner -- 20202021 3840
 ```
 
@@ -63,7 +66,11 @@ cargo run -p simple-matter-ble --features commissioner \
   AddTrustedRoot → AddNOC → CASE → CommissioningComplete → OnOff Toggle → 切断`。
   device 側 stdout に `[onoff] light is now ON/OFF` が出れば属性反映まで通っている。
 - BLE 特有の window/ack 挙動は `btmon`(BlueZ 付属)や nRF Sniffer + Wireshark の BTP
-  dissector でフラグメントを確認できる。
+  dissector でフラグメントを確認できる。手軽には両 example とも `SM_BTP_TRACE=1` で
+  BTP フラグメントの先頭バイト(flags/ack/seq)を stderr にトレースできる。
+- 実測メモ(2026-07-05, 2 USB ドングル構成): btleplug は ATT_MTU を公開しないため
+  BTP は既定 fragment=20 で動く(AddNOC は 20 フラグメント程度に分割される)。
+  この経路でフルコミッショニング+Toggle まで確認済み。
 
 ## chip-tool / chip サンプルとの相互運用(段階3、設計 doc §9.3 の要点)
 
