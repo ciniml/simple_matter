@@ -17,3 +17,13 @@
 
 pub mod engine;
 pub mod wire;
+
+/// IM クライアント(コントローラ側)ハンドラ(`docs/design/controller.md` §4)。
+///
+/// `controller` feature が有効なときのみコンパイルされる(デバイス専用ビルドのフットプリントに
+/// 影響しない、設計 §2.3)。IM の枠組みのみに依存し暗号を持たないため `rustcrypto` は不要。
+#[cfg(feature = "controller")]
+pub mod client;
+
+#[cfg(feature = "controller")]
+pub use client::{ImClient, ImEvent};
