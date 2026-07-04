@@ -50,3 +50,9 @@ rustcrypto = [
 # 依存クレート追加なし・default 無効。デバイス(responder)専用ビルドのフットプリントに
 # 影響しない(docs/design/controller.md §2.3)。
 controller = []
+
+# examples/commissioner は controller feature 必須(ControllerStack / Commissioner /
+# MdnsClient を使う)。required-features で feature 無効時のビルドから除外する。
+[[example]]
+name = "commissioner"
+required-features = ["controller"]
