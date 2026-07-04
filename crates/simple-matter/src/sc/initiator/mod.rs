@@ -201,6 +201,22 @@ impl<'c, C: Crypto, R: Rng, F> ScInitiator<'c, C, R, F> {
         (u32::from_le_bytes(b) & 0x0FFF_FFFF) + 1
     }
 
+    /// 非セキュアメッセージの source Node ID に使うエフェメラル ID を生成する(非 0)。
+    ///
+    /// chip 系実装は非セキュアパケットに source/destination Node ID のいずれかを
+    /// 要求するため、initiator は自身のエフェメラル ID を source として載せる
+    /// (chip-tool と同じ挙動)。乱数取得に失敗した場合は固定値にフォールバックする。
+    pub fn ephemeral_node_id(&mut self) -> u64 {
+        let mut b = [0u8; 8];
+        if self.rng.fill_bytes(&mut b).is_err() {
+            return 1;
+        }
+        match u64::from_le_bytes(b) {
+            0 => 1,
+            id => id,
+        }
+    }
+
     /// PASE ハンドシェイクを開始する(§3.4)。
     ///
     /// `exchange` は統合層が `open_initiator` で開いた unsecured exchange、`reserved` は

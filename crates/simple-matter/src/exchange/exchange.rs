@@ -765,21 +765,28 @@ fn build_packet<C: Crypto, const SESSIONS: usize>(
         ack_ctr,
     };
     // 非セキュアセッションでは、connectedhomeip 側の受信検証(source/destination
-    // Node ID のいずれか必須)を満たすため、既知のピア Node ID(イニシエータの
-    // エフェメラル ID)を宛先として echo する(仕様 §4.6.2)。
-    let dst = if !session.is_encrypted() {
-        match session.peer_node_id() {
+    // Node ID のいずれか必須)を満たすため、(a) responder は既知のピア Node ID
+    // (イニシエータのエフェメラル ID)を宛先として echo し、(b) initiator
+    // (コントローラ側: local_node_id にエフェメラル ID を設定済み)は自身の
+    // Node ID を source として載せる(仕様 §4.6.2、chip-tool と同じ挙動)。
+    let (src_node_id, dst) = if !session.is_encrypted() {
+        let dst = match session.peer_node_id() {
             Some(id) => DstNodeId::Unicast(id),
             None => DstNodeId::None,
-        }
+        };
+        let src = match session.local_node_id() {
+            0 => None,
+            id => Some(id),
+        };
+        (src, dst)
     } else {
-        DstNodeId::None
+        (None, DstNodeId::None)
     };
     let pkt = PacketHeader {
         session_id: session.peer_session_id(),
         sec_flags: SecFlags::from_bits(0),
         ctr,
-        src_node_id: None,
+        src_node_id,
         dst,
     };
 

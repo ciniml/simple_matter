@@ -168,8 +168,9 @@ fn run(passcode: u32, peer_addr: SocketAddr) -> Result<(), String> {
     let mut comm = Commissioner::new(&ca, &crypto, AttestationPolicy::Skip);
 
     // --- 駆動用ソケット(任意ポート)---
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-        .map_err(|e| format!("bind controller socket: {e}"))?;
+    // chip 系デバイスは IPv6 のみを広告することがあるため、デュアルスタック
+    // (v6only=false)の IPv6 ソケットで開き、IPv4 宛は mapped アドレスで送る。
+    let socket = open_dual_stack_udp().map_err(|e| format!("bind controller socket: {e}"))?;
     socket
         .set_read_timeout(Some(Duration::from_millis(50)))
         .map_err(|e| format!("set_read_timeout: {e}"))?;
@@ -400,10 +401,30 @@ fn read_onoff_value(stack: &Ctrl<'_>) -> Option<bool> {
     None
 }
 
+/// デュアルスタック(v6only=false)の IPv6 UDP ソケットを任意ポートで開く。
+fn open_dual_stack_udp() -> std::io::Result<UdpSocket> {
+    let s = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    s.set_only_v6(false)?;
+    s.bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)).into())?;
+    Ok(s.into())
+}
+
+/// IPv4 宛アドレスを IPv4-mapped IPv6 に変換する(デュアルスタックソケット用)。
+fn map_to_v6(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V4(v4) => SocketAddr::new(v4.ip().to_ipv6_mapped().into(), v4.port()),
+        v6 => v6,
+    }
+}
+
 /// [`SendDirective`] を宛先 UDP に送出する(宛先が解決できないものは黙って捨てる)。
 fn send_dir(socket: &UdpSocket, tx: &[u8], dir: &SendDirective) {
     if let Some(addr) = dir.addr.socket_addr() {
-        let _ = socket.send_to(&tx[..dir.len], addr);
+        let _ = socket.send_to(&tx[..dir.len], map_to_v6(addr));
     }
 }
 
@@ -445,7 +466,14 @@ fn browse_commissionable() -> Option<SocketAddr> {
             Ok((n, _src)) => {
                 if let Some(node) = MdnsClient::parse_commissionable(&rx[..n]) {
                     // discriminator 指定なし: アドレスを持つ最初の発見を採用する。
-                    if let Some(ip) = node.addrs.iter().next().copied() {
+                    // 本 example のソケットは IPv4 なので IPv4 アドレスを優先する。
+                    let picked = node
+                        .addrs
+                        .iter()
+                        .find(|a| a.is_ipv4())
+                        .or_else(|| node.addrs.iter().next())
+                        .copied();
+                    if let Some(ip) = picked {
                         let port = if node.port != 0 {
                             node.port
                         } else {

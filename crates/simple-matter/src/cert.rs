@@ -692,9 +692,16 @@ impl<'a> MatterCert<'a> {
         // issuer。
         encode_dn(w, &self.issuer)?;
 
-        // validity。
+        // validity。Matter epoch 0 は「時刻未定義」を表し、notBefore/notAfter とも
+        // 99991231235959Z へ変換する。chip の ChipEpochToASN1Time は「簡単のため
+        // 全ての 0 を相互変換する」と明言しており、notBefore=0 を 2000-01-01 として
+        // 符号化すると chip 側の DER 再構築とハッシュが食い違い署名検証に失敗する。
         w.start_seq()?;
-        encode_time(w, u64::from(self.not_before))?;
+        if self.not_before == 0 {
+            encode_time(w, MATTER_CERT_DOESNT_EXPIRE)?;
+        } else {
+            encode_time(w, u64::from(self.not_before))?;
+        }
         if self.not_after == 0 {
             encode_time(w, MATTER_CERT_DOESNT_EXPIRE)?;
         } else {

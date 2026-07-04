@@ -130,6 +130,8 @@ pub struct ControllerStack<
     mgr: ExchangeManager<Mux<'s, C, R, F, RESULT>, EXCHANGES>,
     tx_pool: BufferPool<TX_BUFS, MAX_PACKET_SIZE>,
     resp: [u8; MAX_PACKET_SIZE],
+    /// 非セキュアメッセージの source Node ID に使うエフェメラル ID(非 0)。
+    ephemeral_node_id: u64,
 }
 
 impl<
@@ -144,13 +146,17 @@ impl<
     > ControllerStack<'s, C, R, F, SESSIONS, EXCHANGES, TX_BUFS, RESULT>
 {
     /// crypto 参照・構築済み [`ScInitiator`] / [`ImClient`] からスタックを組む。
-    pub fn new(crypto: &'s C, sc: ScInitiator<'s, C, R, F>, im: ImClient<RESULT>) -> Self {
+    pub fn new(crypto: &'s C, mut sc: ScInitiator<'s, C, R, F>, im: ImClient<RESULT>) -> Self {
+        // 非セキュアメッセージの source Node ID に使うエフェメラル ID(chip 系の
+        // 受信検証が source/destination いずれかを必須とするため)。
+        let ephemeral_node_id = sc.ephemeral_node_id();
         Self {
             crypto,
             sessions: SessionManager::new(),
             mgr: ExchangeManager::new(ProtocolMux::new(sc, im)),
             tx_pool: BufferPool::new(),
             resp: [0u8; MAX_PACKET_SIZE],
+            ephemeral_node_id,
         }
     }
 
@@ -510,8 +516,11 @@ impl<
         if let Some(id) = existing {
             return Ok(id);
         }
-        self.sessions
-            .insert(SessionInit::plaintext(peer, 0, 1), now_ms)
+        let mut init = SessionInit::plaintext(peer, 0, 1);
+        // initiator 側は自身のエフェメラル Node ID を source として名乗る
+        // (chip 系デバイスの非セキュアパケット検証を満たす)。
+        init.local_node_id = self.ephemeral_node_id;
+        self.sessions.insert(init, now_ms)
     }
 
     /// `self.resp` に書かれた開始 payload を信頼送信し `tx_out` に置く。
