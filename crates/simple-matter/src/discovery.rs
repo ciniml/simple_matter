@@ -46,6 +46,14 @@ use crate::transport::session::fixed::FixedVec;
 
 pub mod dns;
 
+/// discovery クライアント(commissionable browse / operational 解決)。
+///
+/// `controller` feature 有効時のみコンパイルされる(`docs/design/controller.md` §5)。
+/// sans-IO(クエリバイト列の生成とレスポンスの解析・集約のみ)で、ソケット・リトライ・
+/// タイムアウトは呼び出し側の責務。
+#[cfg(feature = "controller")]
+pub mod client;
+
 use dns::{Query, Section, CACHE_FLUSH, C_IN, T_A, T_AAAA, T_ANY, T_PTR};
 
 /// mDNS の UDP ポート(RFC 6762)。

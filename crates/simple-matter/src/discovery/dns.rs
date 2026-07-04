@@ -617,6 +617,185 @@ fn read_name(pkt: &[u8], start: usize, out: &mut Name) -> Option<usize> {
     after
 }
 
+// ==========================================================================
+// クエリ生成 / 型付きレコードアクセサ(`controller` feature 専用の追加)
+//
+// `docs/design/controller.md` §5.2 に基づく discovery クライアント向けの拡張。
+// 既存の [`MsgWriter`](応答専用・QR=1)には一切手を入れず、別ビルダ [`QueryWriter`]
+// と [`Record`] への追加メソッドだけで実現する(§2.3 の cfg 規律:「既存関数の
+// オブジェクトコードを変えない」ため、応答専用ビルダの分岐化ではなく型追加を採る)。
+// ==========================================================================
+
+/// 質問(Question)セクションの QU ビット(RFC 6762 §5.4)。unicast 応答を要求する。
+#[cfg(feature = "controller")]
+pub const QU_UNICAST: u16 = 0x8000;
+
+/// `&mut [u8]` 上に DNS **クエリ**メッセージ(QR=0)を組み立てるライタ。
+///
+/// [`MsgWriter`](応答専用)の鏡像。ヘッダ 12 バイトを予約し、[`question`](Self::question)
+/// で質問を追記、[`finish`](Self::finish) で QDCOUNT を含むヘッダを確定する。境界外書き込みは
+/// panic せず [`Error::NoSpace`] を返す。
+#[cfg(feature = "controller")]
+pub struct QueryWriter<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+    qd: u16,
+}
+
+#[cfg(feature = "controller")]
+impl<'a> QueryWriter<'a> {
+    /// バッファ全体を対象にクエリライタを生成する(ヘッダ分の 12 バイトが必要)。
+    pub fn new(buf: &'a mut [u8]) -> Result<Self> {
+        if buf.len() < HEADER_LEN {
+            return Err(Error::NoSpace);
+        }
+        Ok(Self {
+            buf,
+            pos: HEADER_LEN,
+            qd: 0,
+        })
+    }
+
+    fn put_u8(&mut self, v: u8) -> Result<()> {
+        if self.pos >= self.buf.len() {
+            return Err(Error::NoSpace);
+        }
+        self.buf[self.pos] = v;
+        self.pos += 1;
+        Ok(())
+    }
+
+    fn put_u16(&mut self, v: u16) -> Result<()> {
+        self.put_slice(&v.to_be_bytes())
+    }
+
+    fn put_slice(&mut self, src: &[u8]) -> Result<()> {
+        let end = self.pos.checked_add(src.len()).ok_or(Error::NoSpace)?;
+        if end > self.buf.len() {
+            return Err(Error::NoSpace);
+        }
+        self.buf[self.pos..end].copy_from_slice(src);
+        self.pos = end;
+        Ok(())
+    }
+
+    fn put_name(&mut self, labels: &[&[u8]]) -> Result<()> {
+        for label in labels {
+            if label.is_empty() || label.len() > 63 {
+                return Err(Error::NoSpace);
+            }
+            self.put_u8(label.len() as u8)?;
+            self.put_slice(label)?;
+        }
+        self.put_u8(0)
+    }
+
+    /// 質問を 1 件書く(`name` QTYPE=`qtype` QCLASS=IN)。
+    ///
+    /// `unicast_response` が `true` なら QCLASS の QU ビット([`QU_UNICAST`])を立てる。
+    pub fn question(&mut self, name: &[&[u8]], qtype: u16, unicast_response: bool) -> Result<()> {
+        self.put_name(name)?;
+        self.put_u16(qtype)?;
+        let qclass = if unicast_response {
+            C_IN | QU_UNICAST
+        } else {
+            C_IN
+        };
+        self.put_u16(qclass)?;
+        self.qd = self.qd.saturating_add(1);
+        Ok(())
+    }
+
+    /// 質問数(現時点)。
+    pub fn question_count(&self) -> u16 {
+        self.qd
+    }
+
+    /// メッセージを確定し、書き込んだ総バイト数を返す。
+    ///
+    /// 質問が 1 件も無い場合は `0` を返す(送るべきクエリなし)。
+    pub fn finish(self) -> usize {
+        if self.qd == 0 {
+            return 0;
+        }
+        let buf = self.buf;
+        buf[0..2].copy_from_slice(&0u16.to_be_bytes()); // ID = 0
+        buf[2..4].copy_from_slice(&0u16.to_be_bytes()); // FLAGS = 0(QR=0, 標準クエリ)
+        buf[4..6].copy_from_slice(&self.qd.to_be_bytes()); // QDCOUNT
+        buf[6..8].copy_from_slice(&0u16.to_be_bytes()); // ANCOUNT = 0
+        buf[8..10].copy_from_slice(&0u16.to_be_bytes()); // NSCOUNT = 0
+        buf[10..12].copy_from_slice(&0u16.to_be_bytes()); // ARCOUNT = 0
+        self.pos
+    }
+}
+
+/// TXT RDATA を `key`/`value` ペアとして走査するイテレータ([`Record::txt_entries`])。
+///
+/// 各文字列を最初の `=` で分割する。`=` を含まない文字列は `(全体, &[])` を返す。
+/// 空文字列(長さ 0)は読み飛ばす。
+#[cfg(feature = "controller")]
+pub struct TxtEntries<'a> {
+    rdata: &'a [u8],
+    pos: usize,
+}
+
+#[cfg(feature = "controller")]
+impl<'a> Iterator for TxtEntries<'a> {
+    type Item = (&'a [u8], &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.pos < self.rdata.len() {
+            let len = self.rdata[self.pos] as usize;
+            self.pos += 1;
+            let end = self.pos.checked_add(len)?;
+            if end > self.rdata.len() {
+                return None;
+            }
+            let s = &self.rdata[self.pos..end];
+            self.pos = end;
+            if s.is_empty() {
+                continue;
+            }
+            return match s.iter().position(|&b| b == b'=') {
+                Some(eq) => Some((&s[..eq], &s[eq + 1..])),
+                None => Some((s, &[])),
+            };
+        }
+        None
+    }
+}
+
+#[cfg(feature = "controller")]
+impl<'a> Record<'a> {
+    /// A レコード(TYPE=1)の IPv4 アドレス 4 バイトを返す。種別違い/長さ不足は `None`。
+    pub fn a(&self) -> Option<[u8; 4]> {
+        if self.rtype != T_A || self.rdata.len() < 4 {
+            return None;
+        }
+        let mut o = [0u8; 4];
+        o.copy_from_slice(&self.rdata[..4]);
+        Some(o)
+    }
+
+    /// AAAA レコード(TYPE=28)の IPv6 アドレス 16 バイトを返す。種別違い/長さ不足は `None`。
+    pub fn aaaa(&self) -> Option<[u8; 16]> {
+        if self.rtype != T_AAAA || self.rdata.len() < 16 {
+            return None;
+        }
+        let mut o = [0u8; 16];
+        o.copy_from_slice(&self.rdata[..16]);
+        Some(o)
+    }
+
+    /// TXT RDATA を `key`/`value` ペアとして走査する([`txt_contains`](Self::txt_contains) の一般化)。
+    pub fn txt_entries(&self) -> TxtEntries<'a> {
+        TxtEntries {
+            rdata: self.rdata,
+            pos: 0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
