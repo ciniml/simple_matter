@@ -52,7 +52,14 @@ W3 実装済みだが実機で mDNS ディスカバリがタイムアウト(ネ�
   取得(R1)・subscribe 前 write(R2)とも問題なし。
 - **W2** ✅ 実機: Windows `ble-commissioner.exe` → Linux `ble-onoff-light` へ BLE フル
   コミッショニング + Toggle 完走(fragment=20、115 フラグメント)。
-- **W3** 🔶 実装済み・実機ディスカバリ失敗(§6 が現在の課題):
+- **W3** ✅ UDP 実機完走 / mDNS はファイアウォール保留(2026-07-05 確定):
+  - Windows(192.168.2.11)`commissioner.exe 20202021 192.168.2.14 5540`(IP 直指定)で
+    **UDP フルコミッショニング完走**(PASE→CASE→運用→Toggle、デバイス `[onoff] light is now ON`)。
+    UDP ユニキャスト到達性・W3 コードは正常。
+  - **mDNS マルチキャストブラウズは 35 秒タイムアウト** = Windows Defender FW のマルチキャスト
+    inbound ブロックが最有力(コード欠陥ではない)。切り分け・恒久策は
+    `port-windows-commissioner.md` §3.2b。
+  - 実装内容(以下は完了):
   - UDP commissioner の Windows 対応(QU クエリ + エフェメラルポート)。
   - responder の QU ユニキャスト応答(`MdnsResponder::query_wants_unicast`、
     `Question.unicast`、単体テスト `detects_qu_unicast_requests`)。
@@ -92,31 +99,19 @@ W3 実装済みだが実機で mDNS ディスカバリがタイムアウト(ネ�
   いると配送が安定しない。**QU の socket レベル E2E は avahi の無い環境でしか検証不可**
   (コアロジックは単体テスト済み)。avahi は共有サービスのため停止不可。
 
-## 6. 現在ブロック中の課題(W3 の続き)
+## 6. W3 の切り分け結果(2026-07-05 確定)
 
-**症状**: Windows の `commissioner.exe 20202021`(最新 b58793a、35 秒 window)を実行すると
-`[discovery] no commissionable device found within 35s`。Linux デバイス(192.168.2.14:5540)は
-待ち受け・announce しているのに、Windows 側がデバイスの mDNS announce を 35 秒以内に拾えない。
-→ **マルチキャストが Windows↔Linux 間で流れていない疑い**(コード問題ではなくネットワーク層)。
+**確定**: Windows(192.168.2.11)↔ Linux デバイス(192.168.2.14、同一 /24)で:
+- **UDP 直指定はフル完走**(`commissioner.exe 20202021 192.168.2.14 5540`)。トランスポート・
+  CASE・IM・W3 コードは正常。
+- **mDNS マルチキャストブラウズのみ 35 秒タイムアウト** → Windows Defender ファイアウォールの
+  マルチキャスト inbound ブロックが最有力(コード欠陥ではない)。
 
-**次にユーザに依頼済み(未回答)の切り分け**:
-1. mDNS を完全バイパスして UDP 直指定でコミッショニング:
-   ```powershell
-   .\commissioner.exe 20202021 192.168.2.14 5540
-   ```
-   - 完走する → UDP 到達性 OK、問題は純粋に mDNS マルチキャスト(FW のマルチキャスト受信
-     ブロック / WiFi AP のマルチキャストフィルタ等の環境要因)。W3 コードは正しい。
-   - タイムアウト → UDP ユニキャストも届いていない(サブネット違い / FW が 5540/UDP in を
-     全ブロック等)。
-2. Windows 機の IP(`ipconfig`)が `192.168.2.x`(デバイスと同一サブネット)か確認。
-
-**再開時にやること**:
-- ユーザの上記回答を待って切り分け。UDP 直指定が通れば W3 のコード自体は完了扱いにし、
-  mDNS はネットワーク環境の注記を残す(design doc §3.0 に追記済みの方針)。
-- 必要なら Windows FW ルール(commissioner.exe の inbound UDP 許可、特にマルチキャスト)を
-  ユーザに案内。
-- commissioner example は `commissioner 20202021 <ip> <port>` で IP 直指定に対応済み
-  (`crates/simple-matter/examples/commissioner.rs:115`)。
+**未完(任意・ユーザ環境側)**: mDNS も通したい場合の FW 切り分け・恒久ルールは
+`port-windows-commissioner.md` §3.2b に記載。管理者 PowerShell で
+`Set-NetFirewallProfile -Profile Private -Enabled False` にして mDNS ブラウズが通れば FW 確定、
+恒久策は commissioner.exe への inbound UDP 許可ルール。これはコード作業ではないので、
+W3 は「UDP コミッショニング完走」で実質達成とみなす。
 
 ## 7. 残タスク(優先度順の目安)
 
