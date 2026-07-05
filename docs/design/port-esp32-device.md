@@ -174,8 +174,8 @@ ESP32 で「再起動後も fabric が残る」ために必須。**本移植の�
 | **E2: BLE スモーク → GattPeripheral** ✅(2026-07-05 実機確認) | TrouBLE(0.6、esp-radio 0.18 の bt-hci 0.8 に合わせる)で 0xFFF6 広告 + C1/C2。`GattPeripheral` 実装は `ports/esp32/esp32c6-firmware/src/ble.rs`(worker⇔channel 構造で bluer 版を写像)。R1 は解消: CCCD 検知(`GattEvent::Write` + `accept()` 必須)・`Connection::att_mtu()`・indication は worker が Confirmation 待ちで直列化。切り分け用の生 HCI スモーク bin(`hci-smoke`)と espflash monitor の罠は `ports/esp32/README.md` | PC の `ble-commissioner` から BTP handshake 確立 ✅(fragment=20、PASE SDU 再組立・ACK・クリーン切断まで実測) | M |
 | **E3: BLE コミッショニング** ✅(2026-07-06 実機確認) | embassy 版ポンプ(毎周 poll・subscribe 前保留の教訓を移植)+ MatterStack(`e3-ble-light`、DefaultStack NF=5、WiFi シム込み、NanoC6 青 LED 追従)。乱数は全箇所 TRNG 直結、SPAKE2+ verifier は起動時前計算 | PC commissioner から **フルコミッショニング完走** ✅(PASE→CSR→AddNOC→CASE→CommissioningComplete→Toggle。ゲートの AddNOC 超え。連続 2 fabric も成功)。chip-tool 相互試験は未実施 | M |
 | **E4: KVS + fabric 永続化** ✅(2026-07-06 実機確認) | コアに `kvs::Kvs` trait + `FabricTable::save_to/load_from`(TLV versioned、詳細は本書「E4 設計」節)、ESP32 は esp-storage + sequential-storage(nvs 領域、IDF 非互換)。PC 側 ble-commissioner に CA 永続化(`ca-state.bin`)+ `--operational` モード追加。単体テスト +7(317 passed) | **再起動後の運用 CASE 再確立 ✅**(コミッショニング→`[kvs] saved 1 fabrics`→リセット→`[kvs] restored 1 fabrics`→`--operational` で CASE+Toggle 成功) | M〜L(コア側含む) |
-| **E5: Wi-Fi 実 join + UDP/mDNS** | WifiDriver trait、embassy-net で UDP trait 実装、mDNS(IPv4+IPv6) | chip-tool `pairing ble-wifi`(実 SSID)フルパス + toggle | L |
-| **E6: bloat-check / チューニング** | C3 実測、バッファ・window の const generic 調整 | flash/RAM 実測値を README/ARCHITECTURE に記録 | S |
+| **E5: Wi-Fi 実 join + UDP/mDNS** 実装済み(2026-07-06、実機検証は未) | WifiDriver trait(コア追加)、embassy-net で UDP trait 実装(実利用第 1 号)、mDNS(**IPv4 のみ**に縮小、IPv6 は将来)。詳細は本書「E5 設計」節 | chip-tool `pairing ble-wifi`(実 SSID)フルパス + toggle(実機検証待ち) | L |
+| **E6: bloat-check / チューニング** サイズ記録済み(2026-07-06) | C6 全 bin の `size -A` 実測を `ports/esp32/README.md` に記録(bloat-check 拡張はスコープ外) | flash/RAM 実測値を README に記録 ✅ | S |
 
 **総工数感: L**(E4/E5 がコア側の未整備領域を含むため。BLE 経路だけなら E0-E3 で M)。
 
@@ -287,6 +287,102 @@ PC 側 `ble-commissioner` に 2 つの機能を足してゲートを閉じる:
 `--operational`: CASE 確立 + Toggle 成功。デバイスログは起動時
 `[kvs] restored N fabrics`、保存時 `[kvs] saved N fabrics` を出す(bin は
 `e4-ble-light`。既存 bin は変更しない)。
+
+## E5 設計: Wi-Fi 実 join + UDP/mDNS
+
+E5 の目的は「chip-tool `pairing ble-wifi` が実 SSID で最後まで通る」こと:
+BLE コミッショニング → ConnectNetwork で **実 Wi-Fi join**(esp-radio、BLE と coex)→
+DHCP → **運用 mDNS 広告**(IPv4)→ chip-tool が mDNS で発見 → **CASE over UDP** →
+CommissioningComplete → OnOff Toggle。以下は確定した設計判断。
+
+### E5.1 `WifiDriver` trait(コア `src/wifi.rs`)
+
+§4 の設計を具体化する。`kvs::Kvs` / `crypto::Rng` と同じ「最小 trait +
+プラットフォーム注入」の流儀(依存ゼロ・no_std・feature ゲートなし)。
+
+- `fn connect(&mut self, ssid: &[u8], creds: &[u8])` — join の**開始のみ**
+  (非同期完了)。同期・非ブロッキングであること(IM の invoke ハンドラ =
+  同期 Mealy machine の中から呼ばれる)。実装はリクエストを記録して即返る。
+- `fn status(&self) -> WifiStatus` — `Idle` / `Connecting` / `Connected` /
+  `Failed { reason: i32 }`。統合層(pump)や cluster の遅延反映
+  (`update_from_driver`)がポーリングで読む。
+
+エラーは `connect` からは返さない(開始要求の記録に失敗する要素がない)。失敗は
+すべて `status()` の `Failed` に集約する。
+
+### E5.2 ConnectNetworkResponse は「即 Success + バックグラウンド join」
+
+chip-tool は ConnectNetworkResponse を BLE 上で待つ。仕様は「接続完了後に応答」
+だが、現行 IM エンジンは 1 受信 1 応答の同期 Mealy machine で、遅延 InvokeResponse
+のメカニズムを持たない(§6 R3)。**E5 では Wi-Fi シムで chip-tool 相互運用を実証済みの
+「即 Success を返し、実 join はバックグラウンドで進める」方式を採用する。**
+
+- ConnectNetwork 受信 → `WifiDriver::connect()` を開始 → その場で
+  ConnectNetworkResponse(Success) を返す。
+- chip-tool はその後 mDNS で運用ノードを探すため、join+DHCP が
+  ディスカバリのリトライ窓(数十秒)内に完了すれば全体は成立する。
+- **限界**: join 失敗(パスワード誤り等)を ConnectNetworkResponse で報告できない。
+  失敗は `LastNetworkingStatus` / `LastConnectErrorValue` 属性
+  (`update_from_driver` で反映)からしか観測できず、chip-tool はディスカバリ
+  タイムアウトで失敗する。**将来課題**: `HandlerAction` の遅延応答型を IM エンジンに
+  追加し、`ConnectMaxTimeSeconds` 以内の完了後応答へ移行する(コア IM の中規模改修。
+  E5 スコープ外)。
+
+### E5.3 `NetworkCommissioningWifi` の一般化(型二重化の解消)
+
+既存の Wi-Fi シム版クラスタを `NetworkCommissioningWifi<W: WifiDriver = NullWifiDriver>`
+に一般化し、driver 注入型へ変更する:
+
+- `AddOrUpdateWiFiNetwork` で SSID(tag 0)に加え **credentials(tag 1)も保存**する
+  (最大 64 バイト。WPA2/WPA3 パスフレーズの上限)。
+- `ConnectNetwork` で `driver.connect(ssid, creds)` を呼び、即 Success を返す(E5.2)。
+- **PC シムは `NullWifiDriver`(コア提供の「即 Connected」実装)として統合**し、
+  既定型パラメータにより既存コード(`NetworkCommissioningWifi::new()`)は無変更で
+  動く。型二重化は解消(シム専用型は存在しない)。
+- `update_from_driver()`: driver の `status()` を属性
+  (Networks[].connected / LastNetworkingStatus / LastConnectErrorValue)へ反映する。
+  呼び出しタイミングは統合層(pump)の責務(sans-IO 維持、E4.4 と同じパターン)。
+- `cluster!` マクロは非ジェネリック型専用のため、`ServerCluster` は OpCredsCluster と
+  同様に手書き実装へ移す(メタは static 1 個、挙動は従来と同一)。
+
+### E5.4 ESP32 実装(Wi-Fi / coex)
+
+- **esp-radio 0.18 の Wi-Fi**(`esp_radio::wifi::new(WIFI, ControllerConfig)` →
+  `WifiController` + `Interfaces`)。`coex` feature で BLE と同時動作
+  (コミッショニング中は BLE + Wi-Fi 両アクティブ)。
+- `WifiController::connect_async()` は async なので、IM ハンドラから直接呼べない。
+  **`EspWifiDriver`(コア trait 実装)は要求を `embassy_sync::Signal` に置くだけ**の
+  ハンドルとし、専用の `wifi_task`(pump と並走)が Signal を待って
+  `set_config(Station)` → `connect_async()` を実行、結果を atomic な状態
+  (`WifiStatus` 相当)へ書き戻す。切断イベント時は自動再接続する。
+- esp-radio 0.18 の `StationConfig` はパスワードに `alloc::String` を要求する
+  (ヒープは esp-radio 用に既に存在するため許容。コアは無関係)。
+
+### E5.5 UDP / mDNS(embassy-net、コア trait の実利用第 1 号)
+
+- **embassy-net**(esp-radio の `Interface` が `embassy-net-driver` 0.2 の `Driver` を
+  実装)+ DHCPv4。ports 側 `src/net.rs` に `EspUdp`(`embassy_net::udp::UdpSocket`
+  ラッパ)を置き、コアの `UdpSend` / `UdpReceive` / `UdpMulticast` を実装する。
+- **IPv4 のみ**(§3 の IPv6 有効化は将来スコープへ後送。chip-tool は IPv4 mDNS で
+  相互運用実績あり — PC 版 dual-transport / W3 Windows commissioner で実証済み)。
+- `UdpMulticast::join(Ipv6Addr)` の IPv4 グループは **IPv4-mapped IPv6**
+  (`::ffff:224.0.0.251`)の規約で受け、実装側で unmap して smoltcp の IGMP join に
+  渡す(コア trait のシグネチャ不変更。`canonical_socket_addr` と同じ mapped 規約)。
+- ソケットは 2 本: Matter UDP(5540)と mDNS(5353 + 224.0.0.251 join)。
+  mDNS responder(sans-IO、コア実装済み)は受信バイト列を `handle_query` に渡し、
+  QU クエリはユニキャスト返信(PC 版と同じ)。
+- **運用 mDNS の開始タイミング**: DHCP で IPv4 取得後に `MdnsResponder` を構築
+  (`Host::from_mac(STA MAC, None, Some(ip))`)。fabric `generation()` 変化で
+  operational レコードを更新して再 announce(PC 版と同じパターン)。
+  commissionable 広告は BLE(GATT)側が担うため、mDNS は operational のみ広告する。
+
+### E5.6 bin 構成とリソース
+
+- 新 bin `ports/esp32/esp32c6-firmware/src/bin/e5-light.rs` = e4-ble-light
+  (BLE + fabric 永続化)+ Wi-Fi/UDP/mDNS dual-transport。移植元は PC 版
+  `crates/simple-matter-ble/examples/ble-onoff-light.rs` の select ループ構造。
+- ヒープ: Wi-Fi + BLE coex で esp-radio の要求が増える。E4 の 72KiB から増量し、
+  SRAM 512KiB(C6)内に収める(実測は E6 の表)。
 
 ## 9. 参考(調査ソース)
 

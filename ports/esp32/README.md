@@ -348,3 +348,57 @@ for d in $(bluetoothctl devices | awk '{print $2}'); do
   bluetoothctl info "$d" | grep -qi fff6 && bluetoothctl remove "$d"
 done
 ```
+
+## E5: Wi-Fi 実 join + UDP/mDNS(`e5-light` bin)
+
+`e4-ble-light` + **実 Wi-Fi + UDP dual-transport**。chip-tool の
+`pairing ble-wifi`(実 SSID)が最後まで通る構成。設計は
+`docs/design/port-esp32-device.md` の「E5 設計」節。
+
+- **Wi-Fi**: コアの `wifi::WifiDriver` trait(E5 で追加)を esp-radio で実装
+  (`src/wifi.rs`)。ConnectNetwork の invoke ハンドラ(同期)は要求を
+  `Signal` に置くだけで、join(`connect_async`)は常駐 `wifi_task` が実行する。
+  BLE とは esp-radio の `coex` feature で同時動作。切断時は自動再接続。
+- **UDP**: コアの `UdpSend`/`UdpReceive`/`UdpMulticast` trait を embassy-net 0.9 の
+  `UdpSocket` で実装(`src/net.rs`、**trait 実利用第 1 号**)。DHCPv4。
+  Matter UDP は 5540。IPv4 のみ(IPv6 は将来スコープ)。
+- **mDNS**: DHCP で IPv4 取得後に 5353 + 224.0.0.251(IGMP join)で
+  コアの sans-IO `MdnsResponder` を駆動。operational レコードのみ広告
+  (commissionable は BLE 広告が担う)。QU クエリにはユニキャスト応答。
+- ConnectNetworkResponse は**即 Success + バックグラウンド join**
+  (シムで chip-tool 相互運用実証済みのフロー。遅延応答は将来課題、doc §E5.2)。
+- ヒープは 112KiB(E4 の 72KiB から増量。Wi-Fi+BLE coex の esp-radio 要求)。
+
+```sh
+cd ports/esp32
+cargo run --release --bin e5-light
+# chip-tool でコミッショニング(実 SSID/パスワードを渡す):
+chip-tool pairing ble-wifi 1 <SSID> <PASS> 20202021 3840 --bypass-attestation-verifier true
+# 期待ログ列:
+#   [ble] connected → [btp] established → PASE/CSR/AddNOC(BLE)
+#   → [wifi] connecting to "<SSID>" → [wifi] associated → [net] DHCP up: ip=...
+#   → [mdns] operational advertising → CASE over UDP → CommissioningComplete
+# 操作:
+chip-tool onoff toggle 1 1   # → [onoff] light is now ON / GPIO7 の青 LED 追従
+```
+
+## E6: フェーズ別サイズ実測(`size -A`、release、opt-level="s" + LTO)
+
+全 bin の ELF セクションサイズ(単位バイト、ホスト `size -A`。
+`.text_gap` はメモリレイアウト上のパディングのため除外):
+
+| bin(フェーズ) | .text | .rodata(+wifi) | .rwtext(+wifi) | .data(+wifi) | .bss | flash 概算† | RAM 常駐‡ |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `esp32c6-firmware`(E1 骨格) | 40,654 | 11,472 | 2,076 | 732 | 536 | 55K | 3.3K |
+| `e2-ble`(E2 BLE スモーク) | 369,814 | 45,784 | 30,288 | 7,068 | 90,900 | 453K | 128K |
+| `e3-ble-light`(E3 コミッショニング) | 502,174 | 56,568 | 29,832 | 7,812 | 110,908 | 596K | 149K |
+| `e4-ble-light`(E4 + 永続化) | 525,060 | 58,456 | 30,200 | 7,892 | 112,448 | 622K | 151K |
+| `e5-light`(E5 + Wi-Fi/UDP/mDNS) | 856,426 | 122,936 | 80,772 | 13,428 | 188,200 | 1,074K | 282K |
+
+† flash 概算 = .text + .rodata(+wifi) + .rwtext(+wifi) + .data(+wifi)(ロードイメージ)。
+‡ RAM 常駐 = .rwtext(+wifi) + .data(+wifi) + .bss(スタック除く)。
+E2〜E4 の .bss はヒープ 72KiB を、E5 は 112KiB を含む(esp-alloc の
+`heap_allocator!` は .bss に確保)。E5 の RAM 常駐 282KiB は C6 の SRAM 512KiB に
+収まる(残り ~230KiB がタスクスタック等)。E5 の増分(flash +452K / RAM +131K)は
+ほぼ esp-radio の Wi-Fi ドライバ + smoltcp/embassy-net によるもの。
+bloat-check crate の C6 対応拡張はスコープ外(doc §8 E6 行のとおり記録のみ)。

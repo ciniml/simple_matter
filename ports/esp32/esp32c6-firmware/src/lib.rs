@@ -7,11 +7,17 @@
 //!   [`ble::gatt_worker`]。
 //! - [`kvs`]: コアの `Kvs` trait を内蔵 flash(esp-storage + sequential-storage)で
 //!   実装する [`kvs::EspKvs`](E4 の fabric 永続化バックエンド)。
+//! - [`net`]: コアの UDP trait 群(`UdpSend`/`UdpReceive`/`UdpMulticast`)の
+//!   embassy-net 実装 [`net::EspUdp`](E5。trait 実利用第 1 号)。
+//! - [`wifi`]: コアの `WifiDriver` trait の esp-radio 実装
+//!   ([`wifi::EspWifiDriver`] + 常駐 [`wifi::wifi_task`]、E5)。
 
 #![no_std]
 
 pub mod ble;
 pub mod kvs;
+pub mod net;
+pub mod wifi;
 
 use esp_hal::rng::Trng;
 use simple_matter::crypto::Rng;

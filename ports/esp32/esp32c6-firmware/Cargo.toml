@@ -52,7 +52,14 @@ esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32c6"] }
 # `BleConnector` を渡せない(trait が別クレートバージョンで別物になる)。
 # bt-hci ^0.8 を使う trouble-host の最終版は **0.6.0** なので、それに固定する
 # (esp-radio 0.18 の Cargo.lock も bt-hci 0.8.0 のみ)。
-esp-radio = { version = "0.18.0", features = ["esp32c6", "ble", "unstable"] }
+esp-radio = { version = "0.18.0", features = [
+    "esp32c6",
+    "ble",
+    # E5: Wi-Fi station(実 join)+ BLE 同時動作(coex)。
+    "wifi",
+    "coex",
+    "unstable",
+] }
 # esp-radio が要求する preemptive スケジューラ。`embassy` feature が
 # embassy-time driver + `#[esp_rtos::main]`(thread-mode executor)を提供する。
 esp-rtos = { version = "0.3.0", features = [
@@ -93,3 +100,21 @@ esp-storage = { version = "0.9.0", features = ["esp32c6"] }
 sequential-storage = "7.2"
 embedded-storage = "0.3"
 embedded-storage-async = "0.4"
+
+# --- E5: Wi-Fi 実 join + UDP/mDNS(doc §E5.4 / §E5.5)---
+#
+# embassy-net: esp-radio の `Interface` が embassy-net-driver 0.2 の `Driver` を
+# 実装するため、その系列に合う版を使う。IPv4 のみ(proto-ipv4 + dhcpv4 + igmp 用
+# multicast)。コアの UdpSend/UdpReceive/UdpMulticast は src/net.rs で実装する。
+embassy-net = { version = "0.9", default-features = false, features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "udp",
+    "dhcpv4",
+    "multicast",
+] }
+
+[[bin]]
+# E5: E4 + Wi-Fi 実 join + UDP/mDNS dual-transport(chip-tool `pairing ble-wifi`)。
+name = "e5-light"
+path = "src/bin/e5-light.rs"

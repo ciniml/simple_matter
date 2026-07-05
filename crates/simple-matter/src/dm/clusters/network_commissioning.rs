@@ -9,9 +9,14 @@
 use crate::cluster;
 use crate::dm::clusters::cmd::{close_response, map_tlv, open_response, Fields};
 use crate::dm::codec::{AttrEncoder, CmdResponder};
-use crate::dm::meta::{AccessContext, CommandId};
+use crate::dm::meta::{
+    AccessContext, AttributeId, AttributeMeta, ClusterId, ClusterMeta, CommandId, CommandMeta,
+    Privilege, Quality,
+};
+use crate::dm::ServerCluster;
 use crate::im::wire::ImStatus;
-use crate::tlv::{TlvReader, TlvTag};
+use crate::tlv::{TlvElement, TlvReader, TlvTag};
+use crate::wifi::{NullWifiDriver, WifiDriver, WifiStatus};
 
 /// FeatureMap の Ethernet ビット(EN、bit 2)。
 pub const FEATURE_ETHERNET: u32 = 0x04;
@@ -25,6 +30,8 @@ pub mod net_status {
     pub const SUCCESS: u8 = 0;
     /// NetworkIDNotFound(3)。
     pub const NETWORK_ID_NOT_FOUND: u8 = 3;
+    /// OtherConnectionFailure(9)。ドライバの join 失敗を属性へ反映する際に使う。
+    pub const OTHER_CONNECTION_FAILURE: u8 = 9;
 }
 
 /// Network Commissioning クラスタ(0x0031、Ethernet 最小)。
@@ -113,27 +120,40 @@ cluster! {
     }
 }
 
-/// Network Commissioning クラスタ(0x0031、Wi-Fi **シミュレーション**)。
+/// Network Commissioning クラスタ(0x0031、Wi-Fi。[`WifiDriver`] 注入型)。
 ///
 /// FeatureMap は Wi-Fi(bit 0 = `0x01`)を立て、chip-tool の BLE→Wi-Fi コミッショニング
 /// (`pairing ble-wifi`)が要求する NetworkCommissioning インターフェースを提供する。
+/// 実際の無線 join はプラットフォーム注入の [`WifiDriver`] に委譲する
+/// (`docs/design/port-esp32-device.md` §E5.3)。
 ///
-/// # シミュレーションである点(実際には Wi-Fi に参加しない)
+/// # 応答タイミング(doc §E5.2)
 ///
-/// 本実装は **実際の無線 join を一切行わない**。用途は「BLE で PASE/CASE を張った PC が、
-/// 既に IP 到達可能なネットワーク上に居る」開発・相互運用シナリオである。chip-tool は
-/// BLE 経由の commissionee に対し Wi-Fi/Thread の NetworkCommissioning を要求する
-/// (`AutoCommissioner`: BLE→`mNeedsNetworkSetup=true`、`IsSomeNetworkSupported` は
-/// wifi/thread のみ)ため、Ethernet feature だけでは "does not support any network types" で
-/// 失敗する。そこで Wi-Fi feature を提示し、`AddOrUpdateWiFiNetwork` / `ConnectNetwork` に
-/// **即 Success を返す**ことで、デバイスが既存 IP 経路(BLE と並走する UDP + 運用 mDNS)で
-/// CASE→CommissioningComplete まで到達できるようにする。SSID / 資格情報は保存するが接続には使わない。
+/// `ConnectNetwork` は **`WifiDriver::connect()` を開始した上で即 Success を返す**
+/// (バックグラウンド join)。現行 IM エンジンは 1 受信 1 応答の同期 Mealy machine で
+/// 遅延 InvokeResponse を持たないため、join 完了後の応答は将来課題。join の失敗は
+/// [`update_from_driver`](Self::update_from_driver) 経由で LastNetworkingStatus /
+/// LastConnectErrorValue 属性に反映される。
+///
+/// # PC シム(既定型パラメータ)
+///
+/// 既定の `W = NullWifiDriver` は「即 Connected」のシム。用途は「BLE で PASE/CASE を
+/// 張った PC が、既に IP 到達可能なネットワーク上に居る」開発・相互運用シナリオである。
+/// chip-tool は BLE 経由の commissionee に対し Wi-Fi/Thread の NetworkCommissioning を
+/// 要求する(`AutoCommissioner`: BLE→`mNeedsNetworkSetup=true`、
+/// `IsSomeNetworkSupported` は wifi/thread のみ)ため、Ethernet feature だけでは
+/// "does not support any network types" で失敗する。シムはこのポリシを満たすためだけの
+/// 実装で、SSID / 資格情報は保存するが接続には使わない。
 #[derive(Debug)]
-pub struct NetworkCommissioningWifi {
+pub struct NetworkCommissioningWifi<W: WifiDriver = NullWifiDriver> {
     /// AddOrUpdateWiFiNetwork で受理した SSID(NetworkID として使う)。最大 32 バイト。
     ssid: [u8; 32],
     /// `ssid` の有効長(0 なら未設定=ネットワーク無し)。
     ssid_len: usize,
+    /// AddOrUpdateWiFiNetwork で受理した資格情報(WPA2/WPA3 パスフレーズ)。最大 64 バイト。
+    creds: [u8; 64],
+    /// `creds` の有効長。
+    creds_len: usize,
     /// ConnectNetwork 済みか(Networks[].connected に反映)。
     connected: bool,
     /// InterfaceEnabled(0x0004)。
@@ -142,6 +162,8 @@ pub struct NetworkCommissioningWifi {
     last_status: Option<u8>,
     /// LastConnectErrorValue(0x0007、未設定は null)。
     last_connect_error: Option<i32>,
+    /// プラットフォーム Wi-Fi ドライバ(ConnectNetwork で join を開始する)。
+    driver: W,
 }
 
 impl Default for NetworkCommissioningWifi {
@@ -151,15 +173,55 @@ impl Default for NetworkCommissioningWifi {
 }
 
 impl NetworkCommissioningWifi {
-    /// Wi-Fi シミュレーションモードのクラスタを作る(ネットワーク未設定)。
+    /// Wi-Fi シミュレーションモード([`NullWifiDriver`])のクラスタを作る(ネットワーク未設定)。
     pub const fn new() -> Self {
+        Self::with_driver(NullWifiDriver::new())
+    }
+}
+
+impl<W: WifiDriver> NetworkCommissioningWifi<W> {
+    /// プラットフォームの [`WifiDriver`] を注入してクラスタを作る(ネットワーク未設定)。
+    pub const fn with_driver(driver: W) -> Self {
         Self {
             ssid: [0u8; 32],
             ssid_len: 0,
+            creds: [0u8; 64],
+            creds_len: 0,
             connected: false,
             interface_enabled: true,
             last_status: None,
             last_connect_error: None,
+            driver,
+        }
+    }
+
+    /// 注入されたドライバへの参照。
+    pub fn driver(&self) -> &W {
+        &self.driver
+    }
+
+    /// 注入されたドライバへの可変参照。
+    pub fn driver_mut(&mut self) -> &mut W {
+        &mut self.driver
+    }
+
+    /// ドライバの [`WifiDriver::status`] を属性へ反映する(統合層が定期的に呼ぶ)。
+    ///
+    /// ConnectNetworkResponse は即 Success で返すため(doc §E5.2)、バックグラウンド
+    /// join の結果はこの経路でしか属性に現れない。`Connected` で Networks[].connected を
+    /// 立て、`Failed` で LastNetworkingStatus=OtherConnectionFailure /
+    /// LastConnectErrorValue=reason を記録する。
+    pub fn update_from_driver(&mut self) {
+        match self.driver.status() {
+            WifiStatus::Connected => {
+                self.connected = true;
+            }
+            WifiStatus::Failed { reason } => {
+                self.connected = false;
+                self.last_status = Some(net_status::OTHER_CONNECTION_FAILURE);
+                self.last_connect_error = Some(reason);
+            }
+            WifiStatus::Idle | WifiStatus::Connecting => {}
         }
     }
 
@@ -175,10 +237,17 @@ impl NetworkCommissioningWifi {
         self.ssid_len = n;
     }
 
+    /// 受理した資格情報を保存する(最大 64 バイトに切り詰め)。
+    fn set_creds(&mut self, creds: &[u8]) {
+        let n = creds.len().min(self.creds.len());
+        self.creds[..n].copy_from_slice(&creds[..n]);
+        self.creds_len = n;
+    }
+
     /// InterfaceEnabled(0x0004)を書き込む。
     fn write_interface_enabled(
         &mut self,
-        data: crate::tlv::TlvElement<'_>,
+        data: TlvElement<'_>,
         _acc: &AccessContext,
     ) -> Result<(), ImStatus> {
         self.interface_enabled = data
@@ -267,13 +336,22 @@ impl NetworkCommissioningWifi {
 
     /// 最初の context タグ付き octstr フィールド(tag=0)を取り出す。
     fn first_octstr<'a>(fields: &mut TlvReader<'a>) -> Option<&'a [u8]> {
+        Self::octstr_fields(fields).0
+    }
+
+    /// context タグ 0(SSID/NetworkID)と 1(credentials)の octstr を取り出す。
+    fn octstr_fields<'a>(fields: &mut TlvReader<'a>) -> (Option<&'a [u8]>, Option<&'a [u8]>) {
+        let mut ssid = None;
+        let mut creds = None;
         let mut f = Fields::new(fields);
         while let Some((tag, v)) = f.next() {
-            if tag == 0 {
-                return v.as_bytes().ok();
+            match tag {
+                0 => ssid = v.as_bytes().ok(),
+                1 => creds = v.as_bytes().ok(),
+                _ => {}
             }
         }
-        None
+        (ssid, creds)
     }
 
     /// コマンドを処理する。
@@ -287,10 +365,15 @@ impl NetworkCommissioningWifi {
         match cmd.0 {
             // ScanNetworks(0x00): シム。空結果で Success を返す(chip-tool は既定でスキップ)。
             0x00 => Self::write_scan_response(resp, net_status::SUCCESS),
-            // AddOrUpdateWiFiNetwork(0x02): SSID を保存し NetworkConfigResponse(Success, idx 0)。
+            // AddOrUpdateWiFiNetwork(0x02): SSID + credentials を保存し
+            // NetworkConfigResponse(Success, idx 0)。join はまだ開始しない。
             0x02 => {
-                if let Some(ssid) = Self::first_octstr(fields) {
+                let (ssid, creds) = Self::octstr_fields(fields);
+                if let Some(ssid) = ssid {
                     self.set_ssid(ssid);
+                }
+                if let Some(creds) = creds {
+                    self.set_creds(creds);
                 }
                 self.connected = false;
                 self.last_status = Some(net_status::SUCCESS);
@@ -313,12 +396,16 @@ impl NetworkCommissioningWifi {
                     )
                 }
             }
-            // ConnectNetwork(0x06): シム join 成功。ConnectNetworkResponse(Success, errorValue=null)。
+            // ConnectNetwork(0x06): ドライバの join を開始し、**即 Success** を返す
+            // (バックグラウンド join、doc §E5.2)。join の結果は update_from_driver 経由で
+            // LastNetworkingStatus / LastConnectErrorValue に後から反映される。
             0x06 => {
                 let known = Self::first_octstr(fields)
                     .map(|id| id == self.network_id() && self.ssid_len > 0)
                     .unwrap_or(self.ssid_len > 0);
                 if known {
+                    self.driver
+                        .connect(&self.ssid[..self.ssid_len], &self.creds[..self.creds_len]);
                     self.connected = true;
                     self.last_status = Some(net_status::SUCCESS);
                     self.last_connect_error = None;
@@ -335,68 +422,153 @@ impl NetworkCommissioningWifi {
     }
 }
 
-cluster! {
-    NetworkCommissioningWifi {
-        id: 0x0031,
-        revision: 1,
-        feature_map: 0x01,
-        dirty: _,
-        invoke: (|c: &mut NetworkCommissioningWifi, cmd, fields, resp, acc| c.invoke_cmd(cmd, fields, resp, acc)),
-        attributes: [
-            0x0000 MaxNetworks {
-                access: Administer, quality: [FIXED], subscribe: false,
-                read: (|_c: &NetworkCommissioningWifi, e: &mut AttrEncoder<'_, '_>| e.write_u8(1)),
-                write: _
-            },
-            0x0001 Networks {
-                access: Administer, quality: [], subscribe: false,
-                read: (|c: &NetworkCommissioningWifi, e: &mut AttrEncoder<'_, '_>| c.read_networks(e)),
-                write: _
-            },
-            0x0002 ScanMaxTimeSeconds {
-                access: Administer, quality: [FIXED], subscribe: false,
-                read: (|_c: &NetworkCommissioningWifi, e: &mut AttrEncoder<'_, '_>| e.write_u8(10)),
-                write: _
-            },
-            0x0003 ConnectMaxTimeSeconds {
-                access: Administer, quality: [FIXED], subscribe: false,
-                read: (|_c: &NetworkCommissioningWifi, e: &mut AttrEncoder<'_, '_>| e.write_u8(30)),
-                write: _
-            },
-            0x0004 InterfaceEnabled {
-                access: Administer, quality: [], subscribe: false,
-                read: (|c: &NetworkCommissioningWifi, e: &mut AttrEncoder<'_, '_>| e.write_bool(c.interface_enabled)),
-                write: (|c: &mut NetworkCommissioningWifi, data, acc| c.write_interface_enabled(data, acc))
-            },
-            0x0005 LastNetworkingStatus {
-                access: Administer, quality: [NULLABLE], subscribe: false,
-                read: (|c: &NetworkCommissioningWifi, e: &mut AttrEncoder<'_, '_>| c.read_last_status(e)),
-                write: _
-            },
-            0x0006 LastNetworkID {
-                access: Administer, quality: [NULLABLE], subscribe: false,
-                read: (|c: &NetworkCommissioningWifi, e: &mut AttrEncoder<'_, '_>| c.read_last_network_id(e)),
-                write: _
-            },
-            0x0007 LastConnectErrorValue {
-                access: Administer, quality: [NULLABLE], subscribe: false,
-                read: (|c: &NetworkCommissioningWifi, e: &mut AttrEncoder<'_, '_>| c.read_last_connect_error(e)),
-                write: _
-            },
-            0x0008 SupportedWiFiBands {
-                access: Administer, quality: [FIXED], subscribe: false,
-                read: (|c: &NetworkCommissioningWifi, e: &mut AttrEncoder<'_, '_>| c.read_supported_bands(e)),
-                write: _
-            },
-        ],
-        accepted: [
-            0x00 ScanNetworks,
-            0x02 AddOrUpdateWiFiNetwork,
-            0x04 RemoveNetwork,
-            0x06 ConnectNetwork,
-            0x08 ReorderNetwork,
-        ],
-        generated: [ 0x01, 0x05, 0x07 ],
+/// [`NetworkCommissioningWifi`] のクラスタメタ(全 `W` で共有)。
+///
+/// `cluster!` マクロは非ジェネリック型専用のため、[`ServerCluster`] は
+/// `OpCredsCluster` と同様に手書きで実装する(doc §E5.3)。属性・コマンドの宣言内容は
+/// マクロ版シム(E5 以前)と同一。
+static NETCOMM_WIFI_META: ClusterMeta = ClusterMeta::new(
+    ClusterId(0x0031),
+    1,
+    FEATURE_WIFI,
+    &[
+        // 0x0000 MaxNetworks
+        AttributeMeta::new(
+            AttributeId(0x0000),
+            Privilege::Administer,
+            Quality::FIXED,
+            true,
+            false,
+            false,
+        ),
+        // 0x0001 Networks
+        AttributeMeta::new(
+            AttributeId(0x0001),
+            Privilege::Administer,
+            Quality::NONE,
+            true,
+            false,
+            false,
+        ),
+        // 0x0002 ScanMaxTimeSeconds
+        AttributeMeta::new(
+            AttributeId(0x0002),
+            Privilege::Administer,
+            Quality::FIXED,
+            true,
+            false,
+            false,
+        ),
+        // 0x0003 ConnectMaxTimeSeconds
+        AttributeMeta::new(
+            AttributeId(0x0003),
+            Privilege::Administer,
+            Quality::FIXED,
+            true,
+            false,
+            false,
+        ),
+        // 0x0004 InterfaceEnabled(書き込み可)
+        AttributeMeta::new(
+            AttributeId(0x0004),
+            Privilege::Administer,
+            Quality::NONE,
+            true,
+            true,
+            false,
+        ),
+        // 0x0005 LastNetworkingStatus
+        AttributeMeta::new(
+            AttributeId(0x0005),
+            Privilege::Administer,
+            Quality::NULLABLE,
+            true,
+            false,
+            false,
+        ),
+        // 0x0006 LastNetworkID
+        AttributeMeta::new(
+            AttributeId(0x0006),
+            Privilege::Administer,
+            Quality::NULLABLE,
+            true,
+            false,
+            false,
+        ),
+        // 0x0007 LastConnectErrorValue
+        AttributeMeta::new(
+            AttributeId(0x0007),
+            Privilege::Administer,
+            Quality::NULLABLE,
+            true,
+            false,
+            false,
+        ),
+        // 0x0008 SupportedWiFiBands
+        AttributeMeta::new(
+            AttributeId(0x0008),
+            Privilege::Administer,
+            Quality::FIXED,
+            true,
+            false,
+            false,
+        ),
+    ],
+    &[
+        // ScanNetworks / AddOrUpdateWiFiNetwork / RemoveNetwork / ConnectNetwork / ReorderNetwork
+        CommandMeta::new(CommandId(0x00), false, Privilege::Operate),
+        CommandMeta::new(CommandId(0x02), false, Privilege::Operate),
+        CommandMeta::new(CommandId(0x04), false, Privilege::Operate),
+        CommandMeta::new(CommandId(0x06), false, Privilege::Operate),
+        CommandMeta::new(CommandId(0x08), false, Privilege::Operate),
+    ],
+    &[CommandId(0x01), CommandId(0x05), CommandId(0x07)],
+);
+
+impl<W: WifiDriver> ServerCluster for NetworkCommissioningWifi<W> {
+    fn meta(&self) -> &'static ClusterMeta {
+        &NETCOMM_WIFI_META
+    }
+
+    fn read_attribute(
+        &self,
+        attr: AttributeId,
+        enc: &mut AttrEncoder<'_, '_>,
+    ) -> Result<(), ImStatus> {
+        match attr.0 {
+            0x0000 => enc.write_u8(1),
+            0x0001 => self.read_networks(enc),
+            0x0002 => enc.write_u8(10),
+            0x0003 => enc.write_u8(30),
+            0x0004 => enc.write_bool(self.interface_enabled),
+            0x0005 => self.read_last_status(enc),
+            0x0006 => self.read_last_network_id(enc),
+            0x0007 => self.read_last_connect_error(enc),
+            0x0008 => self.read_supported_bands(enc),
+            _ => Err(ImStatus::UnsupportedAttribute),
+        }
+    }
+
+    fn write_attribute(
+        &mut self,
+        attr: AttributeId,
+        data: TlvElement<'_>,
+        acc: &AccessContext,
+    ) -> Result<(), ImStatus> {
+        match attr.0 {
+            0x0004 => self.write_interface_enabled(data, acc),
+            _ => Err(ImStatus::UnsupportedWrite),
+        }
+    }
+
+    fn invoke_command(
+        &mut self,
+        cmd: CommandId,
+        fields: &mut TlvReader<'_>,
+        resp: &mut CmdResponder<'_, '_>,
+        acc: &AccessContext,
+    ) -> Result<(), ImStatus> {
+        self.invoke_cmd(cmd, fields, resp, acc)
     }
 }
 
@@ -442,7 +614,11 @@ mod wifi_tests {
         }
     }
 
-    fn invoke(net: &mut NetworkCommissioningWifi, cmd: u32, ssid: &[u8]) -> (u32, [u8; 64], usize) {
+    fn invoke<W: WifiDriver>(
+        net: &mut NetworkCommissioningWifi<W>,
+        cmd: u32,
+        ssid: &[u8],
+    ) -> (u32, [u8; 64], usize) {
         let mut fbuf = [0u8; 96];
         let flen = write_ssid_fields(&mut fbuf, ssid);
         // フィールド構造体(context タグ 1)を指す reader を作る。
@@ -529,6 +705,122 @@ mod wifi_tests {
             r2.read_next().unwrap().unwrap().value,
             TlvValue::Boolean(true)
         );
+    }
+
+    /// 受けた connect 要求(ssid/creds)を記録するテスト用ドライバ。
+    struct RecordingDriver {
+        ssid: [u8; 32],
+        ssid_len: usize,
+        creds: [u8; 64],
+        creds_len: usize,
+        calls: usize,
+        status: WifiStatus,
+    }
+
+    impl RecordingDriver {
+        fn new() -> Self {
+            Self {
+                ssid: [0; 32],
+                ssid_len: 0,
+                creds: [0; 64],
+                creds_len: 0,
+                calls: 0,
+                status: WifiStatus::Idle,
+            }
+        }
+        fn ssid(&self) -> &[u8] {
+            &self.ssid[..self.ssid_len]
+        }
+        fn creds(&self) -> &[u8] {
+            &self.creds[..self.creds_len]
+        }
+    }
+
+    impl WifiDriver for RecordingDriver {
+        fn connect(&mut self, ssid: &[u8], creds: &[u8]) {
+            self.ssid[..ssid.len()].copy_from_slice(ssid);
+            self.ssid_len = ssid.len();
+            self.creds[..creds.len()].copy_from_slice(creds);
+            self.creds_len = creds.len();
+            self.calls += 1;
+            self.status = WifiStatus::Connecting;
+        }
+        fn status(&self) -> WifiStatus {
+            self.status
+        }
+    }
+
+    /// AddOrUpdateWiFiNetwork(ssid + credentials)→ ConnectNetwork でドライバに
+    /// 実 SSID / パスフレーズが渡り、応答は即 Success(バックグラウンド join)。
+    #[test]
+    fn connect_starts_driver_join_with_stored_credentials() {
+        let mut net = NetworkCommissioningWifi::with_driver(RecordingDriver::new());
+
+        // AddOrUpdateWiFiNetwork: { 0: ssid, 1: credentials }。
+        let mut fbuf = [0u8; 128];
+        let mut w = TlvWriter::new(&mut fbuf);
+        w.start_struct(&TlvTag::ContextSpecific(1)).unwrap();
+        w.write_bytes(&TlvTag::ContextSpecific(0), b"iotap").unwrap();
+        w.write_bytes(&TlvTag::ContextSpecific(1), b"hogeFugapiyo")
+            .unwrap();
+        w.end_container().unwrap();
+        let flen = w.len();
+        let mut fr = TlvReader::new(&fbuf[..flen]);
+        let mut out = [0u8; 64];
+        let mut ww = TlvWriter::new(&mut out);
+        let mut resp = CmdResponder::new(&mut ww);
+        net.invoke_command(CommandId(0x02), &mut fr, &mut resp, &acc())
+            .unwrap();
+        assert_eq!(resp.response_command().unwrap().0, 0x05);
+        // AddOrUpdate では join を開始しない。
+        assert_eq!(net.driver().calls, 0);
+
+        // ConnectNetwork → ドライバに ssid/creds が渡り、応答は即 Success。
+        let (rid, out, len) = invoke(&mut net, 0x06, b"iotap");
+        assert_eq!(rid, 0x07);
+        assert_eq!(
+            resp_field(&out[..len], 0).unwrap().as_unsigned().unwrap(),
+            net_status::SUCCESS as u64
+        );
+        assert_eq!(net.driver().calls, 1);
+        assert_eq!(net.driver().ssid(), b"iotap");
+        assert_eq!(net.driver().creds(), b"hogeFugapiyo");
+    }
+
+    /// ドライバの Failed を update_from_driver が属性へ反映する。
+    #[test]
+    fn update_from_driver_reflects_failure() {
+        let mut net = NetworkCommissioningWifi::with_driver(RecordingDriver::new());
+        let (_, _, _) = invoke(&mut net, 0x02, b"iotap");
+        let (_, _, _) = invoke(&mut net, 0x06, b"iotap");
+        net.driver_mut().status = WifiStatus::Failed { reason: -42 };
+        net.update_from_driver();
+
+        // LastNetworkingStatus = OtherConnectionFailure(9)。
+        let mut buf = [0u8; 32];
+        let mut w = TlvWriter::new(&mut buf);
+        {
+            let mut e = AttrEncoder::new(&mut w, TlvTag::Anonymous);
+            net.read_attribute(AttributeId(0x0005), &mut e).unwrap();
+        }
+        let mut r = TlvReader::new(&buf);
+        assert_eq!(
+            r.read_next().unwrap().unwrap().value.as_unsigned().unwrap(),
+            net_status::OTHER_CONNECTION_FAILURE as u64
+        );
+
+        // LastConnectErrorValue = -42。
+        let mut buf2 = [0u8; 32];
+        let mut w2 = TlvWriter::new(&mut buf2);
+        {
+            let mut e = AttrEncoder::new(&mut w2, TlvTag::Anonymous);
+            net.read_attribute(AttributeId(0x0007), &mut e).unwrap();
+        }
+        let mut r2 = TlvReader::new(&buf2);
+        assert!(matches!(
+            r2.read_next().unwrap().unwrap().value,
+            TlvValue::SignedInteger(-42)
+        ));
     }
 
     #[test]

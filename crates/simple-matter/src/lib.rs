@@ -36,5 +36,6 @@ pub mod sc;
 pub mod stack;
 pub mod tlv;
 pub mod transport;
+pub mod wifi;
 
 pub use error::Error;
