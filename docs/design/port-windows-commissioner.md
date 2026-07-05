@@ -133,8 +133,8 @@ CASE over UDP)を実装する際は §3 の mDNS/UDP 論点が効いてくる。
 
 | # | リスク | 影響 | 確認方法 / 回避策 |
 |---|---|---|---|
-| R1 | WinRT スキャンで 0xFFF6 service data が取れない | discriminator 照合不能(致命) | W1 で最初に確認。ダメなら btleplug に上流パッチ |
-| R2 | subscribe 前 write が WinRT で失敗 | handshake 不能(致命) | リトライ実装。順序を入れ替える場合は chip 互換が壊れるので不可、要デバッグ |
+| R1 | WinRT スキャンで 0xFFF6 service data が取れない | discriminator 照合不能(致命) | **解消(2026-07-05 W1 実機確認)**: Windows 実機で scan → discriminator 照合が動作 |
+| R2 | subscribe 前 write が WinRT で失敗 | handshake 不能(致命) | **解消(2026-07-05 W1 実機確認)**: BTP handshake 確立まで動作 |
 | R3 | 5353 共有 bind / マルチキャスト受信が Windows 内蔵 mDNS と競合 | 運用ディスカバリ不能 | QU+ユニキャスト応答モード(§3.2)へフォールバック |
 | R4 | WinRT の GATT キャッシュによる接続不安定 | 再現性低下 | デバイス削除手順を README に明記、`disconnect` の確実な実行 |
 | R5 | fragment=20 の性能(コミッショニング所要時間) | UX のみ | 許容(Linux 実測で完走)。btleplug の MTU 公開を追う |
@@ -143,8 +143,8 @@ CASE over UDP)を実装する際は §3 の mDNS/UDP 論点が効いてくる。
 
 | フェーズ | 範囲 | 検証ゲート | 工数感 |
 |---|---|---|---|
-| **W0: ビルド整備** | `cargo check -p simple-matter-ble --features commissioner --target x86_64-pc-windows-msvc` を通す(cfg 漏れ修正)。CI に Windows ビルドチェック(GitHub Actions windows-latest または cross-check)追加 | Windows ターゲットで check/clippy green | S |
-| **W1: BLE スモーク** | Windows 実機 + USB ドングルで `ble-commissioner` を実行し、R1/R2 を確認。scan → connect → handshake 確立まで | `[btp] established` が出る(SM_BTP_TRACE で確認) | S(問題なければ)〜M(btleplug パッチ要の場合) |
+| **W0: ビルド整備** ✅(2026-07-05) | CI に windows-commissioner ジョブ追加、bluer を Linux target 依存化。Linux からは cargo-xwin で .exe をクロスビルド(gnu/gnullvm は import lib 不足で不可) | Windows ターゲットで check/clippy green | S |
+| **W1: BLE スモーク** ✅(2026-07-05 実機確認) | Windows 実機で `ble-commissioner.exe` を実行し R1/R2 とも問題なし | `[btp] established` が出る(SM_BTP_TRACE で確認) | S(問題なければ)〜M(btleplug パッチ要の場合) |
 | **W2: BLE コミッショニング** | 対向は Linux 側 `ble-onoff-light`(実績構成)。PASE→AddNOC まで | commissioner ログで AddNOC 完了 | S |
 | **W3: mDNS/UDP** | 運用 mDNS ブラウズ + CASE over UDP を Windows で。R3 に応じて QU モード実装 | Windows から Linux デバイスへ UDP コミッショニング(既存 `commissioner` example 相当)完走 | M |
 | **W4: フルパス** | BLE→UDP 遷移(commissioner 側の運用遷移が実装され次第)を Windows で chip-lighting-app 相手に | chip デバイスへのフルコミッショニング + Toggle | M(遷移実装自体は別トラック) |
