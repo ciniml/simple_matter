@@ -227,8 +227,13 @@ PASE 第 1 メッセージ(67B SDU)の 4 フラグメント再組立と ACK 返�
 - **`src/bin/hci-smoke.rs`**: trouble-host を外した生 HCI の広告スモーク
   (Reset→Set Adv Params/Data/Enable、`hcismoke` 名で広告 + 毎秒 heartbeat)。
   「コントローラ/ボード起因か、host 層起因か」の切り分けに使う。
-- PC 側 btleplug のアダプタは `SM_BLE_ADAPTER=hci1` 等で明示指定する
-  (本開発機ではスキャンできるアダプタとできないアダプタがあった)。
+- **PC 側 btleplug が発見できない問題(修正済み)**: 旧実装はスキャン時に BlueZ の
+  サービス UUID フィルタ(`SetDiscoveryFilter`)へ 0xFFF6 を渡していたが、Matter の
+  commissionable 広告は **service data のみ**(Service UUID リスト AD なし)のため、
+  BlueZ のバージョン・キャッシュ状態によっては報告されない(Android の無フィルタ
+  スキャンでは見えるのに btleplug で見えない、という実機症状)。無フィルタで
+  スキャンしてコード側で照合する方式に変更。`SM_BLE_TRACE=1` で発見デバイスと
+  照合判断をトレースできる。アダプタは `SM_BLE_ADAPTER=hci1` 等で明示指定。
 
 ### 使用バージョンと API 上の注意点(E2 で判明)
 

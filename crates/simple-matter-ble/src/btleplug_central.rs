@@ -118,13 +118,21 @@ impl GattCentral for BtleplugCentral {
     type PeerHandle = PeripheralId;
 
     async fn scan(&mut self, filter: ScanFilter) -> Result<ScanResult<Self::PeerHandle>> {
+        // `SM_BLE_TRACE=1` で発見デバイスと照合判断を stderr に出す(実機切り分け用)。
+        let trace = std::env::var_os("SM_BLE_TRACE").is_some();
+        // BlueZ 側のサービス UUID フィルタ(SetDiscoveryFilter)は使わず、
+        // 無フィルタでスキャンしてコード側で照合する。Matter の commissionable
+        // 広告は「0xFFF6 の service data のみ」で Service UUID リスト AD を
+        // 含まないため、UUID フィルタだと BlueZ のバージョン・キャッシュ状態に
+        // よって報告されないことがある(実機で発見: Android の無フィルタ
+        // スキャンでは見えるのに btleplug で見えない)。
         self.adapter
-            .start_scan(BtleScanFilter {
-                services: vec![self.matter_uuid],
-            })
+            .start_scan(BtleScanFilter::default())
             .await
             .map_err(map_btle)?;
 
+        let mut reported: std::collections::HashSet<PeripheralId> =
+            std::collections::HashSet::new();
         let deadline = std::time::Instant::now() + SCAN_TIMEOUT;
         loop {
             for p in self.adapter.peripherals().await.map_err(map_btle)? {
@@ -132,7 +140,19 @@ impl GattCentral for BtleplugCentral {
                     Some(props) => props,
                     None => continue,
                 };
-                let Some(sd) = props.service_data.get(&self.matter_uuid) else {
+                let sd = props.service_data.get(&self.matter_uuid);
+                if trace && reported.insert(p.id()) {
+                    eprintln!(
+                        "[ble-trace] seen {} name={:?} rssi={:?} service_data_uuids={:?} fff6={}",
+                        props.address,
+                        props.local_name,
+                        props.rssi,
+                        props.service_data.keys().collect::<Vec<_>>(),
+                        sd.map(|d| format!("{}B", d.len()))
+                            .unwrap_or_else(|| "none".into()),
+                    );
+                }
+                let Some(sd) = sd else {
                     continue;
                 };
                 if sd.len() < 8 {
@@ -141,6 +161,9 @@ impl GattCentral for BtleplugCentral {
                 let mut b = [0u8; 8];
                 b.copy_from_slice(&sd[..8]);
                 let Ok(adv) = AdvData::parse_service_data(&b) else {
+                    if trace {
+                        eprintln!("[ble-trace] {} fff6 parse failed: {:02x?}", props.address, &b);
+                    }
                     continue;
                 };
                 let disc_ok = filter
@@ -149,6 +172,12 @@ impl GattCentral for BtleplugCentral {
                 let vp_ok = filter
                     .vendor_product
                     .is_none_or(|(v, pi)| v == adv.vendor_id && pi == adv.product_id);
+                if trace {
+                    eprintln!(
+                        "[ble-trace] {} matter adv: disc={} vid={:#06x} pid={:#06x} -> disc_ok={} vp_ok={}",
+                        props.address, adv.discriminator, adv.vendor_id, adv.product_id, disc_ok, vp_ok,
+                    );
+                }
                 if disc_ok && vp_ok {
                     self.adapter.stop_scan().await.map_err(map_btle)?;
                     return Ok(ScanResult {

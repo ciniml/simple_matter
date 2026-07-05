@@ -92,7 +92,15 @@ handshake 確立)。次は E3(BLE コミッショニング = MatterStack 統合)
   - 実機切り分けの罠(README に詳述): **`espflash monitor --no-reset` はチップを
     flasher stub に保持し広告が止まる**(「電波が出ない」誤診の元)。観測は
     `stty` + `cat`。生 HCI スモーク bin `hci-smoke` で controller/host 層を切り分け可能。
-  - PC 側 btleplug は `SM_BLE_ADAPTER=hci1` を明示(hci0 はスキャン不調だった)。
+  - PC 側 btleplug は `SM_BLE_ADAPTER=hci1` を明示。
+  - E2 実機化後に発見・修正したバグ 2 件(2026-07-06):
+    1. **切断通知の取りこぼしで再広告停止**(デバイス側): trouble-host 0.6 は切断を
+       `try_send` で通知するためキューが埋まった瞬間の切断が落ちる → worker が 1 秒
+       周期の `is_connected()` ポーリングで確実に回収するよう修正(`2c376e9`)。
+    2. **btleplug スキャンの BlueZ UUID フィルタ**(PC 側): Matter 広告は service
+       data のみで Service UUID リスト AD を含まず、`SetDiscoveryFilter` に掛からない
+       ことがある(Android では見えるのに PC で見えない症状の正体)→ 無フィルタ +
+       コード側照合に変更、`SM_BLE_TRACE=1` トレース追加。
 
 ## 5. クロスビルド / 実機テストの実務メモ
 
