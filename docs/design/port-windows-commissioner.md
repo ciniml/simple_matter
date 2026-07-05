@@ -169,6 +169,8 @@ Windows(192.168.2.11)↔ Linux デバイス(192.168.2.14、同一 /24)で実機�
 - **結論**: W3 は「UDP コミッショニング完走」で実質達成。mDNS マルチキャスト・ディスカバリは
   環境(FW)依存の残課題で、コード欠陥ではない。実運用では運用ノードの IP が判明していれば
   IP 直指定で足りる。
+- **【追記】この FW 仮説は §3.2c の追加調査で棄却された**。真因はコード側(マルチキャスト
+  IF 未指定)で、IF 固定の実装後は FW 無変更で mDNS ブラウズが通ることを実機確認済み。
 
 ### 3.2c mDNS ディスカバリ不発の追加調査(2026-07-05 後半)
 
@@ -210,6 +212,25 @@ FW 仮説の再点検で、**FW と独立に全症状を説明できる第 2 仮
   クエリの宛先(224.0.0.251)と応答の送信元(デバイス実 IP)が異なるため Windows FW の
   ステートフル UDP 許可に一致せずブロックされ得る点に注意(= FW 起因なら QU でも落ちる)。
 
+**解決(2026-07-05 実機確定)— 真因はマルチキャスト IF 未指定**:
+
+IF 固定 + トレース版 exe を Windows 実機で実行した結果、**FW 無変更のまま mDNS ブラウズ→
+フルコミッショニング→Toggle→Read が完走**した。
+
+```text
+[discovery] mDNS QU mode: interface 192.168.2.11, ephemeral port
+[mdns-trace] query sent (37B, qu=true) from Ok(0.0.0.0:49271)
+[mdns-trace] rx 746B from 192.168.2.14:5353 parse=commissionable
+[discovery] found commissionable node at 192.168.2.14:5540 (discriminator=3840)
+...
+[done] commissioning + Toggle + Read succeeded
+```
+
+- 同一マシン・同一 FW 設定で旧 exe はタイムアウト、新 exe は成功 → **仮説 2(IF 未指定)で
+  確定、FW 仮説(§3.2b)は棄却**。connect トリックは正しく LAN 側 IF(192.168.2.11)を選択。
+- QU ユニキャスト応答(デバイス実 IP:5353 → エフェメラルポート)は Windows FW を素通し。
+  上記のステートフル不一致の懸念は実際には発現しなかった。
+
 ### 3.3 IPv6
 
 - 現状 IPv4 のみ実利用(`MDNS_IPV6 = ff02::fb` は定数のみ)。Windows の Matter
@@ -234,7 +255,7 @@ FW 仮説の再点検で、**FW と独立に全症状を説明できる第 2 仮
 | **W0: ビルド整備** ✅(2026-07-05) | CI に windows-commissioner ジョブ追加、bluer を Linux target 依存化。Linux からは cargo-xwin で .exe をクロスビルド(gnu/gnullvm は import lib 不足で不可) | Windows ターゲットで check/clippy green | S |
 | **W1: BLE スモーク** ✅(2026-07-05 実機確認) | Windows 実機で `ble-commissioner.exe` を実行し R1/R2 とも問題なし | `[btp] established` が出る(SM_BTP_TRACE で確認) | S(問題なければ)〜M(btleplug パッチ要の場合) |
 | **W2: BLE コミッショニング** ✅(2026-07-05 実機確認) | Windows 実機の `ble-commissioner.exe` → Linux 側 `ble-onoff-light` に対し、PASE→AddNOC→CASE→CommissioningComplete→OnOff Toggle まで**フル完走**(デバイス側で属性反映・正常切断を確認)。fragment=20(btleplug が MTU 非公開のため)で 115 フラグメント往復 | commissioner ログで AddNOC 完了 | S |
-| **W3: UDP コミッショニング** ✅(2026-07-05 実機確認) / **mDNS ディスカバリ** 🔶(環境要因で保留) | Windows `commissioner.exe 20202021 192.168.2.14 5540`(IP 直指定)で **UDP フルコミッショニング完走**(PASE→CASE→運用→Toggle 反映)。Windows=192.168.2.11 / デバイス=192.168.2.14 の同一サブネットで UDP ユニキャスト到達 OK、W3 のトランスポート/CASE/IM コードは正常。**mDNS マルチキャストブラウズは 35 秒タイムアウト**(§3.3)。responder の QU ユニキャスト応答・REUSEPORT→REUSEADDR・browse 再クエリ+35 秒 window を実装済み。コアロジックは単体テスト済み | IP 直指定で UDP フル完走 ✅ / mDNS 発見は §3.3 | M |
+| **W3: mDNS/UDP** ✅(2026-07-05 実機フル確認) | Windows `commissioner.exe 20202021`(IP 指定なし)で **mDNS ブラウズ→発見→UDP フルコミッショニング→Toggle→Read 完走**。当初 mDNS が 35 秒タイムアウトした真因は**マルチキャスト送信/join の IF 未指定**(仮想アダプタが既定 IF に張り付くとクエリが LAN に出ない)で、LAN 向き IF への明示固定で解決(§3.2c)。QU ユニキャスト応答・REUSEPORT→REUSEADDR・browse 再クエリ+35 秒 window・`SM_MDNS_TRACE` トレースも実装済み | `[discovery] found ...` → フル完走 ✅ | M |
 | **W4: フルパス** | BLE→UDP 遷移(commissioner 側の運用遷移が実装され次第)を Windows で chip-lighting-app 相手に | chip デバイスへのフルコミッショニング + Toggle | M(遷移実装自体は別トラック) |
 
 **総工数感: M**(R1/R2 が素直に通れば W0-W2 は小さく、mDNS 共存が主戦場)。
