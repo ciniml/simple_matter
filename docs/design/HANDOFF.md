@@ -108,6 +108,13 @@ CASE 再確立+Toggle、2026-07-06)。次は E5(実 WiFi join + UDP/mDNS)**。
   Toggle 反映、連続 2 fabric も成功)。NanoC6 青 LED(GPIO7)が OnOff に追従。
   乱数は全箇所 TRNG 直結、毎周 stack.poll() + BTP flush(NoSpace 教訓の移植)。
   RAM 静的 ≈149KB / 512KB。fabric 永続化なし(E4)・実 WiFi なし(E5)。
+  - **chip-tool 相互試験も BLE 区間フル成功(2026-07-06、e4-ble-light 相手)**:
+    `chip-tool pairing ble-wifi 1 TESTSSID testpass 20202021 3840 --ble-controller 0
+    --bypass-attestation-verifier true` で BTP 確立(**fragment=244** = 実 MTU 交渉、
+    大フラグメント経路も実証)→ PASE→AddNOC 成功(デバイスで `[kvs] saved 2 fabrics`)
+    → ConnectNetwork(シム)→ BLE クリーン切断まで完走。その後の運用 mDNS 発見
+    (FindOperationalForStayActive)は UDP/mDNS 未実装のためタイムアウト = **期待どおり、
+    E5 のゲートそのもの**。
 - **E4** ✅ 実機確認(2026-07-06、NanoC6): fabric 永続化。コアに `kvs::Kvs` trait +
   `FabricTable::save_to/load_from`(TLV versioned、設計は port-esp32-device.md
   「E4 設計」節)、運用鍵は `P256Keypair::to_bytes`(既存)で往復、CA 証明書は
@@ -167,7 +174,7 @@ CASE 再確立+Toggle、2026-07-06)。次は E5(実 WiFi join + UDP/mDNS)**。
 
 1. **E5 以降**: 実 WiFi join + UDP/mDNS(embassy-net、WifiDriver trait)→
    bloat-check(E6)(`port-esp32-device.md` のフェーズ表)。E3 の chip-tool
-   `pairing ble-wifi` 相互試験も未実施(PC 版と同一 DataModel なので通る想定)。
+   相互試験は BLE 区間フル成功済み(残るは E5 後の運用 mDNS→CASE over UDP)。
    E4 で追加: コア `kvs::Kvs` trait + `FabricTable::save_to/load_from`(TLV)、
    PC 側 ble-commissioner の CA 永続化(`ca-state.bin`)+ `--operational` モード。
    PC 側の罠: BlueZ は過去ブートの FFF6 広告をキャッシュし stale アドレスへの
