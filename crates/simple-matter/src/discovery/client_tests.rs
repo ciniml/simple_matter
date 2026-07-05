@@ -135,7 +135,8 @@ fn resolve_operational_query_wire_format() {
     let fabric: u64 = 0x2906_C908_D115_D362;
     let node: u64 = 0x8FC7_7724_02CC_9DB4;
     let mut q = [0u8; 256];
-    let len = MdnsClient::build_resolve_operational(&mut q, &fabric.to_be_bytes(), node, false).unwrap();
+    let len =
+        MdnsClient::build_resolve_operational(&mut q, &fabric.to_be_bytes(), node, false).unwrap();
     let parsed = dns::Query::parse(&q[..len]).unwrap();
     let question = parsed.questions().next().unwrap();
     assert_eq!(question.qtype, dns::T_SRV);

@@ -140,7 +140,11 @@ impl MdnsClient {
         let mut inst = [0u8; 33];
         operational_instance_label(compressed_fabric_id, node_id, &mut inst);
         let mut w = QueryWriter::new(out)?;
-        w.question(&[&inst, b"_matter", b"_tcp", b"local"], T_SRV, unicast_response)?;
+        w.question(
+            &[&inst, b"_matter", b"_tcp", b"local"],
+            T_SRV,
+            unicast_response,
+        )?;
         Ok(w.finish())
     }
 

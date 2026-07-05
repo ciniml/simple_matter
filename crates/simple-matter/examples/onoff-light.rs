@@ -281,9 +281,18 @@ fn main() -> std::io::Result<()> {
         // 4) mDNS の受信応答と announce。
         if let Some(msock) = &mdns_socket {
             match msock.recv_from(&mut mdns_rx) {
-                Ok((n, _src)) => {
+                Ok((n, src)) => {
+                    // QU(unicast-response)クエリには送信元へユニキャストで返す
+                    // (5353 を共有できない querier 対策。RFC 6762 §5.4)。それ以外は
+                    // 従来どおりマルチキャスト。
+                    let qu = mdns.query_wants_unicast(&mdns_rx[..n]);
                     if let Some(len) = mdns.handle_query(&mdns_rx[..n], &mut mdns_tx) {
-                        let _ = msock.send_to(&mdns_tx[..len], (MDNS_IPV4, MDNS_PORT));
+                        let dst = if qu {
+                            src
+                        } else {
+                            (MDNS_IPV4, MDNS_PORT).into()
+                        };
+                        let _ = msock.send_to(&mdns_tx[..len], dst);
                     }
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
@@ -314,8 +323,11 @@ fn open_mdns_socket() -> Option<UdpSocket> {
         Some(socket2::Protocol::UDP),
     )
     .ok()?;
+    // SO_REUSEADDR のみ。SO_REUSEPORT はマルチキャストを listener 間で **ロードバランス**
+    // (=1 つに振り分けて他が取りこぼす)ため、avahi 等と共存すると受信クエリを奪われる。
+    // REUSEADDR だけなら同一マルチキャストポートへの複数 bind が許され、全 listener が
+    // 全マルチキャストを受信する(mDNS の定石)。
     socket.set_reuse_address(true).ok()?;
-    socket.set_reuse_port(true).ok()?;
     socket
         .bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, MDNS_PORT)).into())
         .ok()?;

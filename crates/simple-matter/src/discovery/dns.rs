@@ -371,6 +371,8 @@ pub struct Question {
     pub name: Name,
     /// 質問種別(`T_*`)。
     pub qtype: u16,
+    /// QCLASS の QU ビット(RFC 6762 §5.4)。querier がユニキャスト応答を要求している。
+    pub unicast: bool,
 }
 
 /// 質問セクションのイテレータ。
@@ -394,9 +396,14 @@ impl Iterator for Questions<'_> {
             return None;
         }
         let qtype = u16::from_be_bytes([self.pkt[after], self.pkt[after + 1]]);
+        let qclass = u16::from_be_bytes([self.pkt[after + 2], self.pkt[after + 3]]);
         self.pos = after + 4;
         self.left -= 1;
-        Some(Question { name, qtype })
+        Some(Question {
+            name,
+            qtype,
+            unicast: qclass & 0x8000 != 0,
+        })
     }
 }
 

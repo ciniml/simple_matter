@@ -357,11 +357,28 @@ impl<const NOPS: usize> MdnsResponder<NOPS> {
         }
     }
 
+    /// 受信クエリが unicast 応答(QU ビット、RFC 6762 §5.4)を要求しているか。
+    ///
+    /// いずれかの質問で QU ビットが立っていれば `true`。呼び出し側(統合層)は、`true` の
+    /// ときは [`handle_query`](Self::handle_query) の応答をマルチキャスト
+    /// (224.0.0.251:5353)ではなく **クエリ送信元へユニキャスト**で返すべきである。
+    /// これは 5353 を共有 bind できない querier(Windows 内蔵 mDNS と競合する commissioner
+    /// 等)との相互運用に必要(docs/design/port-windows-commissioner.md §3.2)。
+    /// マッチ判定はしない(QU の有無のみ)ので、`handle_query` が `Some` を返したときに併用する。
+    pub fn query_wants_unicast(&self, packet: &[u8]) -> bool {
+        dns::Query::parse(packet)
+            .map(|q| q.questions().any(|question| question.unicast))
+            .unwrap_or(false)
+    }
+
     /// 受信 mDNS クエリを解析し、自サービスに関係する質問があれば応答を生成する。
     ///
     /// 応答すべき質問が 1 件も無い、または不正入力なら `None`(panic しない)。
     /// 応答は「マッチしたサービスの完全なレコード集合」を返す(PTR を回答、
     /// SRV/TXT/A/AAAA を追加情報に)。実コミッショナはこの形を受理できる。
+    ///
+    /// 応答の宛先(マルチキャスト or ユニキャスト)は呼び出し側が決める。
+    /// [`query_wants_unicast`](Self::query_wants_unicast) を参照。
     pub fn handle_query(&self, packet: &[u8], out: &mut [u8]) -> Option<usize> {
         let query = Query::parse(packet)?;
 

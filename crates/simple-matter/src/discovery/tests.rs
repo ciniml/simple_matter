@@ -410,3 +410,40 @@ fn build_query(name: &[&[u8]], qtype: u16) -> [u8; 256] {
     buf[pos..pos + 2].copy_from_slice(&dns::C_IN.to_be_bytes());
     buf
 }
+
+/// QCLASS の QU ビット(RFC 6762 §5.4)を立てた PTR クエリを組み立てる。
+fn build_qu_query(name: &[&[u8]], qtype: u16) -> [u8; 256] {
+    let mut buf = build_query(name, qtype);
+    // QCLASS は名前 + qtype(2) + qclass(2) の末尾 2 バイト。build_query と同じ配置を再計算する。
+    let mut pos = 12;
+    for label in name {
+        pos += 1 + label.len();
+    }
+    pos += 1 + 2; // 名前終端 + qtype
+    let qu = dns::C_IN | 0x8000;
+    buf[pos..pos + 2].copy_from_slice(&qu.to_be_bytes());
+    buf
+}
+
+/// QU クエリを検出し、応答自体は非 QU と同一に生成する
+/// (宛先ユニキャスト化は呼び出し側の責務、port-windows-commissioner.md §3.2)。
+#[test]
+fn detects_qu_unicast_requests() {
+    let mut mdns: MdnsResponder<4> = MdnsResponder::new(test_host(), MATTER_PORT);
+    mdns.set_commissionable(Some(test_commissionable()));
+
+    let name: &[&[u8]] = &[b"_matterc", b"_udp", b"local"];
+    let plain = build_query(name, dns::T_PTR);
+    let qu = build_qu_query(name, dns::T_PTR);
+
+    // QU 検出。
+    assert!(!mdns.query_wants_unicast(&plain));
+    assert!(mdns.query_wants_unicast(&qu));
+
+    // 応答内容は QU 有無に依らず同一(QU は宛先選択のみに影響)。
+    let mut a = [0u8; 1400];
+    let mut b = [0u8; 1400];
+    let la = mdns.handle_query(&plain, &mut a).unwrap();
+    let lb = mdns.handle_query(&qu, &mut b).unwrap();
+    assert_eq!(&a[..la], &b[..lb]);
+}

@@ -101,16 +101,41 @@ CASE over UDP)を実装する際は §3 の mDNS/UDP 論点が効いてくる。
 
 ## 3. UDP / mDNS の論点(BLE→UDP 遷移・運用 CASE 用)
 
+### 3.0 W3 実装で判明した重要な事実(2026-07-05)
+
+W3 の実装中、Linux 開発機(avahi 常駐)で mDNS の実挙動を精査して次を確定した。W3 の
+コード修正はこの知見に基づく。
+
+- **`SO_REUSEPORT` はマルチキャストを listener 間でロードバランス(=1 つに振り分け)する**。
+  avahi と 5353 を共有していると、我々のデバイスの mDNS ソケットは受信クエリを avahi に
+  奪われ、**外部クエリを 1 つも受信しない**(デバイス側の recv ログで確認)。にもかかわらず
+  UDP コミッショニングが成立していたのは、(a) avahi がデバイスの announce をキャッシュして
+  クエリに代理応答する、または (b) commissioner がデバイスの**定期 announce を拾う**ため。
+  → 修正: 全 mDNS listener を **`SO_REUSEADDR` のみ**にした(REUSEPORT はマルチキャスト
+  listener には誤り。REUSEADDR なら同一ポートへの複数 bind で全ソケットが全マルチキャストを
+  受信するのが本来の mDNS 定石)。
+- **デバイスが QU クエリにマルチキャストで応答していた**(旧コード)。これが W2 後の
+  Windows 実機タイムアウトの直接原因の 1 つ。QU querier(エフェメラルポート、5353 非 bind)は
+  マルチキャスト応答を受け取れない。→ 修正: responder に `query_wants_unicast` を追加し、
+  QU クエリには**送信元へユニキャスト**で応答するよう両デバイス example を変更。
+- **発見が定期 announce 依存になり得る**ため、commissioner の browse window(旧 5 秒)は
+  デバイスの再 announce 間隔(既定 30 秒)より短いと取りこぼす。→ 修正: browse を
+  **35 秒 window + 2 秒ごとの再クエリ**にし、「デバイスが受信できれば即応答/できなければ
+  announce を拾う」の両取りにした。
+- **未解決(要クリーン環境)**: avahi 常駐の開発機では、REUSEADDR 化後もデバイスの mDNS 受信は
+  avahi の REUSEPORT ソケットの存在に影響され安定しない(グループに 1 つでも REUSEPORT
+  ソケットがあると配送意味論が変わる)。QU ユニキャスト応答の socket レベル E2E は
+  **avahi の無い環境**(実 Windows↔avahi 無し Linux、または responder 専有ホスト)でのみ
+  クリーンに検証できる。コアの QU 検出・応答生成ロジックは単体テストで検証済み
+  (`discovery::tests::detects_qu_unicast_requests`)。
+
 ### 3.1 ソケットオプション
 
-- 現 examples の `open_mdns_socket()` は socket2 で **SO_REUSEADDR** → 5353 bind →
-  `join_multicast_v4`。Linux では avahi と共存するために SO_REUSEPORT 相当の挙動を
-  期待しているが、**Windows に SO_REUSEPORT はない**。Windows の SO_REUSEADDR は
-  Linux の REUSEPORT に近い「完全共有」を許す(セキュリティ的にはむしろ緩い)ため、
-  bind 自体は通る見込み。
-- ただし **マルチキャスト受信の配送**は「同一グループに join した全ソケット」に届くのが
-  原則だが、Windows 内蔵 mDNS(Dnscache が 5353 を掴む、Win10 1703+)や Bonjour
-  (iTunes 等が入れる mDNSResponder)との共存時の実挙動は環境依存(未確認)。
+- 現 examples の `open_mdns_socket()` は socket2 で **SO_REUSEADDR のみ** → 5353 bind →
+  `join_multicast_v4`(§3.0 で REUSEPORT を除去)。Windows に SO_REUSEPORT はなく、
+  Windows の SO_REUSEADDR は「完全共有」を許すため bind 自体は通る見込み。ただし Windows
+  では commissioner は 5353 を共有せず**エフェメラルポート + QU**(§3.2)を使うため、
+  内蔵 mDNS(Dnscache)や Bonjour との 5353 競合を最初から回避する。
 
 ### 3.2 フォールバック: QU クエリ + ユニキャスト応答
 
@@ -146,7 +171,7 @@ CASE over UDP)を実装する際は §3 の mDNS/UDP 論点が効いてくる。
 | **W0: ビルド整備** ✅(2026-07-05) | CI に windows-commissioner ジョブ追加、bluer を Linux target 依存化。Linux からは cargo-xwin で .exe をクロスビルド(gnu/gnullvm は import lib 不足で不可) | Windows ターゲットで check/clippy green | S |
 | **W1: BLE スモーク** ✅(2026-07-05 実機確認) | Windows 実機で `ble-commissioner.exe` を実行し R1/R2 とも問題なし | `[btp] established` が出る(SM_BTP_TRACE で確認) | S(問題なければ)〜M(btleplug パッチ要の場合) |
 | **W2: BLE コミッショニング** ✅(2026-07-05 実機確認) | Windows 実機の `ble-commissioner.exe` → Linux 側 `ble-onoff-light` に対し、PASE→AddNOC→CASE→CommissioningComplete→OnOff Toggle まで**フル完走**(デバイス側で属性反映・正常切断を確認)。fragment=20(btleplug が MTU 非公開のため)で 115 フラグメント往復 | commissioner ログで AddNOC 完了 | S |
-| **W3: mDNS/UDP** | 運用 mDNS ブラウズ + CASE over UDP を Windows で。R3 に応じて QU モード実装 | Windows から Linux デバイスへ UDP コミッショニング(既存 `commissioner` example 相当)完走 | M |
+| **W3: mDNS/UDP** 🔶(2026-07-05 実装・コア検証済み / Windows 実機再検証待ち) | UDP コミッショナの Windows 移植(QU クエリ + エフェメラルポート、§3.2)、responder の QU ユニキャスト応答、REUSEPORT→REUSEADDR、browse 再クエリ + 35 秒 window(§3.0)。Linux UDP フルパスは改修後も回帰なし。QU socket E2E は avahi 常駐機ではクリーン検証不可(§3.0)、コアロジックは単体テスト済み | Windows commissioner.exe で `[discovery] found ...` → フル完走 | M |
 | **W4: フルパス** | BLE→UDP 遷移(commissioner 側の運用遷移が実装され次第)を Windows で chip-lighting-app 相手に | chip デバイスへのフルコミッショニング + Toggle | M(遷移実装自体は別トラック) |
 
 **総工数感: M**(R1/R2 が素直に通れば W0-W2 は小さく、mDNS 共存が主戦場)。

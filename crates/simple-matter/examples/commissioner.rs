@@ -64,8 +64,12 @@ const ONOFF_CMD_TOGGLE: CommandId = CommandId(0x02);
 
 /// 全体タイムアウト(コミッショニング + 運用往復)。
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(30);
-/// mDNS ブラウズのタイムアウト。
-const MDNS_TIMEOUT: Duration = Duration::from_secs(5);
+/// mDNS ブラウズのタイムアウト。デバイスの再 announce 間隔(既定 30 秒)より長く取り、
+/// クエリに応答できないデバイス(5353 共有で受信を取りこぼす場合)でも定期 announce を
+/// 確実に拾えるようにする。
+const MDNS_TIMEOUT: Duration = Duration::from_secs(35);
+/// ブラウズ中にクエリを再送する間隔。
+const MDNS_REQUERY_INTERVAL: Duration = Duration::from_secs(2);
 
 type Backend = RustCrypto<DemoRng>;
 type Ctrl<'s> = ControllerStack<'s, Backend, DemoRng, ControllerCreds<'s, Backend>, 4, 6, 3, 1280>;
@@ -459,9 +463,19 @@ fn browse_commissionable() -> Option<SocketAddr> {
     let qlen = MdnsClient::build_browse_commissionable(&mut query, qu).ok()?;
     let _ = socket.send_to(&query[..qlen], (MDNS_IPV4, MDNS_PORT));
 
+    // クエリを周期的に再送する。デバイスが 5353 を他の mDNS レスポンダ(avahi 等)と
+    // 共有していると受信クエリを取りこぼすことがあり、その場合は発見が「デバイスの定期
+    // announce(既定 30 秒間隔)を拾う」ことに依存する。そこで window を announce 間隔より
+    // 長く取り、クエリも再送して「デバイスが受信できる場合は即応答/できない場合は announce」
+    // の両取りにする(docs/design/port-windows-commissioner.md §3)。
     let start = Instant::now();
+    let mut last_query = Instant::now();
     let mut rx = [0u8; 1500];
     while start.elapsed() < MDNS_TIMEOUT {
+        if last_query.elapsed() >= MDNS_REQUERY_INTERVAL {
+            let _ = socket.send_to(&query[..qlen], (MDNS_IPV4, MDNS_PORT));
+            last_query = Instant::now();
+        }
         match socket.recv_from(&mut rx) {
             Ok((n, _src)) => {
                 if let Some(node) = MdnsClient::parse_commissionable(&rx[..n]) {
@@ -514,8 +528,9 @@ fn open_mdns_socket() -> Option<(UdpSocket, bool)> {
             Some(socket2::Protocol::UDP),
         )
         .ok()?;
+        // SO_REUSEADDR のみ(SO_REUSEPORT はマルチキャストを listener 間でロードバランス
+        // して取りこぼす。onoff-light の open_mdns_socket 参照)。
         socket.set_reuse_address(true).ok()?;
-        socket.set_reuse_port(true).ok()?;
         socket
             .bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, MDNS_PORT)).into())
             .ok()?;
