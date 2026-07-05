@@ -453,10 +453,10 @@ fn report_phase(phase: Phase) {
 /// `_matterc._udp.local` を PTR ブラウズし、最初に発見した commissionable ノードの
 /// (アドレス, ポート)を返す(discriminator 指定なし)。
 fn browse_commissionable() -> Option<SocketAddr> {
-    let socket = open_mdns_socket()?;
+    let (socket, qu) = open_mdns_socket()?;
 
     let mut query = [0u8; 128];
-    let qlen = MdnsClient::build_browse_commissionable(&mut query).ok()?;
+    let qlen = MdnsClient::build_browse_commissionable(&mut query, qu).ok()?;
     let _ = socket.send_to(&query[..qlen], (MDNS_IPV4, MDNS_PORT));
 
     let start = Instant::now();
@@ -497,28 +497,45 @@ fn browse_commissionable() -> Option<SocketAddr> {
     None
 }
 
-/// mDNS 用 UDP ソケットを開き 224.0.0.251 グループに参加する(onoff-light と同じパターン)。
+/// mDNS 用 UDP ソケットを開く。戻りの `bool` は「QU(unicast-response)モードか」。
 ///
-/// ポート 5353 を他プロセス(avahi 等)が使用中でも共存できるよう SO_REUSEADDR/REUSEPORT を
-/// 立ててから bind する。開けなければ `None`。
-fn open_mdns_socket() -> Option<UdpSocket> {
-    let socket = socket2::Socket::new(
-        socket2::Domain::IPV4,
-        socket2::Type::DGRAM,
-        Some(socket2::Protocol::UDP),
-    )
-    .ok()?;
-    socket.set_reuse_address(true).ok()?;
-    socket.set_reuse_port(true).ok()?;
-    socket
-        .bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, MDNS_PORT)).into())
+/// - **Unix**: 224.0.0.251:5353 の共有 bind(SO_REUSEADDR/REUSEPORT で avahi と共存)。
+///   マルチキャスト応答を受けるので QU 不要(`false`)。実績のある経路(変更なし)。
+/// - **Windows**: 5353 は内蔵 mDNS(Dnscache)が掴んでおり、共有 bind してもマルチキャスト
+///   応答の配送が環境依存で不安定なため、**エフェメラルポート + QU ビット**で応答を
+///   自ポートへのユニキャストで受ける(RFC 6762 §5.4、
+///   docs/design/port-windows-commissioner.md §3.2)。
+fn open_mdns_socket() -> Option<(UdpSocket, bool)> {
+    #[cfg(unix)]
+    {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
         .ok()?;
-    let socket: UdpSocket = socket.into();
-    socket
-        .join_multicast_v4(&MDNS_IPV4, &Ipv4Addr::UNSPECIFIED)
-        .ok()?;
-    socket
-        .set_read_timeout(Some(Duration::from_millis(100)))
-        .ok()?;
-    Some(socket)
+        socket.set_reuse_address(true).ok()?;
+        socket.set_reuse_port(true).ok()?;
+        socket
+            .bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, MDNS_PORT)).into())
+            .ok()?;
+        let socket: UdpSocket = socket.into();
+        socket
+            .join_multicast_v4(&MDNS_IPV4, &Ipv4Addr::UNSPECIFIED)
+            .ok()?;
+        socket
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .ok()?;
+        Some((socket, false))
+    }
+    #[cfg(not(unix))]
+    {
+        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+        // マルチキャスト応答(QU を無視する responder 対策)も拾えるよう join はしておく。
+        let _ = socket.join_multicast_v4(&MDNS_IPV4, &Ipv4Addr::UNSPECIFIED);
+        socket
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .ok()?;
+        Some((socket, true))
+    }
 }

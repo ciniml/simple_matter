@@ -94,23 +94,33 @@ pub struct MdnsClient;
 impl MdnsClient {
     /// `_matterc._udp.local` の PTR クエリ(commissionable browse)を `out` に生成する。
     ///
-    /// 戻りは書き込んだバイト長。
-    pub fn build_browse_commissionable(out: &mut [u8]) -> Result<usize> {
+    /// 戻りは書き込んだバイト長。`unicast_response` は QCLASS の QU ビット(RFC 6762
+    /// §5.4)を立て、応答を送信元ポートへのユニキャストで要求する。5353 の共有 bind が
+    /// できない環境(Windows の内蔵 mDNS と競合する場合等)向けのフォールバック
+    /// (docs/design/port-windows-commissioner.md §3.2)。通常のマルチキャスト運用では
+    /// `false` にする。
+    pub fn build_browse_commissionable(out: &mut [u8], unicast_response: bool) -> Result<usize> {
         let mut w = QueryWriter::new(out)?;
-        w.question(&SVC_COMMISSIONABLE, T_PTR, false)?;
+        w.question(&SVC_COMMISSIONABLE, T_PTR, unicast_response)?;
         Ok(w.finish())
     }
 
     /// long discriminator サブタイプ(`_L<d>._sub._matterc._udp.local`)での絞り込み
     /// PTR クエリを `out` に生成する。
-    pub fn build_browse_discriminator(out: &mut [u8], discriminator: u16) -> Result<usize> {
+    /// `unicast_response` は [`build_browse_commissionable`](MdnsClient::build_browse_commissionable)
+    /// と同じ QU ビット。
+    pub fn build_browse_discriminator(
+        out: &mut [u8],
+        discriminator: u16,
+        unicast_response: bool,
+    ) -> Result<usize> {
         let mut sub = [0u8; 8]; // "_L" + 最大 5 桁
         let sub_len = fmt_subtype_l(discriminator, &mut sub);
         let mut w = QueryWriter::new(out)?;
         w.question(
             &[&sub[..sub_len], b"_sub", b"_matterc", b"_udp", b"local"],
             T_PTR,
-            false,
+            unicast_response,
         )?;
         Ok(w.finish())
     }
@@ -119,15 +129,18 @@ impl MdnsClient {
     /// SRV クエリを `out` に生成する(応答の additional で A/AAAA が同梱される)。
     ///
     /// `compressed_fabric_id` は big-endian 8 バイト。
+    /// `unicast_response` は [`build_browse_commissionable`](MdnsClient::build_browse_commissionable)
+    /// と同じ QU ビット。
     pub fn build_resolve_operational(
         out: &mut [u8],
         compressed_fabric_id: &[u8; 8],
         node_id: u64,
+        unicast_response: bool,
     ) -> Result<usize> {
         let mut inst = [0u8; 33];
         operational_instance_label(compressed_fabric_id, node_id, &mut inst);
         let mut w = QueryWriter::new(out)?;
-        w.question(&[&inst, b"_matter", b"_tcp", b"local"], T_SRV, false)?;
+        w.question(&[&inst, b"_matter", b"_tcp", b"local"], T_SRV, unicast_response)?;
         Ok(w.finish())
     }
 

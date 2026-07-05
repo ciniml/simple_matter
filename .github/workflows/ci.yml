@@ -69,5 +69,8 @@ jobs:
         run: cargo check -p simple-matter-ble --all-features
       - name: Check ble-commissioner example
         run: cargo check -p simple-matter-ble --features commissioner --examples
+      # UDP コミッショナ example も Windows 対応(W3: QU クエリモード)。
+      - name: Check UDP commissioner example
+        run: cargo check -p simple-matter --features controller --example commissioner
       - name: Clippy (commissioner)
         run: cargo clippy -p simple-matter-ble --features commissioner -- -D warnings

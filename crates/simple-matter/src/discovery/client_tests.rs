@@ -34,7 +34,7 @@ fn commissionable_response(instance_id: u64, discriminator: u16, out: &mut [u8])
         CommissioningMode::Standard,
     )));
     let mut q = [0u8; 256];
-    let qlen = MdnsClient::build_browse_commissionable(&mut q).unwrap();
+    let qlen = MdnsClient::build_browse_commissionable(&mut q, false).unwrap();
     mdns.handle_query(&q[..qlen], out).unwrap()
 }
 
@@ -90,7 +90,7 @@ fn roundtrip_operational_resolve() {
 
     let cfid = fabric.to_be_bytes();
     let mut q = [0u8; 256];
-    let qlen = MdnsClient::build_resolve_operational(&mut q, &cfid, node).unwrap();
+    let qlen = MdnsClient::build_resolve_operational(&mut q, &cfid, node, false).unwrap();
     let mut out = [0u8; 1400];
     let len = mdns.handle_query(&q[..qlen], &mut out).unwrap();
 
@@ -109,7 +109,7 @@ fn roundtrip_operational_resolve() {
 #[test]
 fn browse_commissionable_query_wire_format() {
     let mut q = [0u8; 256];
-    let len = MdnsClient::build_browse_commissionable(&mut q).unwrap();
+    let len = MdnsClient::build_browse_commissionable(&mut q, false).unwrap();
     let parsed = dns::Query::parse(&q[..len]).unwrap();
     let mut it = parsed.questions();
     let question = it.next().unwrap();
@@ -121,7 +121,7 @@ fn browse_commissionable_query_wire_format() {
 #[test]
 fn browse_discriminator_query_wire_format() {
     let mut q = [0u8; 256];
-    let len = MdnsClient::build_browse_discriminator(&mut q, 3840).unwrap();
+    let len = MdnsClient::build_browse_discriminator(&mut q, 3840, false).unwrap();
     let parsed = dns::Query::parse(&q[..len]).unwrap();
     let question = parsed.questions().next().unwrap();
     assert_eq!(question.qtype, dns::T_PTR);
@@ -135,7 +135,7 @@ fn resolve_operational_query_wire_format() {
     let fabric: u64 = 0x2906_C908_D115_D362;
     let node: u64 = 0x8FC7_7724_02CC_9DB4;
     let mut q = [0u8; 256];
-    let len = MdnsClient::build_resolve_operational(&mut q, &fabric.to_be_bytes(), node).unwrap();
+    let len = MdnsClient::build_resolve_operational(&mut q, &fabric.to_be_bytes(), node, false).unwrap();
     let parsed = dns::Query::parse(&q[..len]).unwrap();
     let question = parsed.questions().next().unwrap();
     assert_eq!(question.qtype, dns::T_SRV);
@@ -172,7 +172,7 @@ fn malformed_input_does_not_panic() {
 
     // 出力バッファが小さすぎてもクエリ生成は panic せず Err。
     let mut tiny = [0u8; 4];
-    assert!(MdnsClient::build_browse_commissionable(&mut tiny).is_err());
+    assert!(MdnsClient::build_browse_commissionable(&mut tiny, false).is_err());
 }
 
 // ---- (d) 結果テーブル満杯 / 重複 ----
@@ -214,4 +214,32 @@ fn discriminator_filter() {
     // 一致は Added。
     assert_eq!(set.ingest_filtered(&out[..len], 1234), Ingest::Added);
     assert_eq!(set.len(), 1);
+}
+
+/// QU ビット(RFC 6762 §5.4)指定でクエリの QCLASS 最上位ビットが立つ
+/// (Windows の 5353 非共有環境向けユニキャスト応答要求、port-windows-commissioner.md §3.2)。
+#[test]
+fn browse_query_sets_qu_bit_when_requested() {
+    let mut q = [0u8; 128];
+
+    // QU なし: QCLASS = IN(0x0001)。
+    let len = MdnsClient::build_browse_commissionable(&mut q, false).unwrap();
+    let qclass = u16::from_be_bytes([q[len - 2], q[len - 1]]);
+    assert_eq!(qclass, 0x0001);
+
+    // QU あり: 最上位ビットが立つ(0x8001)。名前・QTYPE 部分は同一。
+    let mut qu = [0u8; 128];
+    let len_qu = MdnsClient::build_browse_commissionable(&mut qu, true).unwrap();
+    assert_eq!(len, len_qu);
+    assert_eq!(&q[..len - 2], &qu[..len_qu - 2]);
+    let qclass_qu = u16::from_be_bytes([qu[len_qu - 2], qu[len_qu - 1]]);
+    assert_eq!(qclass_qu, 0x8001);
+
+    // resolve / discriminator ビルダーも同じ QU 経路を通る。
+    let mut r = [0u8; 128];
+    let rlen = MdnsClient::build_resolve_operational(&mut r, &[0u8; 8], 1, true).unwrap();
+    assert_eq!(u16::from_be_bytes([r[rlen - 2], r[rlen - 1]]), 0x8001);
+    let mut d = [0u8; 128];
+    let dlen = MdnsClient::build_browse_discriminator(&mut d, 3840, true).unwrap();
+    assert_eq!(u16::from_be_bytes([d[dlen - 2], d[dlen - 1]]), 0x8001);
 }
