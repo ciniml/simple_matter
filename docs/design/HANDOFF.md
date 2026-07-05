@@ -99,19 +99,32 @@ W3 実装済みだが実機で mDNS ディスカバリがタイムアウト(ネ�
   いると配送が安定しない。**QU の socket レベル E2E は avahi の無い環境でしか検証不可**
   (コアロジックは単体テスト済み)。avahi は共有サービスのため停止不可。
 
-## 6. W3 の切り分け結果(2026-07-05 確定)
+## 6. W3 の切り分け結果(2026-07-05 確定 + 同日後半の追加調査)
 
 **確定**: Windows(192.168.2.11)↔ Linux デバイス(192.168.2.14、同一 /24)で:
 - **UDP 直指定はフル完走**(`commissioner.exe 20202021 192.168.2.14 5540`)。トランスポート・
   CASE・IM・W3 コードは正常。
-- **mDNS マルチキャストブラウズのみ 35 秒タイムアウト** → Windows Defender ファイアウォールの
-  マルチキャスト inbound ブロックが最有力(コード欠陥ではない)。
+- **mDNS マルチキャストブラウズのみ 35 秒タイムアウト**。
 
-**未完(任意・ユーザ環境側)**: mDNS も通したい場合の FW 切り分け・恒久ルールは
-`port-windows-commissioner.md` §3.2b に記載。管理者 PowerShell で
-`Set-NetFirewallProfile -Profile Private -Enabled False` にして mDNS ブラウズが通れば FW 確定、
-恒久策は commissioner.exe への inbound UDP 許可ルール。これはコード作業ではないので、
-W3 は「UDP コミッショニング完走」で実質達成とみなす。
+**追加調査で確定(2026-07-05 後半、詳細 `port-windows-commissioner.md` §3.2c)**:
+- **デバイスの QU ユニキャスト応答は E2E で正常**(avahi 不在の docker + lo 閉域で実測。
+  §5 の「QU の socket E2E は avahi の無い環境でしか検証不可」は解消済み)。デバイス側はシロ。
+- 原因仮説は 2 本立てになった:
+  1. **Windows FW のマルチキャスト inbound ブロック**(従来仮説)。QU 応答ユニキャストも
+     「クエリ宛先(マルチキャスト)≠ 応答送信元(実 IP)」でステートフル許可に一致せず
+     落ち得る。
+  2. **Windows 側のマルチキャスト IF 未指定**(コード欠陥の可能性、新仮説)。仮想アダプタ
+     (WSL/Hyper-V/VPN)が既定 IF だとクエリが LAN に出ない。→ **対策実装済み**:
+     LAN 向き IF への `IP_MULTICAST_IF` + join 固定(connect トリック)。
+- **ブラウズトレース追加**: `SM_MDNS_TRACE=1` で送出クエリと受信パケット(送信元・パース結果)
+  を stderr に表示。次回 Windows 実機ラン 1 回で仮説を判別できる(判定表は §3.2c)。
+- Linux フルパス(ブラウズ→コミッショニング→Toggle→Read)は改修後も回帰なし(実測 green)。
+
+**次の一手(Windows 実機、ユーザ操作要)**: 再クロスビルド済みの
+`target/x86_64-pc-windows-msvc/release/examples/commissioner.exe` を Windows へコピーし、
+`SM_MDNS_TRACE=1`(PowerShell では `$env:SM_MDNS_TRACE=1`)で
+`commissioner.exe 20202021` を実行。出力の読み方は §3.2c の表。rx ゼロなら §3.2b の
+FW 切り分けへ。
 
 ## 7. 残タスク(優先度順の目安)
 

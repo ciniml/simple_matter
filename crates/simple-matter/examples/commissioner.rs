@@ -457,11 +457,18 @@ fn report_phase(phase: Phase) {
 /// `_matterc._udp.local` を PTR ブラウズし、最初に発見した commissionable ノードの
 /// (アドレス, ポート)を返す(discriminator 指定なし)。
 fn browse_commissionable() -> Option<SocketAddr> {
+    let trace = std::env::var_os("SM_MDNS_TRACE").is_some();
     let (socket, qu) = open_mdns_socket()?;
 
     let mut query = [0u8; 128];
     let qlen = MdnsClient::build_browse_commissionable(&mut query, qu).ok()?;
     let _ = socket.send_to(&query[..qlen], (MDNS_IPV4, MDNS_PORT));
+    if trace {
+        eprintln!(
+            "[mdns-trace] query sent ({qlen}B, qu={qu}) from {:?}",
+            socket.local_addr()
+        );
+    }
 
     // クエリを周期的に再送する。デバイスが 5353 を他の mDNS レスポンダ(avahi 等)と
     // 共有していると受信クエリを取りこぼすことがあり、その場合は発見が「デバイスの定期
@@ -478,6 +485,16 @@ fn browse_commissionable() -> Option<SocketAddr> {
         }
         match socket.recv_from(&mut rx) {
             Ok((n, _src)) => {
+                if trace {
+                    eprintln!(
+                        "[mdns-trace] rx {n}B from {_src} parse={}",
+                        if MdnsClient::parse_commissionable(&rx[..n]).is_some() {
+                            "commissionable"
+                        } else {
+                            "no-match"
+                        }
+                    );
+                }
                 if let Some(node) = MdnsClient::parse_commissionable(&rx[..n]) {
                     // discriminator 指定なし: アドレスを持つ最初の発見を採用する。
                     // 本 example のソケットは IPv4 なので IPv4 アドレスを優先する。
@@ -545,12 +562,42 @@ fn open_mdns_socket() -> Option<(UdpSocket, bool)> {
     }
     #[cfg(not(unix))]
     {
-        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+        // Windows は仮想アダプタ(WSL/Hyper-V/VPN)が多く、インターフェース未指定だと
+        // マルチキャストの送信/join が LAN 以外の既定 IF に張り付くことがある
+        // (クエリが LAN に出ない・announce も受からない)。デフォルトルートの
+        // ローカル IPv4(connect トリック)で LAN 向き IF に明示的に固定する。
+        let if_ip = default_route_local_ipv4().unwrap_or(Ipv4Addr::UNSPECIFIED);
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .ok()?;
+        // 送信 IF の固定(未指定だと既定 IF から送出され LAN に届かないことがある)。
+        let _ = socket.set_multicast_if_v4(&if_ip);
+        socket
+            .bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)).into())
+            .ok()?;
+        let socket: UdpSocket = socket.into();
         // マルチキャスト応答(QU を無視する responder 対策)も拾えるよう join はしておく。
-        let _ = socket.join_multicast_v4(&MDNS_IPV4, &Ipv4Addr::UNSPECIFIED);
+        // join も同じ LAN 向き IF に固定する。
+        let _ = socket.join_multicast_v4(&MDNS_IPV4, &if_ip);
         socket
             .set_read_timeout(Some(Duration::from_millis(100)))
             .ok()?;
+        eprintln!("[discovery] mDNS QU mode: interface {if_ip}, ephemeral port");
         Some((socket, true))
+    }
+}
+
+/// デフォルトルートのローカル IPv4 を推定する(外部宛 UDP の `local_addr` から。
+/// 実際にはパケットを送らない)。マルチキャストの送信/join インターフェース固定用。
+#[cfg(not(unix))]
+fn default_route_local_ipv4() -> Option<Ipv4Addr> {
+    let s = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    s.connect((Ipv4Addr::new(8, 8, 8, 8), 53)).ok()?;
+    match s.local_addr().ok()? {
+        SocketAddr::V4(v4) => Some(*v4.ip()),
+        SocketAddr::V6(_) => None,
     }
 }
