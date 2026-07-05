@@ -35,7 +35,7 @@
 // item 単位の #[allow] ではマクロ展開に届かないため、モジュール単位で許容する。
 #![allow(clippy::needless_borrows_for_generic_args)]
 
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select, select3, Either, Either3};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
@@ -366,14 +366,25 @@ async fn run_connection(
         subscribed: false,
     };
     loop {
-        match select(gatt_conn.next(), ch.cmd.receive()).await {
-            Either::First(ev) => {
+        // 1 秒周期でリンク生存も確認する。trouble-host 0.6 の切断通知は内部で
+        // `try_send`(connection_manager::disconnected)されるため、接続イベント
+        // キューが埋まった瞬間の切断は **黙って落ちる**(Disconnected が届かず
+        // 再広告できなくなる。実機で再現)。イベントに依存せず `is_connected()`
+        // をポーリングして確実に回収する。
+        match select3(
+            gatt_conn.next(),
+            ch.cmd.receive(),
+            embassy_time::Timer::after_millis(1000),
+        )
+        .await
+        {
+            Either3::First(ev) => {
                 if let Flow::Disconnected = on_conn_event(ev, gatt_conn, server, ch, &mut st).await
                 {
                     return;
                 }
             }
-            Either::Second(cmd) => match cmd {
+            Either3::Second(cmd) => match cmd {
                 GattCmd::Indicate { len, data } => {
                     if let Flow::Disconnected =
                         send_indication(gatt_conn, server, ch, &mut st, &data[..len]).await
@@ -387,6 +398,13 @@ async fn run_connection(
                     // Disconnected イベントは gatt_conn.next() 側で観測される。
                 }
             },
+            Either3::Third(()) => {
+                if !gatt_conn.raw().is_connected() {
+                    println!("[gatt] link down (missed disconnect event); recovering");
+                    ch.events.send(RawEvent::Disconnected).await;
+                    return;
+                }
+            }
         }
     }
 }
@@ -515,20 +533,29 @@ async fn send_indication(
         return Flow::Continue;
     }
     // confirmation まで待つ。間に来る他の ATT イベントは通常どおり処理する。
+    // run_connection と同じ理由(切断通知の取りこぼし)でリンク生存もポーリングする。
     loop {
-        match gatt_conn.next().await {
-            GattConnectionEvent::Disconnected { .. } => {
+        match select(gatt_conn.next(), embassy_time::Timer::after_millis(1000)).await {
+            Either::First(GattConnectionEvent::Disconnected { .. }) => {
                 ch.events.send(RawEvent::Disconnected).await;
                 ch.done.send(Err(SmError::InvalidState)).await;
                 return Flow::Disconnected;
             }
-            GattConnectionEvent::Gatt { event } => {
+            Either::First(GattConnectionEvent::Gatt { event }) => {
                 if on_att_event(event, gatt_conn, server, ch, st).await {
                     ch.done.send(Ok(())).await;
                     return Flow::Continue;
                 }
             }
-            _ => {}
+            Either::First(_) => {}
+            Either::Second(()) => {
+                if !gatt_conn.raw().is_connected() {
+                    println!("[gatt] link down while awaiting confirmation; recovering");
+                    ch.events.send(RawEvent::Disconnected).await;
+                    ch.done.send(Err(SmError::InvalidState)).await;
+                    return Flow::Disconnected;
+                }
+            }
         }
     }
 }

@@ -166,8 +166,22 @@ async fn pump(gatt: &mut TroubleGattPeripheral<'_>) -> ! {
     let start = Instant::now();
     let mut buf = [0u8; 512];
     let mut sdu = [0u8; MAX_RX_PACKET_SIZE];
+    // 生存確認ログ。シリアルは任意のタイミングで接続される(過去分は残らない)ため、
+    // いつ繋いでも状態がわかるよう定期出力する(実機切り分けで必須と判明)。
+    let mut next_heartbeat_ms: u64 = 0;
 
     loop {
+        let now = now_ms(start);
+        if now >= next_heartbeat_ms {
+            println!(
+                "[alive] t={}s conn={:?} subscribed={}",
+                now / 1000,
+                conn.map(|c| c.0),
+                subscribed
+            );
+            next_heartbeat_ms = now + 10_000;
+        }
+
         // BTP の deadline(遅延 ACK / idle)まで待つ。上限 50ms でクリップして
         // タイムアウト検知(is_timed_out)も定期的に回す。
         let now = now_ms(start);

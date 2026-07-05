@@ -202,6 +202,21 @@ handshake 確立(device: `att_mtu=247, fragment=20` / PC: `fragment=20 window=6`
 PASE 第 1 メッセージ(67B SDU)の 4 フラグメント再組立と ACK 返送、セッション
 タイムアウトでのクリーン切断→自動再広告まで確認。
 
+### 既知の問題と修正(E2 実機で発見)
+
+- **切断通知の取りこぼし → 再広告されず発見不能になるバグ(修正済み)**:
+  trouble-host 0.6 の `connection_manager::disconnected()` は切断イベントを
+  `try_send` で通知するため、接続イベントキューが埋まった瞬間の切断は**黙って
+  落ちる**。この場合 GATT worker が `Disconnected` を永遠に待ち、再広告されない
+  (デバイスは生きているのに BLE スキャンから消える。スマホのスキャナアプリで
+  接続→切断した後などに実機で再現)。対策として worker は 1 秒周期で
+  `Connection::is_connected()` をポーリングし、イベントが落ちても確実に
+  切断を回収して再広告に戻る(`ble.rs` の run_connection / send_indication)。
+- **接続中は広告が止まる(仕様)**: 単一接続設計のため、スキャナアプリ等が
+  接続を保持している間は他のホストから発見できない。切断すれば自動で再広告する。
+- e2-ble は `[alive] t=..s conn=.. subscribed=..` を 10 秒ごとに出す(シリアルを
+  後から繋いでも生存・状態確認できる)。
+
 ### 実機デバッグの罠(E2 で確認)
 
 - **`espflash monitor --no-reset` はチップを flasher stub に入れて保持する**
