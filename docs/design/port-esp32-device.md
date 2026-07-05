@@ -171,7 +171,7 @@ ESP32 で「再起動後も fabric が残る」ために必須。**本移植の�
 |---|---|---|---|
 | **E0: コアのクロスビルド CI** ✅(2026-07-05) | `riscv32imc-unknown-none-elf` で simple-matter(ble, controller なし/あり)を check | CI green(コード変更ゼロのはず) | S |
 | **E1: ports 骨格 + Lチカ** ✅(2026-07-05 実機確認、M5Stack NanoC6) | ports/esp32 workspace、esp-hal(1.1.1)で C6 起動・ログ・TRNG→`Rng`・P-256 鍵生成(ユーザ指定で C3→C6)。実機で発見した罠: **esp-bootloader-esp-idf の `esp_app_desc!()` 必須**(無いと TG0 WDT リセットループ)+ **espflash は 4.x 必須**(3.x は欠如を検出せず書き込む)。詳細 `ports/esp32/README.md` | 実機でログ出力・乱数取得 ✅(バナー→TRNG→SEC1 tag 0x04→heartbeat) | S |
-| **E2: BLE スモーク → GattPeripheral** | TrouBLE で 0xFFF6 広告 + C1/C2、R1 確認。`GattPeripheral` 実装 | PC の `ble-commissioner` から BTP handshake 確立(fragment 交渉まで) | M |
+| **E2: BLE スモーク → GattPeripheral** ✅(2026-07-05 実機確認) | TrouBLE(0.6、esp-radio 0.18 の bt-hci 0.8 に合わせる)で 0xFFF6 広告 + C1/C2。`GattPeripheral` 実装は `ports/esp32/esp32c6-firmware/src/ble.rs`(worker⇔channel 構造で bluer 版を写像)。R1 は解消: CCCD 検知(`GattEvent::Write` + `accept()` 必須)・`Connection::att_mtu()`・indication は worker が Confirmation 待ちで直列化。切り分け用の生 HCI スモーク bin(`hci-smoke`)と espflash monitor の罠は `ports/esp32/README.md` | PC の `ble-commissioner` から BTP handshake 確立 ✅(fragment=20、PASE SDU 再組立・ACK・クリーン切断まで実測) | M |
 | **E3: BLE コミッショニング** | embassy 版ポンプ(毎周 poll・subscribe 前保留の教訓を移植)+ MatterStack | PC commissioner から PASE→AddNOC(chip-tool code-paseonly も) | M |
 | **E4: KVS + fabric 永続化** | コアに Kvs trait + fabric TLV 保存/復元、esp-storage 実装 | 再起動後に運用 CASE が再確立できる | M〜L(コア側含む) |
 | **E5: Wi-Fi 実 join + UDP/mDNS** | WifiDriver trait、embassy-net で UDP trait 実装、mDNS(IPv4+IPv6) | chip-tool `pairing ble-wifi`(実 SSID)フルパス + toggle | L |

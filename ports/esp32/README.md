@@ -5,8 +5,9 @@
 (esp-hal / esp-println / esp-backtrace)の lock をコアから分離する
 (`docs/design/port-esp32-device.md` §7 / リスク R4)。
 
-現状は **フェーズ E1(ports 骨格 + 起動ログ + TRNG→Rng)** のみ。
-BLE コミッショニング・Wi-Fi join・UDP/mDNS は後続フェーズ(E2 以降)。
+現状は **フェーズ E1(ports 骨格 + 起動ログ + TRNG→Rng)** と
+**フェーズ E2(BLE アドバタイズ + GATT C1/C2 + BTP handshake)** を実装済み。
+Wi-Fi join・UDP/mDNS は後続フェーズ(E3 以降)。
 
 ## ターゲット: ESP32-C6 を選んだ経緯
 
@@ -27,8 +28,12 @@ ports/esp32/
 ├── Cargo.toml              # 別 workspace(members = ["esp32c6-firmware"])
 ├── rust-toolchain.toml     # stable + riscv32imac ターゲット
 ├── .cargo/config.toml      # ターゲット既定・linkall.x・force-frame-pointers・espflash runner
-└── esp32c6-firmware/       # bin crate(E1 骨格ファームウェア)
-    └── src/main.rs
+└── esp32c6-firmware/       # lib + 複数 bin
+    └── src/
+        ├── main.rs         # default bin(E1 骨格ファームウェア)
+        ├── lib.rs          # 共有部(EspRng)
+        ├── ble.rs          # GattPeripheral の TrouBLE 実装 + GATT worker(E2)
+        └── bin/e2-ble.rs   # E2 ファームウェア(BLE adv + BTP handshake)
 ```
 
 ## 前提
@@ -104,7 +109,7 @@ espflash flash --monitor \
 | フェーズ | 範囲 | 本ポートの状態 |
 |---|---|---|
 | E1 | ports 骨格 + 起動ログ + TRNG→`crypto::Rng` + P-256 鍵生成 | ✅ **実機確認済み**(2026-07-05、M5Stack NanoC6) |
-| E2 | BLE スモーク → `GattPeripheral`(TrouBLE) | 未 |
+| E2 | BLE スモーク → `GattPeripheral`(TrouBLE) | ✅ **実機確認済み**(2026-07-05、PC ble-commissioner と BTP handshake 確立) |
 | E3〜 | コミッショニング / KVS / Wi-Fi join / UDP・mDNS | 未 |
 
 実機確認(2026-07-05、M5Stack NanoC6 / ESP32-C6 rev v0.1、USB シリアル/JTAG =
@@ -166,3 +171,84 @@ esp-hal の `Trng` は `TrngSource`(SAR ADC のエントロピー源)が有効�
   (esp-hal の build.rs が `linkall.x`→`memory.x`/`esp32c6.x`/`hal-defaults.x` を
   `OUT_DIR` に配置)と、RISC-V で **必須の** `-C force-frame-pointers`
   (esp-backtrace README)を指定する。
+
+## E2: BLE(`e2-ble` bin)
+
+コアの `GattPeripheral` trait(ble-btp.md §5.1)を TrouBLE で実装し、
+0xFFF6 commissionable アドバタイズ + C1/C2 GATT サービス + BTP handshake を通す。
+MatterStack は載せない(handshake = fragment 交渉までが E2 の検証ゲート。
+PASE 以降は E3)。
+
+```sh
+cd ports/esp32
+cargo run --release --bin e2-ble        # flash + monitor
+```
+
+PC 側(BlueZ / btleplug が使える Linux):
+
+```sh
+cargo run -p simple-matter-ble --features commissioner --example ble-commissioner -- 20202021 3840
+```
+
+期待ログ(デバイス側): `[ble] advertising` → `[ble] central connected` →
+`[btp rx] len=9 65 6c ...`(handshake req)→ `[ble] C2 subscribed` →
+`[btp tx] len=6 65 6c 04 ...`(handshake resp)→
+**`[btp] established (att_mtu=..., fragment=...)`**。
+PC 側は handshake 確立後 PASE に進んで失敗するが、それは E2 スコープ外
+(デバイスは PASE メッセージを `[btp] rx sdu` としてログするのみ)。
+
+**実機確認済み(2026-07-05、NanoC6 ↔ PC btleplug/hci1)**: 上記の全シーケンスを実測。
+handshake 確立(device: `att_mtu=247, fragment=20` / PC: `fragment=20 window=6`)、
+PASE 第 1 メッセージ(67B SDU)の 4 フラグメント再組立と ACK 返送、セッション
+タイムアウトでのクリーン切断→自動再広告まで確認。
+
+### 実機デバッグの罠(E2 で確認)
+
+- **`espflash monitor --no-reset` はチップを flasher stub に入れて保持する**
+  (アプリが止まり、BLE 広告も消える)。「広告が出ない」ように見えたら、まず
+  モニタ方法を疑う。副作用のない観測は `stty -F /dev/ttyACM0 115200 raw -echo`
+  → `cat /dev/ttyACM0`(制御線に触らない)。リセットから確実にログを取るには
+  `espflash flash`(書き込み後に hard-reset でアプリ起動)直後に cat を繋ぐ。
+- **`src/bin/hci-smoke.rs`**: trouble-host を外した生 HCI の広告スモーク
+  (Reset→Set Adv Params/Data/Enable、`hcismoke` 名で広告 + 毎秒 heartbeat)。
+  「コントローラ/ボード起因か、host 層起因か」の切り分けに使う。
+- PC 側 btleplug のアダプタは `SM_BLE_ADAPTER=hci1` 等で明示指定する
+  (本開発機ではスキャンできるアダプタとできないアダプタがあった)。
+
+### 使用バージョンと API 上の注意点(E2 で判明)
+
+- **esp-radio 0.18.0**(旧 esp-wifi。features: `esp32c6, ble, unstable`):
+  - `BleConnector::new(peripherals.BT, esp_radio::ble::Config::default())` が
+    BLE controller(HCI)。`esp_radio::init()` の明示呼び出しは不要
+    (`BleConnector::new` 内部の `RadioRefGuard` が行う)。
+  - **preemptive スケジューラ必須**: `esp_rtos::start(timg0.timer0,
+    sw_int.software_interrupt0)` を **radio 初期化より先に** 呼ぶ(呼ばないと
+    `BleConnector::new` が panic)。
+  - **ヒープ必須**(controller タスク・内部バッファ): `esp_alloc::heap_allocator!`
+    で確保する。本 FW は 72KB で動作余裕を見ている(E6 で実測・調整)。
+- **esp-rtos 0.3.0**(features: `esp32c6, embassy, esp-radio, esp-alloc`):
+  `embassy` feature が embassy-time driver と `#[esp_rtos::main]`
+  (thread-mode executor で async main を回すマクロ)を提供する。
+  embassy-executor は **arch-\* feature を付けずに** 依存に入れる(esp-rtos README)。
+- **trouble-host は 0.6.0 に固定**(0.7 は使えない):
+  esp-radio 0.18 の `BleConnector` は **bt-hci 0.8** の `Transport` を実装するが、
+  trouble-host 0.7 は **bt-hci 0.9** を要求し、trait がクレートバージョン違いで
+  別物になるため `ExternalController` に渡せない。bt-hci ^0.8 の最終版が 0.6.0。
+  - GATT server は `#[gatt_server]` / `#[gatt_service]` マクロで宣言
+    (`heapless 0.9` / `static_cell` / `embassy-sync 0.7` を **こちらの依存にも**
+    追加する必要がある — マクロ生成コードがこれらをクレート名で参照する)。
+  - **negotiated ATT_MTU** は `Connection::att_mtu()`。接続直後は未交渉なので、
+    bluer 版と同じく「最初の C1 write / subscribe 観測時」に `Connected` イベントへ
+    載せる。
+  - **CCCD(subscribe)検知**: CCCD への write も通常の `GattEvent::Write` として
+    アプリに届く(`handle == c2.cccd_handle`、値の bit1=0x02 が indication)。
+    `event.accept()` を呼ぶと attribute server が CCCD 状態を記録する
+    (accept を忘れると `Characteristic::indicate` が黙って no-op になる)。
+  - **indication は confirmation を待たない**(`Characteristic::indicate` は PDU を
+    キューするだけ)。ATT は同時 1 indication 制約があるため、本実装の GATT worker が
+    ATT Handle Value Confirmation(`AttClient::Confirmation`)の受信まで次の
+    indicate 要求を受けない。
+  - default packet pool は MTU 251 / 8 packets(`HostResources<DefaultPacketPool, 1, 1>`
+    で同時 1 接続)。BTP fragment 上限 244 に対して十分。
+- **サイズ実測(e2-ble, release)**: `.text` 357KB / `.rodata` 41KB /
+  `.data+.bss` 約 97KB(esp-radio BLE controller + TrouBLE + BTP 込み)。

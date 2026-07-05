@@ -9,8 +9,8 @@
 
 BLE コミッショニングは chip-tool 相互運用まで達成済み。移植は **Windows: W0-W3 完了
 (W3 は mDNS ディスカバリ込みで実機フル完走、2026-07-05)**、
-**ESP32-C6: E1 実機確認済み(2026-07-05、M5Stack NanoC6)。次は E2(TrouBLE で
-GattPeripheral)**。
+**ESP32-C6: E1/E2 実機確認済み(2026-07-05、M5Stack NanoC6。E2 = TrouBLE で BTP
+handshake 確立)。次は E3(BLE コミッショニング = MatterStack 統合)**。
 
 ## 2. リポジトリ状態
 
@@ -84,6 +84,15 @@ GattPeripheral)**。
     書き込む + C6 への stub 接続がタイムアウトする(`--no-stub` は可)。
   - 非 TTY 環境では `espflash flash --monitor` が「Failed to initialize input reader」で
     落ちる → `script -qec "espflash flash --monitor ..." /dev/null` で pty を与える。
+- **E2** ✅ 実機確認(2026-07-05、NanoC6 ↔ PC ble-commissioner/btleplug hci1):
+  TrouBLE 0.6(esp-radio 0.18 = bt-hci 0.8 に合わせ、0.7 は不可)で `GattPeripheral`
+  実装(`ports/esp32/esp32c6-firmware/src/ble.rs`、worker⇔channel 構造)。
+  **BTP handshake 確立**(fragment=20)、PASE 第 1 SDU(67B)の 4 フラグメント
+  再組立 + ACK、タイムアウト切断→自動再広告まで実測。
+  - 実機切り分けの罠(README に詳述): **`espflash monitor --no-reset` はチップを
+    flasher stub に保持し広告が止まる**(「電波が出ない」誤診の元)。観測は
+    `stty` + `cat`。生 HCI スモーク bin `hci-smoke` で controller/host 層を切り分け可能。
+  - PC 側 btleplug は `SM_BLE_ADAPTER=hci1` を明示(hci0 はスキャン不調だった)。
 
 ## 5. クロスビルド / 実機テストの実務メモ
 
@@ -130,9 +139,9 @@ GattPeripheral)**。
 
 ## 7. 残タスク(優先度順の目安)
 
-1. **E2 以降**: TrouBLE で `GattPeripheral` 実装(E2: PC の ble-commissioner から BTP
-   handshake 確立)→ BLE コミッショニング(E3)→ KVS/fabric 永続化(E4)→ 実 WiFi
-   join(E5)(`port-esp32-device.md` のフェーズ表)。
+1. **E3 以降**: BLE コミッショニング(E3 = e2-ble の pump に MatterStack を統合、
+   PC commissioner から PASE→AddNOC)→ KVS/fabric 永続化(E4)→ 実 WiFi join(E5)
+   (`port-esp32-device.md` のフェーズ表)。
 2. **W4**: chip デバイス相手のフルパス(commissioner 側の BLE→UDP 運用遷移の実装が前提)。
 3. **方向 B 完結**: 我々の commissioner → chip-lighting-app の AddNOC 後、BLE を閉じて
    運用 mDNS→CASE over UDP→CommissioningComplete(現状 AddNOC まで実証済み)。

@@ -5,6 +5,19 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 publish = false
 
+# lib(no_std の共有部: EspRng / TroubleGattPeripheral)+ 複数 bin 構成。
+# default bin(src/main.rs)= E1 骨格、src/bin/e2-ble.rs = E2 BLE ファームウェア。
+[lib]
+name = "esp32c6_firmware"
+
+[[bin]]
+name = "esp32c6-firmware"
+path = "src/main.rs"
+
+[[bin]]
+name = "e2-ble"
+path = "src/bin/e2-ble.rs"
+
 [dependencies]
 esp-hal = { version = "1.1.1", features = ["esp32c6", "unstable"] }
 esp-println = { version = "0.17.0", features = ["esp32c6"] }
@@ -21,3 +34,41 @@ simple-matter = { path = "../../../crates/simple-matter", default-features = fal
     "ble",
 ] }
 esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32c6"] }
+
+# --- E2: BLE(esp-radio BLE controller + TrouBLE host)---
+#
+# esp-radio 0.18 の `BleConnector` は **bt-hci 0.8** の `Transport` を実装する。
+# trouble-host 0.7 は bt-hci **0.9** を要求するため `ExternalController` に
+# `BleConnector` を渡せない(trait が別クレートバージョンで別物になる)。
+# bt-hci ^0.8 を使う trouble-host の最終版は **0.6.0** なので、それに固定する
+# (esp-radio 0.18 の Cargo.lock も bt-hci 0.8.0 のみ)。
+esp-radio = { version = "0.18.0", features = ["esp32c6", "ble", "unstable"] }
+# esp-radio が要求する preemptive スケジューラ。`embassy` feature が
+# embassy-time driver + `#[esp_rtos::main]`(thread-mode executor)を提供する。
+esp-rtos = { version = "0.3.0", features = [
+    "esp32c6",
+    "embassy",
+    "esp-radio",
+    "esp-alloc",
+] }
+# esp-radio の内部バッファ・BLE controller タスクはヒープを要求する。
+esp-alloc = "0.10.0"
+trouble-host = { version = "0.6.0", default-features = false, features = [
+    "peripheral",
+    "gatt",
+    "derive",
+    "default-packet-pool",
+] }
+# BleConnector が実装する HCI Transport / ExternalController(esp-radio と同じ 0.8 系)。
+bt-hci = "0.8"
+# esp-rtos の executor 統合を使うため arch-* feature は付けない(esp-rtos README)。
+embassy-executor = "0.10.0"
+embassy-time = "0.5.1"
+embassy-futures = "0.1.2"
+# trouble-host 0.6 と同じ 0.7 系に合わせる(gatt_server マクロが
+# `embassy_sync::blocking_mutex::raw::NoopRawMutex` をこちらのクレート名前空間で参照する)。
+embassy-sync = "0.7"
+# trouble-host 0.6 の gatt_traits(AsGatt/FromGatt)実装と同じ 0.9 系。
+heapless = "0.9"
+# gatt_service マクロが characteristic 値の静的ストレージに使う。
+static_cell = "2.1"
