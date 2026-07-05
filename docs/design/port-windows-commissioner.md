@@ -145,7 +145,7 @@ CASE over UDP)を実装する際は §3 の mDNS/UDP 論点が効いてくる。
 |---|---|---|---|
 | **W0: ビルド整備** ✅(2026-07-05) | CI に windows-commissioner ジョブ追加、bluer を Linux target 依存化。Linux からは cargo-xwin で .exe をクロスビルド(gnu/gnullvm は import lib 不足で不可) | Windows ターゲットで check/clippy green | S |
 | **W1: BLE スモーク** ✅(2026-07-05 実機確認) | Windows 実機で `ble-commissioner.exe` を実行し R1/R2 とも問題なし | `[btp] established` が出る(SM_BTP_TRACE で確認) | S(問題なければ)〜M(btleplug パッチ要の場合) |
-| **W2: BLE コミッショニング** | 対向は Linux 側 `ble-onoff-light`(実績構成)。PASE→AddNOC まで | commissioner ログで AddNOC 完了 | S |
+| **W2: BLE コミッショニング** ✅(2026-07-05 実機確認) | Windows 実機の `ble-commissioner.exe` → Linux 側 `ble-onoff-light` に対し、PASE→AddNOC→CASE→CommissioningComplete→OnOff Toggle まで**フル完走**(デバイス側で属性反映・正常切断を確認)。fragment=20(btleplug が MTU 非公開のため)で 115 フラグメント往復 | commissioner ログで AddNOC 完了 | S |
 | **W3: mDNS/UDP** | 運用 mDNS ブラウズ + CASE over UDP を Windows で。R3 に応じて QU モード実装 | Windows から Linux デバイスへ UDP コミッショニング(既存 `commissioner` example 相当)完走 | M |
 | **W4: フルパス** | BLE→UDP 遷移(commissioner 側の運用遷移が実装され次第)を Windows で chip-lighting-app 相手に | chip デバイスへのフルコミッショニング + Toggle | M(遷移実装自体は別トラック) |
 
