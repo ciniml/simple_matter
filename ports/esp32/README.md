@@ -5,9 +5,9 @@
 (esp-hal / esp-println / esp-backtrace)の lock をコアから分離する
 (`docs/design/port-esp32-device.md` §7 / リスク R4)。
 
-現状は **フェーズ E1(ports 骨格 + 起動ログ + TRNG→Rng)** と
-**フェーズ E2(BLE アドバタイズ + GATT C1/C2 + BTP handshake)** を実装済み。
-Wi-Fi join・UDP/mDNS は後続フェーズ(E3 以降)。
+現状は **E1(骨格 + TRNG)/ E2(BLE + BTP handshake)/ E3(MatterStack 統合 =
+BLE フルコミッショニング + On/Off ライト)** まで実機確認済み。
+KVS 永続化・Wi-Fi join・UDP/mDNS は後続フェーズ(E4 以降)。
 
 ## ターゲット: ESP32-C6 を選んだ経緯
 
@@ -33,7 +33,10 @@ ports/esp32/
         ├── main.rs         # default bin(E1 骨格ファームウェア)
         ├── lib.rs          # 共有部(EspRng)
         ├── ble.rs          # GattPeripheral の TrouBLE 実装 + GATT worker(E2)
-        └── bin/e2-ble.rs   # E2 ファームウェア(BLE adv + BTP handshake)
+        └── bin/
+            ├── e2-ble.rs       # E2: BLE adv + BTP handshake(スタック無し)
+            ├── e3-ble-light.rs # E3: MatterStack 統合 On/Off ライト(BLE フルコミッショニング)
+            └── hci-smoke.rs    # 生 HCI 広告スモーク(RF 切り分け用)
 ```
 
 ## 前提
@@ -110,7 +113,8 @@ espflash flash --monitor \
 |---|---|---|
 | E1 | ports 骨格 + 起動ログ + TRNG→`crypto::Rng` + P-256 鍵生成 | ✅ **実機確認済み**(2026-07-05、M5Stack NanoC6) |
 | E2 | BLE スモーク → `GattPeripheral`(TrouBLE) | ✅ **実機確認済み**(2026-07-05、PC ble-commissioner と BTP handshake 確立) |
-| E3〜 | コミッショニング / KVS / Wi-Fi join / UDP・mDNS | 未 |
+| E3 | BLE コミッショニング(MatterStack 統合、`e3-ble-light`) | ✅ **実機確認済み**(2026-07-06、PC ble-commissioner からフルコミッショニング+Toggle、青 LED 追従) |
+| E4〜 | KVS / Wi-Fi join / UDP・mDNS | 未 |
 
 実機確認(2026-07-05、M5Stack NanoC6 / ESP32-C6 rev v0.1、USB シリアル/JTAG =
 `/dev/ttyACM0`): 期待ログの全項目(バナー → `[trng]` サンプル → P-256 公開鍵
@@ -272,3 +276,37 @@ PASE 第 1 メッセージ(67B SDU)の 4 フラグメント再組立と ACK 返�
     で同時 1 接続)。BTP fragment 上限 244 に対して十分。
 - **サイズ実測(e2-ble, release)**: `.text` 357KB / `.rodata` 41KB /
   `.data+.bss` 約 97KB(esp-radio BLE controller + TrouBLE + BTP 込み)。
+
+## E3: BLE コミッショニング(`e3-ble-light` bin)
+
+`e2-ble` の pump に `MatterStack`(DefaultStack、NF=5)を統合した On/Off ライト。
+PC 版 `ble-onoff-light.rs` の BLE 経路を no_std/embassy に写像したもので、
+WiFi シム(`NetworkCommissioningWifi`)込み。UDP/mDNS は E5、fabric 永続化は E4。
+
+```sh
+cd ports/esp32
+cargo run --release --bin e3-ble-light      # flash + monitor
+```
+
+PC 側:
+
+```sh
+cargo run -p simple-matter-ble --features commissioner --example ble-commissioner -- 20202021 3840
+```
+
+**実機確認済み(2026-07-06、NanoC6 ↔ PC btleplug/hci1)**: PASE→CSR→AddNOC→CASE→
+CommissioningComplete→**OnOff Toggle 反映**までフル完走(E3 ゲートの AddNOC を超えて
+フルパス)。連続 2 回のコミッショニング(切断→再広告→2 fabric 目)も成功。
+M5Stack NanoC6 の **青 LED(GPIO7)が OnOff 属性に追従**する。
+
+実装メモ:
+
+- **毎イテレーションで `stack.poll()` と BTP flush の両方を回す**(exchange 回収。
+  回さないと AddNOC が NoSpace で黙って死ぬ — PC 実機で踏んだ教訓の移植。
+  ble-btp.md §11-4)。
+- 乱数は crypto/SC/OpCreds/DAC の全箇所 TRNG 直結(PC 版の DemoRng::from_time は
+  std 依存のため排除)。SPAKE2+ verifier(PBKDF2)は起動時に前計算。
+- BTP フラグメントトレースは既定 off(`BTP_TRACE`)。AddNOC の数十フラグメントで
+  UART ログが ACK タイミングを圧迫し得るため。
+- サイズ実測: flash = .text 491KB + .rodata 52KB、RAM 静的 ≈ 149KB / 512KB
+  (heap 72KB 含む)。`MatterStack` 本体は約 11.3KB(main スタック上)。

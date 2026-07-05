@@ -18,6 +18,11 @@ path = "src/main.rs"
 name = "e2-ble"
 path = "src/bin/e2-ble.rs"
 
+# E3: BLE(BTP)経由のフルコミッショニング On/Off ライト(MatterStack 統合)。
+[[bin]]
+name = "e3-ble-light"
+path = "src/bin/e3-ble-light.rs"
+
 [dependencies]
 esp-hal = { version = "1.1.1", features = ["esp32c6", "unstable"] }
 esp-println = { version = "0.17.0", features = ["esp32c6"] }

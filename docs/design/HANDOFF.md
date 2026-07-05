@@ -9,8 +9,8 @@
 
 BLE コミッショニングは chip-tool 相互運用まで達成済み。移植は **Windows: W0-W3 完了
 (W3 は mDNS ディスカバリ込みで実機フル完走、2026-07-05)**、
-**ESP32-C6: E1/E2 実機確認済み(2026-07-05、M5Stack NanoC6。E2 = TrouBLE で BTP
-handshake 確立)。次は E3(BLE コミッショニング = MatterStack 統合)**。
+**ESP32-C6: E1/E2/E3 実機確認済み(E3 = MatterStack 統合、PC commissioner から
+BLE フルコミッショニング+Toggle 完走、2026-07-06)。次は E4(KVS/fabric 永続化)**。
 
 ## 2. リポジトリ状態
 
@@ -101,6 +101,13 @@ handshake 確立)。次は E3(BLE コミッショニング = MatterStack 統合)
        data のみで Service UUID リスト AD を含まず、`SetDiscoveryFilter` に掛からない
        ことがある(Android では見えるのに PC で見えない症状の正体)→ 無フィルタ +
        コード側照合に変更、`SM_BLE_TRACE=1` トレース追加。
+- **E3** ✅ 実機確認(2026-07-06、NanoC6 ↔ PC ble-commissioner):
+  `e3-ble-light` bin(MatterStack DefaultStack NF=5 + WiFi シム + On/Off ライト、
+  PC 版 ble-onoff-light の BLE 経路を no_std/embassy に写像)で
+  **BLE フルコミッショニング完走**(PASE→CSR→AddNOC→CASE→CommissioningComplete→
+  Toggle 反映、連続 2 fabric も成功)。NanoC6 青 LED(GPIO7)が OnOff に追従。
+  乱数は全箇所 TRNG 直結、毎周 stack.poll() + BTP flush(NoSpace 教訓の移植)。
+  RAM 静的 ≈149KB / 512KB。fabric 永続化なし(E4)・実 WiFi なし(E5)。
 
 ## 5. クロスビルド / 実機テストの実務メモ
 
@@ -147,9 +154,10 @@ handshake 確立)。次は E3(BLE コミッショニング = MatterStack 統合)
 
 ## 7. 残タスク(優先度順の目安)
 
-1. **E3 以降**: BLE コミッショニング(E3 = e2-ble の pump に MatterStack を統合、
-   PC commissioner から PASE→AddNOC)→ KVS/fabric 永続化(E4)→ 実 WiFi join(E5)
-   (`port-esp32-device.md` のフェーズ表)。
+1. **E4 以降**: KVS/fabric 永続化(E4 = コアに Kvs trait + esp-storage 実装、
+   再起動後の運用 CASE 再確立がゲート)→ 実 WiFi join(E5)→ bloat-check(E6)
+   (`port-esp32-device.md` のフェーズ表)。E3 の chip-tool `pairing ble-wifi`
+   相互試験も未実施(PC 版と同一 DataModel なので通る想定)。
 2. **W4**: chip デバイス相手のフルパス(commissioner 側の BLE→UDP 運用遷移の実装が前提)。
 3. **方向 B 完結**: 我々の commissioner → chip-lighting-app の AddNOC 後、BLE を閉じて
    運用 mDNS→CASE over UDP→CommissioningComplete(現状 AddNOC まで実証済み)。
