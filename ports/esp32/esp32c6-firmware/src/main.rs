@@ -27,6 +27,11 @@ use esp_hal::rng::{Trng, TrngSource};
 
 use esp_println::println;
 
+// ESP-IDF 2nd stage bootloader が要求するアプリディスクリプタを .rodata に埋め込む。
+// これが無いとブートローダがアプリを起動できず TG0 WDT リセットループになる
+// (espflash 4.x は書き込み時に欠如を検出して拒否する)。
+esp_bootloader_esp_idf::esp_app_desc!();
+
 use simple_matter::crypto::rustcrypto::RustCrypto;
 use simple_matter::crypto::{Crypto, P256Keypair, P256PublicKey, Rng};
 use simple_matter::error::Result;

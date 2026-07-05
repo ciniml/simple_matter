@@ -34,11 +34,17 @@ ports/esp32/
 ## 前提
 
 - Rust stable(`rust-toolchain.toml` が `riscv32imac-unknown-none-elf` を自動追加)。
-- 書き込み/モニタには [`espflash`](https://github.com/esp-rs/espflash) が必要:
+- 書き込み/モニタには [`espflash`](https://github.com/esp-rs/espflash) **v4 以降**が必要:
 
   ```sh
-  cargo install espflash
+  cargo install espflash --locked
   ```
+
+  **espflash 3.x は不可**(2026-07-05 実機で確認した罠): アプリディスクリプタを検証せず
+  書き込むため一見成功するが、ブートローダがアプリを起動できず **TG0 WDT リセット
+  ループ**(`rst:0x7 (TG0_WDT_HPSYS)` の繰り返し・アプリログ一切なし)になる。
+  espflash 4.x は欠如を書き込み時に検出して明確なエラーを出す。なお 3.3.0 は C6 への
+  stub 接続自体もタイムアウトすることがある(`--no-stub` では接続可)。
 
 - ESP32-C6 ボード(USB シリアル/JTAG 経由)。
 
@@ -97,9 +103,13 @@ espflash flash --monitor \
 
 | フェーズ | 範囲 | 本ポートの状態 |
 |---|---|---|
-| E1 | ports 骨格 + 起動ログ + TRNG→`crypto::Rng` + P-256 鍵生成 | **本コミット** |
+| E1 | ports 骨格 + 起動ログ + TRNG→`crypto::Rng` + P-256 鍵生成 | ✅ **実機確認済み**(2026-07-05、M5Stack NanoC6) |
 | E2 | BLE スモーク → `GattPeripheral`(TrouBLE) | 未 |
 | E3〜 | コミッショニング / KVS / Wi-Fi join / UDP・mDNS | 未 |
+
+実機確認(2026-07-05、M5Stack NanoC6 / ESP32-C6 rev v0.1、USB シリアル/JTAG =
+`/dev/ttyACM0`): 期待ログの全項目(バナー → `[trng]` サンプル → P-256 公開鍵
+SEC1 tag 0x04 → 1 Hz heartbeat 継続)を確認。WDT リセットなしで安定動作。
 
 E1 が実機で証明するのは「esp-hal で C6 が起動しログが出る」「esp-hal の **真性乱数
 (TRNG)** をコアの `crypto::Rng` trait に橋渡しできる」「その RNG でコアの
@@ -148,6 +158,10 @@ esp-hal の `Trng` は `TrngSource`(SAR ADC のエントロピー源)が有効�
 - **esp-backtrace 0.19.0**: feature は `esp32c6, println, panic-handler`
   (`exception-handler` feature は **存在しない** ので付けるとビルド失敗する)。
   `use esp_backtrace as _;` でリンクする。
+- **esp-bootloader-esp-idf 0.5.0**(**必須**): `esp_bootloader_esp_idf::esp_app_desc!()`
+  をアプリに 1 回置いて ESP-IDF アプリディスクリプタを埋め込む。無いとブートローダが
+  アプリを起動できず TG0 WDT リセットループになる(前掲「前提」の espflash 3.x の罠と
+  同根。espflash 4.x なら書き込み時にエラーで検出される)。feature は `esp32c6`。
 - **リンク**: `.cargo/config.toml` の rustflags に `-C link-arg=-Tlinkall.x`
   (esp-hal の build.rs が `linkall.x`→`memory.x`/`esp32c6.x`/`hal-defaults.x` を
   `OUT_DIR` に配置)と、RISC-V で **必須の** `-C force-frame-pointers`

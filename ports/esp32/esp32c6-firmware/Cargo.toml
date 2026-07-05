@@ -20,3 +20,4 @@ simple-matter = { path = "../../../crates/simple-matter", default-features = fal
     "rustcrypto",
     "ble",
 ] }
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32c6"] }

@@ -169,8 +169,8 @@ ESP32 で「再起動後も fabric が残る」ために必須。**本移植の�
 
 | フェーズ | 範囲 | 検証ゲート | 工数感 |
 |---|---|---|---|
-| **E0: コアのクロスビルド CI** | `riscv32imc-unknown-none-elf` で simple-matter(ble, controller なし/あり)を check | CI green(コード変更ゼロのはず) | S |
-| **E1: ports 骨格 + Lチカ** | ports/esp32 workspace、esp-hal + embassy で C3 起動・ログ・TRNG→`Rng` | 実機でログ出力・乱数取得 | S |
+| **E0: コアのクロスビルド CI** ✅(2026-07-05) | `riscv32imc-unknown-none-elf` で simple-matter(ble, controller なし/あり)を check | CI green(コード変更ゼロのはず) | S |
+| **E1: ports 骨格 + Lチカ** ✅(2026-07-05 実機確認、M5Stack NanoC6) | ports/esp32 workspace、esp-hal(1.1.1)で C6 起動・ログ・TRNG→`Rng`・P-256 鍵生成(ユーザ指定で C3→C6)。実機で発見した罠: **esp-bootloader-esp-idf の `esp_app_desc!()` 必須**(無いと TG0 WDT リセットループ)+ **espflash は 4.x 必須**(3.x は欠如を検出せず書き込む)。詳細 `ports/esp32/README.md` | 実機でログ出力・乱数取得 ✅(バナー→TRNG→SEC1 tag 0x04→heartbeat) | S |
 | **E2: BLE スモーク → GattPeripheral** | TrouBLE で 0xFFF6 広告 + C1/C2、R1 確認。`GattPeripheral` 実装 | PC の `ble-commissioner` から BTP handshake 確立(fragment 交渉まで) | M |
 | **E3: BLE コミッショニング** | embassy 版ポンプ(毎周 poll・subscribe 前保留の教訓を移植)+ MatterStack | PC commissioner から PASE→AddNOC(chip-tool code-paseonly も) | M |
 | **E4: KVS + fabric 永続化** | コアに Kvs trait + fabric TLV 保存/復元、esp-storage 実装 | 再起動後に運用 CASE が再確立できる | M〜L(コア側含む) |

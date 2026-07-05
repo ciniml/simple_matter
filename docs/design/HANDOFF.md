@@ -9,7 +9,8 @@
 
 BLE コミッショニングは chip-tool 相互運用まで達成済み。移植は **Windows: W0-W3 完了
 (W3 は mDNS ディスカバリ込みで実機フル完走、2026-07-05)**、
-**ESP32-C6: E1(骨格 FW)ビルド完了・実機未確認**。
+**ESP32-C6: E1 実機確認済み(2026-07-05、M5Stack NanoC6)。次は E2(TrouBLE で
+GattPeripheral)**。
 
 ## 2. リポジトリ状態
 
@@ -73,9 +74,16 @@ BLE コミッショニングは chip-tool 相互運用まで達成済み。移�
 
 ### ESP32-C6 移植
 - **E0** ✅: コアの `riscv32imc-unknown-none-elf` クロスビルド(CI 済み、コード変更ゼロ)。
-- **E1** 🔶 ビルドのみ(実機未確認): `ports/esp32/`(別 workspace、Cargo.lock 分離)に
-  ESP32-C6 FW。esp-hal 1.1.1、TRNG→`crypto::Rng` アダプタ、P-256 鍵生成、heartbeat。
-  `.text` 40.7KB。**実機で `cargo run --release` して期待ログ確認が E1 の残作業**。
+- **E1** ✅ 実機確認(2026-07-05、M5Stack NanoC6 / `/dev/ttyACM0`): 期待ログ全項目
+  (バナー → `[trng]` → P-256 公開鍵 SEC1 tag 0x04 → 1 Hz heartbeat 継続)を確認。
+  実機で発見・修正した罠 2 つ(詳細 `ports/esp32/README.md`):
+  - **`esp_bootloader_esp_idf::esp_app_desc!()` が必須**(esp-bootloader-esp-idf 0.5.0 を
+    追加)。無いとブートローダがアプリを起動できず **TG0 WDT リセットループ**
+    (`rst:0x7`、アプリログなし)。
+  - **espflash 4.x 必須**(4.4.0 に更新済み)。3.3.0 はディスクリプタ欠如を検出せず
+    書き込む + C6 への stub 接続がタイムアウトする(`--no-stub` は可)。
+  - 非 TTY 環境では `espflash flash --monitor` が「Failed to initialize input reader」で
+    落ちる → `script -qec "espflash flash --monitor ..." /dev/null` で pty を与える。
 
 ## 5. クロスビルド / 実機テストの実務メモ
 
@@ -122,12 +130,11 @@ BLE コミッショニングは chip-tool 相互運用まで達成済み。移�
 
 ## 7. 残タスク(優先度順の目安)
 
-1. **W4**: chip デバイス相手のフルパス(commissioner 側の BLE→UDP 運用遷移の実装が前提)。
-2. **E1 実機確認**: ESP32-C6 ボードで `cd ports/esp32 && cargo run --release`。
-   期待ログ: バナー → `[trng]` → `[crypto] P-256 keypair generated ... SEC1 tag 0x04` → heartbeat。
-3. **E2 以降**: TrouBLE で `GattPeripheral` 実装 → BLE コミッショニング → KVS/fabric 永続化
-   → 実 WiFi join(`port-esp32-device.md` のフェーズ表)。
-4. **方向 B 完結**: 我々の commissioner → chip-lighting-app の AddNOC 後、BLE を閉じて
+1. **E2 以降**: TrouBLE で `GattPeripheral` 実装(E2: PC の ble-commissioner から BTP
+   handshake 確立)→ BLE コミッショニング(E3)→ KVS/fabric 永続化(E4)→ 実 WiFi
+   join(E5)(`port-esp32-device.md` のフェーズ表)。
+2. **W4**: chip デバイス相手のフルパス(commissioner 側の BLE→UDP 運用遷移の実装が前提)。
+3. **方向 B 完結**: 我々の commissioner → chip-lighting-app の AddNOC 後、BLE を閉じて
    運用 mDNS→CASE over UDP→CommissioningComplete(現状 AddNOC まで実証済み)。
 
 ## 8. 既知の割り切り(コード内 doc コメントにも記載)
