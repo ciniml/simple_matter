@@ -6,8 +6,8 @@
 (`docs/design/port-esp32-device.md` §7 / リスク R4)。
 
 現状は **E1(骨格 + TRNG)/ E2(BLE + BTP handshake)/ E3(MatterStack 統合 =
-BLE フルコミッショニング + On/Off ライト)** まで実機確認済み。
-KVS 永続化・Wi-Fi join・UDP/mDNS は後続フェーズ(E4 以降)。
+BLE フルコミッショニング)/ E4(fabric 永続化 = リブート後の CASE 再確立)** まで
+実機確認済み。Wi-Fi join・UDP/mDNS は後続フェーズ(E5 以降)。
 
 ## ターゲット: ESP32-C6 を選んだ経緯
 
@@ -33,9 +33,11 @@ ports/esp32/
         ├── main.rs         # default bin(E1 骨格ファームウェア)
         ├── lib.rs          # 共有部(EspRng)
         ├── ble.rs          # GattPeripheral の TrouBLE 実装 + GATT worker(E2)
+        ├── kvs.rs          # Kvs trait の esp-storage + sequential-storage 実装(E4)
         └── bin/
             ├── e2-ble.rs       # E2: BLE adv + BTP handshake(スタック無し)
             ├── e3-ble-light.rs # E3: MatterStack 統合 On/Off ライト(BLE フルコミッショニング)
+            ├── e4-ble-light.rs # E4: e3 + fabric 永続化(リブート後 CASE 再確立)
             └── hci-smoke.rs    # 生 HCI 広告スモーク(RF 切り分け用)
 ```
 
@@ -114,7 +116,8 @@ espflash flash --monitor \
 | E1 | ports 骨格 + 起動ログ + TRNG→`crypto::Rng` + P-256 鍵生成 | ✅ **実機確認済み**(2026-07-05、M5Stack NanoC6) |
 | E2 | BLE スモーク → `GattPeripheral`(TrouBLE) | ✅ **実機確認済み**(2026-07-05、PC ble-commissioner と BTP handshake 確立) |
 | E3 | BLE コミッショニング(MatterStack 統合、`e3-ble-light`) | ✅ **実機確認済み**(2026-07-06、PC ble-commissioner からフルコミッショニング+Toggle、青 LED 追従) |
-| E4〜 | KVS / Wi-Fi join / UDP・mDNS | 未 |
+| E4 | KVS + fabric 永続化(`e4-ble-light`) | ✅ **実機確認済み**(2026-07-06、リブート後に `--operational` で CASE 再確立+Toggle) |
+| E5〜 | Wi-Fi join / UDP・mDNS | 未 |
 
 実機確認(2026-07-05、M5Stack NanoC6 / ESP32-C6 rev v0.1、USB シリアル/JTAG =
 `/dev/ttyACM0`): 期待ログの全項目(バナー → `[trng]` サンプル → P-256 公開鍵
@@ -310,3 +313,38 @@ M5Stack NanoC6 の **青 LED(GPIO7)が OnOff 属性に追従**する。
   UART ログが ACK タイミングを圧迫し得るため。
 - サイズ実測: flash = .text 491KB + .rodata 52KB、RAM 静的 ≈ 149KB / 512KB
   (heap 72KB 含む)。`MatterStack` 本体は約 11.3KB(main スタック上)。
+
+## E4: fabric 永続化(`e4-ble-light` bin)
+
+`e3-ble-light` + KVS 永続化。コアの `kvs::Kvs` trait を esp-storage +
+sequential-storage で実装(`src/kvs.rs`、パーティションの nvs 領域 0x9000..0xF000
+を自前フォーマットで使用 — IDF NVS 非互換)。fabric は AddNOC 直後
+(generation 変化検知)に TLV で保存され、リブート時に復元される。
+設計は `docs/design/port-esp32-device.md` の「E4 設計」節。
+
+```sh
+cd ports/esp32
+cargo run --release --bin e4-ble-light
+# run1(コミッショニング。PC 側に ca-state.bin が保存される):
+cargo run -p simple-matter-ble --features commissioner --example ble-commissioner -- 20202021 3840
+#   → デバイス: [kvs] saved 1 fabrics (generation=1)
+# デバイスをリセット → [kvs] restored 1 fabrics
+# run2(PASE なしで運用 CASE 再確立):
+cargo run -p simple-matter-ble --features commissioner --example ble-commissioner -- 20202021 3840 --operational
+#   → [case] ESTABLISHED → Toggle acknowledged
+```
+
+**実機確認済み(2026-07-06、NanoC6)**: 上記フロー完走。BLE 稼働中の flash 書き込み
+(AddNOC 直後)も問題なし。
+
+### BlueZ の stale キャッシュ(PC 側の既知の罠)
+
+デバイスのランダムアドレスは**起動毎に変わる**が、BlueZ は過去ブートの広告
+(FFF6 service data 込み)をキャッシュし続けるため、スキャンが古いアドレスに
+マッチして **connect がタイムアウト/abort する**ことがある。症状が出たら:
+
+```sh
+for d in $(bluetoothctl devices | awk '{print $2}'); do
+  bluetoothctl info "$d" | grep -qi fff6 && bluetoothctl remove "$d"
+done
+```

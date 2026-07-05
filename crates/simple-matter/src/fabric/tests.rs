@@ -697,6 +697,336 @@ fn verify_peer_noc_returns_identity() {
 }
 
 // ---------------------------------------------------------------------------
+// 永続化(save_to / load_from、fabric/persist.rs)
+// ---------------------------------------------------------------------------
+
+/// テスト用インメモリ KVS(固定スロット、ヒープ不使用)。
+struct MemKvs {
+    slots: [MemSlot; 8],
+}
+
+struct MemSlot {
+    used: bool,
+    key: [u8; 8],
+    klen: usize,
+    val: [u8; MAX_FABRIC_RECORD_LEN],
+    vlen: usize,
+}
+
+impl MemKvs {
+    fn new() -> Self {
+        Self {
+            slots: core::array::from_fn(|_| MemSlot {
+                used: false,
+                key: [0; 8],
+                klen: 0,
+                val: [0; MAX_FABRIC_RECORD_LEN],
+                vlen: 0,
+            }),
+        }
+    }
+
+    fn find(&self, key: &[u8]) -> Option<usize> {
+        self.slots
+            .iter()
+            .position(|s| s.used && &s.key[..s.klen] == key)
+    }
+
+    /// 保存済み値を直接改竄する(破損シミュレーション)。
+    fn corrupt(&mut self, key: &[u8], at: usize) {
+        let i = self.find(key).expect("key must exist");
+        let vlen = self.slots[i].vlen;
+        self.slots[i].val[at.min(vlen - 1)] ^= 0x01;
+    }
+}
+
+impl crate::kvs::Kvs for MemKvs {
+    fn get(&mut self, key: &[u8], buf: &mut [u8]) -> Result<Option<usize>> {
+        match self.find(key) {
+            Some(i) => {
+                let s = &self.slots[i];
+                if buf.len() < s.vlen {
+                    return Err(Error::NoSpace);
+                }
+                buf[..s.vlen].copy_from_slice(&s.val[..s.vlen]);
+                Ok(Some(s.vlen))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn set(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        assert!(key.len() <= 8 && value.len() <= MAX_FABRIC_RECORD_LEN);
+        let i = match self.find(key) {
+            Some(i) => i,
+            None => self
+                .slots
+                .iter()
+                .position(|s| !s.used)
+                .ok_or(Error::NoSpace)?,
+        };
+        let s = &mut self.slots[i];
+        s.used = true;
+        s.key = [0; 8];
+        s.key[..key.len()].copy_from_slice(key);
+        s.klen = key.len();
+        s.val[..value.len()].copy_from_slice(value);
+        s.vlen = value.len();
+        Ok(())
+    }
+
+    fn remove(&mut self, key: &[u8]) -> Result<()> {
+        if let Some(i) = self.find(key) {
+            self.slots[i].used = false;
+        }
+        Ok(())
+    }
+}
+
+/// ICAC を持たない 2 通チェーン(RCAC が直接 NOC を署名)。icac 省略パスの検証用。
+fn build_chain_no_icac(crypto: &RustCrypto<DummyRng>, node_id: u64, noc_scalar: u8) -> Chain {
+    let rcac_kp = crypto.p256_keypair_from_bytes(&[0x11; 32]).unwrap();
+    let noc_kp = crypto.p256_keypair_from_bytes(&[noc_scalar; 32]).unwrap();
+    let rcac_pub = rcac_kp.public_key().to_bytes();
+    let noc_pub = noc_kp.public_key().to_bytes();
+
+    let mut c = Chain {
+        rcac: [0; 400],
+        rcac_len: 0,
+        icac: [0; 400],
+        icac_len: 0,
+        noc: [0; 400],
+        noc_len: 0,
+        rcac_pub,
+        noc_kp,
+    };
+    let rcac_dn = [
+        DnInt {
+            tag: dn_attr::MATTER_RCAC_ID,
+            val: RCAC_ID,
+        },
+        DnInt {
+            tag: dn_attr::MATTER_FABRIC_ID,
+            val: FABRIC_ID,
+        },
+    ];
+    c.rcac_len = write_cert(
+        &mut c.rcac,
+        &[0x00],
+        &rcac_dn,
+        NOT_BEFORE,
+        NOT_AFTER,
+        &rcac_dn,
+        &rcac_pub,
+        true,
+        None,
+        key_usage::KEY_CERT_SIGN | key_usage::CRL_SIGN,
+        &[],
+        &RCAC_SKID,
+        &RCAC_SKID,
+        &rcac_kp,
+    );
+    c.noc_len = write_cert(
+        &mut c.noc,
+        &[0x02],
+        &rcac_dn,
+        NOT_BEFORE,
+        NOT_AFTER,
+        &[
+            DnInt {
+                tag: dn_attr::MATTER_NODE_ID,
+                val: node_id,
+            },
+            DnInt {
+                tag: dn_attr::MATTER_FABRIC_ID,
+                val: FABRIC_ID,
+            },
+        ],
+        &noc_pub,
+        false,
+        None,
+        key_usage::DIGITAL_SIGNATURE,
+        &[ext_key_usage::SERVER_AUTH, ext_key_usage::CLIENT_AUTH],
+        &NOC_SKID,
+        &RCAC_SKID,
+        &rcac_kp,
+    );
+    c
+}
+
+/// 2 fabric(ICAC あり/なし)を入れたテーブルを作る共通ヘルパ。
+fn populated_table(crypto: &RustCrypto<DummyRng>) -> (Table<5>, Chain, Chain) {
+    let c0 = build_chain(crypto, NODE_ID, 0x33);
+    let c1 = build_chain_no_icac(crypto, NODE_ID + 1, 0x44);
+    let mut table: Table<5> = FabricTable::new();
+    table
+        .add(
+            crypto,
+            c0.rcac(),
+            Some(c0.icac()),
+            c0.noc(),
+            crypto.p256_keypair_from_bytes(&[0x33; 32]).unwrap(),
+            &EPOCH_KEY,
+            0x8000,
+            NOW,
+            "living-room",
+        )
+        .unwrap();
+    table
+        .add(
+            crypto,
+            c1.rcac(),
+            None,
+            c1.noc(),
+            crypto.p256_keypair_from_bytes(&[0x44; 32]).unwrap(),
+            &[0x77; 16],
+            0x8001,
+            NOW,
+            "",
+        )
+        .unwrap();
+    (table, c0, c1)
+}
+
+#[test]
+fn persist_save_load_roundtrip_preserves_case_material() {
+    use crate::sc::case::creds::Fabric;
+
+    let crypto = backend();
+    let (table, c0, c1) = populated_table(&crypto);
+    let mut kvs = MemKvs::new();
+    table.save_to(&mut kvs).unwrap();
+
+    // 新テーブル(リブート想定、now=0 = 壁時計なし)へ復元する。
+    let mut restored: Table<5> = FabricTable::new();
+    let n = restored.load_from(&mut kvs, &crypto, 0).unwrap();
+    assert_eq!(n, 2);
+    assert_eq!(restored.len(), 2);
+    // LKGT が復元される(now=0 でも証明書検証が通ったのはこのため)。
+    assert_eq!(restored.last_known_good_epoch(), table.last_known_good_epoch());
+
+    // CASE 再確立に必要な素材が保存前と等価であること。
+    for (orig, chain) in [(1u8, &c0), (2u8, &c1)] {
+        let idx = NonZeroU8::new(orig).unwrap();
+        let a = table.get(idx).unwrap();
+        let b = restored.get(idx).unwrap();
+        assert_eq!(a.fabric_id(), b.fabric_id());
+        assert_eq!(a.node_id(), b.node_id());
+        assert_eq!(a.vendor_id(), b.vendor_id());
+        assert_eq!(a.label(), b.label());
+        assert_eq!(a.ipk(), b.ipk());
+        assert_eq!(a.ipk_epoch_key(), b.ipk_epoch_key());
+        assert_eq!(a.root_public_key(), b.root_public_key());
+        assert_eq!(a.compressed_fabric_id(), b.compressed_fabric_id());
+        assert_eq!(a.rcac(), chain.rcac());
+        assert_eq!(b.rcac(), chain.rcac());
+        assert_eq!(a.noc(), b.noc());
+        assert_eq!(a.icac(), b.icac());
+        assert_eq!(a.operational_key_bytes(), b.operational_key_bytes());
+
+        // 復元した運用鍵で署名でき、NOC 公開鍵で検証が通る(CASE Sigma 署名の等価性)。
+        let msg = b"sigma3 after reboot";
+        let mut sig = [0u8; 64];
+        Fabric::sign(b, msg, &mut sig).unwrap();
+        let pk = crypto
+            .p256_public_key_from_bytes(&chain.noc_kp.public_key().to_bytes())
+            .unwrap();
+        assert!(pk.verify(msg, &sig).unwrap());
+    }
+
+    // destination identifier(CASE Sigma1 の fabric 逆引き)も等価。
+    let random = [0xAB; 32];
+    let mut dest = [0u8; 32];
+    table
+        .get(NonZeroU8::new(1).unwrap())
+        .unwrap()
+        .compute_destination_id(&crypto, &random, NODE_ID, &mut dest)
+        .unwrap();
+    assert_eq!(
+        restored.find_by_dest_id(&crypto, &random, &dest),
+        Some(NonZeroU8::new(1).unwrap())
+    );
+}
+
+#[test]
+fn persist_load_from_empty_kvs_is_first_boot() {
+    let crypto = backend();
+    let mut kvs = MemKvs::new();
+    let mut table: Table<5> = FabricTable::new();
+    assert_eq!(table.load_from(&mut kvs, &crypto, 0).unwrap(), 0);
+    assert!(table.is_empty());
+}
+
+#[test]
+fn persist_load_rejects_nonempty_table() {
+    let crypto = backend();
+    let (table, _, _) = populated_table(&crypto);
+    let mut kvs = MemKvs::new();
+    table.save_to(&mut kvs).unwrap();
+
+    let (mut nonempty, _, _) = populated_table(&crypto);
+    assert_eq!(
+        nonempty.load_from(&mut kvs, &crypto, 0),
+        Err(Error::InvalidState)
+    );
+}
+
+#[test]
+fn persist_load_rejects_unknown_schema_version() {
+    use crate::kvs::Kvs;
+
+    let crypto = backend();
+    let (table, _, _) = populated_table(&crypto);
+    let mut kvs = MemKvs::new();
+    table.save_to(&mut kvs).unwrap();
+
+    // メタを version=2 で上書きする。
+    let mut meta = [0u8; 16];
+    let len = {
+        let mut w = TlvWriter::new(&mut meta);
+        w.start_struct(&TlvTag::Anonymous).unwrap();
+        w.write_u8(&cx(0), 2).unwrap();
+        w.write_u32(&cx(1), 0).unwrap();
+        w.end_container().unwrap();
+        w.len()
+    };
+    kvs.set(b"fabm", &meta[..len]).unwrap();
+
+    let mut restored: Table<5> = FabricTable::new();
+    assert_eq!(restored.load_from(&mut kvs, &crypto, 0), Err(Error::Decode));
+}
+
+#[test]
+fn persist_load_rejects_tampered_record() {
+    let crypto = backend();
+    let (table, _, _) = populated_table(&crypto);
+    let mut kvs = MemKvs::new();
+    table.save_to(&mut kvs).unwrap();
+    // 運用秘密鍵(cx6)のバイトを破壊 → NOC 公開鍵との一致検査で必ず落ちる。
+    kvs.corrupt(b"fab0", 60);
+
+    let mut restored: Table<5> = FabricTable::new();
+    assert!(restored.load_from(&mut kvs, &crypto, 0).is_err());
+}
+
+#[test]
+fn persist_save_removes_deleted_slots() {
+    let crypto = backend();
+    let (mut table, _, _) = populated_table(&crypto);
+    let mut kvs = MemKvs::new();
+    table.save_to(&mut kvs).unwrap();
+
+    // index 1 を削除して再保存 → 復元は 1 fabric(index 2)のみ。
+    table.remove(NonZeroU8::new(1).unwrap()).unwrap();
+    table.save_to(&mut kvs).unwrap();
+
+    let mut restored: Table<5> = FabricTable::new();
+    assert_eq!(restored.load_from(&mut kvs, &crypto, 0).unwrap(), 1);
+    assert!(restored.get(NonZeroU8::new(2).unwrap()).is_some());
+    assert!(restored.get(NonZeroU8::new(1).unwrap()).is_none());
+}
+
+// ---------------------------------------------------------------------------
 // 実 chip-cert チェーン(埋め込み実バイト列)を add のチェーン検証段が受理すること
 // 出典: research/rs-matter/rs-matter/src/cert.rs(chip-cert 生成の NOC1/ICAC1/RCA1)
 // ---------------------------------------------------------------------------

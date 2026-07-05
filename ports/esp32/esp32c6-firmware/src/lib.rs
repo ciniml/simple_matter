@@ -5,10 +5,13 @@
 //! - [`ble`]: コアの `GattPeripheral` trait を TrouBLE(trouble-host)で実装する
 //!   [`ble::TroubleGattPeripheral`] と、その裏で GATT 接続を駆動するワーカー
 //!   [`ble::gatt_worker`]。
+//! - [`kvs`]: コアの `Kvs` trait を内蔵 flash(esp-storage + sequential-storage)で
+//!   実装する [`kvs::EspKvs`](E4 の fabric 永続化バックエンド)。
 
 #![no_std]
 
 pub mod ble;
+pub mod kvs;
 
 use esp_hal::rng::Trng;
 use simple_matter::crypto::Rng;

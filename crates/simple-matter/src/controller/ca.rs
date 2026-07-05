@@ -72,8 +72,72 @@ impl<C: Crypto> Ca<C> {
         vendor_id: u16,
         now_epoch_s: u32,
     ) -> Result<Self> {
-        // 1. root 鍵ペアと自己署名 RCAC(rcac-id は fabric-id を流用。値の一意性は検証に無関係)。
+        // 鍵ペアと IPK epoch key を新規生成し、共通の構築(証明書発行 + creds 登録)に渡す。
         let root_kp = crypto.p256_generate_keypair()?;
+        let comm_kp = crypto.p256_generate_keypair()?;
+        let mut ipk_epoch_key = [0u8; 16];
+        rng.fill_bytes(&mut ipk_epoch_key)?;
+        Self::build(
+            crypto,
+            root_kp,
+            comm_kp,
+            ipk_epoch_key,
+            fabric_id,
+            controller_node_id,
+            vendor_id,
+            3,
+            now_epoch_s,
+        )
+    }
+
+    /// 保存済みの鍵素材から CA を復元する(**persistence 専用**、
+    /// `docs/design/port-esp32-device.md` §E4.6)。
+    ///
+    /// RCAC / コントローラ NOC は保存せず、同じ鍵から**再生成**する。証明書の内容
+    /// (serial 1/2・not-before/after = 0)は固定で、署名は決定的(RFC 6979)なので
+    /// [`Ca::generate`] が発行したものと同一バイト列になる。`next_serial` は発行済み
+    /// デバイス NOC との serial 重複を避けるために引き継ぐ。
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore(
+        crypto: &C,
+        root_key: &[u8; crate::crypto::P256_SECRET_KEY_LEN],
+        controller_key: &[u8; crate::crypto::P256_SECRET_KEY_LEN],
+        ipk_epoch_key: [u8; 16],
+        fabric_id: u64,
+        controller_node_id: u64,
+        vendor_id: u16,
+        next_serial: u32,
+        now_epoch_s: u32,
+    ) -> Result<Self> {
+        let root_kp = crypto.p256_keypair_from_bytes(root_key)?;
+        let comm_kp = crypto.p256_keypair_from_bytes(controller_key)?;
+        Self::build(
+            crypto,
+            root_kp,
+            comm_kp,
+            ipk_epoch_key,
+            fabric_id,
+            controller_node_id,
+            vendor_id,
+            next_serial,
+            now_epoch_s,
+        )
+    }
+
+    /// 鍵ペア・IPK から CA を組み立てる(generate / restore の共通部)。
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        crypto: &C,
+        root_kp: C::Keypair,
+        comm_kp: C::Keypair,
+        ipk_epoch_key: [u8; 16],
+        fabric_id: u64,
+        controller_node_id: u64,
+        vendor_id: u16,
+        next_serial: u32,
+        now_epoch_s: u32,
+    ) -> Result<Self> {
+        // 1. 自己署名 RCAC(rcac-id は fabric-id を流用。値の一意性は検証に無関係)。
         let root_pub = root_kp.public_key().to_bytes();
         let rcac_skid = key_id(crypto, &root_pub);
         let rcac_id = fabric_id;
@@ -101,12 +165,7 @@ impl<C: Crypto> Ca<C> {
             &root_kp,
         )?;
 
-        // 2. IPK epoch key(乱数)。
-        let mut ipk_epoch_key = [0u8; 16];
-        rng.fill_bytes(&mut ipk_epoch_key)?;
-
-        // 3. コントローラ自身の運用鍵ペア + NOC。
-        let comm_kp = crypto.p256_generate_keypair()?;
+        // 2. コントローラ自身の NOC(運用鍵ペアは引数)。
         let comm_pub = comm_kp.public_key().to_bytes();
         let comm_skid = key_id(crypto, &comm_pub);
         let noc_dn = [
@@ -133,7 +192,7 @@ impl<C: Crypto> Ca<C> {
             &root_kp,
         )?;
 
-        // 4. 自 fabric をテーブルへ追加(チェーン検証・IPK 導出込み)。
+        // 3. 自 fabric をテーブルへ追加(チェーン検証・IPK 導出込み)。
         let mut creds = FabricTable::new();
         creds.add(
             crypto,
@@ -157,7 +216,7 @@ impl<C: Crypto> Ca<C> {
             controller_node_id,
             vendor_id,
             ipk_epoch_key,
-            next_serial: Cell::new(3),
+            next_serial: Cell::new(next_serial),
             creds,
         })
     }
@@ -234,5 +293,26 @@ impl<C: Crypto> Ca<C> {
     /// コントローラの運用資格情報(CASE initiator の素材、§6.3)。
     pub fn creds(&self) -> &FabricTable<C, 1> {
         &self.creds
+    }
+
+    // ----------------------------------------------------------------------
+    // persistence 用 accessor(`docs/design/port-esp32-device.md` §E4.6)。
+    // 秘密鍵の取り出しは CA 状態の保存のためにのみ使うこと。
+    // ----------------------------------------------------------------------
+
+    /// root(RCAC)秘密鍵の生スカラ(**persistence 専用**)。
+    pub fn root_key_bytes(&self) -> [u8; crate::crypto::P256_SECRET_KEY_LEN] {
+        self.root_kp.to_bytes()
+    }
+
+    /// コントローラ運用鍵ペアの秘密スカラ(**persistence 専用**)。
+    pub fn controller_key_bytes(&self) -> Result<[u8; crate::crypto::P256_SECRET_KEY_LEN]> {
+        let entry = self.creds.iter().next().ok_or(Error::NotFound)?;
+        Ok(entry.operational_key_bytes())
+    }
+
+    /// 次に発行する NOC の serial(保存して [`Ca::restore`] に渡す)。
+    pub fn next_serial(&self) -> u32 {
+        self.next_serial.get()
     }
 }

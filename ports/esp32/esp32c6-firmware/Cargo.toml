@@ -23,6 +23,11 @@ path = "src/bin/e2-ble.rs"
 name = "e3-ble-light"
 path = "src/bin/e3-ble-light.rs"
 
+# E4: E3 + fabric 永続化(flash KVS。リブート後の運用 CASE 再確立)。
+[[bin]]
+name = "e4-ble-light"
+path = "src/bin/e4-ble-light.rs"
+
 [dependencies]
 esp-hal = { version = "1.1.1", features = ["esp32c6", "unstable"] }
 esp-println = { version = "0.17.0", features = ["esp32c6"] }
@@ -77,3 +82,14 @@ embassy-sync = "0.7"
 heapless = "0.9"
 # gatt_service マクロが characteristic 値の静的ストレージに使う。
 static_cell = "2.1"
+
+# --- E4: fabric 永続化(flash KVS、doc §E4.5)---
+#
+# esp-storage: 内蔵 flash への embedded-storage trait 実装(FlashStorage)。
+# sequential-storage: no_std の wear-leveling 付き KV(map)。API は
+# embedded-storage-async なので、blocking の FlashStorage を src/kvs.rs の
+# 薄いアダプタで持ち上げ、embassy-futures の block_on で駆動する。
+esp-storage = { version = "0.9.0", features = ["esp32c6"] }
+sequential-storage = "7.2"
+embedded-storage = "0.3"
+embedded-storage-async = "0.4"

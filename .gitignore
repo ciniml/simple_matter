@@ -5,3 +5,4 @@ PLAN.md
 ports/*/target/
 # 組込みファームウェアは再現性のため lock をコミットする(port-esp32-device.md R4)
 !ports/esp32/Cargo.lock
+ca-state.bin

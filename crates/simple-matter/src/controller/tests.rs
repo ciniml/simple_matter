@@ -131,6 +131,59 @@ fn issue_noc_serials_are_distinct() {
 }
 
 #[test]
+fn ca_restore_reproduces_identical_credentials() {
+    let crypto = crypto();
+    let ca = Ca::<Crb>::generate(
+        &crypto,
+        &mut SeqRng(0x4444),
+        FABRIC_ID,
+        COMM_NODE,
+        VENDOR,
+        0,
+    )
+    .unwrap();
+
+    // 発行を 1 回進めて serial カウンタを動かしてから素材を export する。
+    let dev_kp = crypto.p256_keypair_from_bytes(&[0x33; 32]).unwrap();
+    let dev_pub = dev_kp.public_key().to_bytes();
+    let mut noc1 = [0u8; 512];
+    let n1 = ca.issue_noc(&crypto, &dev_pub, DEVICE_NODE, &mut noc1).unwrap();
+
+    let restored = Ca::<Crb>::restore(
+        &crypto,
+        &ca.root_key_bytes(),
+        &ca.controller_key_bytes().unwrap(),
+        *ca.ipk_epoch_key(),
+        ca.fabric_id(),
+        ca.controller_node_id(),
+        ca.vendor_id(),
+        ca.next_serial(),
+        0,
+    )
+    .expect("Ca::restore");
+
+    // 署名が決定的(RFC 6979)なので RCAC・コントローラ NOC は同一バイト列になる。
+    assert_eq!(restored.rcac(), ca.rcac());
+    assert_eq!(restored.ipk_epoch_key(), ca.ipk_epoch_key());
+    let a = ca.creds().iter().next().unwrap();
+    let b = restored.creds().iter().next().unwrap();
+    assert_eq!(a.noc(), b.noc());
+    assert_eq!(a.ipk(), b.ipk());
+    assert_eq!(a.compressed_fabric_id(), b.compressed_fabric_id());
+
+    // serial は引き継がれ、restore 後に発行する NOC は generate 側の「次の 1 通」と一致する。
+    let mut noc2 = [0u8; 512];
+    let n2 = restored
+        .issue_noc(&crypto, &dev_pub, DEVICE_NODE, &mut noc2)
+        .unwrap();
+    let mut noc1b = [0u8; 512];
+    let n1b = ca.issue_noc(&crypto, &dev_pub, DEVICE_NODE, &mut noc1b).unwrap();
+    assert_eq!(&noc2[..n2], &noc1b[..n1b]);
+    // 最初に発行した NOC とは serial が異なる。
+    assert_ne!(&noc1[..n1], &noc2[..n2]);
+}
+
+#[test]
 fn parse_csr_round_trips_write_csr() {
     let crypto = crypto();
     let kp = crypto.p256_keypair_from_bytes(&[0x55; 32]).unwrap();

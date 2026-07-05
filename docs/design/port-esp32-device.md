@@ -173,11 +173,120 @@ ESP32 で「再起動後も fabric が残る」ために必須。**本移植の�
 | **E1: ports 骨格 + Lチカ** ✅(2026-07-05 実機確認、M5Stack NanoC6) | ports/esp32 workspace、esp-hal(1.1.1)で C6 起動・ログ・TRNG→`Rng`・P-256 鍵生成(ユーザ指定で C3→C6)。実機で発見した罠: **esp-bootloader-esp-idf の `esp_app_desc!()` 必須**(無いと TG0 WDT リセットループ)+ **espflash は 4.x 必須**(3.x は欠如を検出せず書き込む)。詳細 `ports/esp32/README.md` | 実機でログ出力・乱数取得 ✅(バナー→TRNG→SEC1 tag 0x04→heartbeat) | S |
 | **E2: BLE スモーク → GattPeripheral** ✅(2026-07-05 実機確認) | TrouBLE(0.6、esp-radio 0.18 の bt-hci 0.8 に合わせる)で 0xFFF6 広告 + C1/C2。`GattPeripheral` 実装は `ports/esp32/esp32c6-firmware/src/ble.rs`(worker⇔channel 構造で bluer 版を写像)。R1 は解消: CCCD 検知(`GattEvent::Write` + `accept()` 必須)・`Connection::att_mtu()`・indication は worker が Confirmation 待ちで直列化。切り分け用の生 HCI スモーク bin(`hci-smoke`)と espflash monitor の罠は `ports/esp32/README.md` | PC の `ble-commissioner` から BTP handshake 確立 ✅(fragment=20、PASE SDU 再組立・ACK・クリーン切断まで実測) | M |
 | **E3: BLE コミッショニング** ✅(2026-07-06 実機確認) | embassy 版ポンプ(毎周 poll・subscribe 前保留の教訓を移植)+ MatterStack(`e3-ble-light`、DefaultStack NF=5、WiFi シム込み、NanoC6 青 LED 追従)。乱数は全箇所 TRNG 直結、SPAKE2+ verifier は起動時前計算 | PC commissioner から **フルコミッショニング完走** ✅(PASE→CSR→AddNOC→CASE→CommissioningComplete→Toggle。ゲートの AddNOC 超え。連続 2 fabric も成功)。chip-tool 相互試験は未実施 | M |
-| **E4: KVS + fabric 永続化** | コアに Kvs trait + fabric TLV 保存/復元、esp-storage 実装 | 再起動後に運用 CASE が再確立できる | M〜L(コア側含む) |
+| **E4: KVS + fabric 永続化** ✅(2026-07-06 実機確認) | コアに `kvs::Kvs` trait + `FabricTable::save_to/load_from`(TLV versioned、詳細は本書「E4 設計」節)、ESP32 は esp-storage + sequential-storage(nvs 領域、IDF 非互換)。PC 側 ble-commissioner に CA 永続化(`ca-state.bin`)+ `--operational` モード追加。単体テスト +7(317 passed) | **再起動後の運用 CASE 再確立 ✅**(コミッショニング→`[kvs] saved 1 fabrics`→リセット→`[kvs] restored 1 fabrics`→`--operational` で CASE+Toggle 成功) | M〜L(コア側含む) |
 | **E5: Wi-Fi 実 join + UDP/mDNS** | WifiDriver trait、embassy-net で UDP trait 実装、mDNS(IPv4+IPv6) | chip-tool `pairing ble-wifi`(実 SSID)フルパス + toggle | L |
 | **E6: bloat-check / チューニング** | C3 実測、バッファ・window の const generic 調整 | flash/RAM 実測値を README/ARCHITECTURE に記録 | S |
 
 **総工数感: L**(E4/E5 がコア側の未整備領域を含むため。BLE 経路だけなら E0-E3 で M)。
+
+## E4 設計: KVS と fabric 永続化
+
+E4 の目的は「デバイスをリブートしても運用 CASE を再確立できる」こと。そのために
+(1) コアに最小の KVS 抽象を切り、(2) `FabricTable` を TLV で保存/復元できるようにし、
+(3) ESP32-C6 の flash(`nvs` パーティション領域)に実装を接続する。以下は確定した設計判断。
+
+### E4.1 `Kvs` trait(コア `src/kvs.rs`)
+
+- **置き場所はコア**(`crates/simple-matter/src/kvs.rs`、feature ゲートなし・依存ゼロ)。
+  `crypto::Rng` と同じ「最小 trait + プラットフォーム注入」の流儀(ARCHITECTURE 原則 9)。
+  trait 定義だけなら no_std・alloc 非依存・フットプリントゼロで常時コンパイルできる。
+- **同期(blocking)API**。flash 書き込みは低頻度パス(fabric 変更時のみ)であり、
+  コアを executor 非依存に保つ現行方針(Clock も値渡し)と揃える。ESP32 側の
+  非同期 flash API は実装側で `block_on` 相当により吸収する(下層は元々 blocking)。
+- シグネチャ(キーは短いバイト列、値は borrowed slice。ヒープ確保なし):
+  - `fn get(&mut self, key: &[u8], buf: &mut [u8]) -> Result<Option<usize>>`
+    — 無ければ `Ok(None)`、あれば `buf` 先頭に値をコピーし長さを返す。`buf` 不足は `NoSpace`。
+  - `fn set(&mut self, key: &[u8], value: &[u8]) -> Result<()>` — 上書き。
+  - `fn remove(&mut self, key: &[u8]) -> Result<()>` — **キー不在でも `Ok`**
+    (呼び出し側が空スロットを無条件に消せるように冪等とする)。
+  `&mut self` なのは flash ドライバが本質的に排他だから(共有したい層が外側で包む)。
+
+### E4.2 fabric 永続化フォーマット(versioned TLV)
+
+既存の `src/tlv.rs`(Matter TLV)でエンコードする。専用フォーマットを増やさず、
+既にコアにあるコーデックを再利用するのが理由(パーサの二重化を避ける)。
+
+- **キーはスロット毎**: `b"fab0"`..`b"fab{N-1}"`(スロット位置 = テーブル内順序。
+  N ≤ 10 前提、`DefaultStack` は NF=5)。メタは `b"fabm"`。
+- **メタレコード**(`fabm`): struct { cx0: schema version (u8, 現行 1), cx1:
+  last_known_good_epoch (u32) }。version 不一致は復元拒否(`Error::Decode`)—
+  将来のマイグレーションはここで分岐する。
+- **fabric レコード**(`fabN`): struct {
+  cx1: fabric_index (u8), cx2: fabric_id (u64), cx3: node_id (u64),
+  cx4: vendor_id (u16), cx5: ipk_epoch_key (bytes 16), cx6: 運用秘密鍵 (bytes 32),
+  cx7: RCAC TLV 原本 (bytes), cx8: ICAC TLV 原本 (bytes, 無ければ省略),
+  cx9: NOC TLV 原本 (bytes), cx10: label (utf8), cx11: compressed_fabric_id (bytes 8) }。
+- **保存するのは「素材」であり導出値は復元時に再計算する**: root_public_key /
+  operational IPK は RCAC / epoch key から再導出(HKDF は安価)。cx11 の
+  compressed_fabric_id は照合用に保存し、再導出値と不一致なら破損として拒否する。
+- レコード上限は `MAX_FABRIC_RECORD_LEN`(証明書 3 通 ≤ 400B ×3 + 鍵 + タグ類)。
+
+### E4.3 秘密鍵の取り出し(公開 API の増分)
+
+- `P256Keypair::to_bytes()`(秘密スカラ 32B の export)と
+  `Crypto::p256_keypair_from_bytes()`(import)は**既に trait に存在**するため
+  trait 変更は不要。
+- `FabricEntry::operational_key_bytes()` を追加(`to_bytes` の薄い転送)。
+  **persistence 専用**と doc に明記し、これ以外の用途で秘密鍵を触らせない。
+- controller 側 `Ca` にも同趣旨の persistence 用 API を追加する(E4.6)。
+
+### E4.4 `FabricTable` の save/load
+
+- `save_to(&self, kvs)` — メタ + 全スロットを書き、**空きスロットのキーは remove**
+  (削除された fabric がゾンビ復活しないように)。
+- `load_from(&mut self, kvs, crypto, now) -> Result<usize>` — 空テーブル前提
+  (非空は `InvalidState`)。復元数を返す。メタ不在は「初回起動」として `Ok(0)`。
+- **復元時もチェーン検証・NOC 公開鍵と運用鍵の一致検査を add と同水準で行う**
+  (flash 破損・改竄をロード段で検出する)。検証時刻は `max(now, 保存済み LKGT,
+  チェーンの notBefore)`(壁時計を持たないデバイスの LKGT 復元、add と同じ扱い)。
+  fabric_index は保存値を採用(採番し直さない — コントローラが覚えている index と
+  一致させる必要はないが、remove 後の非連続 index を保存どおり保つ)。
+- **呼び出しタイミングは統合層の責務**: `FabricTable::generation()` の変化を検知して
+  `save_to` を呼ぶ(PC 版 onoff-light の operational 広告更新と同じパターン)。
+  コアはいつ保存するかを知らない(sans-IO 維持)。
+
+### E4.5 ESP32 実装(`ports/esp32/esp32c6-firmware/src/kvs.rs`)
+
+- **esp-storage(`FlashStorage`)+ sequential-storage(map)** で `Kvs` を実装する。
+  sequential-storage は no_std の wear-leveling 付き KV(ページ巡回 + 追記型)。
+  **IDF の NVS フォーマットとは非互換の自前フォーマット**であることを明記する
+  (領域だけを間借りする。IDF ツールで読み書きしない前提)。
+- 使用領域はパーティションテーブルの `nvs`(offset 0x9000, len 0x6000 = 4KiB × 6
+  ページ)。espflash 既定テーブルの nvs と同じ位置で、アプリ領域と衝突しない。
+- sequential-storage の API は async(embedded-storage-async)なので、blocking の
+  `FlashStorage` を async trait に持ち上げる薄いアダプタを書き、`Kvs` 実装内で
+  `embassy_futures::block_on` で駆動する(下層が blocking なので即完了する)。
+- キーは 4 バイト固定(`fab0` 等)を u64 にパックして sequential-storage の
+  `Key` 制約を満たす。コアには esp 依存を一切入れない。
+- 既知のリスク(実機で要観測): flash 書き込み中はキャッシュが止まるため、BLE
+  (esp-radio)稼働中の erase/write でタイミング違反が出る可能性。E4 の保存契機は
+  コミッショニング直後(数回)のみなので影響は限定的、問題が出たら BLE idle 時に
+  遅延保存する。
+
+### E4.6 検証プロトコル(E4 ゲート)と PC 側の追加
+
+デバイス単体では「リブート後に CASE が張れる」ことを外から証明できないため、
+PC 側 `ble-commissioner` に 2 つの機能を足してゲートを閉じる:
+
+1. **CA 永続化**: 初回に CA の素材(root 秘密鍵・コントローラ運用秘密鍵・IPK epoch
+   key・fabric_id/node_id/vendor_id・serial カウンタ)をファイル保存し、以後再利用する。
+   パスは `--ca-state <file>`(既定 `./ca-state.bin`)。証明書(RCAC/NOC)は保存しない
+   — 署名が決定的(RFC 6979)なので同じ鍵から**同一バイト列を再生成できる**し、
+   CASE の検証は鍵素材にしか依存しない。コアに `Ca::restore(...)` と persistence 用
+   accessor(`root_key_bytes` / `operational_key_bytes` / `next_serial`)を追加する。
+2. **`--operational` モード**: スキャン → BLE 接続 → BTP handshake → **PASE を飛ばして
+   CASE のみ**(`ControllerStack::start_case`、経路は既存 API で足りる)→ OnOff Toggle。
+   `Commissioner` は使わない(example 層で `sc_take_event()` の `CaseEstablished` を
+   待つ最小フロー)。
+
+デバイス側はリブート後も **commissionable 広告を出し続ける**(E3 と同じ広告)。
+運用広告 = mDNS は E5 スコープであり、E4 では「BLE で繋いで CASE だけ張る」ことで
+永続化の正しさを検証する(テストの簡略化。Matter 本来の運用経路ではない点に注意)。
+
+**E4 ゲート**: run1(通常コミッショニング)→ デバイスリセット → run2
+`--operational`: CASE 確立 + Toggle 成功。デバイスログは起動時
+`[kvs] restored N fabrics`、保存時 `[kvs] saved N fabrics` を出す(bin は
+`e4-ble-light`。既存 bin は変更しない)。
 
 ## 9. 参考(調査ソース)
 

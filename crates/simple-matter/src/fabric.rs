@@ -224,6 +224,15 @@ impl<C: Crypto> FabricEntry<C> {
         }
     }
 
+    /// 運用鍵ペアの秘密スカラ(32 バイト、ビッグエンディアン)。
+    ///
+    /// **persistence 専用**(`docs/design/port-esp32-device.md` §E4.3)。fabric
+    /// レコードの KVS 保存([`FabricTable::save_to`])のためにのみ使うこと。署名は
+    /// [`FabricEntry::sign`] を使い、この生鍵を他の用途に持ち出さない。
+    pub fn operational_key_bytes(&self) -> [u8; crate::crypto::P256_SECRET_KEY_LEN] {
+        self.keypair.to_bytes()
+    }
+
     /// 運用鍵で `msg` に ECDSA 署名し `out` に生 `r || s`(64 バイト)を書く。
     pub fn sign(&self, msg: &[u8], out: &mut [u8; SIGNATURE_LEN]) -> Result<()> {
         self.keypair.sign(msg, out)
@@ -689,6 +698,10 @@ fn derive_operational_ipk<C: Crypto>(
     )?;
     Ok(out)
 }
+
+mod persist;
+
+pub use persist::{FABRIC_SCHEMA_VERSION, MAX_FABRIC_RECORD_LEN};
 
 #[cfg(all(test, feature = "rustcrypto"))]
 mod tests;

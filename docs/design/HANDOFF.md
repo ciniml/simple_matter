@@ -9,8 +9,8 @@
 
 BLE コミッショニングは chip-tool 相互運用まで達成済み。移植は **Windows: W0-W3 完了
 (W3 は mDNS ディスカバリ込みで実機フル完走、2026-07-05)**、
-**ESP32-C6: E1/E2/E3 実機確認済み(E3 = MatterStack 統合、PC commissioner から
-BLE フルコミッショニング+Toggle 完走、2026-07-06)。次は E4(KVS/fabric 永続化)**。
+**ESP32-C6: E1〜E4 実機確認済み(E4 = fabric 永続化、リブート後に `--operational` で
+CASE 再確立+Toggle、2026-07-06)。次は E5(実 WiFi join + UDP/mDNS)**。
 
 ## 2. リポジトリ状態
 
@@ -108,6 +108,17 @@ BLE フルコミッショニング+Toggle 完走、2026-07-06)。次は E4(KVS/f
   Toggle 反映、連続 2 fabric も成功)。NanoC6 青 LED(GPIO7)が OnOff に追従。
   乱数は全箇所 TRNG 直結、毎周 stack.poll() + BTP flush(NoSpace 教訓の移植)。
   RAM 静的 ≈149KB / 512KB。fabric 永続化なし(E4)・実 WiFi なし(E5)。
+- **E4** ✅ 実機確認(2026-07-06、NanoC6): fabric 永続化。コアに `kvs::Kvs` trait +
+  `FabricTable::save_to/load_from`(TLV versioned、設計は port-esp32-device.md
+  「E4 設計」節)、運用鍵は `P256Keypair::to_bytes`(既存)で往復、CA 証明書は
+  決定的署名により鍵から再生成。ESP32 は esp-storage + sequential-storage
+  (nvs 領域、IDF 非互換)。PC 側 ble-commissioner に CA 永続化(`ca-state.bin`)+
+  `--operational` モード(PASE なしで CASE→Toggle)。
+  **ゲート実測**: run1 コミッショニング→`[kvs] saved 1 fabrics`→リセット→
+  `[kvs] restored 1 fabrics`→run2 `--operational` で CASE 再確立+Toggle 成功。
+  単体テスト +7(計 317)。BLE 稼働中の flash 書き込みも問題なし。
+  PC 側の罠: **BlueZ が過去ブートの FFF6 広告をキャッシュ**し stale アドレスへの
+  connect が失敗する → FFF6 デバイスを `bluetoothctl remove`(README 参照)。
 
 ## 5. クロスビルド / 実機テストの実務メモ
 
@@ -154,10 +165,13 @@ BLE フルコミッショニング+Toggle 完走、2026-07-06)。次は E4(KVS/f
 
 ## 7. 残タスク(優先度順の目安)
 
-1. **E4 以降**: KVS/fabric 永続化(E4 = コアに Kvs trait + esp-storage 実装、
-   再起動後の運用 CASE 再確立がゲート)→ 実 WiFi join(E5)→ bloat-check(E6)
-   (`port-esp32-device.md` のフェーズ表)。E3 の chip-tool `pairing ble-wifi`
-   相互試験も未実施(PC 版と同一 DataModel なので通る想定)。
+1. **E5 以降**: 実 WiFi join + UDP/mDNS(embassy-net、WifiDriver trait)→
+   bloat-check(E6)(`port-esp32-device.md` のフェーズ表)。E3 の chip-tool
+   `pairing ble-wifi` 相互試験も未実施(PC 版と同一 DataModel なので通る想定)。
+   E4 で追加: コア `kvs::Kvs` trait + `FabricTable::save_to/load_from`(TLV)、
+   PC 側 ble-commissioner の CA 永続化(`ca-state.bin`)+ `--operational` モード。
+   PC 側の罠: BlueZ は過去ブートの FFF6 広告をキャッシュし stale アドレスへの
+   connect が失敗する → `bluetoothctl remove`(ports/esp32/README.md 参照)。
 2. **W4**: chip デバイス相手のフルパス(commissioner 側の BLE→UDP 運用遷移の実装が前提)。
 3. **方向 B 完結**: 我々の commissioner → chip-lighting-app の AddNOC 後、BLE を閉じて
    運用 mDNS→CASE over UDP→CommissioningComplete(現状 AddNOC まで実証済み)。
