@@ -562,14 +562,8 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         let max_neg = max.max(min).max(1);
 
         let id = self.alloc_sub_id();
-        let mut sub = Subscription::<PATHS>::new(
-            id,
-            rx.exchange.session(),
-            *acc,
-            min,
-            max_neg,
-            now_ms,
-        );
+        let mut sub =
+            Subscription::<PATHS>::new(id, rx.exchange.session(), *acc, min, max_neg, now_ms);
         let mut txn = ReadTxn::<PATHS>::new(rx.exchange, *acc, ReadKind::Priming(id), now_ms);
         for p in req.attr_paths()? {
             let p = p?;
@@ -746,9 +740,10 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         self.data_version = self.data_version.wrapping_add(1);
         let suppress = req.suppress_response()?;
         let timed_flag = req.timed_request()?;
-        if let Err(st) = self.check_timed(rx.exchange, timed_flag, now_ms) {
-            return status_response(tx, st);
-        }
+        let was_timed = match self.check_timed(rx.exchange, timed_flag, now_ms) {
+            Ok(b) => b,
+            Err(st) => return status_response(tx, st),
+        };
 
         let session = rx.exchange.session();
         let header = InvokeResponseHeader {
@@ -764,7 +759,7 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
             let _ = encode_invoke_response(tx, header, |cw| {
                 for item in req.invoke_requests()? {
                     let item = item?;
-                    effects.merge(invoke_one(dm, &item, acc, cw)?);
+                    effects.merge(invoke_one(dm, &item, acc, was_timed, cw)?);
                 }
                 Ok(())
             });
@@ -776,7 +771,7 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         let len = encode_invoke_response(tx, header, |cw| {
             for item in req.invoke_requests()? {
                 let item = item?;
-                effects.merge(invoke_one(dm, &item, acc, cw)?);
+                effects.merge(invoke_one(dm, &item, acc, was_timed, cw)?);
             }
             Ok(())
         })?;
@@ -837,12 +832,14 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
     }
 
     /// 後続 Write/Invoke の Timed 整合を検証し、armed なら消費する(設計 §5.5)。
+    ///
+    /// 成功時は「timed 経由だったか」を返す(timed 必須コマンドの強制に使う)。
     fn check_timed(
         &mut self,
         exchange: ExchangeId,
         timed_flag: bool,
         now_ms: u64,
-    ) -> core::result::Result<(), ImStatus> {
+    ) -> core::result::Result<bool, ImStatus> {
         let found = self.timed.iter().position(|t| t.exchange == exchange);
         if let Some(i) = found {
             let deadline = self.timed[i].deadline_ms;
@@ -853,11 +850,11 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
             if now_ms > deadline {
                 return Err(ImStatus::Timeout);
             }
-            Ok(())
+            Ok(true)
         } else if timed_flag {
             Err(ImStatus::TimedRequestMismatch)
         } else {
-            Ok(())
+            Ok(false)
         }
     }
 
@@ -1181,6 +1178,7 @@ fn invoke_one<D: DataModel + ?Sized>(
     dm: &mut D,
     item: &CommandDataRef<'_>,
     acc: &AccessContext,
+    was_timed: bool,
     cw: &mut CmdRespWriter<'_, '_>,
 ) -> Result<InvokeEffects> {
     let path = item.path;
@@ -1194,14 +1192,14 @@ fn invoke_one<D: DataModel + ?Sized>(
     }
     // 必要権限はコマンドメタの access(未知コマンドは既定 Operate。クラスタが
     // UnsupportedCommand を返す)。存在チェック → ACL の順(acl.md §3)。
-    let required = match dm.cluster(path.endpoint, path.cluster) {
+    let (required, needs_timed) = match dm.cluster(path.endpoint, path.cluster) {
         Some(c) => c
             .meta()
             .accepted_commands
             .iter()
             .find(|m| m.id == path.command)
-            .map(|m| m.access)
-            .unwrap_or(Privilege::Operate),
+            .map(|m| (m.access, m.timed))
+            .unwrap_or((Privilege::Operate, false)),
         None => {
             cw.push_status(
                 &path,
@@ -1211,6 +1209,15 @@ fn invoke_one<D: DataModel + ?Sized>(
             return Ok(InvokeEffects::default());
         }
     };
+    // timed 必須コマンドの強制(設計 §5.5 / admin-commissioning.md §3)。
+    if needs_timed && !was_timed {
+        cw.push_status(
+            &path,
+            &StatusIB::simple(ImStatus::NeedsTimedInteraction),
+            item.command_ref,
+        )?;
+        return Ok(InvokeEffects::default());
+    }
     if !allowed(dm, acc, path.endpoint, path.cluster, required) {
         cw.push_status(
             &path,
@@ -1231,9 +1238,9 @@ fn invoke_one<D: DataModel + ?Sized>(
     let mut fr = TlvReader::new(item.fields.unwrap_or(&[]));
     let mut scratch = [0u8; INVOKE_SCRATCH];
     // resp/sw の借用をブロックで閉じ、確定後にスクラッチを読めるようにする。
-    let (result, response_cmd, effects, scratch_len) = {
+    let (result, response_cmd, effects, cluster_status, scratch_len) = {
         let mut sw = TlvWriter::new(&mut scratch);
-        let (result, response_cmd, effects) = {
+        let (result, response_cmd, effects, cluster_status) = {
             let mut resp = CmdResponder::new(&mut sw);
             let result = cluster.invoke_command(path.command, &mut fr, &mut resp, acc);
             let effects = InvokeEffects {
@@ -1241,10 +1248,15 @@ fn invoke_one<D: DataModel + ?Sized>(
                 case_admin: resp.requested_case_admin_acl(),
                 removed_fabric: resp.requested_fabric_removed(),
             };
-            (result, resp.response_command(), effects)
+            (
+                result,
+                resp.response_command(),
+                effects,
+                resp.cluster_status(),
+            )
         };
         let scratch_len = sw.len();
-        (result, response_cmd, effects, scratch_len)
+        (result, response_cmd, effects, cluster_status, scratch_len)
     };
 
     match result {
@@ -1263,7 +1275,8 @@ fn invoke_one<D: DataModel + ?Sized>(
             }
         }
         Err(s) => {
-            cw.push_status(&path, &StatusIB::simple(s), item.command_ref)?;
+            // クラスタ固有ステータス(§11.19.6 等)があれば StatusIB.cluster_status に写す。
+            cw.push_status(&path, &StatusIB::new(s, cluster_status), item.command_ref)?;
         }
     }
     Ok(effects)

@@ -175,6 +175,20 @@ impl<
         self.mgr.handler_mut().im.data_model_mut()
     }
 
+    /// PASE 設定を差し替える(OpenCommissioningWindow の動的 verifier 注入。
+    /// `docs/design/admin-commissioning.md` §4)。
+    pub fn set_pase_config(&mut self, config: crate::sc::PaseConfig) {
+        self.mgr.handler_mut().sc.set_pase_config(config);
+    }
+
+    /// PASE 受理ゲートを切り替える(コミッショニング窓の開閉)。
+    ///
+    /// `false` の間、新規 PBKDFParamRequest には Busy StatusReport が返る。確立済み
+    /// セッションには影響しない。
+    pub fn set_pase_enabled(&mut self, enabled: bool) {
+        self.mgr.handler_mut().sc.set_pase_enabled(enabled);
+    }
+
     /// 次に [`poll`](Self::poll) すべき最も早い絶対時刻(ミリ秒)。
     ///
     /// MRP 再送/ACK 期限([`ExchangeManager::next_deadline`])と IM 購読レポート期限

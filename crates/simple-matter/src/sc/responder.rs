@@ -111,6 +111,9 @@ pub struct SecureChannel<'c, C: Crypto, R: Rng, F, const H: usize> {
     crypto: &'c C,
     rng: R,
     config: PaseConfig,
+    /// PASE 受理ゲート(コミッショニング窓)。`false` の間は PBKDFParamRequest に
+    /// Busy StatusReport を返す(`docs/design/admin-commissioning.md` §4)。
+    pase_enabled: bool,
     fabrics: F,
     pool: HandshakePool<H, C::Sha256>,
     /// CASE session resumption レコード(メモリ内・固定容量。設計 §7.4)。
@@ -137,10 +140,29 @@ impl<'c, C: Crypto, R: Rng, F, const H: usize> SecureChannel<'c, C, R, F, H> {
             crypto,
             rng,
             config,
+            pase_enabled: true,
             fabrics,
             pool: HandshakePool::new(),
             resumptions: ResumptionStore::new(),
         }
+    }
+
+    /// PASE 設定(SPAKE2+ 検証子 / salt / iterations)を差し替える。
+    ///
+    /// OpenCommissioningWindow(ECM)の動的 verifier 注入に使う
+    /// (`docs/design/admin-commissioning.md` §4)。進行中・確立済みセッションには影響せず、
+    /// 以降の新規 PASE ハンドシェイクから適用される。
+    pub fn set_pase_config(&mut self, config: PaseConfig) {
+        self.config = config;
+    }
+
+    /// PASE 受理ゲートを切り替える(コミッショニング窓の開閉)。
+    ///
+    /// `false` の間、新規 PBKDFParamRequest には Busy StatusReport を返す
+    /// (chip 系コミッショナはリトライ可能エラーとして扱う)。確立済みセッションは影響を
+    /// 受けない。
+    pub fn set_pase_enabled(&mut self, enabled: bool) {
+        self.pase_enabled = enabled;
     }
 
     /// 進行中ハンドシェイク数を返す。
@@ -201,6 +223,11 @@ impl<'c, C: Crypto, R: Rng, F, const H: usize> SecureChannel<'c, C, R, F, H> {
         now_ms: u64,
     ) -> Result<HandlerAction> {
         let req = PbkdfParamReq::decode(rx.payload)?;
+
+        // コミッショニング窓が閉じている間は受理しない(admin-commissioning.md §4)。
+        if !self.pase_enabled {
+            return self.busy(tx);
+        }
 
         // passcode_id != 0 は未対応。
         if req.passcode_id != 0 {

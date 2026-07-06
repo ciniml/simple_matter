@@ -24,16 +24,17 @@ use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use simple_matter::acl::{AclHandle, AclTable};
 use simple_matter::crypto::rustcrypto::RustCrypto;
 use simple_matter::crypto::Rng;
 use simple_matter::discovery::{
     Commissionable, CommissioningMode, Host, MdnsResponder, Operational, MATTER_PORT, MDNS_IPV4,
     MDNS_PORT,
 };
-use simple_matter::acl::{AclHandle, AclTable};
 use simple_matter::dm::clusters::{
-    AccessControlCluster, BasicInfoConfig, BasicInformationCluster, DescriptorCluster,
-    GeneralCommissioning, NetworkCommissioning, OnOffCluster, OpCredsCluster, TestDacProvider,
+    AccessControlCluster, AdminCommissioningCluster, BasicInfoConfig, BasicInformationCluster,
+    CommissioningWindow, DescriptorCluster, GeneralCommissioning, NetworkCommissioning,
+    OnOffCluster, OpCredsCluster, TestDacProvider, WindowEvent,
 };
 use simple_matter::dm::meta::{ClusterId, DeviceType, EndpointId, EndpointMeta};
 use simple_matter::dm::{DataModel, ServerCluster};
@@ -105,6 +106,7 @@ static EP0_SERVERS: &[ClusterId] = &[
     ClusterId(0x0028),
     ClusterId(0x0030),
     ClusterId(0x0031),
+    ClusterId(0x003C),
     ClusterId(0x003E),
     ClusterId(0x001D),
 ];
@@ -120,6 +122,7 @@ struct Light<'s> {
     basic: BasicInformationCluster,
     gc: GeneralCommissioning,
     net: NetworkCommissioning,
+    admin: AdminCommissioningCluster<'s>,
     opcreds: OpCreds<'s>,
     desc0: DescriptorCluster,
     onoff: OnOffCluster,
@@ -147,6 +150,7 @@ impl DataModel for Light<'_> {
             (0, 0x0028) => Some(&self.basic),
             (0, 0x0030) => Some(&self.gc),
             (0, 0x0031) => Some(&self.net),
+            (0, 0x003C) => Some(&self.admin),
             (0, 0x003E) => Some(&self.opcreds),
             (0, 0x001D) => Some(&self.desc0),
             (1, 0x0006) => Some(&self.onoff),
@@ -160,6 +164,7 @@ impl DataModel for Light<'_> {
             (0, 0x0028) => Some(&mut self.basic),
             (0, 0x0030) => Some(&mut self.gc),
             (0, 0x0031) => Some(&mut self.net),
+            (0, 0x003C) => Some(&mut self.admin),
             (0, 0x003E) => Some(&mut self.opcreds),
             (0, 0x001D) => Some(&mut self.desc0),
             (1, 0x0006) => Some(&mut self.onoff),
@@ -171,6 +176,8 @@ impl DataModel for Light<'_> {
         if self.gc.on_tick(now_ms) {
             self.opcreds.on_failsafe_expired();
         }
+        // コミッショニング窓のタイムアウト自動クローズ(admin-commissioning.md §2)。
+        let _ = self.admin.on_tick(now_ms);
         None
     }
     fn acl(&self) -> Option<&dyn AclHandle> {
@@ -182,6 +189,7 @@ impl DataModel for Light<'_> {
 fn build_light<'s>(
     fabrics: &'s RefCell<FabricTable<Backend, NF>>,
     acl: &'s RefCell<AclTable<NACL>>,
+    window: &'s RefCell<CommissioningWindow>,
 ) -> Light<'s> {
     let dac_crypto = RustCrypto::new(DemoRng::from_time());
     let dac = TestDacProvider::new(&dac_crypto).expect("test DAC");
@@ -191,6 +199,7 @@ fn build_light<'s>(
         basic: BasicInformationCluster::new(&CFG),
         gc: GeneralCommissioning::default_config(),
         net: NetworkCommissioning::new(b"eth0"),
+        admin: AdminCommissioningCluster::new(window),
         opcreds: OpCredsCluster::new_shared(fabrics, RustCrypto::new(DemoRng::from_time()), dac),
         desc0: DescriptorCluster::new(EndpointId(0), EP0_DT, EP0_SERVERS, &[], EP0_PARTS),
         // On/Off 変化を println で通知する。
@@ -207,11 +216,13 @@ fn main() -> std::io::Result<()> {
     let fabrics: RefCell<FabricTable<Backend, NF>> = RefCell::new(FabricTable::new());
     // ACL テーブル(AccessControl クラスタと IM エンジンの権限評価が共有)。
     let acl: RefCell<AclTable<NACL>> = RefCell::new(AclTable::new());
+    // コミッショニング窓(AdminCommissioning クラスタと app ループが共有)。
+    let window: RefCell<CommissioningWindow> = RefCell::new(CommissioningWindow::new());
 
     let config = PaseConfig::from_passcode_default(PASSCODE, &SALT).expect("PASE config");
     let creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
     let sc = SecureChannel::new(&crypto, DemoRng::from_time(), config, creds);
-    let im = InteractionModel::new(build_light(&fabrics, &acl));
+    let im = InteractionModel::new(build_light(&fabrics, &acl, &window));
     let mut stack: DefaultStack<Backend, DemoRng, Light> = MatterStack::new(&crypto, sc, im);
 
     let socket = UdpSocket::bind("0.0.0.0:5540")?;
@@ -224,17 +235,22 @@ fn main() -> std::io::Result<()> {
     let mac = MDNS_INSTANCE_ID.to_be_bytes(); // 下位 6 バイトをホスト名(MAC 相当)に使う
     let host = Host::from_mac(&mac[2..8], None, Some(local_ipv4));
     let mut mdns: MdnsResponder<NF> = MdnsResponder::new(host, MATTER_PORT);
-    mdns.set_commissionable(Some(Commissionable {
+    // commissionable 広告の組み立て(起動時 CM=1 / ECM 窓オープン時 CM=2 で再利用)。
+    let commissionable = |discriminator: u16, mode: CommissioningMode| Commissionable {
         device_type: Some(0x0100),
         device_name: Some(CFG.product_name),
         ..Commissionable::new(
             MDNS_INSTANCE_ID,
-            DISCRIMINATOR,
+            discriminator,
             CFG.vendor_id,
             CFG.product_id,
-            CommissioningMode::Standard,
+            mode,
         )
-    }));
+    };
+    mdns.set_commissionable(Some(commissionable(
+        DISCRIMINATOR,
+        CommissioningMode::Standard,
+    )));
     let mdns_socket = open_mdns_socket();
 
     println!("simple-matter On/Off light listening on UDP/5540");
@@ -250,6 +266,10 @@ fn main() -> std::io::Result<()> {
     let mut mdns_tx = [0u8; 1500];
     // 直近に広告済みの fabric 世代(変化検知に使う)。
     let mut last_generation = fabrics.borrow().generation();
+    // 起動時コミッショニング窓(未コミッショニング時の announcement 窓)が開いているか。
+    let mut boot_window_open = true;
+    // 直近の fabric 数(窓経由コミッショニング完了の検知に使う)。
+    let mut last_fabric_count = fabrics.borrow().len();
 
     loop {
         // 1) Matter UDP の受信処理。
@@ -291,6 +311,8 @@ fn main() -> std::io::Result<()> {
         }
 
         // 3) fabric が増減したら operational 広告に反映して再 announce。
+        //    初回コミッショニング(fabric 0 → 1+)で起動時窓を閉じ、全 fabric 削除で再び開く
+        //    (docs/design/admin-commissioning.md §5)。
         let gen = fabrics.borrow().generation();
         if gen != last_generation {
             last_generation = gen;
@@ -301,6 +323,82 @@ fn main() -> std::io::Result<()> {
                 .collect();
             mdns.set_operational(ops);
             mdns.notify_change(now_ms(&start));
+            let fabric_count = fabrics.borrow().len();
+            // 窓経由のコミッショニング完了(fabric 追加)で窓を閉じる(§11.19.5)。
+            // Closed イベントは次の 3.5) が PASE 無効化と広告停止に反映する。
+            if fabric_count > last_fabric_count && window.borrow().is_open() {
+                window.borrow_mut().close_window();
+                println!("[window] commissioning succeeded; closing window");
+            }
+            last_fabric_count = fabric_count;
+            if boot_window_open && fabric_count > 0 && !window.borrow().is_open() {
+                boot_window_open = false;
+                stack.set_pase_enabled(false);
+                mdns.set_commissionable(None);
+                mdns.notify_change(now_ms(&start));
+                println!("[window] initial commissioning done; commissioning window closed");
+            } else if !boot_window_open && fabric_count == 0 && !window.borrow().is_open() {
+                boot_window_open = true;
+                let cfg = PaseConfig::from_passcode_default(PASSCODE, &SALT).expect("PASE config");
+                stack.set_pase_config(cfg);
+                stack.set_pase_enabled(true);
+                mdns.set_commissionable(Some(commissionable(
+                    DISCRIMINATOR,
+                    CommissioningMode::Standard,
+                )));
+                mdns.notify_change(now_ms(&start));
+                println!("[window] all fabrics removed; reopening initial commissioning window");
+            }
+        }
+
+        // 3.5) コミッショニング窓イベント(OpenCommissioningWindow / Revoke / タイムアウト)を
+        //      PASE 設定と mDNS 広告へ反映する(admin-commissioning.md §4/§5)。
+        // 注意: `if let` の scrutinee の borrow_mut はボディ全体で生存するため、先に取り出す。
+        let window_event = window.borrow_mut().take_event();
+        if let Some(ev) = window_event {
+            let now = now_ms(&start);
+            match ev {
+                WindowEvent::OpenedEnhanced { discriminator } => {
+                    if let Some(cfg) = window.borrow().pase_config() {
+                        stack.set_pase_config(cfg);
+                        stack.set_pase_enabled(true);
+                        mdns.set_commissionable(Some(commissionable(
+                            discriminator,
+                            CommissioningMode::Enhanced,
+                        )));
+                        mdns.notify_change(now);
+                        println!(
+                            "[window] enhanced commissioning window open (CM=2, discriminator {discriminator})"
+                        );
+                    }
+                }
+                WindowEvent::OpenedBasic => {
+                    let cfg =
+                        PaseConfig::from_passcode_default(PASSCODE, &SALT).expect("PASE config");
+                    stack.set_pase_config(cfg);
+                    stack.set_pase_enabled(true);
+                    mdns.set_commissionable(Some(commissionable(
+                        DISCRIMINATOR,
+                        CommissioningMode::Standard,
+                    )));
+                    mdns.notify_change(now);
+                    println!("[window] basic commissioning window open (CM=1)");
+                }
+                WindowEvent::Closed => {
+                    stack.set_pase_enabled(false);
+                    mdns.set_commissionable(None);
+                    mdns.notify_change(now);
+                    println!("[window] commissioning window closed");
+                }
+            }
+            // AdminVendorId を fabric テーブルから解決して書き戻す(admin-commissioning.md §7)。
+            let admin_idx = window.borrow().admin_fabric_index();
+            if let Some(idx) = admin_idx {
+                let vid = fabrics.borrow().get(idx).map(|f| f.vendor_id());
+                if let Some(vid) = vid {
+                    window.borrow_mut().set_admin_vendor_id(vid);
+                }
+            }
         }
 
         // 4) mDNS の受信応答と announce。

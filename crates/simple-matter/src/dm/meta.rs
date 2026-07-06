@@ -292,16 +292,25 @@ pub struct CommandMeta {
     pub response: bool,
     /// 起動に必要な権限。
     pub access: Privilege,
+    /// timed invoke 必須か(TimedRequest 未経由なら NeedsTimedInteraction)。
+    pub timed: bool,
 }
 
 impl CommandMeta {
-    /// 新しい [`CommandMeta`] を作る。
+    /// 新しい [`CommandMeta`] を作る(timed 不要が既定)。
     pub const fn new(id: CommandId, response: bool, access: Privilege) -> Self {
         Self {
             id,
             response,
             access,
+            timed: false,
         }
+    }
+
+    /// timed invoke 必須フラグを設定する(builder)。
+    pub const fn with_timed(mut self, timed: bool) -> Self {
+        self.timed = timed;
+        self
     }
 }
 

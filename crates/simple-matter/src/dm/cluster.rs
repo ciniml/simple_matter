@@ -131,6 +131,18 @@ macro_rules! __cmd_access {
     };
 }
 
+/// コマンドの timed 必須メタ: `@timed` 注釈があれば true。
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __cmd_timed {
+    () => {
+        false
+    };
+    (timed) => {
+        true
+    };
+}
+
 /// invoke ディスパッチ: `_` は UnsupportedCommand、`(クロージャ)` は全引数付きで起動。
 #[macro_export]
 #[doc(hidden)]
@@ -220,7 +232,7 @@ macro_rules! cluster {
                     }
                 ),* $(,)?
             ],
-            accepted: [ $( $cid:literal $cname:ident $( => $cacc:ident )? ),* $(,)? ],
+            accepted: [ $( $cid:literal $cname:ident $( => $cacc:ident )? $( @ $ctimed:ident )? ),* $(,)? ],
             generated: [ $( $gid:literal ),* $(,)? ],
         }
     ) => {
@@ -247,7 +259,7 @@ macro_rules! cluster {
                                 $crate::dm::meta::CommandId($cid),
                                 false,
                                 $crate::__cmd_access!($( $cacc )?),
-                            )
+                            ).with_timed($crate::__cmd_timed!($( $ctimed )?))
                         ),* ],
                         &[ $( $crate::dm::meta::CommandId($gid) ),* ],
                     );

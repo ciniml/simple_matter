@@ -698,9 +698,7 @@ mod acl_enforcement {
     use crate::acl::{AclEntry, AclHandle, AclTable};
     use crate::dm::clusters::AccessControlCluster;
     use crate::dm::codec::CmdResponder;
-    use crate::dm::meta::{
-        AccessContext, ClusterMeta, CommandMeta, EndpointMeta, Privilege,
-    };
+    use crate::dm::meta::{AccessContext, ClusterMeta, CommandMeta, EndpointMeta, Privilege};
     use crate::dm::{DataModel, ServerCluster};
     use crate::tlv::TlvReader;
     use core::cell::RefCell;
@@ -715,8 +713,7 @@ mod acl_enforcement {
         CommandMeta::new(CommandId(0x00), false, Privilege::Administer),
         CommandMeta::new(CommandId(0x01), false, Privilege::Administer),
     ];
-    static STUB_META: ClusterMeta =
-        ClusterMeta::new(ClusterId(0xFC01), 1, 0, &[], STUB_CMDS, &[]);
+    static STUB_META: ClusterMeta = ClusterMeta::new(ClusterId(0xFC01), 1, 0, &[], STUB_CMDS, &[]);
 
     impl ServerCluster for EffectsStub {
         fn meta(&self) -> &'static ClusterMeta {
@@ -873,7 +870,10 @@ mod acl_enforcement {
         let acl = RefCell::new(AclTable::new());
         let (mut im, mut mgr, ex) = setup_acl(&acl);
         // ACL 空 → invoke は UnsupportedAccess、状態は変化しない。
-        assert_eq!(invoke_on(&mut im, &mut mgr, ex), ImStatus::UnsupportedAccess);
+        assert_eq!(
+            invoke_on(&mut im, &mut mgr, ex),
+            ImStatus::UnsupportedAccess
+        );
         assert!(!im.data_model().on_off.is_on());
 
         // read も per-path の UnsupportedAccess StatusIB。
@@ -919,7 +919,10 @@ mod acl_enforcement {
             .add(AclEntry::case_admin(NonZeroU8::new(1).unwrap(), 0xDEAD))
             .unwrap();
         let (mut im, mut mgr, ex) = setup_acl(&acl);
-        assert_eq!(invoke_on(&mut im, &mut mgr, ex), ImStatus::UnsupportedAccess);
+        assert_eq!(
+            invoke_on(&mut im, &mut mgr, ex),
+            ImStatus::UnsupportedAccess
+        );
     }
 
     #[test]
@@ -989,7 +992,10 @@ mod acl_enforcement {
             })
         })
         .unwrap();
-        assert_eq!(do_write(&mut im, &mut mgr, ex, &req[..wlen]), ImStatus::Success);
+        assert_eq!(
+            do_write(&mut im, &mut mgr, ex, &req[..wlen]),
+            ImStatus::Success
+        );
         assert_eq!(acl.borrow().len(), 1);
 
         // Append(ListIndex null): Operate エントリを追記。
@@ -1001,7 +1007,10 @@ mod acl_enforcement {
             })
         })
         .unwrap();
-        assert_eq!(do_write(&mut im, &mut mgr, ex, &req[..wlen]), ImStatus::Success);
+        assert_eq!(
+            do_write(&mut im, &mut mgr, ex, &req[..wlen]),
+            ImStatus::Success
+        );
         assert_eq!(acl.borrow().len(), 2);
 
         // 読み戻し(fabricFiltered)で 2 エントリ。
@@ -1147,4 +1156,152 @@ mod acl_enforcement {
             .unwrap();
         assert_eq!(acl.borrow().len(), 0);
     }
+}
+
+// ==========================================================================
+// 12. timed 必須コマンドの強制(AdminCommissioning OpenCommissioningWindow)
+// ==========================================================================
+
+/// AdminCommissioning クラスタだけを持つ最小デバイス(窓は外部所有 RefCell)。
+struct AdminDev<'a> {
+    admin: crate::dm::clusters::AdminCommissioningCluster<'a>,
+}
+
+impl crate::dm::DataModel for AdminDev<'_> {
+    fn endpoints(&self) -> &[crate::dm::meta::EndpointMeta] {
+        static DT: &[crate::dm::meta::DeviceType] = &[crate::dm::meta::DeviceType::new(0x0016, 1)];
+        static CL: &[ClusterId] = &[ClusterId(0x003C)];
+        static EPS: &[crate::dm::meta::EndpointMeta] =
+            &[crate::dm::meta::EndpointMeta::new(EndpointId(0), DT, CL)];
+        EPS
+    }
+    fn clusters_on(&self, ep: EndpointId) -> &[ClusterId] {
+        static CL: &[ClusterId] = &[ClusterId(0x003C)];
+        if ep.0 == 0 {
+            CL
+        } else {
+            &[]
+        }
+    }
+    fn cluster(&self, ep: EndpointId, cl: ClusterId) -> Option<&dyn crate::dm::ServerCluster> {
+        match (ep.0, cl.0) {
+            (0, 0x003C) => Some(&self.admin),
+            _ => None,
+        }
+    }
+    fn cluster_mut(
+        &mut self,
+        ep: EndpointId,
+        cl: ClusterId,
+    ) -> Option<&mut dyn crate::dm::ServerCluster> {
+        match (ep.0, cl.0) {
+            (0, 0x003C) => Some(&mut self.admin),
+            _ => None,
+        }
+    }
+}
+
+/// OCW の InvokeRequest を組む(timed フラグは引数)。
+fn ocw_request(req: &mut [u8], timed: bool) -> usize {
+    encode_invoke_request(
+        req,
+        InvokeRequestHeader {
+            suppress_response: false,
+            timed_request: timed,
+        },
+        |cw| {
+            cw.push(
+                &CommandPath::new(EndpointId(0), ClusterId(0x003C), CommandId(0x00)),
+                None,
+                Some(|w: &mut TlvWriter<'_>, t: &TlvTag| {
+                    w.start_struct(t)?;
+                    w.write_u16(&TlvTag::ContextSpecific(0), 300)?;
+                    w.write_bytes(&TlvTag::ContextSpecific(1), &[0xAB; 97])?;
+                    w.write_u16(&TlvTag::ContextSpecific(2), 3841)?;
+                    w.write_u32(&TlvTag::ContextSpecific(3), 1000)?;
+                    w.write_bytes(&TlvTag::ContextSpecific(4), &[0x5A; 16])?;
+                    w.end_container()
+                }),
+            )
+        },
+    )
+    .unwrap()
+}
+
+/// InvokeResponse 先頭要素の StatusIB(status, cluster_status)を返す。
+fn first_status(msg: &[u8]) -> (ImStatus, Option<u8>) {
+    let ir = InvokeResponseRef::new(msg).unwrap();
+    match ir.invoke_responses().unwrap().next().unwrap().unwrap() {
+        InvokeResponseRefItem::Status(s) => (s.status.status, s.status.cluster_status),
+        InvokeResponseRefItem::Command(_) => panic!("OCW returns status only"),
+    }
+}
+
+#[test]
+fn timed_required_command_enforced() {
+    use crate::dm::clusters::administrator_commissioning::{status_code, window_status};
+    use crate::dm::clusters::{AdminCommissioningCluster, CommissioningWindow};
+    use crate::im::wire::TimedRequest;
+
+    let window = core::cell::RefCell::new(CommissioningWindow::new());
+    let (_, mut mgr, ex) = setup();
+    let mut im: InteractionModel<AdminDev<'_>, 2, 2, 8> = InteractionModel::new(AdminDev {
+        admin: AdminCommissioningCluster::new(&window),
+    });
+
+    // (a) timed 無しの OCW → NeedsTimedInteraction、窓は閉じたまま。
+    let mut req = [0u8; 256];
+    let ilen = ocw_request(&mut req, false);
+    let ih = phdr(ImOpCode::InvokeRequest.to_u8());
+    let mut tx = [0u8; 256];
+    let a = im
+        .handle(&rxm(&ih, &req[..ilen], ex), &mut tx, &mut mgr, 0)
+        .unwrap();
+    let (op, len, _) = parts(a);
+    assert_eq!(op, ImOpCode::InvokeResponse.to_u8());
+    assert_eq!(
+        first_status(&tx[..len]),
+        (ImStatus::NeedsTimedInteraction, None)
+    );
+    assert_eq!(window.borrow().status(), window_status::WINDOW_NOT_OPEN);
+
+    // (b) TimedRequest → timed フラグ付き OCW → Success、ECM 窓が開く。
+    let mut treq = [0u8; 16];
+    let tlen = TimedRequest::new(10_000).encode(&mut treq).unwrap();
+    let th = phdr(ImOpCode::TimedRequest.to_u8());
+    let a = im
+        .handle(&rxm(&th, &treq[..tlen], ex), &mut tx, &mut mgr, 0)
+        .unwrap();
+    let (op, _, is_close) = parts(a);
+    assert_eq!(op, ImOpCode::StatusResponse.to_u8());
+    assert!(!is_close, "TimedRequest is followed by the Invoke");
+
+    let ilen = ocw_request(&mut req, true);
+    let a = im
+        .handle(&rxm(&ih, &req[..ilen], ex), &mut tx, &mut mgr, 100)
+        .unwrap();
+    let (op, len, _) = parts(a);
+    assert_eq!(op, ImOpCode::InvokeResponse.to_u8());
+    assert_eq!(first_status(&tx[..len]), (ImStatus::Success, None));
+    assert_eq!(
+        window.borrow().status(),
+        window_status::ENHANCED_WINDOW_OPEN
+    );
+    assert_eq!(window.borrow().discriminator(), 3841);
+
+    // (c) 窓オープン中の再 OCW(timed 経由)→ Failure + cluster status Busy。
+    let a = im
+        .handle(&rxm(&th, &treq[..tlen], ex), &mut tx, &mut mgr, 200)
+        .unwrap();
+    let (op, _, _) = parts(a);
+    assert_eq!(op, ImOpCode::StatusResponse.to_u8());
+    let ilen = ocw_request(&mut req, true);
+    let a = im
+        .handle(&rxm(&ih, &req[..ilen], ex), &mut tx, &mut mgr, 300)
+        .unwrap();
+    let (_, len, _) = parts(a);
+    assert_eq!(
+        first_status(&tx[..len]),
+        (ImStatus::Failure, Some(status_code::BUSY))
+    );
 }

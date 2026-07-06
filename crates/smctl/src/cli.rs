@@ -30,6 +30,10 @@ pub struct Globals {
     pub discriminator: Option<u16>,
     /// 機械可読 JSON 出力(1 行 1 オブジェクト)。情報行は stderr へ逃がす。
     pub json: bool,
+    /// `admincommissioning open-window --passcode N`(省略時は乱数生成)。
+    pub passcode: Option<u32>,
+    /// `--timed <ms>`: invoke を timed interaction(TimedRequest → Invoke)で行う。
+    pub timed_ms: Option<u16>,
 }
 
 impl Globals {
@@ -41,6 +45,8 @@ impl Globals {
             label: None,
             discriminator: None,
             json: false,
+            passcode: None,
+            timed_ms: None,
         }
     }
 }
@@ -53,6 +59,8 @@ impl Clone for Globals {
             label: self.label.clone(),
             discriminator: self.discriminator,
             json: self.json,
+            passcode: self.passcode,
+            timed_ms: self.timed_ms,
         }
     }
 }
@@ -123,6 +131,19 @@ pub enum Cmd {
     Wait {
         secs: f64,
     },
+    /// AdministratorCommissioning: ECM 窓オープン(SPAKE2+ verifier 生成 + timed invoke。
+    /// `docs/design/admin-commissioning.md` §6)。
+    AdminOpenWindow {
+        node: u64,
+        timeout_s: u16,
+        discriminator: u16,
+        /// 省略時は乱数生成(無効パスコードを除外)。
+        passcode: Option<u32>,
+    },
+    /// AdministratorCommissioning: RevokeCommissioning(timed invoke)。
+    AdminRevoke {
+        node: u64,
+    },
     /// バッチ実行(`-` = stdin)。
     Batch {
         source: String,
@@ -168,6 +189,18 @@ fn parse_globals(args: &[String], base: &Globals) -> Result<(Globals, Vec<String
                 g.discriminator = Some(d);
             }
             "--json" => g.json = true,
+            "--passcode" => {
+                let v = it.next().ok_or("--passcode requires a value")?;
+                let p: u32 = v
+                    .parse()
+                    .map_err(|_| format!("invalid --passcode: {v:?}"))?;
+                g.passcode = Some(p);
+            }
+            "--timed" => {
+                let v = it.next().ok_or("--timed requires a value (milliseconds)")?;
+                let ms: u16 = v.parse().map_err(|_| format!("invalid --timed: {v:?}"))?;
+                g.timed_ms = Some(ms);
+            }
             "-h" | "--help" => {
                 pos.clear();
                 pos.push("help".to_string());
@@ -192,6 +225,7 @@ pub fn parse(args: &[String], base: &Globals) -> Result<(Globals, Cmd), String> 
     let cmd = match cmd.as_str() {
         "help" => Cmd::Help,
         "pairing" => parse_pairing(&pos[1..])?,
+        "admincommissioning" => parse_admincommissioning(&g, &pos[1..])?,
         "discover" => parse_discover(&g, &pos[1..])?,
         "any" => parse_any(&pos[1..])?,
         "wait" => {
@@ -380,6 +414,51 @@ fn parse_pairing(args: &[String]) -> Result<Cmd, String> {
             "usage: smctl pairing <onnetwork|onnetwork-long|address|ble|ble-handoff|ble-wifi|\
              list> ... (see `smctl help`)"
                 .into(),
+        ),
+    }
+}
+
+/// `admincommissioning <open-window|revoke>`(専用サブコマンド。汎用 invoke と違い
+/// open-window は PAKE verifier の生成と manual pairing code の表示まで行う)。
+fn parse_admincommissioning(g: &Globals, args: &[String]) -> Result<Cmd, String> {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    match sub {
+        "open-window" => {
+            let [node, timeout, disc] = expect_args(
+                args,
+                1,
+                3,
+                "admincommissioning open-window <node-id> <timeout-s> <discriminator> \
+                 [--passcode N]",
+            )?[..] else {
+                unreachable!()
+            };
+            let timeout_s: u16 = timeout
+                .parse()
+                .map_err(|_| format!("invalid timeout: {timeout:?}"))?;
+            let discriminator = parse_disc(disc)?;
+            if discriminator > 0x0FFF {
+                return Err(format!(
+                    "discriminator out of range (12-bit): {discriminator}"
+                ));
+            }
+            Ok(Cmd::AdminOpenWindow {
+                node: parse_u64(node)?,
+                timeout_s,
+                discriminator,
+                passcode: g.passcode,
+            })
+        }
+        "revoke" => {
+            let [node] = expect_args(args, 1, 1, "admincommissioning revoke <node-id>")?[..] else {
+                unreachable!()
+            };
+            Ok(Cmd::AdminRevoke {
+                node: parse_u64(node)?,
+            })
+        }
+        _ => Err(
+            "usage: smctl admincommissioning <open-window|revoke> ... (see `smctl help`)".into(),
         ),
     }
 }
@@ -734,6 +813,10 @@ USAGE:
   smctl pairing ble-wifi        <node-id> <passcode> <ssid> <password> [discriminator]
                                 (BLE commissioning + WiFi provisioning -> CASE over UDP)
   smctl pairing list
+  smctl admincommissioning open-window <node-id> <timeout-s> <discriminator> [--passcode N]
+                                (open an enhanced commissioning window; prints the
+                                 generated passcode + manual pairing code)
+  smctl admincommissioning revoke <node-id>
   smctl discover commissionable [--discriminator N]
   smctl discover operational <node-id>
   smctl <cluster> read       <attr> <node-id> <endpoint>
@@ -757,6 +840,9 @@ OPTIONS:
   --timeout <sec>       overall operation timeout (default 30)
   --label <text>        label recorded in the address book on pairing
   --discriminator <n>   filter for `discover commissionable`
+  --passcode <n>        passcode for `admincommissioning open-window` (default: random)
+  --timed <ms>          send cluster command invokes as timed interactions
+                        (TimedRequest -> Invoke); required by some commands
   --json                machine-readable output: one JSON object per line on
                         stdout (read/write/invoke/subscribe reports/discover);
                         human-readable progress moves to stderr. Works in
@@ -992,6 +1078,42 @@ mod tests {
         assert!(parse_err("pairing onnetwork 1").starts_with("usage:"));
         assert!(parse_err("--frobnicate onoff toggle 1 1").contains("unknown option"));
         assert!(parse_err("pairing onnetwork x 20202021").contains("invalid"));
+    }
+
+    #[test]
+    fn admincommissioning_open_window_and_revoke() {
+        let (_, cmd) = parse_ok("admincommissioning open-window 1 300 3841");
+        assert!(matches!(
+            cmd,
+            Cmd::AdminOpenWindow {
+                node: 1,
+                timeout_s: 300,
+                discriminator: 3841,
+                passcode: None,
+            }
+        ));
+        let (g, cmd) = parse_ok("admincommissioning open-window 1 300 3841 --passcode 12341234");
+        assert!(matches!(
+            cmd,
+            Cmd::AdminOpenWindow {
+                passcode: Some(12341234),
+                ..
+            }
+        ));
+        assert_eq!(g.passcode, Some(12341234));
+        let (_, cmd) = parse_ok("admincommissioning revoke 7");
+        assert!(matches!(cmd, Cmd::AdminRevoke { node: 7 }));
+        assert!(parse_err("admincommissioning open-window 1 300 5000").contains("out of range"));
+        assert!(parse_err("admincommissioning open-window 1").starts_with("usage:"));
+        assert!(parse_err("admincommissioning bogus").starts_with("usage:"));
+    }
+
+    #[test]
+    fn timed_flag_parses() {
+        let (g, cmd) = parse_ok("--timed 10000 onoff toggle 1 1");
+        assert_eq!(g.timed_ms, Some(10_000));
+        assert!(matches!(cmd, Cmd::Invoke { .. }));
+        assert!(parse_err("--timed x onoff toggle 1 1").contains("invalid --timed"));
     }
 
     #[test]

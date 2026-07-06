@@ -263,7 +263,15 @@ impl<'a> Exec<'a> {
                 *command,
                 fields.clone(),
                 raw_fields.clone(),
+                self.g.timed_ms,
             ),
+            Cmd::AdminOpenWindow {
+                node,
+                timeout_s,
+                discriminator,
+                passcode,
+            } => self.admin_open_window(*node, *timeout_s, *discriminator, *passcode),
+            Cmd::AdminRevoke { node } => self.admin_revoke(*node),
             Cmd::Subscribe {
                 node,
                 ep,
@@ -788,6 +796,10 @@ impl<'a> Exec<'a> {
     }
 
     /// コマンド Invoke。`raw_fields` があればコマンドフィールド全体を生 TLV から転写する。
+    ///
+    /// `timed_ms` があれば timed interaction(TimedRequest → Invoke)として送る
+    /// (`docs/design/admin-commissioning.md` §3)。
+    #[allow(clippy::too_many_arguments)]
     fn invoke(
         &mut self,
         node_id: u64,
@@ -796,29 +808,31 @@ impl<'a> Exec<'a> {
         command: CommandId,
         fields: Vec<(u8, ValueKind, Parsed)>,
         raw_fields: Option<Vec<u8>>,
+        timed_ms: Option<u16>,
     ) -> Result<(), String> {
         let session = self.case_session(node_id)?;
         let path = CommandPath::new(EndpointId(ep), cluster, command);
         let now = self.now_ms();
-        let dir = self
-            .stack
-            .start_invoke(
-                session,
-                path,
-                move |w, t| match &raw_fields {
-                    Some(raw) => transcode_tlv(w, t, raw),
-                    None => {
-                        w.start_struct(t)?;
-                        for (tag, kind, v) in &fields {
-                            write_value(w, &TlvTag::ContextSpecific(*tag), *kind, v)?;
-                        }
-                        w.end_container()
-                    }
-                },
-                now,
-                &mut self.tx,
-            )
-            .map_err(|e| format!("start_invoke: {e:?}"))?;
+        let write_fields = move |w: &mut TlvWriter<'_>, t: &TlvTag| match &raw_fields {
+            Some(raw) => transcode_tlv(w, t, raw),
+            None => {
+                w.start_struct(t)?;
+                for (tag, kind, v) in &fields {
+                    write_value(w, &TlvTag::ContextSpecific(*tag), *kind, v)?;
+                }
+                w.end_container()
+            }
+        };
+        let dir = match timed_ms {
+            Some(ms) => self
+                .stack
+                .start_invoke_timed(session, ms, path, write_fields, now, &mut self.tx)
+                .map_err(|e| format!("start_invoke_timed: {e:?}"))?,
+            None => self
+                .stack
+                .start_invoke(session, path, write_fields, now, &mut self.tx)
+                .map_err(|e| format!("start_invoke: {e:?}"))?,
+        };
         send_dir(&self.socket, &self.tx, &dir);
         match self.wait_txn_event(Instant::now() + self.g.timeout)? {
             Some(ImEvent::InvokeDone { status }) => {
@@ -851,6 +865,93 @@ impl<'a> Exec<'a> {
         }
         self.flush();
         Ok(())
+    }
+
+    /// `admincommissioning open-window`: ECM 窓オープン(設計 §6)。
+    ///
+    /// passcode(省略時は乱数)から SPAKE2+ verifier (w0 ‖ L) を導出し、
+    /// OpenCommissioningWindow(0x003C/0x00)を timed invoke で送る。成功したら
+    /// 2 人目のコントローラ向けに passcode / discriminator / manual pairing code を表示する。
+    fn admin_open_window(
+        &mut self,
+        node_id: u64,
+        timeout_s: u16,
+        discriminator: u16,
+        passcode: Option<u32>,
+    ) -> Result<(), String> {
+        use simple_matter::crypto::spake2p::compute_verifier;
+        use simple_matter::crypto::Rng as _;
+
+        let passcode = match passcode {
+            Some(p) => {
+                if !passcode_is_valid(p) {
+                    return Err(format!("invalid setup passcode: {p}"));
+                }
+                p
+            }
+            None => random_passcode()?,
+        };
+        let mut salt = [0u8; 16];
+        OsRng
+            .fill_bytes(&mut salt)
+            .map_err(|e| format!("rng: {e:?}"))?;
+        const ITERATIONS: u32 = 1000;
+        let v = compute_verifier(passcode, &salt, ITERATIONS)
+            .map_err(|e| format!("compute_verifier: {e:?}"))?;
+        let mut verifier = Vec::with_capacity(97);
+        verifier.extend_from_slice(&v.w0);
+        verifier.extend_from_slice(&v.l);
+
+        let fields = vec![
+            (0u8, ValueKind::U16, Parsed::Unsigned(timeout_s as u64)),
+            (1u8, ValueKind::Bytes, Parsed::Bytes(verifier)),
+            (2u8, ValueKind::U16, Parsed::Unsigned(discriminator as u64)),
+            (3u8, ValueKind::U32, Parsed::Unsigned(ITERATIONS as u64)),
+            (4u8, ValueKind::Bytes, Parsed::Bytes(salt.to_vec())),
+        ];
+        self.invoke(
+            node_id,
+            0,
+            ClusterId(0x003C),
+            CommandId(0x00),
+            fields,
+            None,
+            Some(TIMED_INVOKE_TIMEOUT_MS),
+        )?;
+
+        let manual_code = manual_pairing_code(discriminator, passcode);
+        if json::enabled() {
+            Obj::new("openCommissioningWindow")
+                .num("node", node_id)
+                .num("timeoutSeconds", timeout_s as u64)
+                .num("discriminator", discriminator as u64)
+                .num("passcode", passcode as u64)
+                .str("manualPairingCode", &manual_code)
+                .emit();
+        } else {
+            println!("[admincommissioning] commissioning window open for {timeout_s}s");
+            println!("  passcode:            {passcode:08}");
+            println!("  discriminator:       {discriminator}");
+            println!("  manual pairing code: {manual_code}");
+            println!(
+                "  second controller: smctl --state-dir <dir2> pairing onnetwork-long \
+                 <node-id> {passcode} {discriminator}"
+            );
+        }
+        Ok(())
+    }
+
+    /// `admincommissioning revoke`: RevokeCommissioning(timed invoke)。
+    fn admin_revoke(&mut self, node_id: u64) -> Result<(), String> {
+        self.invoke(
+            node_id,
+            0,
+            ClusterId(0x003C),
+            CommandId(0x02),
+            Vec::new(),
+            None,
+            Some(TIMED_INVOKE_TIMEOUT_MS),
+        )
     }
 
     /// 属性 Subscribe。
@@ -936,6 +1037,82 @@ impl<'a> Exec<'a> {
 }
 
 /// フェーズ遷移を人間可読に表示する。
+/// timed invoke の TimedRequest タイムアウト(ミリ秒。chip-tool の既定 10 秒相当)。
+const TIMED_INVOKE_TIMEOUT_MS: u16 = 10_000;
+
+/// setup passcode の有効性(§5.1.7: 全 0 / 全同一数字 / 連番等の 12 値と範囲を除外)。
+fn passcode_is_valid(p: u32) -> bool {
+    const INVALID: [u32; 12] = [
+        0, 11111111, 22222222, 33333333, 44444444, 55555555, 66666666, 77777777, 88888888,
+        99999999, 12345678, 87654321,
+    ];
+    (1..=99_999_998).contains(&p) && !INVALID.contains(&p)
+}
+
+/// 有効な setup passcode を乱数生成する。
+fn random_passcode() -> Result<u32, String> {
+    use simple_matter::crypto::Rng as _;
+    let mut b = [0u8; 4];
+    for _ in 0..16 {
+        OsRng
+            .fill_bytes(&mut b)
+            .map_err(|e| format!("rng: {e:?}"))?;
+        let p = u32::from_le_bytes(b) % 99_999_998 + 1;
+        if passcode_is_valid(p) {
+            return Ok(p);
+        }
+    }
+    Err("could not generate a valid passcode".into())
+}
+
+/// 11 桁 manual pairing code(§5.1.4.1、VID/PID なし・カスタムフローなし)。
+///
+/// - digit 1: `(VID_PID_present(0) << 2) | (discriminator >> 10)`
+/// - digits 2-6: `((discriminator & 0x300) << 6) | (passcode & 0x3FFF)`
+/// - digits 7-10: `passcode >> 14`
+/// - digit 11: Verhoeff 検査数字
+pub(crate) fn manual_pairing_code(discriminator: u16, passcode: u32) -> String {
+    let d1 = (discriminator >> 10) as u32; // 上位 2 ビット(VID_PID_present = 0)
+    let d2_6 = (((discriminator as u32) & 0x300) << 6) | (passcode & 0x3FFF);
+    let d7_10 = passcode >> 14;
+    let body = format!("{d1:01}{d2_6:05}{d7_10:04}");
+    let check = verhoeff_check_digit(&body);
+    format!("{body}{check}")
+}
+
+/// Verhoeff 検査数字(manual pairing code の末尾桁)。
+fn verhoeff_check_digit(digits: &str) -> u8 {
+    const D: [[u8; 10]; 10] = [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        [1, 2, 3, 4, 0, 6, 7, 8, 9, 5],
+        [2, 3, 4, 0, 1, 7, 8, 9, 5, 6],
+        [3, 4, 0, 1, 2, 8, 9, 5, 6, 7],
+        [4, 0, 1, 2, 3, 9, 5, 6, 7, 8],
+        [5, 9, 8, 7, 6, 0, 4, 3, 2, 1],
+        [6, 5, 9, 8, 7, 1, 0, 4, 3, 2],
+        [7, 6, 5, 9, 8, 2, 1, 0, 4, 3],
+        [8, 7, 6, 5, 9, 3, 2, 1, 0, 4],
+        [9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
+    ];
+    const P: [[u8; 10]; 8] = [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        [1, 5, 7, 6, 2, 8, 3, 0, 9, 4],
+        [5, 8, 0, 3, 7, 9, 6, 1, 4, 2],
+        [8, 9, 1, 6, 0, 4, 3, 5, 2, 7],
+        [9, 4, 5, 3, 1, 2, 6, 8, 7, 0],
+        [4, 2, 8, 6, 5, 7, 3, 9, 0, 1],
+        [2, 7, 9, 3, 8, 0, 6, 4, 1, 5],
+        [7, 0, 4, 6, 9, 1, 3, 2, 5, 8],
+    ];
+    const INV: [u8; 10] = [0, 4, 3, 2, 1, 5, 6, 7, 8, 9];
+    let mut c: u8 = 0;
+    for (i, ch) in digits.bytes().rev().enumerate() {
+        let digit = ch - b'0';
+        c = D[c as usize][P[(i + 1) % 8][digit as usize] as usize];
+    }
+    INV[c as usize]
+}
+
 pub(crate) fn report_phase(phase: Phase) {
     let name = match phase {
         Phase::Idle => "Idle",
@@ -1374,5 +1551,34 @@ fn fmt_element(r: &mut TlvReader, e: &TlvElement) -> String {
             format!("{open}{}{close}", parts.join(", "))
         }
         TlvValue::ContainerEnd => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod admin_tests {
+    use super::*;
+
+    #[test]
+    fn manual_pairing_code_matches_chip_tool() {
+        // chip-tool の既定テスト値(disc 3840 / passcode 20202021)の manual code。
+        assert_eq!(manual_pairing_code(3840, 20202021), "34970112332");
+    }
+
+    #[test]
+    fn passcode_validity() {
+        assert!(passcode_is_valid(20202021));
+        assert!(passcode_is_valid(1));
+        assert!(passcode_is_valid(99_999_998));
+        assert!(!passcode_is_valid(0));
+        assert!(!passcode_is_valid(11111111));
+        assert!(!passcode_is_valid(12345678));
+        assert!(!passcode_is_valid(99_999_999));
+    }
+
+    #[test]
+    fn random_passcode_is_valid() {
+        for _ in 0..32 {
+            assert!(passcode_is_valid(random_passcode().unwrap()));
+        }
     }
 }

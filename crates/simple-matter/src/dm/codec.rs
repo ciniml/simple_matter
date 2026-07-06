@@ -297,6 +297,7 @@ pub struct CmdResponder<'w, 'b> {
     promote_fabric: Option<core::num::NonZeroU8>,
     case_admin_acl: Option<(core::num::NonZeroU8, u64)>,
     removed_fabric: Option<core::num::NonZeroU8>,
+    cluster_status: Option<u8>,
 }
 
 impl<'w, 'b> CmdResponder<'w, 'b> {
@@ -308,7 +309,21 @@ impl<'w, 'b> CmdResponder<'w, 'b> {
             promote_fabric: None,
             case_admin_acl: None,
             removed_fabric: None,
+            cluster_status: None,
         }
+    }
+
+    /// クラスタ固有ステータスコードを宣言する(§11.19.6 等)。
+    ///
+    /// `Err(ImStatus::Failure)` と併用すると、IM エンジンが CommandStatusIB の
+    /// `StatusIB.cluster_status` に写す(chip の `ClusterStatusCode` 相当)。
+    pub fn set_cluster_status(&mut self, code: u8) {
+        self.cluster_status = Some(code);
+    }
+
+    /// 宣言済みのクラスタ固有ステータス(あれば)。
+    pub const fn cluster_status(&self) -> Option<u8> {
+        self.cluster_status
     }
 
     /// 生成レスポンスのコマンド ID を宣言する。

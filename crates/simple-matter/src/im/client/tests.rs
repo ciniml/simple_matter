@@ -967,7 +967,10 @@ fn chunked_device_report() {
             data += 1;
         }
     }
-    assert!(data > 8, "chunked report aggregated many attributes: {data}");
+    assert!(
+        data > 8,
+        "chunked report aggregated many attributes: {data}"
+    );
 }
 
 // ==========================================================================
@@ -1136,4 +1139,52 @@ fn unknown_subscription_report_is_rejected() {
     let sr = StatusResponse::decode(&tx[..len]).unwrap();
     assert_eq!(sr.status, ImStatus::InvalidSubscription);
     assert_eq!(im.take_event(), None, "no event for rejected report");
+}
+
+// ==========================================================================
+// timed invoke(TimedRequest → StatusResponse → Invoke)
+// ==========================================================================
+
+#[test]
+fn timed_invoke_onoff_on() {
+    let crypto = crypto();
+    let (mut dev_mgr, mut dev_sessions, mut dev_pool) = device();
+    let (mut cli_mgr, mut cli_sessions, mut cli_pool) = client();
+    let cli_s = establish_case_pair(&mut cli_sessions, &mut dev_sessions);
+    assert!(!dev_mgr.handler().im.data_model().onoff.is_on());
+
+    let ex = cli_mgr.open_initiator(cli_s).unwrap();
+    let path = CommandPath::new(EndpointId(1), ClusterId(0x0006), CommandId(0x0001)); // On
+    let mut out = [0u8; 128];
+    // TimedRequest が out に書かれ、InvokeRequest(timed=true)は client 内部に退避される。
+    let plen = cli_mgr
+        .handler_mut()
+        .im
+        .start_invoke_timed(ex, 10_000, path, empty_fields, &mut out, NOW)
+        .unwrap();
+
+    run(
+        &crypto,
+        &mut cli_mgr,
+        &mut cli_sessions,
+        &mut cli_pool,
+        &mut dev_mgr,
+        &mut dev_sessions,
+        &mut dev_pool,
+        1600,
+        ex,
+        ImOpCode::TimedRequest as u8,
+        &out[..plen],
+    );
+
+    assert_eq!(
+        cli_mgr.handler_mut().im.take_event(),
+        Some(ImEvent::InvokeDone {
+            status: ImStatus::Success
+        })
+    );
+    assert!(
+        dev_mgr.handler().im.data_model().onoff.is_on(),
+        "device OnOff turned on via timed invoke"
+    );
 }

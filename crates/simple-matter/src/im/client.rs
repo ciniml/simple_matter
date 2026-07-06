@@ -49,8 +49,8 @@ use crate::im::wire::{
     encode_invoke_request, encode_read_request, encode_subscribe_request, encode_write_request,
     AttributeDataRef, AttributePath, AttributeReportRef, AttributeStatusRef, CommandPath, ImOpCode,
     ImStatus, InvokeRequestHeader, InvokeResponseRef, InvokeResponseRefItem, ReportDataRef,
-    StatusIB, StatusResponse, SubscribeResponse, WriteRequestHeader, WriteResponseRef,
-    PROTO_ID_INTERACTION_MODEL,
+    StatusIB, StatusResponse, SubscribeResponse, TimedRequest, WriteRequestHeader,
+    WriteResponseRef, PROTO_ID_INTERACTION_MODEL,
 };
 use crate::tlv::{ContainerType, TlvReader, TlvTag, TlvValue, TlvWriter};
 use crate::transport::session::fixed::FixedVec;
@@ -207,6 +207,12 @@ pub struct ImClient<const RESULT: usize = DEFAULT_RESULT_LEN> {
     sub_truncated: bool,
     /// 購読系イベントの 1 深度 slot(txn イベントと分離。取り出し前の上書きは最新優先)。
     sub_event: Option<ImEvent>,
+    /// timed invoke の 2 相目(InvokeRequest payload)の退避長。
+    ///
+    /// [`Self::start_invoke_timed`] が InvokeRequest を `result` に先エンコードして退避し、
+    /// TimedRequest への `StatusResponse(SUCCESS)` 受信時に同 exchange の応答として送出する
+    /// (`docs/design/admin-commissioning.md` §3)。
+    pending_invoke_len: Option<usize>,
 }
 
 impl<const RESULT: usize> Default for ImClient<RESULT> {
@@ -230,6 +236,7 @@ impl<const RESULT: usize> ImClient<RESULT> {
             sub_result_len: 0,
             sub_truncated: false,
             sub_event: None,
+            pending_invoke_len: None,
         }
     }
 
@@ -359,6 +366,53 @@ impl<const RESULT: usize> ImClient<RESULT> {
         self.finish_start(len)
     }
 
+    /// timed invoke(TimedRequest → Invoke)トランザクションを開始する(設計 §5.5)。
+    ///
+    /// `out` には **TimedRequest**(opcode = [`ImOpCode::TimedRequest`])が書かれる。
+    /// InvokeRequest(`timedRequest=true`)は内部バッファへ先エンコードして退避し、
+    /// デバイスの `StatusResponse(SUCCESS)` 受信時に同 exchange の応答として自動送出する。
+    /// 完了は通常の Invoke と同じく [`ImEvent::InvokeDone`]。
+    pub fn start_invoke_timed<F>(
+        &mut self,
+        exchange: ExchangeId,
+        timeout_ms: u16,
+        path: CommandPath,
+        fields: F,
+        out: &mut [u8],
+        now_ms: u64,
+    ) -> Result<usize>
+    where
+        F: FnOnce(&mut TlvWriter<'_>, &TlvTag) -> Result<()>,
+    {
+        self.begin(exchange, TxnKind::Invoke, now_ms)?;
+        // InvokeRequest を result バッファへ先エンコードして退避する(Invoke の結果書き込みは
+        // InvokeResponse 受信時なので競合しない)。
+        let header = InvokeRequestHeader {
+            suppress_response: false,
+            timed_request: true,
+        };
+        let invoke_len = match encode_invoke_request(&mut self.result, header, |cw| {
+            cw.push(&path, None, Some(fields))
+        }) {
+            Ok(l) => l,
+            Err(e) => {
+                self.txn = None;
+                return Err(e);
+            }
+        };
+        self.pending_invoke_len = Some(invoke_len);
+        let len = TimedRequest::new(timeout_ms).encode(out);
+        match len {
+            Ok(l) => Ok(l),
+            Err(e) => {
+                self.txn = None;
+                self.pending_invoke_len = None;
+                self.result_len = 0;
+                Err(e)
+            }
+        }
+    }
+
     /// 単一属性の Write トランザクションを開始する。
     ///
     /// `value` は属性値を `tag`(context 2)で書くクロージャ。WriteRequest を `out` に書き
@@ -437,11 +491,7 @@ impl<const RESULT: usize> ImClient<RESULT> {
         }
         // keep-alive 途絶の検出(§4.5.3)。
         loop {
-            let Some(i) = self
-                .subs
-                .iter()
-                .position(|s| now_ms > s.lost_deadline_ms())
-            else {
+            let Some(i) = self.subs.iter().position(|s| now_ms > s.lost_deadline_ms()) else {
                 break;
             };
             let id = self.subs.swap_remove(i).id;
@@ -467,6 +517,7 @@ impl<const RESULT: usize> ImClient<RESULT> {
         self.result_len = 0;
         self.truncated = false;
         self.event = None;
+        self.pending_invoke_len = None;
         self.txn = Some(ClientTxn {
             exchange,
             started_ms: now_ms,
@@ -689,10 +740,22 @@ impl<const RESULT: usize> ImClient<RESULT> {
     }
 
     /// StatusResponse を受信した(エラー終端、§4.2)。
-    fn on_status(&mut self, rx: &RxMessage<'_>) -> Result<HandlerAction> {
+    fn on_status(&mut self, rx: &RxMessage<'_>, tx: &mut [u8]) -> Result<HandlerAction> {
         let status = StatusResponse::decode(rx.payload)
             .map(|s| s.status)
             .unwrap_or(ImStatus::InvalidAction);
+        // timed invoke の 2 相目: TimedRequest への SUCCESS で退避済み InvokeRequest を送出する。
+        if let Some(len) = self.pending_invoke_len.take() {
+            if status.is_success() {
+                if len > tx.len() {
+                    return self.fail(ImStatus::ResourceExhausted);
+                }
+                tx[..len].copy_from_slice(&self.result[..len]);
+                self.result_len = 0;
+                return Ok(respond(ImOpCode::InvokeRequest, len));
+            }
+            return self.fail(status);
+        }
         self.fail(status)
     }
 
@@ -780,7 +843,7 @@ impl<const RESULT: usize> ProtocolHandler for ImClient<RESULT> {
                 ImOpCode::InvokeResponse => self.on_invoke_resp(rx),
                 ImOpCode::WriteResponse => self.on_write_resp(rx),
                 ImOpCode::SubscribeResponse => self.on_subscribe_resp(rx, now_ms),
-                ImOpCode::StatusResponse => self.on_status(rx),
+                ImOpCode::StatusResponse => self.on_status(rx, tx),
                 // client 宛に Request 系は来ない(silent drop)。
                 _ => Ok(HandlerAction::None),
             };
