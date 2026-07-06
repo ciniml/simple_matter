@@ -23,6 +23,10 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test (host)
         run: cargo test --all-features
+      # smctl(CLI コントローラ、docs/design/cli-controller.md §6 C4)。ワークスペース一括に
+      # 含まれるが、CLI ツール単体のゲートとして明示する。
+      - name: Test smctl
+        run: cargo test -p smctl --all-features
       # no_std クロスチェックはコアクレートのみ(simple-matter-ble は std/tokio 前提の
       # PC バックエンドなのでワークスペース一括では通らない)。RISC-V は ESP32-C3 移植の
       # 前提ゲート E0(docs/design/port-esp32-device.md §8)。
@@ -79,5 +83,7 @@ jobs:
       # ネイティブでの BLE feature 込みビルドを検証する(bluer 非依存の担保)。
       - name: Build smctl (BLE feature)
         run: cargo build -p smctl --features ble
+      - name: Test smctl (Windows)
+        run: cargo test -p smctl --features ble
       - name: Clippy smctl (BLE feature)
         run: cargo clippy -p smctl --features ble -- -D warnings

@@ -1146,7 +1146,10 @@ impl<C: Crypto, R: Rng, F: FabricStore + NocResolver, const H: usize> ProtocolHa
                         }
                     }
                 }
-                Ok(HandlerAction::None)
+                // StatusReport は会話の終端(responder が最後の受信者)。exchange を
+                // 終端予約しないと slot がプールに残り続け、resumption を繰り返すと
+                // EXCHANGES 枯渇で新規ハンドシェイクへ応答不能になる(C4 実機で検出)。
+                Ok(HandlerAction::CloseSilent)
             }
             // group / その他は本ピースではスコープ外(silent drop)。
             _ => Err(Error::InvalidState),
@@ -1311,7 +1314,7 @@ mod tests {
                 len,
                 ..
             } => (opcode, len, reliable),
-            HandlerAction::None => panic!("expected Respond/Close"),
+            HandlerAction::None | HandlerAction::CloseSilent => panic!("expected Respond/Close"),
         }
     }
 
@@ -2120,7 +2123,7 @@ mod case_tests {
                 len,
                 ..
             } => (opcode, len, reliable),
-            HandlerAction::None => panic!("expected Respond/Close"),
+            HandlerAction::None | HandlerAction::CloseSilent => panic!("expected Respond/Close"),
         }
     }
 

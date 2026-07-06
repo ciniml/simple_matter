@@ -29,7 +29,7 @@ use crate::clusters::{self, ValueKind};
 use crate::json::{self, info, Obj};
 use crate::runner::udp::{open_dual_stack_udp, pump_commissioner, send_dir};
 use crate::runner::{mdns, Backend, Ctrl};
-use crate::state::{ca as ca_state, nodes, StateDir};
+use crate::state::{ca as ca_state, nodes, resume, StateDir};
 use crate::OsRng;
 
 /// mDNS ブラウズの最低タイムアウト。デバイスの再 announce 間隔(既定 30 秒)より長く取る。
@@ -548,6 +548,26 @@ impl<'a> Exec<'a> {
                 })?
         };
 
+        // 0) 永続化済みの resumption 素材があれば取り込む(C4、設計 doc §4.3)。
+        //    以後の start_case は Sigma1 に resumptionID + resumeMIC(ctx6/7)を付け、
+        //    responder が受理すれば Sigma2_Resume で確立する。不成立(responder が
+        //    素材を失っている等)はコアがフル CASE へフォールバックする。
+        if self
+            .stack
+            .resumption_export(CONTROLLER_FABRIC_INDEX, node_id)
+            .is_none()
+        {
+            if let Some(m) = resume::load(&self.state.resume_path(node_id)) {
+                self.stack.resumption_import(
+                    CONTROLLER_FABRIC_INDEX,
+                    node_id,
+                    &m.resumption_id,
+                    &m.shared_secret,
+                );
+                info!("[case] resumption material loaded; will attempt session resumption");
+            }
+        }
+
         // 1) キャッシュアドレスへ CASE を試みる(未解決 sentinel はスキップ)。
         let cached = entry.last_addr;
         let deadline = Instant::now() + self.g.timeout;
@@ -602,9 +622,26 @@ impl<'a> Exec<'a> {
         };
         self.quiesce(Instant::now() + self.g.timeout)?;
 
-        if used_addr != cached {
+        {
             let _lock = self.state.lock()?;
-            nodes::update_addr(&self.state.nodes_path(), node_id, used_addr)?;
+            if used_addr != cached {
+                nodes::update_addr(&self.state.nodes_path(), node_id, used_addr)?;
+            }
+            // 確立で resumptionID はローテートするので、成立経路(フル/レジューム)に
+            // かかわらず現行素材を書き出す。次回接続はこの素材で resumption を試みる。
+            if let Some((rid, secret)) = self
+                .stack
+                .resumption_export(CONTROLLER_FABRIC_INDEX, node_id)
+            {
+                resume::save(
+                    &self.state.resume_path(node_id),
+                    &resume::ResumeMaterial {
+                        resumption_id: rid,
+                        shared_secret: secret,
+                    },
+                )?;
+                info!("[case] resumption material saved for node {node_id}");
+            }
         }
         self.cases.push((node_id, session));
         Ok(session)

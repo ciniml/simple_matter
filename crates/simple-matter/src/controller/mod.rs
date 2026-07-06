@@ -189,6 +189,39 @@ impl<
         self.mgr.handler_mut().sc.take_event()
     }
 
+    /// ピアの CASE resumption 素材を取り出す(アプリ層の永続化用。
+    /// [`ScInitiator::resumption_export`] への委譲)。
+    pub fn resumption_export(
+        &self,
+        fabric_idx: NonZeroU8,
+        peer_node_id: u64,
+    ) -> Option<(
+        [u8; crate::sc::case::common::CASE_RESUMPTION_ID_LEN],
+        [u8; crate::sc::case::common::SHARED_SECRET_LEN],
+    )> {
+        self.mgr
+            .handler()
+            .sc
+            .resumption_export(fabric_idx, peer_node_id)
+    }
+
+    /// アプリ層が永続化していた CASE resumption 素材を取り込む
+    /// ([`ScInitiator::resumption_import`] への委譲)。
+    pub fn resumption_import(
+        &mut self,
+        fabric_idx: NonZeroU8,
+        peer_node_id: u64,
+        resumption_id: &[u8; crate::sc::case::common::CASE_RESUMPTION_ID_LEN],
+        shared_secret: &[u8; crate::sc::case::common::SHARED_SECRET_LEN],
+    ) {
+        self.mgr.handler_mut().sc.resumption_import(
+            fabric_idx,
+            peer_node_id,
+            resumption_id,
+            shared_secret,
+        );
+    }
+
     /// IM client の完了/失敗イベントを 1 件取り出す(§4.4)。
     pub fn im_take_event(&mut self) -> Option<ImEvent> {
         self.mgr.handler_mut().im.take_event()
@@ -275,6 +308,14 @@ impl<
 
         let dir = match report.action {
             HandlerAction::None => None,
+            // 応答なしの終端。この後の共通スイープ(下)でも終端予約されるが、
+            // ハンドラの明示宣言を尊重してここでも予約する。
+            HandlerAction::CloseSilent => {
+                if let Some(ex) = report.exchange {
+                    self.mgr.mark_closing(ex);
+                }
+                None
+            }
             HandlerAction::Respond {
                 opcode,
                 proto_id,

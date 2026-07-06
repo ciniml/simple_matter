@@ -414,6 +414,14 @@ fn deliver<H: Dispatcher>(
             (opcode, len)
         }
         HandlerAction::None => return None,
+        // 応答なしの終端(resumed 終端の StatusReport 受理)。実スタック同様に
+        // 終端予約する(回収は poll)。
+        HandlerAction::CloseSilent => {
+            if let Some(ex) = report.exchange {
+                mgr.mark_closing(ex);
+            }
+            return None;
+        }
     };
     let ex = report.exchange.unwrap();
     let mut payload = [0u8; 1600];
@@ -1008,6 +1016,24 @@ fn case_resumption_round_trip() {
     // 責務の後始末: ハンドシェイク slot が両側とも解放されている。
     assert!(!init_mgr.handler().sc.is_busy());
     assert_eq!(resp_mgr.handler().sc.handshake_count(), 0);
+
+    // 回帰(C4 実機で検出): resumed ハンドシェイクは responder が最後の受信者
+    // (initiator の成功 StatusReport)なので、受理時に exchange を終端予約
+    // (CloseSilent)しないと slot がプールに残り続け、EXCHANGES 回の resumption 後に
+    // デバイスが新規ハンドシェイクへ応答不能になる。standalone ACK(200ms)を
+    // 流し切った後に slot が回収されることを確認する。
+    let before = resp_mgr.len();
+    assert!(before >= 1);
+    loop {
+        if let crate::exchange::PollAction::Idle { .. } = resp_mgr.poll(NOW + 210, 0) {
+            break;
+        }
+    }
+    assert_eq!(
+        resp_mgr.len(),
+        before - 1,
+        "resumed-handshake responder exchange must be reclaimed after CloseSilent"
+    );
 }
 
 /// responder がレコードを失った場合(再起動相当 = 新しい SecureChannel)、initiator の

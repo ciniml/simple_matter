@@ -195,7 +195,7 @@ where
             assert_eq!(opcode, ImOpCode::InvokeResponse.to_u8());
             len
         }
-        HandlerAction::None => panic!("expected InvokeResponse"),
+        HandlerAction::None | HandlerAction::CloseSilent => panic!("expected InvokeResponse"),
     }
 }
 

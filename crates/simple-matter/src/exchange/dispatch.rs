@@ -58,6 +58,11 @@ pub enum HandlerAction {
         /// `tx` に書き込まれた応答 payload のバイト長。
         len: usize,
     },
+    /// 応答は無いが、これが会話の終端である(相手の終端メッセージ —
+    /// 例: CASE resumption の成功 StatusReport — を受理した)。統合層は exchange を
+    /// 終端予約(`mark_closing`)する。受信 reliable メッセージへの ACK は MRP が
+    /// 流し切ってから slot が回収される(プール枯渇防止)。
+    CloseSilent,
     /// [`Respond`](HandlerAction::Respond) と同じく `tx` に payload を書いたが、
     /// これがハンドシェイクの終端であり送出後に会話を閉じてよい(終端 StatusReport)。
     Close {

@@ -4,7 +4,8 @@
 //! ~/.smctl/
 //! ├── state.lock      # プロセス間排他(状態ファイル読み書きの短い区間のみ保持)
 //! ├── ca-state.bin    # CA 鍵素材(既存 v1 フォーマット互換、state/ca.rs)
-//! └── nodes.tlv       # ノードアドレス帳(state/nodes.rs)
+//! ├── nodes.tlv       # ノードアドレス帳(state/nodes.rs)
+//! └── resume/<node-id>.tlv  # CASE resumption 素材(state/resume.rs、C4)
 //! ```
 //!
 //! ロックは**状態ファイルの読み書き区間だけ**保持する(コマンド全体では持たない)。
@@ -15,6 +16,7 @@ use std::time::{Duration, Instant};
 
 pub mod ca;
 pub mod nodes;
+pub mod resume;
 
 /// ロック獲得の最大待ち時間。
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -42,6 +44,11 @@ impl StateDir {
     /// `nodes.tlv` のパス。
     pub fn nodes_path(&self) -> PathBuf {
         self.dir.join("nodes.tlv")
+    }
+
+    /// `resume/<node-id>.tlv` のパス(CASE resumption 素材、state/resume.rs)。
+    pub fn resume_path(&self, node_id: u64) -> PathBuf {
+        resume::path_for(&self.dir, node_id)
     }
 
     /// `state.lock` を獲得する(create_new。既存なら 100ms 間隔で最大 5 秒リトライ)。

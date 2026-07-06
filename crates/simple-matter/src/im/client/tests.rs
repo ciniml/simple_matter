@@ -272,7 +272,7 @@ fn deliver<H: Dispatcher>(
             len,
             ..
         } => (opcode, proto_id, len),
-        HandlerAction::None => return None,
+        HandlerAction::None | HandlerAction::CloseSilent => return None,
     };
     let ex = report.exchange.unwrap();
     let mut payload = [0u8; 1600];

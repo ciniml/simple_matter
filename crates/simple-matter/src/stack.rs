@@ -241,6 +241,14 @@ impl<
 
         match report.action {
             HandlerAction::None => None,
+            // 相手の終端メッセージを受理した(応答なし)。exchange を終端予約し、
+            // 未送 ACK が流れ次第 poll が slot を回収する。
+            HandlerAction::CloseSilent => {
+                if let Some(ex) = report.exchange {
+                    self.mgr.mark_closing(ex);
+                }
+                None
+            }
             HandlerAction::Respond {
                 opcode,
                 proto_id,

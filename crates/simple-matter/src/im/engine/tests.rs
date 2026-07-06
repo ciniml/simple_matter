@@ -148,7 +148,7 @@ fn parts(a: HandlerAction) -> (u8, usize, bool) {
     match a {
         HandlerAction::Respond { opcode, len, .. } => (opcode, len, false),
         HandlerAction::Close { opcode, len, .. } => (opcode, len, true),
-        HandlerAction::None => panic!("expected a response action"),
+        HandlerAction::None | HandlerAction::CloseSilent => panic!("expected a response action"),
     }
 }
 

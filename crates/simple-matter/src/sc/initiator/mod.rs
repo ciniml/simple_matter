@@ -158,6 +158,39 @@ impl<'c, C: Crypto, R: Rng, F> ScInitiator<'c, C, R, F> {
         self.resumptions.len()
     }
 
+    /// ピアの resumption 素材(現行 resumptionID + SharedSecret)を取り出す。
+    ///
+    /// アプリ層の永続化用(置き場とライフサイクル管理はアプリ層、コアは
+    /// export/import のみ — `kvs::Kvs`/`FabricTable::save_to` と同じ分業)。
+    /// レコードが無ければ `None`。
+    pub fn resumption_export(
+        &self,
+        fabric_index: NonZeroU8,
+        peer_node_id: u64,
+    ) -> Option<(
+        [u8; common::CASE_RESUMPTION_ID_LEN],
+        [u8; common::SHARED_SECRET_LEN],
+    )> {
+        self.resumptions
+            .find_by_peer(fabric_index, peer_node_id)
+            .map(|r| (r.resumption_id, *r.shared_secret))
+    }
+
+    /// アプリ層が永続化していた resumption 素材を取り込む(`(fabric, peer)` で upsert)。
+    ///
+    /// 次回 `start_case` の Sigma1 に resumptionID + initiatorResumeMIC(ctx6/7)が
+    /// 付き、responder が受理すれば Sigma2_Resume 経路で確立する(§7.4)。
+    pub fn resumption_import(
+        &mut self,
+        fabric_index: NonZeroU8,
+        peer_node_id: u64,
+        resumption_id: &[u8; common::CASE_RESUMPTION_ID_LEN],
+        shared_secret: &[u8; common::SHARED_SECRET_LEN],
+    ) {
+        self.resumptions
+            .save(fabric_index, peer_node_id, resumption_id, shared_secret);
+    }
+
     /// 進行中ハンドシェイクがあれば `true`。
     pub fn is_busy(&self) -> bool {
         self.hs.is_some()
