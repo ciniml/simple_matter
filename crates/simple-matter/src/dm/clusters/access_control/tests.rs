@@ -60,7 +60,12 @@ fn encode_replace_all(buf: &mut [u8], privilege: u8, subjects: &[u64]) -> usize 
 }
 
 /// Append 用のエントリ値をエンコードする。
-fn encode_append(buf: &mut [u8], privilege: u8, subjects: &[u64], fabric_index: Option<u8>) -> usize {
+fn encode_append(
+    buf: &mut [u8],
+    privilege: u8,
+    subjects: &[u64],
+    fabric_index: Option<u8>,
+) -> usize {
     let mut w = TlvWriter::new(buf);
     write_wire_entry(
         &mut w,
@@ -251,7 +256,8 @@ fn scalar_attributes_report_spec_minimums() {
         let mut w = TlvWriter::new(&mut out);
         {
             let mut enc = AttrEncoder::new(&mut w, TlvTag::Anonymous);
-            cl.read_attribute(AttributeId(attr), &mut enc, &acc).unwrap();
+            cl.read_attribute(AttributeId(attr), &mut enc, &acc)
+                .unwrap();
         }
         let v = TlvReader::new(&out)
             .read_next()

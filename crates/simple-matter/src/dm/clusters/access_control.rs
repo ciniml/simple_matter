@@ -226,7 +226,10 @@ fn decode_wire_entry(
     let mut targets = [AclTarget::default(); MAX_ACL_TARGETS];
     let mut ntargets = 0usize;
     loop {
-        let e = r.read_next().map_err(bad)?.ok_or(ImStatus::InvalidDataType)?;
+        let e = r
+            .read_next()
+            .map_err(bad)?
+            .ok_or(ImStatus::InvalidDataType)?;
         match (e.tag, e.value) {
             (_, TlvValue::ContainerEnd) => break,
             (crate::tlv::TlvTag::ContextSpecific(1), v) => {
@@ -245,38 +248,46 @@ fn decode_wire_entry(
                 }
             }
             (crate::tlv::TlvTag::ContextSpecific(3), TlvValue::Null) => {}
-            (crate::tlv::TlvTag::ContextSpecific(3), TlvValue::ContainerStart(ContainerType::Array)) => {
-                loop {
-                    let el = r.read_next().map_err(bad)?.ok_or(ImStatus::InvalidDataType)?;
-                    match el.value {
-                        TlvValue::ContainerEnd => break,
-                        v => {
-                            if nsubjects >= MAX_ACL_SUBJECTS {
-                                return Err(ImStatus::ConstraintError);
-                            }
-                            subjects[nsubjects] = v.as_unsigned().map_err(bad)?;
-                            nsubjects += 1;
+            (
+                crate::tlv::TlvTag::ContextSpecific(3),
+                TlvValue::ContainerStart(ContainerType::Array),
+            ) => loop {
+                let el = r
+                    .read_next()
+                    .map_err(bad)?
+                    .ok_or(ImStatus::InvalidDataType)?;
+                match el.value {
+                    TlvValue::ContainerEnd => break,
+                    v => {
+                        if nsubjects >= MAX_ACL_SUBJECTS {
+                            return Err(ImStatus::ConstraintError);
                         }
+                        subjects[nsubjects] = v.as_unsigned().map_err(bad)?;
+                        nsubjects += 1;
                     }
                 }
-            }
+            },
             (crate::tlv::TlvTag::ContextSpecific(4), TlvValue::Null) => {}
-            (crate::tlv::TlvTag::ContextSpecific(4), TlvValue::ContainerStart(ContainerType::Array)) => {
-                loop {
-                    let el = r.read_next().map_err(bad)?.ok_or(ImStatus::InvalidDataType)?;
-                    match el.value {
-                        TlvValue::ContainerEnd => break,
-                        TlvValue::ContainerStart(ContainerType::Structure) => {
-                            if ntargets >= MAX_ACL_TARGETS {
-                                return Err(ImStatus::ConstraintError);
-                            }
-                            targets[ntargets] = decode_wire_target(r)?;
-                            ntargets += 1;
+            (
+                crate::tlv::TlvTag::ContextSpecific(4),
+                TlvValue::ContainerStart(ContainerType::Array),
+            ) => loop {
+                let el = r
+                    .read_next()
+                    .map_err(bad)?
+                    .ok_or(ImStatus::InvalidDataType)?;
+                match el.value {
+                    TlvValue::ContainerEnd => break,
+                    TlvValue::ContainerStart(ContainerType::Structure) => {
+                        if ntargets >= MAX_ACL_TARGETS {
+                            return Err(ImStatus::ConstraintError);
                         }
-                        _ => return Err(ImStatus::InvalidDataType),
+                        targets[ntargets] = decode_wire_target(r)?;
+                        ntargets += 1;
                     }
+                    _ => return Err(ImStatus::InvalidDataType),
                 }
-            }
+            },
             (_, v) => {
                 // fabricIndex(254)や未知フィールドはスキップ。
                 if matches!(v, TlvValue::ContainerStart(_)) {
@@ -304,7 +315,10 @@ fn decode_wire_target(r: &mut TlvReader<'_>) -> Result<AclTarget, ImStatus> {
     let bad = |_| ImStatus::InvalidDataType;
     let mut t = AclTarget::default();
     loop {
-        let e = r.read_next().map_err(bad)?.ok_or(ImStatus::InvalidDataType)?;
+        let e = r
+            .read_next()
+            .map_err(bad)?
+            .ok_or(ImStatus::InvalidDataType)?;
         match (e.tag, e.value) {
             (_, TlvValue::ContainerEnd) => break,
             (_, TlvValue::Null) => {}

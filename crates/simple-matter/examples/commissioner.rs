@@ -527,7 +527,9 @@ fn run_subscribe_demo(
             }
             Some(ImEvent::SubscriptionReport { subscription_id }) => {
                 if subscription_id != sub_id {
-                    return Err(format!("report for unexpected subscription {subscription_id}"));
+                    return Err(format!(
+                        "report for unexpected subscription {subscription_id}"
+                    ));
                 }
                 let v = sub_report_onoff_value(stack);
                 println!(

@@ -268,8 +268,12 @@ fn basic_info_read_and_node_label_write() {
     let a = acc();
     let mut wbuf = [0u8; 64];
     let n = encode_str_value(&mut wbuf, "Kitchen");
-    c.write_attribute(AttributeId(0x0005), crate::dm::AttrWrite::new(&wbuf[..n]), &a)
-        .unwrap();
+    c.write_attribute(
+        AttributeId(0x0005),
+        crate::dm::AttrWrite::new(&wbuf[..n]),
+        &a,
+    )
+    .unwrap();
     assert_eq!(c.node_label(), "Kitchen");
     assert!(c.take_dirty());
     let (_, res) = read_attr(&c, 0x0005, &mut buf);
@@ -278,20 +282,32 @@ fn basic_info_read_and_node_label_write() {
 
     // 読み取り専用属性への書込は UnsupportedWrite。
     let n = encode_str_value(&mut wbuf, "x");
-    let r = c.write_attribute(AttributeId(0x0001), crate::dm::AttrWrite::new(&wbuf[..n]), &a);
+    let r = c.write_attribute(
+        AttributeId(0x0001),
+        crate::dm::AttrWrite::new(&wbuf[..n]),
+        &a,
+    );
     assert_eq!(r, Err(ImStatus::UnsupportedWrite));
 
     // 長すぎる NodeLabel(> 32)は ConstraintError。
     let long = "0123456789012345678901234567890123"; // 34 文字
     let n = encode_str_value(&mut wbuf, long);
-    let r = c.write_attribute(AttributeId(0x0005), crate::dm::AttrWrite::new(&wbuf[..n]), &a);
+    let r = c.write_attribute(
+        AttributeId(0x0005),
+        crate::dm::AttrWrite::new(&wbuf[..n]),
+        &a,
+    );
     assert_eq!(r, Err(ImStatus::ConstraintError));
 
     // 型不一致の書込は InvalidDataType。
     let mut w = TlvWriter::new(&mut wbuf);
     w.write_u8(&TlvTag::Anonymous, 1).unwrap();
     let n = w.len();
-    let r = c.write_attribute(AttributeId(0x0005), crate::dm::AttrWrite::new(&wbuf[..n]), &a);
+    let r = c.write_attribute(
+        AttributeId(0x0005),
+        crate::dm::AttrWrite::new(&wbuf[..n]),
+        &a,
+    );
     assert_eq!(r, Err(ImStatus::InvalidDataType));
 }
 

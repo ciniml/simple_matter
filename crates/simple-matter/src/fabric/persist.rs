@@ -261,8 +261,7 @@ fn decode_record(record: &[u8]) -> Result<RawRecord<'_>> {
             _ => r.skip(&e)?,
         }
     }
-    let fabric_index =
-        NonZeroU8::new(fabric_index.ok_or(Error::Decode)?).ok_or(Error::Decode)?;
+    let fabric_index = NonZeroU8::new(fabric_index.ok_or(Error::Decode)?).ok_or(Error::Decode)?;
     let label = label.ok_or(Error::Decode)?;
     if label.len() > MAX_FABRIC_LABEL_LEN {
         return Err(Error::Decode);

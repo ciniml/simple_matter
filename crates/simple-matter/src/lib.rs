@@ -9,13 +9,13 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+pub mod acl;
 /// BTP(Bluetooth Transport Protocol)コア。`ble` feature 有効時のみ。
 ///
 /// `docs/design/ble-btp.md` §4。sans-IO no_std の BLE トランスポート状態機械で、
 /// BLE 無効ビルドには一切コンパイルされない(フットプリント不変、設計 §7)。
 #[cfg(feature = "ble")]
 pub mod btp;
-pub mod acl;
 pub mod buf;
 pub mod cert;
 /// コントローラ(commissioner)側の統合層。`controller` + `rustcrypto` feature 有効時のみ。

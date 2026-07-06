@@ -190,7 +190,10 @@ fn build_device(fabrics: &RefCell<FabricTable<Crb, 5>>) -> Dev<'_> {
 }
 
 /// NetworkCommissioning クラスタ差し替え版(Wi-Fi コミッショニングのテスト用)。
-fn build_device_with<N: ServerCluster>(fabrics: &RefCell<FabricTable<Crb, 5>>, net: N) -> Dev<'_, N> {
+fn build_device_with<N: ServerCluster>(
+    fabrics: &RefCell<FabricTable<Crb, 5>>,
+    net: N,
+) -> Dev<'_, N> {
     let dac_crypto = RustCrypto::new(SeqRng(0xDAC0_0001));
     let dac = TestDacProvider::new(&dac_crypto).unwrap();
     Dev {
@@ -1540,7 +1543,8 @@ mod controller_e2e {
         let config = PaseConfig::from_passcode(PASSCODE, &SALT, ITERATIONS).unwrap();
         let dev_creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
         let sc = SecureChannel::new(&crypto, SeqRng(0x5C00_0002), config, dev_creds);
-        let im = InteractionModel::new(build_device_with(&fabrics, NetworkCommissioningWifi::new()));
+        let im =
+            InteractionModel::new(build_device_with(&fabrics, NetworkCommissioningWifi::new()));
         let mut dev: TestStack<'_, NetworkCommissioningWifi> = MatterStack::new(&crypto, sc, im);
 
         // --- コントローラ側 ---
@@ -1608,7 +1612,10 @@ mod controller_e2e {
             .expect("Ca::generate");
         let mut comm = Commissioner::new(&ca, &crypto, AttestationPolicy::Skip);
         assert!(comm
-            .set_wifi_credentials(&[0x41; MAX_WIFI_SSID_LEN], &[0x42; MAX_WIFI_CREDENTIALS_LEN])
+            .set_wifi_credentials(
+                &[0x41; MAX_WIFI_SSID_LEN],
+                &[0x42; MAX_WIFI_CREDENTIALS_LEN]
+            )
             .is_ok());
         assert!(comm
             .set_wifi_credentials(&[0x41; MAX_WIFI_SSID_LEN + 1], b"pw")

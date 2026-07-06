@@ -657,7 +657,8 @@ mod wifi_tests {
         let mut w = TlvWriter::new(&mut buf);
         {
             let mut e = AttrEncoder::new(&mut w, TlvTag::Anonymous);
-            net.read_attribute(AttributeId(0x0001), &mut e, &acc()).unwrap();
+            net.read_attribute(AttributeId(0x0001), &mut e, &acc())
+                .unwrap();
         }
         // 配列 → 構造体 → { 0: ssid, 1: connected }。
         let mut r = TlvReader::new(&buf);
@@ -692,7 +693,8 @@ mod wifi_tests {
         let mut w2 = TlvWriter::new(&mut buf2);
         {
             let mut e = AttrEncoder::new(&mut w2, TlvTag::Anonymous);
-            net.read_attribute(AttributeId(0x0001), &mut e, &acc()).unwrap();
+            net.read_attribute(AttributeId(0x0001), &mut e, &acc())
+                .unwrap();
         }
         let mut r2 = TlvReader::new(&buf2);
         r2.read_next().unwrap(); // array
@@ -757,7 +759,8 @@ mod wifi_tests {
         let mut fbuf = [0u8; 128];
         let mut w = TlvWriter::new(&mut fbuf);
         w.start_struct(&TlvTag::ContextSpecific(1)).unwrap();
-        w.write_bytes(&TlvTag::ContextSpecific(0), b"iotap").unwrap();
+        w.write_bytes(&TlvTag::ContextSpecific(0), b"iotap")
+            .unwrap();
         w.write_bytes(&TlvTag::ContextSpecific(1), b"hogeFugapiyo")
             .unwrap();
         w.end_container().unwrap();
@@ -798,7 +801,8 @@ mod wifi_tests {
         let mut w = TlvWriter::new(&mut buf);
         {
             let mut e = AttrEncoder::new(&mut w, TlvTag::Anonymous);
-            net.read_attribute(AttributeId(0x0005), &mut e, &acc()).unwrap();
+            net.read_attribute(AttributeId(0x0005), &mut e, &acc())
+                .unwrap();
         }
         let mut r = TlvReader::new(&buf);
         assert_eq!(
@@ -811,7 +815,8 @@ mod wifi_tests {
         let mut w2 = TlvWriter::new(&mut buf2);
         {
             let mut e = AttrEncoder::new(&mut w2, TlvTag::Anonymous);
-            net.read_attribute(AttributeId(0x0007), &mut e, &acc()).unwrap();
+            net.read_attribute(AttributeId(0x0007), &mut e, &acc())
+                .unwrap();
         }
         let mut r2 = TlvReader::new(&buf2);
         assert!(matches!(

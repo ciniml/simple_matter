@@ -223,7 +223,8 @@ impl AclEntry {
         if matches!(self.auth_mode, AuthMode::Pase) {
             return false;
         }
-        if matches!(self.privilege, Privilege::Administer) && !matches!(self.auth_mode, AuthMode::Case)
+        if matches!(self.privilege, Privilege::Administer)
+            && !matches!(self.auth_mode, AuthMode::Case)
         {
             return false;
         }
@@ -412,8 +413,13 @@ impl<const E: usize> AclTable<E> {
 /// の両方へ共有参照を渡す。
 pub trait AclHandle {
     /// アクセス `acc` が (endpoint, cluster) に `required` 権限を持つか。
-    fn check(&self, acc: &AccessContext, ep: EndpointId, cl: ClusterId, required: Privilege)
-        -> bool;
+    fn check(
+        &self,
+        acc: &AccessContext,
+        ep: EndpointId,
+        cl: ClusterId,
+        required: Privilege,
+    ) -> bool;
 
     /// AddNOC 成功時の bootstrap admin エントリを追加する(§11.17.6.8)。
     fn add_case_admin(&self, fabric: NonZeroU8, subject: u64) -> Result<()>;
@@ -602,9 +608,8 @@ fn decode_entry(r: &mut TlvReader<'_>) -> Result<AclEntry> {
                 fabric = Some(v.as_unsigned()?.try_into().map_err(|_| Error::Decode)?)
             }
             (TlvTag::ContextSpecific(2), v) => {
-                privilege = privilege_from_wire(
-                    v.as_unsigned()?.try_into().map_err(|_| Error::Decode)?,
-                );
+                privilege =
+                    privilege_from_wire(v.as_unsigned()?.try_into().map_err(|_| Error::Decode)?);
                 if privilege.is_none() {
                     return Err(Error::Decode);
                 }

@@ -162,7 +162,10 @@ impl GattCentral for BtleplugCentral {
                 b.copy_from_slice(&sd[..8]);
                 let Ok(adv) = AdvData::parse_service_data(&b) else {
                     if trace {
-                        eprintln!("[ble-trace] {} fff6 parse failed: {:02x?}", props.address, &b);
+                        eprintln!(
+                            "[ble-trace] {} fff6 parse failed: {:02x?}",
+                            props.address, &b
+                        );
                     }
                     continue;
                 };

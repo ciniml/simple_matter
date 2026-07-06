@@ -147,7 +147,9 @@ fn ca_restore_reproduces_identical_credentials() {
     let dev_kp = crypto.p256_keypair_from_bytes(&[0x33; 32]).unwrap();
     let dev_pub = dev_kp.public_key().to_bytes();
     let mut noc1 = [0u8; 512];
-    let n1 = ca.issue_noc(&crypto, &dev_pub, DEVICE_NODE, &mut noc1).unwrap();
+    let n1 = ca
+        .issue_noc(&crypto, &dev_pub, DEVICE_NODE, &mut noc1)
+        .unwrap();
 
     let restored = Ca::<Crb>::restore(
         &crypto,
@@ -177,7 +179,9 @@ fn ca_restore_reproduces_identical_credentials() {
         .issue_noc(&crypto, &dev_pub, DEVICE_NODE, &mut noc2)
         .unwrap();
     let mut noc1b = [0u8; 512];
-    let n1b = ca.issue_noc(&crypto, &dev_pub, DEVICE_NODE, &mut noc1b).unwrap();
+    let n1b = ca
+        .issue_noc(&crypto, &dev_pub, DEVICE_NODE, &mut noc1b)
+        .unwrap();
     assert_eq!(&noc2[..n2], &noc1b[..n1b]);
     // 最初に発行した NOC とは serial が異なる。
     assert_ne!(&noc1[..n1], &noc2[..n2]);

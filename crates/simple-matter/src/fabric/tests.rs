@@ -903,7 +903,10 @@ fn persist_save_load_roundtrip_preserves_case_material() {
     assert_eq!(n, 2);
     assert_eq!(restored.len(), 2);
     // LKGT が復元される(now=0 でも証明書検証が通ったのはこのため)。
-    assert_eq!(restored.last_known_good_epoch(), table.last_known_good_epoch());
+    assert_eq!(
+        restored.last_known_good_epoch(),
+        table.last_known_good_epoch()
+    );
 
     // CASE 再確立に必要な素材が保存前と等価であること。
     for (orig, chain) in [(1u8, &c0), (2u8, &c1)] {

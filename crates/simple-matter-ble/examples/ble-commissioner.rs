@@ -551,7 +551,10 @@ async fn run(opts: Opts) -> Result<(), String> {
                 .map_err(|e| format!("set_read_timeout: {e}"))?;
             println!(
                 "[udp] controller socket bound on {}",
-                socket.local_addr().map(|a| a.to_string()).unwrap_or_default()
+                socket
+                    .local_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default()
             );
 
             comm.set_peer(PeerAddr::Udp(device_addr));
@@ -760,7 +763,9 @@ fn drive_commission_udp(
 
     loop {
         if udp_start.elapsed() > UDP_TIMEOUT {
-            return Err(format!("UDP commissioning timed out in phase {last_phase:?}"));
+            return Err(format!(
+                "UDP commissioning timed out in phase {last_phase:?}"
+            ));
         }
 
         // 進捗を進める(イベント消費 → 次の start_* を発行)。
@@ -785,7 +790,9 @@ fn drive_commission_udp(
                     return Ok(session);
                 }
                 Phase::Failed { stage, reason } => {
-                    return Err(format!("UDP commissioning failed at stage {stage}: {reason:?}"));
+                    return Err(format!(
+                        "UDP commissioning failed at stage {stage}: {reason:?}"
+                    ));
                 }
                 _ => {}
             }
@@ -923,7 +930,11 @@ fn resolve_operational(ca: &Ca<Backend>, node_id: u64) -> Result<SocketAddr, Str
                 if trace {
                     eprintln!(
                         "[mdns-trace] rx {n}B from {src} parse={}",
-                        if parsed.is_some() { "operational" } else { "no-match" }
+                        if parsed.is_some() {
+                            "operational"
+                        } else {
+                            "no-match"
+                        }
                     );
                 }
                 if let Some(node) = parsed {
@@ -935,7 +946,11 @@ fn resolve_operational(ca: &Ca<Backend>, node_id: u64) -> Result<SocketAddr, Str
                         .or_else(|| node.addrs.iter().next())
                         .copied();
                     if let Some(ip) = picked {
-                        let port = if node.port != 0 { node.port } else { MATTER_PORT };
+                        let port = if node.port != 0 {
+                            node.port
+                        } else {
+                            MATTER_PORT
+                        };
                         return Ok(SocketAddr::new(ip, port));
                     }
                 }

@@ -485,7 +485,10 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
                 stack
                     .start_invoke(
                         session,
-                        cmd_path(CLUSTER_NETWORK_COMMISSIONING, CMD_ADD_OR_UPDATE_WIFI_NETWORK),
+                        cmd_path(
+                            CLUSTER_NETWORK_COMMISSIONING,
+                            CMD_ADD_OR_UPDATE_WIFI_NETWORK,
+                        ),
                         move |w, t| {
                             w.start_struct(t)?;
                             w.write_bytes(&cx(0), ssid)?; // SSID

@@ -653,7 +653,8 @@ fn network_commissioning_reads_ethernet_networks() {
     let mut w = TlvWriter::new(&mut buf);
     {
         let mut enc = AttrEncoder::new(&mut w, TlvTag::Anonymous);
-        sc.read_attribute(AttributeId(0x0000), &mut enc, &acc()).unwrap(); // MaxNetworks
+        sc.read_attribute(AttributeId(0x0000), &mut enc, &acc())
+            .unwrap(); // MaxNetworks
     }
     assert_eq!(
         TlvReader::new(&buf).read_next().unwrap().unwrap().value,

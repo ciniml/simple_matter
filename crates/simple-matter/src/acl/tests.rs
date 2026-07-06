@@ -268,12 +268,7 @@ fn handle_add_case_admin_and_remove_fabric() {
     let cell: RefCell<AclTable<8>> = RefCell::new(AclTable::new());
     let h: &dyn AclHandle = &cell;
     h.add_case_admin(f(1), 0x0011_2233).unwrap();
-    assert!(h.check(
-        &case_acc(1, 0x0011_2233),
-        EP1,
-        ONOFF,
-        Privilege::Administer
-    ));
+    assert!(h.check(&case_acc(1, 0x0011_2233), EP1, ONOFF, Privilege::Administer));
     h.remove_fabric(f(1));
     assert!(!h.check(&case_acc(1, 0x0011_2233), EP1, ONOFF, Privilege::View));
     assert_eq!(cell.borrow().len(), 0);

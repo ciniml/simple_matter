@@ -385,8 +385,7 @@ impl AttributePath {
                         TlvValue::Null => path.list_append = true,
                         v => {
                             let idx = v.as_unsigned()?;
-                            path.list_index =
-                                Some(u16::try_from(idx).map_err(|_| Error::Decode)?);
+                            path.list_index = Some(u16::try_from(idx).map_err(|_| Error::Decode)?);
                         }
                     }
                 }

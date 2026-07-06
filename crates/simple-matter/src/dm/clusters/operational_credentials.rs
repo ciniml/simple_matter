@@ -313,7 +313,11 @@ impl<C: Crypto, DAC: DacProvider, const N: usize, FT: FabricAccess<C, N>>
         })
     }
 
-    fn read_fabrics(&self, e: &mut AttrEncoder<'_, '_>, acc: &AccessContext) -> Result<(), ImStatus> {
+    fn read_fabrics(
+        &self,
+        e: &mut AttrEncoder<'_, '_>,
+        acc: &AccessContext,
+    ) -> Result<(), ImStatus> {
         e.write_array(|a| {
             for f in self.fabrics.get().iter() {
                 if !Self::row_visible(acc, f.fabric_index()) {
