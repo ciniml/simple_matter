@@ -22,11 +22,13 @@
 //! **開発用** DAC チェーン([`dev_creds`](TestDacProvider) 参照)を用いる。実 X.509 DER
 //! のため chip-tool が DAC 公開鍵を抽出して NOCSR 署名を検証できる(相互運用確認済み)。
 //!
-//! # fabric-scoped 属性の初期スコープ
+//! # fabric-scoped 属性
 //!
-//! [`ServerCluster::read_attribute`] は [`AccessContext`] を受け取らないため、NOCs /
-//! Fabrics は fabric フィルタせず全 fabric 行を返す(設計 §10 の割り切り。full ACL /
-//! fabric-filtered read は後日)。CurrentFabricIndex も同様に 0 を返す。
+//! full ACL 導入(`docs/design/acl.md`)で [`ServerCluster::read_attribute`] が
+//! [`AccessContext`] を受け取るようになり、CurrentFabricIndex はセッションの fabric index を
+//! 返す。NOCs / Fabrics / TrustedRootCertificates はリクエストの fabricFiltered フラグ
+//! (`AccessContext::fabric_filtered`)が立っていれば自 fabric 行のみ返す
+//! (`false` 時の他 fabric 行の redact は未対応の割り切り、acl.md §1)。
 
 use core::cell::RefCell;
 use core::num::NonZeroU8;
@@ -287,9 +289,17 @@ impl<C: Crypto, DAC: DacProvider, const N: usize, FT: FabricAccess<C, N>>
 
     // --- 属性読み取り ---
 
-    fn read_nocs(&self, e: &mut AttrEncoder<'_, '_>) -> Result<(), ImStatus> {
+    /// fabricFiltered read で行を返すか(自 fabric のみ)。
+    fn row_visible(acc: &AccessContext, idx: NonZeroU8) -> bool {
+        !acc.fabric_filtered || acc.fabric_idx == Some(idx)
+    }
+
+    fn read_nocs(&self, e: &mut AttrEncoder<'_, '_>, acc: &AccessContext) -> Result<(), ImStatus> {
         e.write_array(|a| {
             for f in self.fabrics.get().iter() {
+                if !Self::row_visible(acc, f.fabric_index()) {
+                    continue;
+                }
                 a.push_struct(|s| {
                     s.field_bytes(1, f.noc())?;
                     match f.icac() {
@@ -303,9 +313,12 @@ impl<C: Crypto, DAC: DacProvider, const N: usize, FT: FabricAccess<C, N>>
         })
     }
 
-    fn read_fabrics(&self, e: &mut AttrEncoder<'_, '_>) -> Result<(), ImStatus> {
+    fn read_fabrics(&self, e: &mut AttrEncoder<'_, '_>, acc: &AccessContext) -> Result<(), ImStatus> {
         e.write_array(|a| {
             for f in self.fabrics.get().iter() {
+                if !Self::row_visible(acc, f.fabric_index()) {
+                    continue;
+                }
                 a.push_struct(|s| {
                     s.field_bytes(1, f.root_public_key())?;
                     s.field_u16(2, f.vendor_id())?;
@@ -319,9 +332,16 @@ impl<C: Crypto, DAC: DacProvider, const N: usize, FT: FabricAccess<C, N>>
         })
     }
 
-    fn read_trusted_roots(&self, e: &mut AttrEncoder<'_, '_>) -> Result<(), ImStatus> {
+    fn read_trusted_roots(
+        &self,
+        e: &mut AttrEncoder<'_, '_>,
+        acc: &AccessContext,
+    ) -> Result<(), ImStatus> {
         e.write_array(|a| {
             for f in self.fabrics.get().iter() {
+                if !Self::row_visible(acc, f.fabric_index()) {
+                    continue;
+                }
                 a.push_bytes(f.rcac())?;
             }
             Ok(())
@@ -494,6 +514,7 @@ impl<C: Crypto, DAC: DacProvider, const N: usize, FT: FabricAccess<C, N>>
         let mut noc: &[u8] = &[];
         let mut icac: Option<&[u8]> = None;
         let mut ipk: &[u8] = &[];
+        let mut case_admin_subject: u64 = 0;
         let mut admin_vendor_id: u16 = 0;
         let mut f = Fields::new(fields);
         while let Some((tag, v)) = f.next() {
@@ -501,7 +522,8 @@ impl<C: Crypto, DAC: DacProvider, const N: usize, FT: FabricAccess<C, N>>
                 (0, TlvValue::ByteString(b)) => noc = b,
                 (1, TlvValue::ByteString(b)) => icac = Some(b),
                 (2, TlvValue::ByteString(b)) => ipk = b,
-                // 3: caseAdminSubject(u64)は初期スコープでは未使用(ACL クラスタ導入時に反映)。
+                // 3: caseAdminSubject。AddNOC 成功時に bootstrap admin ACL を生成する(§11.17.6.8)。
+                (3, val) => case_admin_subject = val.as_unsigned().unwrap_or(0),
                 (4, val) => admin_vendor_id = val.as_unsigned().unwrap_or(0) as u16,
                 _ => {}
             }
@@ -546,6 +568,11 @@ impl<C: Crypto, DAC: DacProvider, const N: usize, FT: FabricAccess<C, N>>
                 // PASE セッションを確定 fabric へ昇格する要求(設計 §9.4)。
                 let _ = acc;
                 resp.request_fabric_promotion(idx);
+                // caseAdminSubject への bootstrap admin ACL エントリ生成を要求する
+                // (§11.17.6.8。0 は不正 subject のためスキップ)。
+                if case_admin_subject != 0 {
+                    resp.request_case_admin_acl(idx, case_admin_subject);
+                }
                 write_noc_response(resp, noc_status::OK, Some(idx.get()))
             }
             Err(e) => {
@@ -607,6 +634,8 @@ impl<C: Crypto, DAC: DacProvider, const N: usize, FT: FabricAccess<C, N>>
         match self.fabrics.get_mut().remove(idx) {
             Ok(()) => {
                 self.dirty.mark();
+                // 当該 fabric の ACL エントリ連動削除を要求する(docs/design/acl.md §3)。
+                resp.request_fabric_removed(idx);
                 write_noc_response(resp, noc_status::OK, Some(idx.get()))
             }
             Err(_) => write_noc_response(resp, noc_status::INVALID_FABRIC_INDEX, None),
@@ -661,15 +690,16 @@ impl<C: Crypto, DAC: DacProvider, const N: usize, FT: FabricAccess<C, N>> Server
         &self,
         attr: AttributeId,
         enc: &mut AttrEncoder<'_, '_>,
+        acc: &AccessContext,
     ) -> Result<(), ImStatus> {
         match attr.0 {
-            0x00 => self.read_nocs(enc),
-            0x01 => self.read_fabrics(enc),
+            0x00 => self.read_nocs(enc, acc),
+            0x01 => self.read_fabrics(enc, acc),
             0x02 => enc.write_u8(N as u8),
             0x03 => enc.write_u8(self.fabrics.get().len() as u8),
-            0x04 => self.read_trusted_roots(enc),
-            // CurrentFabricIndex: read_attribute は acc を持たないため 0(初期スコープ)。
-            0x05 => enc.write_u8(0),
+            0x04 => self.read_trusted_roots(enc, acc),
+            // CurrentFabricIndex: アクセス元セッションの fabric index(未確定は 0)。
+            0x05 => enc.write_u8(acc.fabric_idx.map(NonZeroU8::get).unwrap_or(0)),
             _ => Err(ImStatus::UnsupportedAttribute),
         }
     }

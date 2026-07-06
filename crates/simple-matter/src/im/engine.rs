@@ -24,9 +24,10 @@
 //!   実装済み `dm::codec::AttrEncoder` はロールバックを持たない(意図的に IM へ委譲)。本エンジンは
 //!   `im::wire::ReportChunkBuilder`([`TlvWriter::checkpoint`](crate::tlv::TlvWriter)ベース)で
 //!   「試し書き→巻き戻し」を行う。
-//! - **ACL 近似**: 設計 §10 どおり最小近似。CASE = fabric メンバに Administer 相当、PASE =
-//!   コミッショニング必須クラスタのみ許可(それ以外は `UnsupportedAccess`)。per-entry ACL 照合は
-//!   持たない。`DataModel::take_dirty` は実装済み trait に無いため、[`InteractionModel::poll_subscriptions`]
+//! - **ACL**: `DataModel::acl` が `Some` のデバイスは full ACL(per-entry 照合、
+//!   `docs/design/acl.md`)で判定する。`None` のデバイスは従来の最小近似(設計 §10:
+//!   CASE = fabric メンバに Administer 相当、PASE = コミッショニング必須クラスタのみ許可)に
+//!   フォールバックする。`DataModel::take_dirty` は実装済み trait に無いため、[`InteractionModel::poll_subscriptions`]
 //!   が (endpoint, cluster) を走査して各クラスタの [`ServerCluster::take_dirty`](crate::dm::ServerCluster)
 //!   を集約する(設計 §6.2 の意図を trait 変更なしで実現)。
 //! - **DataVersion は単一共有カウンタ**: レポートの AttributeDataIB には DataVersion を必ず付与する
@@ -40,7 +41,7 @@ use crate::dm::codec::{AttrEncoder, CmdResponder};
 use crate::dm::meta::{
     is_global_attribute, AccessContext, ClusterId, EndpointId, Privilege, SessionKind,
 };
-use crate::dm::{read_global_attribute, DataModel};
+use crate::dm::{read_global_attribute, AttrWrite, DataModel, ListOp};
 use crate::error::{Error, Result};
 use crate::exchange::{ExchangeId, HandlerAction, ProtocolHandler, RxMessage};
 use crate::im::wire::{
@@ -70,8 +71,31 @@ const MAX_SWEEP: usize = 64;
 const INVOKE_SCRATCH: usize = 900;
 
 /// PASE セッションからアクセス可能なコミッショニング必須クラスタか(設計 §10.1)。
+///
+/// **従来近似(`DataModel::acl` が `None`)専用**。full ACL では PASE は implicit
+/// Administer(全クラスタ)になる(`docs/design/acl.md` §3)。
 const fn is_commissioning_cluster(cl: ClusterId) -> bool {
     matches!(cl.0, 0x0028 | 0x0030 | 0x0031 | 0x003E)
+}
+
+/// アクセス `acc` が (ep, cl) へ `required` 権限を持つか(`docs/design/acl.md` §3)。
+///
+/// `DataModel::acl` が `Some` なら full ACL(per-entry 照合)、`None` なら従来近似
+/// (PASE = コミッショニングクラスタのみ、CASE = セッション付与権限)で判定する。
+fn allowed<D: DataModel + ?Sized>(
+    dm: &D,
+    acc: &AccessContext,
+    ep: EndpointId,
+    cl: ClusterId,
+    required: Privilege,
+) -> bool {
+    match dm.acl() {
+        Some(a) => a.check(acc, ep, cl, required),
+        None => match acc.kind {
+            SessionKind::Pase => is_commissioning_cluster(cl),
+            SessionKind::Case => acc.has_privilege(required),
+        },
+    }
 }
 
 /// [`HandlerAction::Respond`] を IM 応答として組む。
@@ -100,11 +124,11 @@ fn status_response(tx: &mut [u8], status: ImStatus) -> Result<HandlerAction> {
     Ok(close(ImOpCode::StatusResponse, true, len))
 }
 
-/// セッションからアクセス文脈を導く(設計 §10、ACL 最小近似)。
+/// セッションからアクセス文脈を導く(設計 §10 / `docs/design/acl.md` §5)。
 ///
-/// IM は暗号セッション必須のため、PlainText は [`Error::InvalidState`]。PASE/CASE いずれも
-/// 粗く Administer 相当を与え、per-entry ACL 照合は行わない(クラスタ単位のゲートは
-/// [`is_commissioning_cluster`] で別途行う)。
+/// IM は暗号セッション必須のため、PlainText は [`Error::InvalidState`]。CASE は subject
+/// NodeId と peer CAT をセッションから写す。`privilege` フィールドの Administer は
+/// 従来近似(`DataModel::acl` == None)経路でのみ使われる。
 fn access_from_session<const S: usize>(
     sessions: &SessionManager<S>,
     session: SessionId,
@@ -126,7 +150,8 @@ fn access_from_session<const S: usize>(
             Some(fabric_idx),
             s.peer_node_id().unwrap_or(0),
             Privilege::Administer,
-        ),
+        )
+        .with_cats(s.peer_cats()),
     };
     Ok(base.with_env(now_ms, challenge))
 }
@@ -228,8 +253,9 @@ struct Subscription<const P: usize> {
     id: u32,
     /// 購読者(暗号セッション)。
     session: SessionId,
-    /// 所属 fabric(レポートの acc に使う)。
-    fabric_idx: Option<NonZeroU8>,
+    /// プライミング時のアクセス文脈(定期レポートの ACL 再評価に使う、
+    /// `docs/design/acl.md` §3)。
+    acc: AccessContext,
     /// 購読パス列(固定上限)。
     paths: [AttributePath; P],
     /// `paths` の有効長。
@@ -251,7 +277,7 @@ impl<const P: usize> Subscription<P> {
     fn new(
         id: u32,
         session: SessionId,
-        fabric_idx: Option<NonZeroU8>,
+        acc: AccessContext,
         min_interval_s: u16,
         max_interval_s: u16,
         now_ms: u64,
@@ -259,7 +285,7 @@ impl<const P: usize> Subscription<P> {
         Self {
             id,
             session,
-            fabric_idx,
+            acc,
             paths: [AttributePath::default(); P],
             npaths: 0,
             min_interval_s,
@@ -347,7 +373,8 @@ fn emit_chunk<D: DataModel + ?Sized, const P: usize>(
         };
         let wire = cpath.to_wire();
 
-        let denied = txn.acc.kind == SessionKind::Pase && !is_commissioning_cluster(cpath.cluster);
+        // 属性 read の必要権限はメタの access(グローバル属性の合成メタは View)。
+        let denied = !allowed(dm, &txn.acc, cpath.endpoint, cpath.cluster, meta.access);
 
         let fit = if denied || !meta.readable {
             let st = if denied {
@@ -367,7 +394,7 @@ fn emit_chunk<D: DataModel + ?Sized, const P: usize>(
                 let r = if is_global_attribute(cpath.attribute) {
                     read_global_attribute(cluster.meta(), cpath.attribute, &mut enc)
                 } else {
-                    cluster.read_attribute(cpath.attribute, &mut enc)
+                    cluster.read_attribute(cpath.attribute, &mut enc, &txn.acc)
                 };
                 match r {
                     Ok(()) => Ok(()),
@@ -480,7 +507,8 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         now_ms: u64,
     ) -> Result<HandlerAction> {
         let req = ReadRequestRef::new(rx.payload)?;
-        let mut txn = ReadTxn::<PATHS>::new(rx.exchange, *acc, ReadKind::Read, now_ms);
+        let acc = acc.with_fabric_filtered(req.fabric_filtered().unwrap_or(false));
+        let mut txn = ReadTxn::<PATHS>::new(rx.exchange, acc, ReadKind::Read, now_ms);
         for p in req.attr_paths()? {
             let p = p?;
             if txn.npaths >= PATHS {
@@ -527,6 +555,7 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
             return status_response(tx, ImStatus::ResourceExhausted);
         }
         let req = SubscribeRequestRef::new(rx.payload)?;
+        let acc = &acc.with_fabric_filtered(req.fabric_filtered().unwrap_or(false));
         let min = req.min_interval_floor_s()?;
         let max = req.max_interval_ceiling_s()?;
         // ネゴシエート: 上限を採用しつつ min 以上・最低 1 秒にクランプ。
@@ -536,7 +565,7 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         let mut sub = Subscription::<PATHS>::new(
             id,
             rx.exchange.session(),
-            acc.fabric_idx,
+            *acc,
             min,
             max_neg,
             now_ms,
@@ -726,7 +755,7 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
             suppress_response: false,
             more_chunks: false,
         };
-        let mut promote: Option<NonZeroU8> = None;
+        let mut effects = InvokeEffects::default();
 
         if suppress {
             // 応答は送らないが副作用(および AddNOC の fabric 昇格)は適用する。
@@ -735,15 +764,11 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
             let _ = encode_invoke_response(tx, header, |cw| {
                 for item in req.invoke_requests()? {
                     let item = item?;
-                    if let Some(p) = invoke_one(dm, &item, acc, cw)? {
-                        promote = Some(p);
-                    }
+                    effects.merge(invoke_one(dm, &item, acc, cw)?);
                 }
                 Ok(())
             });
-            if let Some(p) = promote {
-                let _ = sessions.promote_pase_fabric(session, p);
-            }
+            self.apply_invoke_effects(effects, session, sessions);
             return Ok(HandlerAction::None);
         }
 
@@ -751,16 +776,34 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         let len = encode_invoke_response(tx, header, |cw| {
             for item in req.invoke_requests()? {
                 let item = item?;
-                if let Some(p) = invoke_one(dm, &item, acc, cw)? {
-                    promote = Some(p);
-                }
+                effects.merge(invoke_one(dm, &item, acc, cw)?);
             }
             Ok(())
         })?;
-        if let Some(p) = promote {
+        self.apply_invoke_effects(effects, session, sessions);
+        Ok(close(ImOpCode::InvokeResponse, true, len))
+    }
+
+    /// invoke の副作用(fabric 昇格・bootstrap admin ACL・fabric 連動 ACL 削除)を適用する。
+    fn apply_invoke_effects<const SN: usize>(
+        &mut self,
+        effects: InvokeEffects,
+        session: SessionId,
+        sessions: &mut SessionManager<SN>,
+    ) {
+        if let Some(p) = effects.promote {
             let _ = sessions.promote_pase_fabric(session, p);
         }
-        Ok(close(ImOpCode::InvokeResponse, true, len))
+        if let Some(acl) = self.dm.acl() {
+            if let Some((fabric, subject)) = effects.case_admin {
+                // 満杯等は best-effort(コミッショニング自体は継続。エントリが無ければ
+                // 当該 subject の CASE アクセスが拒否されるだけで安全側)。
+                let _ = acl.add_case_admin(fabric, subject);
+            }
+            if let Some(fabric) = effects.removed_fabric {
+                acl.remove_fabric(fabric);
+            }
+        }
     }
 
     // ----------------------------------------------------------------------
@@ -891,12 +934,9 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         let Some(si) = self.subs.iter().position(|s| s.id == subscription) else {
             return Err(Error::NotFound);
         };
-        let acc = AccessContext::new(
-            SessionKind::Case,
-            self.subs[si].fabric_idx,
-            0,
-            Privilege::Administer,
-        );
+        // プライミング時のアクセス文脈で ACL を再評価する(時刻のみ更新)。
+        let mut acc = self.subs[si].acc;
+        acc.now_ms = now_ms;
         let mut txn = ReadTxn::<PATHS>::new(exchange, acc, ReadKind::Report(subscription), now_ms);
         {
             let sub = &self.subs[si];
@@ -1056,32 +1096,78 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
     }
 }
 
-/// 1 つの AttributeDataIB を書き込み、結果ステータスを返す(設計 §9)。
+/// 1 つの AttributeDataIB を書き込み、結果ステータスを返す(設計 §9 / `docs/design/acl.md` §4)。
+///
+/// パスの ListIndex が null(`list_append`)の場合は list 属性への 1 要素追記
+/// ([`ListOp::AppendItem`])としてクラスタへ渡す。数値 ListIndex 指定の write は非対応
+/// (`InvalidAction`)。
 fn write_one<D: DataModel + ?Sized>(
     dm: &mut D,
     item: &AttributeDataRef<'_>,
     acc: &AccessContext,
 ) -> ImStatus {
-    let Some(cp) = item.path.to_concrete() else {
+    let p = item.path;
+    let (Some(endpoint), Some(cluster_id), Some(attribute)) = (p.endpoint, p.cluster, p.attribute)
+    else {
         return ImStatus::InvalidAction;
     };
-    if !dm.endpoints().iter().any(|e| e.id == cp.endpoint) {
+    if p.list_index.is_some() {
+        return ImStatus::InvalidAction;
+    }
+    if !dm.endpoints().iter().any(|e| e.id == endpoint) {
         return ImStatus::UnsupportedEndpoint;
     }
-    if acc.kind == SessionKind::Pase && !is_commissioning_cluster(cp.cluster) {
+    // 必要権限は属性メタの write_access(未知属性は既定 Operate。クラスタが
+    // UnsupportedWrite/UnsupportedAttribute を返す)。存在チェック → ACL の順(acl.md §3)。
+    let required = match dm.cluster(endpoint, cluster_id) {
+        Some(c) => c
+            .meta()
+            .attribute(attribute)
+            .map(|m| m.write_access)
+            .unwrap_or(Privilege::Operate),
+        None => return ImStatus::UnsupportedCluster,
+    };
+    if !allowed(dm, acc, endpoint, cluster_id, required) {
         return ImStatus::UnsupportedAccess;
     }
-    let Some(cluster) = dm.cluster_mut(cp.endpoint, cp.cluster) else {
+    let Some(cluster) = dm.cluster_mut(endpoint, cluster_id) else {
         return ImStatus::UnsupportedCluster;
     };
-    let mut r = item.value();
-    let elem = match r.read_next() {
-        Ok(Some(e)) => e,
-        _ => return ImStatus::InvalidDataType,
+    let op = if p.list_append {
+        ListOp::AppendItem
+    } else {
+        ListOp::ReplaceAll
     };
-    match cluster.write_attribute(cp.attribute, elem, acc) {
+    let data = AttrWrite::new(item.data).with_op(op);
+    match cluster.write_attribute(attribute, data, acc) {
         Ok(()) => ImStatus::Success,
         Err(s) => s,
+    }
+}
+
+/// invoke の副作用(クラスタからエンジンへの後処理要求、設計 §9.4 / `docs/design/acl.md` §3)。
+#[derive(Debug, Clone, Copy, Default)]
+struct InvokeEffects {
+    /// PASE セッションの fabric 昇格(AddNOC)。
+    promote: Option<NonZeroU8>,
+    /// bootstrap admin ACL の生成(AddNOC の caseAdminSubject)。
+    case_admin: Option<(NonZeroU8, u64)>,
+    /// fabric 削除に連動する ACL エントリ削除(RemoveFabric)。
+    removed_fabric: Option<NonZeroU8>,
+}
+
+impl InvokeEffects {
+    /// `other` の要求をマージする(後勝ち)。
+    fn merge(&mut self, other: InvokeEffects) {
+        if other.promote.is_some() {
+            self.promote = other.promote;
+        }
+        if other.case_admin.is_some() {
+            self.case_admin = other.case_admin;
+        }
+        if other.removed_fabric.is_some() {
+            self.removed_fabric = other.removed_fabric;
+        }
     }
 }
 
@@ -1090,13 +1176,13 @@ fn write_one<D: DataModel + ?Sized>(
 /// クラスタが [`CmdResponder::set_response`](crate::dm::codec::CmdResponder::set_response) で
 /// 生成レスポンスを宣言した場合、そのフィールド(スクラッチ上の匿名構造体)を InvokeResponseIB の
 /// CommandDataIB へ転写する。宣言が無ければ結果ステータスを CommandStatusIB として書く。
-/// 返り値はクラスタが要求した fabric 昇格(AddNOC 用、設計 §9.4)。
+/// 返り値はクラスタが要求した副作用([`InvokeEffects`])。
 fn invoke_one<D: DataModel + ?Sized>(
     dm: &mut D,
     item: &CommandDataRef<'_>,
     acc: &AccessContext,
     cw: &mut CmdRespWriter<'_, '_>,
-) -> Result<Option<NonZeroU8>> {
+) -> Result<InvokeEffects> {
     let path = item.path;
     if !dm.endpoints().iter().any(|e| e.id == path.endpoint) {
         cw.push_status(
@@ -1104,15 +1190,34 @@ fn invoke_one<D: DataModel + ?Sized>(
             &StatusIB::simple(ImStatus::UnsupportedEndpoint),
             item.command_ref,
         )?;
-        return Ok(None);
+        return Ok(InvokeEffects::default());
     }
-    if acc.kind == SessionKind::Pase && !is_commissioning_cluster(path.cluster) {
+    // 必要権限はコマンドメタの access(未知コマンドは既定 Operate。クラスタが
+    // UnsupportedCommand を返す)。存在チェック → ACL の順(acl.md §3)。
+    let required = match dm.cluster(path.endpoint, path.cluster) {
+        Some(c) => c
+            .meta()
+            .accepted_commands
+            .iter()
+            .find(|m| m.id == path.command)
+            .map(|m| m.access)
+            .unwrap_or(Privilege::Operate),
+        None => {
+            cw.push_status(
+                &path,
+                &StatusIB::simple(ImStatus::UnsupportedCluster),
+                item.command_ref,
+            )?;
+            return Ok(InvokeEffects::default());
+        }
+    };
+    if !allowed(dm, acc, path.endpoint, path.cluster, required) {
         cw.push_status(
             &path,
             &StatusIB::simple(ImStatus::UnsupportedAccess),
             item.command_ref,
         )?;
-        return Ok(None);
+        return Ok(InvokeEffects::default());
     }
     let Some(cluster) = dm.cluster_mut(path.endpoint, path.cluster) else {
         cw.push_status(
@@ -1120,21 +1225,26 @@ fn invoke_one<D: DataModel + ?Sized>(
             &StatusIB::simple(ImStatus::UnsupportedCluster),
             item.command_ref,
         )?;
-        return Ok(None);
+        return Ok(InvokeEffects::default());
     };
 
     let mut fr = TlvReader::new(item.fields.unwrap_or(&[]));
     let mut scratch = [0u8; INVOKE_SCRATCH];
     // resp/sw の借用をブロックで閉じ、確定後にスクラッチを読めるようにする。
-    let (result, response_cmd, promote, scratch_len) = {
+    let (result, response_cmd, effects, scratch_len) = {
         let mut sw = TlvWriter::new(&mut scratch);
-        let (result, response_cmd, promote) = {
+        let (result, response_cmd, effects) = {
             let mut resp = CmdResponder::new(&mut sw);
             let result = cluster.invoke_command(path.command, &mut fr, &mut resp, acc);
-            (result, resp.response_command(), resp.requested_promotion())
+            let effects = InvokeEffects {
+                promote: resp.requested_promotion(),
+                case_admin: resp.requested_case_admin_acl(),
+                removed_fabric: resp.requested_fabric_removed(),
+            };
+            (result, resp.response_command(), effects)
         };
         let scratch_len = sw.len();
-        (result, response_cmd, promote, scratch_len)
+        (result, response_cmd, effects, scratch_len)
     };
 
     match result {
@@ -1156,7 +1266,7 @@ fn invoke_one<D: DataModel + ?Sized>(
             cw.push_status(&path, &StatusIB::simple(s), item.command_ref)?;
         }
     }
-    Ok(promote)
+    Ok(effects)
 }
 
 impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize> ProtocolHandler

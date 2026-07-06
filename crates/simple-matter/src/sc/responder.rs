@@ -983,6 +983,8 @@ impl<C: Crypto, R: Rng, F: FabricStore + NocResolver, const H: usize>
         let mut enc_key = [0u8; KEY_LEN];
         let mut att = [0u8; KEY_LEN];
         let peer_node_id;
+        let mut peer_cats = [0u32; 3];
+        let peer_cat_count;
         {
             let (noc, icac, signature) = match case::decode_tbe_certs(&scratch[..pt_len]) {
                 Ok(v) => v,
@@ -1033,6 +1035,9 @@ impl<C: Crypto, R: Rng, F: FabricStore + NocResolver, const H: usize>
                 }
             }
             peer_node_id = identity.node_id();
+            // ACL 照合用に peer NOC の CAT を控える(commit 後にセッションへ設定)。
+            peer_cat_count = identity.cats().len().min(peer_cats.len());
+            peer_cats[..peer_cat_count].copy_from_slice(&identity.cats()[..peer_cat_count]);
 
             // 全検証通過後に初めて Sigma3 を TT に畳み、SEKeys を導出する(§7.1)。
             tt.update(rx.payload);
@@ -1082,6 +1087,10 @@ impl<C: Crypto, R: Rng, F: FabricStore + NocResolver, const H: usize>
         if sessions.commit(reserved, init, now_ms).is_err() {
             sessions.remove(reserved);
             return self.terminal(tx, ScStatusCode::InvalidParameter, &[]);
+        }
+        // ACL 照合用に peer NOC の CAT をセッションへ設定する(`docs/design/acl.md` §5)。
+        if let Some(sess) = sessions.get_mut(reserved, now_ms) {
+            sess.set_peer_cats(&peer_cats[..peer_cat_count]);
         }
 
         // フル CASE 成功: resumption レコードを保存(TBE2 に載せた resumptionID + ECDH

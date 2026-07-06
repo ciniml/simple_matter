@@ -642,14 +642,18 @@ fn add_noc_without_trusted_root_fails() {
 fn network_commissioning_reads_ethernet_networks() {
     let dev = CommNode::build();
     use crate::dm::codec::AttrEncoder;
+    use crate::dm::meta::{Privilege, SessionKind};
     use crate::dm::DataModel;
+    fn acc() -> crate::dm::meta::AccessContext {
+        crate::dm::meta::AccessContext::new(SessionKind::Case, None, 0, Privilege::Administer)
+    }
     let sc = dev.cluster(EndpointId(0), ClusterId(0x0031)).unwrap();
     assert_eq!(sc.meta().feature_map, 0x04, "Ethernet feature");
     let mut buf = [0u8; 64];
     let mut w = TlvWriter::new(&mut buf);
     {
         let mut enc = AttrEncoder::new(&mut w, TlvTag::Anonymous);
-        sc.read_attribute(AttributeId(0x0000), &mut enc).unwrap(); // MaxNetworks
+        sc.read_attribute(AttributeId(0x0000), &mut enc, &acc()).unwrap(); // MaxNetworks
     }
     assert_eq!(
         TlvReader::new(&buf).read_next().unwrap().unwrap().value,

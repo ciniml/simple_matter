@@ -28,12 +28,98 @@ pub mod meta;
 pub use cluster::{read_global_attribute, Dirty};
 pub use expand::PathExpandCursor;
 
+use crate::acl::AclHandle;
 use crate::dm::codec::{AttrEncoder, CmdResponder};
 use crate::dm::meta::{
     AccessContext, AttributeId, ClusterId, ClusterMeta, CommandId, EndpointId, EndpointMeta,
 };
+use crate::error::Error;
 use crate::im::wire::ImStatus;
 use crate::tlv::{TlvElement, TlvReader};
+
+/// list 属性書き込みの操作種別(`docs/design/acl.md` §4)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListOp {
+    /// 値全体で置き換える(パスに ListIndex 無し。スカラー属性は常にこれ)。
+    ReplaceAll,
+    /// 1 要素を追記する(パスの ListIndex = null。chip の chunked list write)。
+    AppendItem,
+}
+
+/// 属性書き込みのデータビュー(値サブツリー全体の生 TLV + list 操作)。
+///
+/// 従来の `TlvElement`(先頭要素のみ)ではコンテナ(list 属性)の中身を辿れないため、
+/// 生スライスを渡してクラスタが自分で [`TlvReader`] で iterate できるようにする。
+#[derive(Debug, Clone, Copy)]
+pub struct AttrWrite<'a> {
+    /// 値要素の生 TLV(元のタグ込み・サブツリー全体)。
+    pub raw: &'a [u8],
+    /// list 操作種別。
+    pub op: ListOp,
+}
+
+impl<'a> AttrWrite<'a> {
+    /// 生 TLV から作る(操作は [`ListOp::ReplaceAll`])。
+    pub const fn new(raw: &'a [u8]) -> Self {
+        Self {
+            raw,
+            op: ListOp::ReplaceAll,
+        }
+    }
+
+    /// 操作種別を差し替えた複製を返す。
+    pub const fn with_op(mut self, op: ListOp) -> Self {
+        self.op = op;
+        self
+    }
+
+    /// 値を読む [`TlvReader`](先頭が値要素)。
+    pub fn reader(&self) -> TlvReader<'a> {
+        TlvReader::new(self.raw)
+    }
+
+    /// 先頭の値要素を返す(スカラー属性用)。
+    pub fn element(&self) -> Result<TlvElement<'a>, ImStatus> {
+        self.reader()
+            .read_next()
+            .ok()
+            .flatten()
+            .ok_or(ImStatus::InvalidDataType)
+    }
+
+    /// 先頭要素を符号なし整数として読む(スカラー属性の便宜)。
+    pub fn as_unsigned(&self) -> Result<u64, ImStatus> {
+        self.element()?
+            .value
+            .as_unsigned()
+            .map_err(|_| ImStatus::InvalidDataType)
+    }
+
+    /// 先頭要素を真偽値として読む。
+    pub fn as_bool(&self) -> Result<bool, ImStatus> {
+        self.element()?
+            .value
+            .as_bool()
+            .map_err(|_| ImStatus::InvalidDataType)
+    }
+
+    /// 先頭要素を UTF-8 文字列として読む。
+    pub fn as_str(&self) -> Result<&'a str, ImStatus> {
+        self.element()?
+            .value
+            .as_str()
+            .map_err(|_| ImStatus::InvalidDataType)
+    }
+}
+
+/// [`crate::Error`] を書き込み系の [`ImStatus`] へ写像する(クラスタ実装の便宜)。
+pub fn map_write_err(e: Error) -> ImStatus {
+    match e {
+        Error::NoSpace => ImStatus::ResourceExhausted,
+        Error::Decode => ImStatus::ConstraintError,
+        _ => ImStatus::Failure,
+    }
+}
 
 /// 1 クラスタの combined 実装(メタデータ列挙 + read/write/invoke dispatch、設計 §7.1)。
 ///
@@ -47,17 +133,21 @@ pub trait ServerCluster {
     fn meta(&self) -> &'static ClusterMeta;
 
     /// 固有属性 `attr` の値を `enc` に書く。未知属性は [`ImStatus::UnsupportedAttribute`]。
+    ///
+    /// `acc` は fabric-scoped 属性(OpCreds の CurrentFabricIndex、ACL の fabric フィルタ等)
+    /// のために渡す。多くのクラスタは無視してよい。
     fn read_attribute(
         &self,
         attr: AttributeId,
         enc: &mut AttrEncoder<'_, '_>,
+        acc: &AccessContext,
     ) -> Result<(), ImStatus>;
 
     /// 固有属性 `attr` に `data` を書き込む。既定は [`ImStatus::UnsupportedWrite`]。
     fn write_attribute(
         &mut self,
         attr: AttributeId,
-        data: TlvElement<'_>,
+        data: AttrWrite<'_>,
         acc: &AccessContext,
     ) -> Result<(), ImStatus> {
         let _ = (attr, data, acc);
@@ -109,6 +199,15 @@ pub trait DataModel {
     /// どのクラスタが fail-safe を持つか判定できないため、乖離。手書き `DataModel` 実装で
     /// 配線するか、将来の `device!` 拡張で対応)。返り値は次に処理すべき絶対時刻(あれば)。
     fn on_tick(&mut self, _now_ms: u64) -> Option<u64> {
+        None
+    }
+
+    /// このデバイスの ACL(`docs/design/acl.md` §3)。
+    ///
+    /// `Some` を返すデバイスは IM エンジンが full ACL(per-entry 照合)で権限判定する。
+    /// 既定の `None` は従来近似(PASE=コミッショニングクラスタのみ、CASE=Administer 相当)
+    /// にフォールバックする(ACL クラスタを持たない最小デバイス/テスト用)。
+    fn acl(&self) -> Option<&dyn AclHandle> {
         None
     }
 }

@@ -13,9 +13,9 @@ use crate::dm::meta::{
     AccessContext, AttributeId, AttributeMeta, ClusterId, ClusterMeta, CommandId, CommandMeta,
     Privilege, Quality,
 };
-use crate::dm::ServerCluster;
+use crate::dm::{AttrWrite, ServerCluster};
 use crate::im::wire::ImStatus;
-use crate::tlv::{TlvElement, TlvReader, TlvTag};
+use crate::tlv::{TlvReader, TlvTag};
 use crate::wifi::{NullWifiDriver, WifiDriver, WifiStatus};
 
 /// FeatureMap の Ethernet ビット(EN、bit 2)。
@@ -55,13 +55,10 @@ impl NetworkCommissioning {
     /// InterfaceEnabled(0x0004)を書き込む。
     fn write_interface_enabled(
         &mut self,
-        data: crate::tlv::TlvElement<'_>,
+        data: crate::dm::AttrWrite<'_>,
         _acc: &crate::dm::meta::AccessContext,
     ) -> Result<(), ImStatus> {
-        self.interface_enabled = data
-            .value
-            .as_bool()
-            .map_err(|_| ImStatus::InvalidDataType)?;
+        self.interface_enabled = data.as_bool()?;
         Ok(())
     }
 
@@ -97,7 +94,7 @@ cluster! {
             0x0004 InterfaceEnabled {
                 access: Administer, quality: [], subscribe: false,
                 read: (|c: &NetworkCommissioning, e: &mut AttrEncoder<'_, '_>| e.write_bool(c.interface_enabled)),
-                write: (|c: &mut NetworkCommissioning, data, acc| c.write_interface_enabled(data, acc))
+                write: (Administer, |c: &mut NetworkCommissioning, data, acc| c.write_interface_enabled(data, acc))
             },
             0x0005 LastNetworkingStatus {
                 access: Administer, quality: [NULLABLE], subscribe: false,
@@ -247,13 +244,10 @@ impl<W: WifiDriver> NetworkCommissioningWifi<W> {
     /// InterfaceEnabled(0x0004)を書き込む。
     fn write_interface_enabled(
         &mut self,
-        data: TlvElement<'_>,
+        data: AttrWrite<'_>,
         _acc: &AccessContext,
     ) -> Result<(), ImStatus> {
-        self.interface_enabled = data
-            .value
-            .as_bool()
-            .map_err(|_| ImStatus::InvalidDataType)?;
+        self.interface_enabled = data.as_bool()?;
         Ok(())
     }
 
@@ -468,7 +462,7 @@ static NETCOMM_WIFI_META: ClusterMeta = ClusterMeta::new(
             false,
             false,
         ),
-        // 0x0004 InterfaceEnabled(書き込み可)
+        // 0x0004 InterfaceEnabled(書き込み可、write は Administer)
         AttributeMeta::new(
             AttributeId(0x0004),
             Privilege::Administer,
@@ -476,7 +470,8 @@ static NETCOMM_WIFI_META: ClusterMeta = ClusterMeta::new(
             true,
             true,
             false,
-        ),
+        )
+        .with_write_access(Privilege::Administer),
         // 0x0005 LastNetworkingStatus
         AttributeMeta::new(
             AttributeId(0x0005),
@@ -516,11 +511,12 @@ static NETCOMM_WIFI_META: ClusterMeta = ClusterMeta::new(
     ],
     &[
         // ScanNetworks / AddOrUpdateWiFiNetwork / RemoveNetwork / ConnectNetwork / ReorderNetwork
-        CommandMeta::new(CommandId(0x00), false, Privilege::Operate),
-        CommandMeta::new(CommandId(0x02), false, Privilege::Operate),
-        CommandMeta::new(CommandId(0x04), false, Privilege::Operate),
-        CommandMeta::new(CommandId(0x06), false, Privilege::Operate),
-        CommandMeta::new(CommandId(0x08), false, Privilege::Operate),
+        // (いずれも仕様 §11.8 の必要権限は Administer)
+        CommandMeta::new(CommandId(0x00), false, Privilege::Administer),
+        CommandMeta::new(CommandId(0x02), false, Privilege::Administer),
+        CommandMeta::new(CommandId(0x04), false, Privilege::Administer),
+        CommandMeta::new(CommandId(0x06), false, Privilege::Administer),
+        CommandMeta::new(CommandId(0x08), false, Privilege::Administer),
     ],
     &[CommandId(0x01), CommandId(0x05), CommandId(0x07)],
 );
@@ -534,6 +530,7 @@ impl<W: WifiDriver> ServerCluster for NetworkCommissioningWifi<W> {
         &self,
         attr: AttributeId,
         enc: &mut AttrEncoder<'_, '_>,
+        _acc: &AccessContext,
     ) -> Result<(), ImStatus> {
         match attr.0 {
             0x0000 => enc.write_u8(1),
@@ -552,7 +549,7 @@ impl<W: WifiDriver> ServerCluster for NetworkCommissioningWifi<W> {
     fn write_attribute(
         &mut self,
         attr: AttributeId,
-        data: TlvElement<'_>,
+        data: AttrWrite<'_>,
         acc: &AccessContext,
     ) -> Result<(), ImStatus> {
         match attr.0 {
@@ -660,7 +657,7 @@ mod wifi_tests {
         let mut w = TlvWriter::new(&mut buf);
         {
             let mut e = AttrEncoder::new(&mut w, TlvTag::Anonymous);
-            net.read_attribute(AttributeId(0x0001), &mut e).unwrap();
+            net.read_attribute(AttributeId(0x0001), &mut e, &acc()).unwrap();
         }
         // 配列 → 構造体 → { 0: ssid, 1: connected }。
         let mut r = TlvReader::new(&buf);
@@ -695,7 +692,7 @@ mod wifi_tests {
         let mut w2 = TlvWriter::new(&mut buf2);
         {
             let mut e = AttrEncoder::new(&mut w2, TlvTag::Anonymous);
-            net.read_attribute(AttributeId(0x0001), &mut e).unwrap();
+            net.read_attribute(AttributeId(0x0001), &mut e, &acc()).unwrap();
         }
         let mut r2 = TlvReader::new(&buf2);
         r2.read_next().unwrap(); // array
@@ -801,7 +798,7 @@ mod wifi_tests {
         let mut w = TlvWriter::new(&mut buf);
         {
             let mut e = AttrEncoder::new(&mut w, TlvTag::Anonymous);
-            net.read_attribute(AttributeId(0x0005), &mut e).unwrap();
+            net.read_attribute(AttributeId(0x0005), &mut e, &acc()).unwrap();
         }
         let mut r = TlvReader::new(&buf);
         assert_eq!(
@@ -814,7 +811,7 @@ mod wifi_tests {
         let mut w2 = TlvWriter::new(&mut buf2);
         {
             let mut e = AttrEncoder::new(&mut w2, TlvTag::Anonymous);
-            net.read_attribute(AttributeId(0x0007), &mut e).unwrap();
+            net.read_attribute(AttributeId(0x0007), &mut e, &acc()).unwrap();
         }
         let mut r2 = TlvReader::new(&buf2);
         assert!(matches!(

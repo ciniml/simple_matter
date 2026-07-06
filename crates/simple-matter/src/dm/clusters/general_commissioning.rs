@@ -155,13 +155,10 @@ impl GeneralCommissioning {
     /// Breadcrumb(0x0000)を書き込む。
     fn write_breadcrumb(
         &mut self,
-        data: crate::tlv::TlvElement<'_>,
+        data: crate::dm::AttrWrite<'_>,
         _acc: &AccessContext,
     ) -> Result<(), ImStatus> {
-        let v = data
-            .value
-            .as_unsigned()
-            .map_err(|_| ImStatus::InvalidDataType)?;
+        let v = data.as_unsigned()?;
         self.fail_safe.breadcrumb = v;
         self.dirty.mark();
         Ok(())
@@ -276,7 +273,7 @@ cluster! {
             0x0000 Breadcrumb {
                 access: View, quality: [], subscribe: true,
                 read: (|c: &GeneralCommissioning, e: &mut AttrEncoder<'_, '_>| e.write_u64(c.fail_safe.breadcrumb)),
-                write: (|c: &mut GeneralCommissioning, data, acc| c.write_breadcrumb(data, acc))
+                write: (Administer, |c: &mut GeneralCommissioning, data, acc| c.write_breadcrumb(data, acc))
             },
             0x0001 BasicCommissioningInfo {
                 access: View, quality: [FIXED], subscribe: false,
@@ -299,7 +296,7 @@ cluster! {
                 write: _
             },
         ],
-        accepted: [ 0x00 ArmFailSafe, 0x02 SetRegulatoryConfig, 0x04 CommissioningComplete ],
+        accepted: [ 0x00 ArmFailSafe => Administer, 0x02 SetRegulatoryConfig => Administer, 0x04 CommissioningComplete => Administer ],
         generated: [ 0x01, 0x03, 0x05 ],
     }
 }

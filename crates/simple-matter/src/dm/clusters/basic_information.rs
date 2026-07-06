@@ -8,8 +8,8 @@ use crate::cluster;
 use crate::dm::cluster::Dirty;
 use crate::dm::codec::AttrEncoder;
 use crate::dm::meta::AccessContext;
+use crate::dm::AttrWrite;
 use crate::im::wire::ImStatus;
-use crate::tlv::TlvElement;
 
 /// NodeLabel の最大長(Matter 仕様: char_string length 32)。
 pub const NODE_LABEL_MAX: usize = 32;
@@ -71,10 +71,10 @@ impl BasicInformationCluster {
     /// NodeLabel(0x0005)を書き込む。
     fn write_node_label(
         &mut self,
-        data: TlvElement<'_>,
+        data: AttrWrite<'_>,
         _acc: &AccessContext,
     ) -> Result<(), ImStatus> {
-        let s = data.value.as_str().map_err(|_| ImStatus::InvalidDataType)?;
+        let s = data.as_str()?;
         let bytes = s.as_bytes();
         if bytes.len() > NODE_LABEL_MAX {
             return Err(ImStatus::ConstraintError);
@@ -122,7 +122,7 @@ cluster! {
             0x0005 NodeLabel {
                 access: View, quality: [NONVOLATILE], subscribe: true,
                 read: (|c: &BasicInformationCluster, e: &mut AttrEncoder<'_, '_>| e.write_str(c.node_label())),
-                write: (|c: &mut BasicInformationCluster, data, acc| c.write_node_label(data, acc))
+                write: (Manage, |c: &mut BasicInformationCluster, data, acc| c.write_node_label(data, acc))
             },
             0x0007 HardwareVersion {
                 access: View, quality: [FIXED], subscribe: false,

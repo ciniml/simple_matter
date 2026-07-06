@@ -112,6 +112,9 @@ pub enum SlotState {
     Expired,
 }
 
+/// 1 セッションが保持できる CASE peer の CAT 最大数(NOC あたり最大 3、Matter 仕様)。
+pub const MAX_SESSION_CATS: usize = 3;
+
 /// セッション確立(または予約 slot への commit)に必要なパラメータ。
 ///
 /// ハンドシェイク完了時に `sc` 層がこの値を作って [`SessionManager::insert`] または
@@ -173,6 +176,10 @@ pub struct Session {
     peer_addr: PeerAddr,
     local_node_id: u64,
     peer_node_id: Option<u64>,
+    /// CASE peer の NOC に含まれる CAT(ACL 照合用。先頭 `peer_cat_count` 件が有効)。
+    peer_cats: [u32; MAX_SESSION_CATS],
+    /// `peer_cats` の有効件数。
+    peer_cat_count: u8,
     local_session_id: u16,
     peer_session_id: u16,
     enc_key: [u8; AES_CCM_KEY_LEN],
@@ -204,6 +211,19 @@ impl Session {
     /// ピアの Node ID を返す(未確定なら `None`)。
     pub const fn peer_node_id(&self) -> Option<u64> {
         self.peer_node_id
+    }
+
+    /// CASE peer の CAT(CASE Authenticated Tag)群を返す(フル CASE 確立時のみ非空)。
+    pub fn peer_cats(&self) -> &[u32] {
+        &self.peer_cats[..self.peer_cat_count as usize]
+    }
+
+    /// CASE peer の CAT 群を設定する(Sigma3 検証後に sc 層が呼ぶ。先頭
+    /// [`MAX_SESSION_CATS`] 件に丸める)。
+    pub fn set_peer_cats(&mut self, cats: &[u32]) {
+        let n = cats.len().min(MAX_SESSION_CATS);
+        self.peer_cats[..n].copy_from_slice(&cats[..n]);
+        self.peer_cat_count = n as u8;
     }
 
     /// ピアの Node ID が未確定の場合のみ設定する。
@@ -519,6 +539,8 @@ impl<const SESSIONS: usize> SessionManager<SESSIONS> {
             peer_addr: init.peer_addr,
             local_node_id: init.local_node_id,
             peer_node_id: init.peer_node_id,
+            peer_cats: [0; MAX_SESSION_CATS],
+            peer_cat_count: 0,
             local_session_id,
             peer_session_id: init.peer_session_id,
             enc_key: init.enc_key,
@@ -546,6 +568,8 @@ impl<const SESSIONS: usize> SessionManager<SESSIONS> {
             peer_addr,
             local_node_id: 0,
             peer_node_id: None,
+            peer_cats: [0; MAX_SESSION_CATS],
+            peer_cat_count: 0,
             local_session_id,
             peer_session_id: 0,
             enc_key: [0u8; AES_CCM_KEY_LEN],
@@ -576,6 +600,8 @@ impl<const SESSIONS: usize> SessionManager<SESSIONS> {
         s.peer_addr = init.peer_addr;
         s.local_node_id = init.local_node_id;
         s.peer_node_id = init.peer_node_id;
+        s.peer_cats = [0; MAX_SESSION_CATS];
+        s.peer_cat_count = 0;
         s.peer_session_id = init.peer_session_id;
         s.enc_key = init.enc_key;
         s.dec_key = init.dec_key;

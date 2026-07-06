@@ -165,6 +165,7 @@ fn read_request_decode() {
         cluster: Some(cl(0x001D)),
         attribute: None, // ワイルドカード attribute
         list_index: None,
+        list_append: false,
         enable_tag_compression: false,
     };
     let n = encode_read_request(&mut buf, true, |p| {
@@ -537,6 +538,7 @@ fn path_concrete_conversions() {
         cluster: Some(cl(6)),
         attribute: Some(at(0)),
         list_index: None,
+        list_append: false,
         enable_tag_compression: false,
     };
     assert_eq!(wild.to_concrete(), None);

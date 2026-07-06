@@ -17,7 +17,7 @@ use crate::dm::meta::{
 };
 use crate::dm::{read_global_attribute, DataModel, PathExpandCursor, ServerCluster};
 use crate::im::wire::{AttributePath, ConcreteAttrPath, ImStatus};
-use crate::tlv::{ContainerType, TlvElement, TlvReader, TlvTag, TlvValue, TlvWriter};
+use crate::tlv::{ContainerType, TlvReader, TlvTag, TlvValue, TlvWriter};
 
 // ==========================================================================
 // テスト用デバイス(2 エンドポイント合成)
@@ -84,12 +84,19 @@ impl TestDevice {
 // デコードヘルパ
 // ==========================================================================
 
+/// 匿名タグの UTF-8 文字列値を `buf` に TLV エンコードする(write テスト用)。
+fn encode_str_value(buf: &mut [u8], s: &str) -> usize {
+    let mut w = TlvWriter::new(buf);
+    w.write_utf8(&TlvTag::Anonymous, s).unwrap();
+    w.len()
+}
+
 /// `read_attribute` を実行し、書き込み長と結果を返す。
 fn read_attr(sc: &dyn ServerCluster, attr: u32, buf: &mut [u8]) -> (usize, Result<(), ImStatus>) {
     let mut w = TlvWriter::new(buf);
     let res = {
         let mut enc = AttrEncoder::new(&mut w, TlvTag::Anonymous);
-        sc.read_attribute(AttributeId(attr), &mut enc)
+        sc.read_attribute(AttributeId(attr), &mut enc, &acc())
     };
     (w.len(), res)
 }
@@ -259,11 +266,10 @@ fn basic_info_read_and_node_label_write() {
 
     // NodeLabel 書込 → 反映 + dirty。
     let a = acc();
-    let data = TlvElement {
-        tag: TlvTag::Anonymous,
-        value: TlvValue::Utf8String("Kitchen"),
-    };
-    c.write_attribute(AttributeId(0x0005), data, &a).unwrap();
+    let mut wbuf = [0u8; 64];
+    let n = encode_str_value(&mut wbuf, "Kitchen");
+    c.write_attribute(AttributeId(0x0005), crate::dm::AttrWrite::new(&wbuf[..n]), &a)
+        .unwrap();
     assert_eq!(c.node_label(), "Kitchen");
     assert!(c.take_dirty());
     let (_, res) = read_attr(&c, 0x0005, &mut buf);
@@ -271,28 +277,21 @@ fn basic_info_read_and_node_label_write() {
     assert_eq!(scalar(&buf), TlvValue::Utf8String("Kitchen"));
 
     // 読み取り専用属性への書込は UnsupportedWrite。
-    let data = TlvElement {
-        tag: TlvTag::Anonymous,
-        value: TlvValue::Utf8String("x"),
-    };
-    let r = c.write_attribute(AttributeId(0x0001), data, &a);
+    let n = encode_str_value(&mut wbuf, "x");
+    let r = c.write_attribute(AttributeId(0x0001), crate::dm::AttrWrite::new(&wbuf[..n]), &a);
     assert_eq!(r, Err(ImStatus::UnsupportedWrite));
 
     // 長すぎる NodeLabel(> 32)は ConstraintError。
     let long = "0123456789012345678901234567890123"; // 34 文字
-    let data = TlvElement {
-        tag: TlvTag::Anonymous,
-        value: TlvValue::Utf8String(long),
-    };
-    let r = c.write_attribute(AttributeId(0x0005), data, &a);
+    let n = encode_str_value(&mut wbuf, long);
+    let r = c.write_attribute(AttributeId(0x0005), crate::dm::AttrWrite::new(&wbuf[..n]), &a);
     assert_eq!(r, Err(ImStatus::ConstraintError));
 
     // 型不一致の書込は InvalidDataType。
-    let data = TlvElement {
-        tag: TlvTag::Anonymous,
-        value: TlvValue::UnsignedInteger(1),
-    };
-    let r = c.write_attribute(AttributeId(0x0005), data, &a);
+    let mut w = TlvWriter::new(&mut wbuf);
+    w.write_u8(&TlvTag::Anonymous, 1).unwrap();
+    let n = w.len();
+    let r = c.write_attribute(AttributeId(0x0005), crate::dm::AttrWrite::new(&wbuf[..n]), &a);
     assert_eq!(r, Err(ImStatus::InvalidDataType));
 }
 
@@ -383,6 +382,7 @@ fn expand_specific_cluster() {
         cluster: Some(ClusterId(0x0006)),
         attribute: None,
         list_index: None,
+        list_append: false,
         enable_tag_compression: false,
     }];
     let (out, n) = expand_all(&dev, &paths);
@@ -420,6 +420,7 @@ fn expand_concrete_and_nonexistent() {
         cluster: None,
         attribute: None,
         list_index: None,
+        list_append: false,
         enable_tag_compression: false,
     }];
     let (_, n) = expand_all(&dev, &paths);
@@ -431,6 +432,7 @@ fn expand_concrete_and_nonexistent() {
         cluster: Some(ClusterId(0x1234)),
         attribute: None,
         list_index: None,
+        list_append: false,
         enable_tag_compression: false,
     }];
     let (_, n) = expand_all(&dev, &paths);

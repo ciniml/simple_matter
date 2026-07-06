@@ -30,9 +30,10 @@ use simple_matter::discovery::{
     Commissionable, CommissioningMode, Host, MdnsResponder, Operational, MATTER_PORT, MDNS_IPV4,
     MDNS_PORT,
 };
+use simple_matter::acl::{AclHandle, AclTable};
 use simple_matter::dm::clusters::{
-    BasicInfoConfig, BasicInformationCluster, DescriptorCluster, GeneralCommissioning,
-    NetworkCommissioning, OnOffCluster, OpCredsCluster, TestDacProvider,
+    AccessControlCluster, BasicInfoConfig, BasicInformationCluster, DescriptorCluster,
+    GeneralCommissioning, NetworkCommissioning, OnOffCluster, OpCredsCluster, TestDacProvider,
 };
 use simple_matter::dm::meta::{ClusterId, DeviceType, EndpointId, EndpointMeta};
 use simple_matter::dm::{DataModel, ServerCluster};
@@ -45,6 +46,8 @@ use simple_matter::transport::net::{PeerAddr, MAX_RX_PACKET_SIZE};
 const PASSCODE: u32 = 20202021;
 const SALT: [u8; 16] = *b"SPAKE2P Key Salt";
 const NF: usize = 5;
+/// ACL テーブル容量(fabric 5 × per-fabric 上限 4)。
+const NACL: usize = 20;
 
 /// コミッショニング discriminator(12 ビット)。chip-tool の既定テスト値。
 const DISCRIMINATOR: u16 = 3840;
@@ -98,6 +101,7 @@ static CFG: BasicInfoConfig = BasicInfoConfig {
 };
 
 static EP0_SERVERS: &[ClusterId] = &[
+    ClusterId(0x001F),
     ClusterId(0x0028),
     ClusterId(0x0030),
     ClusterId(0x0031),
@@ -111,6 +115,8 @@ static EP0_PARTS: &[EndpointId] = &[EndpointId(1)];
 static EP1_PARTS: &[EndpointId] = &[];
 
 struct Light<'s> {
+    acl: &'s RefCell<AclTable<NACL>>,
+    access_control: AccessControlCluster<'s, NACL>,
     basic: BasicInformationCluster,
     gc: GeneralCommissioning,
     net: NetworkCommissioning,
@@ -137,6 +143,7 @@ impl DataModel for Light<'_> {
     }
     fn cluster(&self, ep: EndpointId, cl: ClusterId) -> Option<&dyn ServerCluster> {
         match (ep.0, cl.0) {
+            (0, 0x001F) => Some(&self.access_control),
             (0, 0x0028) => Some(&self.basic),
             (0, 0x0030) => Some(&self.gc),
             (0, 0x0031) => Some(&self.net),
@@ -149,6 +156,7 @@ impl DataModel for Light<'_> {
     }
     fn cluster_mut(&mut self, ep: EndpointId, cl: ClusterId) -> Option<&mut dyn ServerCluster> {
         match (ep.0, cl.0) {
+            (0, 0x001F) => Some(&mut self.access_control),
             (0, 0x0028) => Some(&mut self.basic),
             (0, 0x0030) => Some(&mut self.gc),
             (0, 0x0031) => Some(&mut self.net),
@@ -165,12 +173,21 @@ impl DataModel for Light<'_> {
         }
         None
     }
+    fn acl(&self) -> Option<&dyn AclHandle> {
+        // full ACL(per-entry 照合)を有効化する(docs/design/acl.md §3)。
+        Some(self.acl)
+    }
 }
 
-fn build_light(fabrics: &RefCell<FabricTable<Backend, NF>>) -> Light<'_> {
+fn build_light<'s>(
+    fabrics: &'s RefCell<FabricTable<Backend, NF>>,
+    acl: &'s RefCell<AclTable<NACL>>,
+) -> Light<'s> {
     let dac_crypto = RustCrypto::new(DemoRng::from_time());
     let dac = TestDacProvider::new(&dac_crypto).expect("test DAC");
     Light {
+        acl,
+        access_control: AccessControlCluster::new(acl),
         basic: BasicInformationCluster::new(&CFG),
         gc: GeneralCommissioning::default_config(),
         net: NetworkCommissioning::new(b"eth0"),
@@ -188,11 +205,13 @@ fn main() -> std::io::Result<()> {
     // 外部所有:crypto(SC/creds/stack が借用)と fabric テーブル(OpCreds/CASE が共有)。
     let crypto = RustCrypto::new(DemoRng::from_time());
     let fabrics: RefCell<FabricTable<Backend, NF>> = RefCell::new(FabricTable::new());
+    // ACL テーブル(AccessControl クラスタと IM エンジンの権限評価が共有)。
+    let acl: RefCell<AclTable<NACL>> = RefCell::new(AclTable::new());
 
     let config = PaseConfig::from_passcode_default(PASSCODE, &SALT).expect("PASE config");
     let creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
     let sc = SecureChannel::new(&crypto, DemoRng::from_time(), config, creds);
-    let im = InteractionModel::new(build_light(&fabrics));
+    let im = InteractionModel::new(build_light(&fabrics, &acl));
     let mut stack: DefaultStack<Backend, DemoRng, Light> = MatterStack::new(&crypto, sc, im);
 
     let socket = UdpSocket::bind("0.0.0.0:5540")?;

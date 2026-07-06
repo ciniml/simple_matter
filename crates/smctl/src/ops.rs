@@ -716,6 +716,7 @@ impl<'a> Exec<'a> {
             cluster: Some(cluster),
             attribute: attr,
             list_index: None,
+            list_append: false,
             enable_tag_compression: false,
         };
         let now = self.now_ms();

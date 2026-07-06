@@ -179,6 +179,13 @@ impl<'b> ArrayEncoder<'_, 'b> {
             .map_err(map_err)
     }
 
+    /// `u64` 要素を追加する(ACL の subjects など)。
+    pub fn push_u64(&mut self, v: u64) -> Result<(), ImStatus> {
+        self.writer
+            .write_u64(&TlvTag::Anonymous, v)
+            .map_err(map_err)
+    }
+
     /// 匿名構造体要素を追加する。`f` に [`StructEncoder`] を渡してフィールドを書く。
     pub fn push_struct<F>(&mut self, f: F) -> Result<(), ImStatus>
     where
@@ -259,6 +266,23 @@ impl StructEncoder<'_, '_> {
             .write_null(&TlvTag::ContextSpecific(ctx))
             .map_err(map_err)
     }
+
+    /// context タグ `ctx` の配列フィールドを書く(ACL エントリの subjects/targets 等)。
+    pub fn field_array<F>(&mut self, ctx: u8, f: F) -> Result<(), ImStatus>
+    where
+        F: FnOnce(&mut ArrayEncoder<'_, '_>) -> Result<(), ImStatus>,
+    {
+        self.writer
+            .start_array(&TlvTag::ContextSpecific(ctx))
+            .map_err(map_err)?;
+        {
+            let mut ae = ArrayEncoder {
+                writer: self.writer,
+            };
+            f(&mut ae)?;
+        }
+        self.writer.end_container().map_err(map_err)
+    }
 }
 
 /// Invoke の生成レスポンスを書くレスポンダ(設計 §7.2)。
@@ -271,6 +295,8 @@ pub struct CmdResponder<'w, 'b> {
     writer: &'w mut TlvWriter<'b>,
     response: Option<CommandId>,
     promote_fabric: Option<core::num::NonZeroU8>,
+    case_admin_acl: Option<(core::num::NonZeroU8, u64)>,
+    removed_fabric: Option<core::num::NonZeroU8>,
 }
 
 impl<'w, 'b> CmdResponder<'w, 'b> {
@@ -280,6 +306,8 @@ impl<'w, 'b> CmdResponder<'w, 'b> {
             writer,
             response: None,
             promote_fabric: None,
+            case_admin_acl: None,
+            removed_fabric: None,
         }
     }
 
@@ -308,6 +336,29 @@ impl<'w, 'b> CmdResponder<'w, 'b> {
     /// 要求された fabric 昇格(あれば)。
     pub const fn requested_promotion(&self) -> Option<core::num::NonZeroU8> {
         self.promote_fabric
+    }
+
+    /// AddNOC 成功時に、caseAdminSubject への bootstrap admin ACL エントリ生成を要求する
+    /// (§11.17.6.8、`docs/design/acl.md` §3)。IM エンジンが invoke 後に
+    /// [`crate::acl::AclHandle::add_case_admin`] を呼ぶ。
+    pub fn request_case_admin_acl(&mut self, fabric_idx: core::num::NonZeroU8, subject: u64) {
+        self.case_admin_acl = Some((fabric_idx, subject));
+    }
+
+    /// 要求された bootstrap admin ACL(あれば)。
+    pub const fn requested_case_admin_acl(&self) -> Option<(core::num::NonZeroU8, u64)> {
+        self.case_admin_acl
+    }
+
+    /// RemoveFabric 成功時に、当該 fabric の ACL エントリ連動削除を要求する。
+    /// IM エンジンが invoke 後に [`crate::acl::AclHandle::remove_fabric`] を呼ぶ。
+    pub fn request_fabric_removed(&mut self, fabric_idx: core::num::NonZeroU8) {
+        self.removed_fabric = Some(fabric_idx);
+    }
+
+    /// 要求された fabric 連動削除(あれば)。
+    pub const fn requested_fabric_removed(&self) -> Option<core::num::NonZeroU8> {
+        self.removed_fabric
     }
 
     /// レスポンスフィールドを書くための下位 [`TlvWriter`] を返す。

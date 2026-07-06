@@ -275,7 +275,7 @@ fn decode_resp(
     (phdr.proto_opcode, payload.len(), pkt.ctr)
 }
 
-/// PASE 上でコマンドを invoke し、InvokeResponse を `out` に得て長さを返す。
+/// PASE 上でコマンドを invoke し、InvokeResponse を `out` に得て長さを返す(EP0)。
 #[allow(clippy::too_many_arguments)]
 fn pase_invoke<F>(
     stack: &mut TestStack<'_>,
@@ -293,10 +293,34 @@ fn pase_invoke<F>(
 where
     F: FnOnce(&mut TlvWriter, &TlvTag) -> Result<()>,
 {
+    pase_invoke_ep(
+        stack, crypto, device_sid, i2r, r2i, 0, cluster, command, ctr, ack, fields, out,
+    )
+}
+
+/// PASE 上でコマンドを invoke し、InvokeResponse を `out` に得て長さを返す。
+#[allow(clippy::too_many_arguments)]
+fn pase_invoke_ep<F>(
+    stack: &mut TestStack<'_>,
+    crypto: &Crb,
+    device_sid: u16,
+    i2r: &[u8; 16],
+    r2i: &[u8; 16],
+    endpoint: u16,
+    cluster: u32,
+    command: u32,
+    ctr: &mut u32,
+    ack: &mut Option<u32>,
+    fields: F,
+    out: &mut [u8],
+) -> usize
+where
+    F: FnOnce(&mut TlvWriter, &TlvTag) -> Result<()>,
+{
     let mut fbuf = [0u8; 900];
     let ilen = encode_invoke_request(&mut fbuf, InvokeRequestHeader::default(), |cw| {
         cw.push(
-            &CommandPath::new(EndpointId(0), ClusterId(cluster), CommandId(command)),
+            &CommandPath::new(EndpointId(endpoint), ClusterId(cluster), CommandId(command)),
             None,
             Some(fields),
         )
@@ -685,12 +709,15 @@ fn onoff_light_end_to_end() {
     let mut imc_ack = Some(dctr);
 
     // OnOff invoke over PASE は ACL で拒否される(UnsupportedAccess = 0x7e)。
-    let rl = pase_invoke(
+    // ACL 無しデバイス(DataModel::acl == None)の従来近似ゲートの回帰テスト。
+    // full ACL デバイスでは PASE は implicit Administer で許可される(acl.md §3)。
+    let rl = pase_invoke_ep(
         &mut stack,
         &crypto,
         device_sid,
         &pase_i2r,
         &pase_r2i,
+        1,
         0x0006,
         0x01,
         &mut pase_ctr,

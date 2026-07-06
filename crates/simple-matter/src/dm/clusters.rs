@@ -3,6 +3,7 @@
 //! いずれも [`crate::cluster!`] マクロを用いた combined 実装(logic/translation 分離なし)。
 //! 属性ストレージと dirty フラグをクラスタ構造体が所有する。
 
+pub mod access_control;
 pub mod basic_information;
 pub(crate) mod cmd;
 pub mod descriptor;
@@ -11,6 +12,7 @@ pub mod network_commissioning;
 pub mod on_off;
 pub mod operational_credentials;
 
+pub use access_control::AccessControlCluster;
 pub use basic_information::{BasicInfoConfig, BasicInformationCluster};
 pub use descriptor::DescriptorCluster;
 pub use general_commissioning::{FailSafe, GeneralCommissioning};

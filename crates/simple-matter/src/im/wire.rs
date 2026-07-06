@@ -283,6 +283,9 @@ pub struct AttributePath {
     pub attribute: Option<AttributeId>,
     /// list 要素インデックス(Write の list 編集用)。初期は保持のみ。
     pub list_index: Option<u16>,
+    /// ListIndex が **null** だったか(chip の list append/modify マーカ。
+    /// `docs/design/acl.md` §4)。write では「1 要素追記」を意味する。
+    pub list_append: bool,
     /// EnableTagCompression。受理はするが device 側では無視する。
     pub enable_tag_compression: bool,
 }
@@ -299,6 +302,7 @@ impl AttributePath {
             cluster: Some(cluster),
             attribute: Some(attribute),
             list_index: None,
+            list_append: false,
             enable_tag_compression: false,
         }
     }
@@ -308,10 +312,11 @@ impl AttributePath {
         Self::concrete(p.endpoint, p.cluster, p.attribute)
     }
 
-    /// ワイルドカード/`list_index` を含まない完全解決済みなら [`ConcreteAttrPath`] を返す。
+    /// ワイルドカード/`list_index`(append 含む)を含まない完全解決済みなら
+    /// [`ConcreteAttrPath`] を返す。
     pub const fn to_concrete(&self) -> Option<ConcreteAttrPath> {
         match (self.endpoint, self.cluster, self.attribute) {
-            (Some(e), Some(c), Some(a)) if self.list_index.is_none() => {
+            (Some(e), Some(c), Some(a)) if self.list_index.is_none() && !self.list_append => {
                 Some(ConcreteAttrPath::new(e, c, a))
             }
             _ => None,
@@ -349,7 +354,9 @@ impl AttributePath {
         if let Some(a) = self.attribute {
             w.write_u32(&TlvTag::ContextSpecific(4), a.0)?;
         }
-        if let Some(i) = self.list_index {
+        if self.list_append {
+            w.write_null(&TlvTag::ContextSpecific(5))?;
+        } else if let Some(i) = self.list_index {
             w.write_u16(&TlvTag::ContextSpecific(5), i)?;
         }
         w.end_container()
@@ -371,7 +378,18 @@ impl AttributePath {
                 2 => path.endpoint = Some(EndpointId(read_u16(r)?)),
                 3 => path.cluster = Some(ClusterId(read_u32(r)?)),
                 4 => path.attribute = Some(AttributeId(read_u32(r)?)),
-                5 => path.list_index = Some(read_u16(r)?),
+                5 => {
+                    // ListIndex は nullable(null = list append/modify マーカ)。
+                    let e = r.read_next()?.ok_or(Error::Decode)?;
+                    match e.value {
+                        TlvValue::Null => path.list_append = true,
+                        v => {
+                            let idx = v.as_unsigned()?;
+                            path.list_index =
+                                Some(u16::try_from(idx).map_err(|_| Error::Decode)?);
+                        }
+                    }
+                }
                 _ => skip_field(r)?,
             }
         }

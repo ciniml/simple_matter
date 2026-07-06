@@ -89,7 +89,13 @@ pub enum SessionKind {
     Case,
 }
 
-/// アクセス文脈(read/write/invoke に渡す最小限の呼び出し元情報、設計 §10)。
+/// 1 セッションが保持できる CASE Authenticated Tag(CAT)の最大数。
+///
+/// Matter 仕様上、1 つの NOC に付与できる CAT は最大 3(`crate::sc::case::creds::MAX_PEER_CATS`
+/// と同値。依存方向のため独立に定義する)。
+pub const MAX_ACCESS_CATS: usize = 3;
+
+/// アクセス文脈(read/write/invoke に渡す最小限の呼び出し元情報、設計 §10 / `docs/design/acl.md` §5)。
 ///
 /// 設計 §1 では `im/access.rs` に置く型だが、`dm::clusters` が `im` エンジンを知らずに
 /// 参照できるよう(依存方向の維持)、本ピースでは `dm::meta` に定義する。
@@ -99,10 +105,24 @@ pub struct AccessContext {
     pub kind: SessionKind,
     /// fabric インデックス(CASE なら `Some`、PASE コミッショニングは `None`)。
     pub fabric_idx: Option<core::num::NonZeroU8>,
-    /// CASE の subject NodeId(将来の CAT/ACL 用)。
+    /// CASE の subject NodeId(ACL 照合に使う)。
     pub subject: u64,
+    /// CASE セッションの peer NOC に含まれる CAT(先頭 `cat_count` 件が有効)。
+    ///
+    /// ACL エントリの CAT subject(`0xFFFF_FFFD_xxxx_xxxx`)照合に使う(`docs/design/acl.md` §2)。
+    pub cats: [u32; MAX_ACCESS_CATS],
+    /// `cats` の有効件数。
+    pub cat_count: u8,
     /// このアクセスに付与された権限。
+    ///
+    /// full ACL(`DataModel::acl` が `Some`)経路では per-entry 照合が権限を決めるため
+    /// 使われない。従来近似(`acl() == None`)経路でのみ意味を持つ。
     pub privilege: Privilege,
+    /// リクエストの fabricFiltered フラグ(ReadRequest / SubscribeRequest 由来)。
+    ///
+    /// fabric-scoped list 属性(ACL 等)の read で自 fabric 行のみ返すかの判定に使う。
+    /// write/invoke では常に `false`。
+    pub fabric_filtered: bool,
     /// このアクセスの発生時刻(注入された単調増加ミリ秒)。
     ///
     /// General Commissioning の fail-safe 期限計算や Operational Credentials の
@@ -131,7 +151,10 @@ impl AccessContext {
             kind,
             fabric_idx,
             subject,
+            cats: [0; MAX_ACCESS_CATS],
+            cat_count: 0,
             privilege,
+            fabric_filtered: false,
             now_ms: 0,
             att_challenge: [0u8; 16],
         }
@@ -141,6 +164,20 @@ impl AccessContext {
     pub const fn with_env(mut self, now_ms: u64, att_challenge: [u8; 16]) -> Self {
         self.now_ms = now_ms;
         self.att_challenge = att_challenge;
+        self
+    }
+
+    /// CASE peer の CAT 群を注入した複製を返す(`cats` の先頭 [`MAX_ACCESS_CATS`] 件に丸める)。
+    pub fn with_cats(mut self, cats: &[u32]) -> Self {
+        let n = cats.len().min(MAX_ACCESS_CATS);
+        self.cats[..n].copy_from_slice(&cats[..n]);
+        self.cat_count = n as u8;
+        self
+    }
+
+    /// リクエストの fabricFiltered フラグを注入した複製を返す。
+    pub const fn with_fabric_filtered(mut self, filtered: bool) -> Self {
+        self.fabric_filtered = filtered;
         self
     }
 
@@ -194,6 +231,11 @@ pub struct AttributeMeta {
     pub id: AttributeId,
     /// 読み取りに必要な権限。
     pub access: Privilege,
+    /// 書き込みに必要な権限(`writable == false` なら未使用)。
+    ///
+    /// 仕様の既定は Operate。Breadcrumb / ACL のように read と write で権限が異なる
+    /// 属性のため read(`access`)と分離する(`docs/design/acl.md` §3)。
+    pub write_access: Privilege,
     /// quality フラグ。
     pub quality: Quality,
     /// 読み取り可能か。
@@ -205,7 +247,7 @@ pub struct AttributeMeta {
 }
 
 impl AttributeMeta {
-    /// 新しい [`AttributeMeta`] を作る。
+    /// 新しい [`AttributeMeta`] を作る(write 権限は既定の Operate)。
     pub const fn new(
         id: AttributeId,
         access: Privilege,
@@ -217,11 +259,18 @@ impl AttributeMeta {
         Self {
             id,
             access,
+            write_access: Privilege::Operate,
             quality,
             readable,
             writable,
             subscribable,
         }
+    }
+
+    /// write 権限を上書きした複製を返す(`const` チェーン用)。
+    pub const fn with_write_access(mut self, write_access: Privilege) -> Self {
+        self.write_access = write_access;
+        self
     }
 
     /// グローバル属性 `id` の合成メタデータ(全て View 読み取り専用)を作る。

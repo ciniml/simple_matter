@@ -169,6 +169,7 @@ fn onoff_cluster_path() -> AttributePath {
         cluster: Some(ClusterId(0x0006)),
         attribute: None,
         list_index: None,
+        list_append: false,
         enable_tag_compression: false,
     }
 }
@@ -685,5 +686,465 @@ fn timed_write_paths() {
             StatusResponse::decode(&tx[..len]).unwrap().status,
             ImStatus::TimedRequestMismatch
         );
+    }
+}
+
+// ==========================================================================
+// 8. full ACL(DataModel::acl = Some、docs/design/acl.md §3/§4/§8)
+// ==========================================================================
+
+mod acl_enforcement {
+    use super::*;
+    use crate::acl::{AclEntry, AclHandle, AclTable};
+    use crate::dm::clusters::AccessControlCluster;
+    use crate::dm::codec::CmdResponder;
+    use crate::dm::meta::{
+        AccessContext, ClusterMeta, CommandMeta, EndpointMeta, Privilege,
+    };
+    use crate::dm::{DataModel, ServerCluster};
+    use crate::tlv::TlvReader;
+    use core::cell::RefCell;
+
+    /// AddNOC / RemoveFabric の副作用要求だけを再現するスタブクラスタ(0xFC01)。
+    ///
+    /// コマンド 0x00 = `request_case_admin_acl(fabric 1, subject 0xCAFE)`、
+    /// 0x01 = `request_fabric_removed(fabric 1)`。
+    struct EffectsStub;
+
+    static STUB_CMDS: &[CommandMeta] = &[
+        CommandMeta::new(CommandId(0x00), false, Privilege::Administer),
+        CommandMeta::new(CommandId(0x01), false, Privilege::Administer),
+    ];
+    static STUB_META: ClusterMeta =
+        ClusterMeta::new(ClusterId(0xFC01), 1, 0, &[], STUB_CMDS, &[]);
+
+    impl ServerCluster for EffectsStub {
+        fn meta(&self) -> &'static ClusterMeta {
+            &STUB_META
+        }
+        fn read_attribute(
+            &self,
+            _attr: AttributeId,
+            _enc: &mut crate::dm::codec::AttrEncoder<'_, '_>,
+            _acc: &AccessContext,
+        ) -> Result<(), ImStatus> {
+            Err(ImStatus::UnsupportedAttribute)
+        }
+        fn invoke_command(
+            &mut self,
+            cmd: CommandId,
+            _fields: &mut TlvReader<'_>,
+            resp: &mut CmdResponder<'_, '_>,
+            _acc: &AccessContext,
+        ) -> Result<(), ImStatus> {
+            match cmd.0 {
+                0x00 => {
+                    resp.request_case_admin_acl(NonZeroU8::new(1).unwrap(), 0xCAFE);
+                    Ok(())
+                }
+                0x01 => {
+                    resp.request_fabric_removed(NonZeroU8::new(1).unwrap());
+                    Ok(())
+                }
+                _ => Err(ImStatus::UnsupportedCommand),
+            }
+        }
+    }
+
+    /// full ACL 付きライト(EP0: AccessControl + スタブ、EP1: On/Off)。手書き DataModel。
+    struct AclLight<'a> {
+        acl: &'a RefCell<AclTable<8>>,
+        ac: AccessControlCluster<'a, 8>,
+        on_off: OnOffCluster,
+        stub: EffectsStub,
+    }
+
+    static ACL_EP0: &[ClusterId] = &[ClusterId(0x001F), ClusterId(0xFC01)];
+    static ACL_EP1: &[ClusterId] = &[ClusterId(0x0006)];
+
+    impl DataModel for AclLight<'_> {
+        fn endpoints(&self) -> &[EndpointMeta] {
+            static EPS: &[EndpointMeta] = &[
+                EndpointMeta::new(EndpointId(0), &[], ACL_EP0),
+                EndpointMeta::new(EndpointId(1), &[], ACL_EP1),
+            ];
+            EPS
+        }
+        fn clusters_on(&self, ep: EndpointId) -> &[ClusterId] {
+            match ep.0 {
+                0 => ACL_EP0,
+                1 => ACL_EP1,
+                _ => &[],
+            }
+        }
+        fn cluster(&self, ep: EndpointId, cl: ClusterId) -> Option<&dyn ServerCluster> {
+            match (ep.0, cl.0) {
+                (0, 0x001F) => Some(&self.ac),
+                (0, 0xFC01) => Some(&self.stub),
+                (1, 0x0006) => Some(&self.on_off),
+                _ => None,
+            }
+        }
+        fn cluster_mut(&mut self, ep: EndpointId, cl: ClusterId) -> Option<&mut dyn ServerCluster> {
+            match (ep.0, cl.0) {
+                (0, 0x001F) => Some(&mut self.ac),
+                (0, 0xFC01) => Some(&mut self.stub),
+                (1, 0x0006) => Some(&mut self.on_off),
+                _ => None,
+            }
+        }
+        fn acl(&self) -> Option<&dyn AclHandle> {
+            Some(self.acl)
+        }
+    }
+
+    type AclIm<'a> = InteractionModel<AclLight<'a>, 2, 2, 8>;
+
+    /// CASE(fabric 1, subject 0x1234)セッションと IM を組む。
+    fn setup_acl(acl: &RefCell<AclTable<8>>) -> (AclIm<'_>, SessionManager<2>, ExchangeId) {
+        let mut mgr: SessionManager<2> = SessionManager::new();
+        let init = SessionInit {
+            peer_addr: addr(),
+            local_node_id: 1,
+            peer_node_id: Some(0x1234),
+            peer_session_id: 1,
+            tx_ctr_start: 1,
+            rx_ctr_start: 0,
+            mode: SessionMode::Case {
+                fabric_idx: NonZeroU8::new(1).unwrap(),
+            },
+            enc_key: [0u8; 16],
+            dec_key: [0u8; 16],
+            att_challenge: [0u8; 16],
+        };
+        let sid = mgr.insert(init, 0).unwrap();
+        let ex = ExchangeId::from_parts(sid, EXCH_ID);
+        let light = AclLight {
+            acl,
+            ac: AccessControlCluster::new(acl),
+            on_off: OnOffCluster::new(),
+            stub: EffectsStub,
+        };
+        (AclIm::new(light), mgr, ex)
+    }
+
+    /// PASE セッションに差し替えた setup。
+    fn setup_acl_pase(acl: &RefCell<AclTable<8>>) -> (AclIm<'_>, SessionManager<2>, ExchangeId) {
+        let mut mgr: SessionManager<2> = SessionManager::new();
+        let mut init = SessionInit::plaintext(addr(), 1, 1);
+        init.mode = SessionMode::Pase { fabric_idx: 0 };
+        let sid = mgr.insert(init, 0).unwrap();
+        let ex = ExchangeId::from_parts(sid, EXCH_ID);
+        let light = AclLight {
+            acl,
+            ac: AccessControlCluster::new(acl),
+            on_off: OnOffCluster::new(),
+            stub: EffectsStub,
+        };
+        (AclIm::new(light), mgr, ex)
+    }
+
+    /// On/Off の On(0x01)を invoke し、応答の先頭 status を返す。
+    fn invoke_on(im: &mut AclIm<'_>, mgr: &mut SessionManager<2>, ex: ExchangeId) -> ImStatus {
+        let mut req = [0u8; 64];
+        let ilen = encode_invoke_request(&mut req, InvokeRequestHeader::default(), |cw| {
+            cw.push(
+                &CommandPath::new(EndpointId(1), ClusterId(0x0006), CommandId(0x01)),
+                None,
+                None::<fn(&mut TlvWriter, &TlvTag) -> crate::error::Result<()>>,
+            )
+        })
+        .unwrap();
+        let ih = phdr(ImOpCode::InvokeRequest.to_u8());
+        let mut tx = [0u8; 128];
+        let a = im
+            .handle(&rxm(&ih, &req[..ilen], ex), &mut tx, mgr, 0)
+            .unwrap();
+        let (_, len, _) = parts(a);
+        let ir = InvokeResponseRef::new(&tx[..len]).unwrap();
+        match ir.invoke_responses().unwrap().next().unwrap().unwrap() {
+            InvokeResponseRefItem::Status(s) => s.status.status,
+            InvokeResponseRefItem::Command(_) => panic!("status expected"),
+        }
+    }
+
+    #[test]
+    fn case_without_entry_is_denied() {
+        let acl = RefCell::new(AclTable::new());
+        let (mut im, mut mgr, ex) = setup_acl(&acl);
+        // ACL 空 → invoke は UnsupportedAccess、状態は変化しない。
+        assert_eq!(invoke_on(&mut im, &mut mgr, ex), ImStatus::UnsupportedAccess);
+        assert!(!im.data_model().on_off.is_on());
+
+        // read も per-path の UnsupportedAccess StatusIB。
+        let mut req = [0u8; 64];
+        let rlen = encode_read_request(&mut req, false, |p| {
+            p.push(&AttributePath::concrete(
+                EndpointId(1),
+                ClusterId(0x0006),
+                AttributeId(0x0000),
+            ))
+        })
+        .unwrap();
+        let rh = phdr(ImOpCode::ReadRequest.to_u8());
+        let mut tx = [0u8; 256];
+        let a = im
+            .handle(&rxm(&rh, &req[..rlen], ex), &mut tx, &mut mgr, 0)
+            .unwrap();
+        let (_, len, _) = parts(a);
+        let rd = ReportDataRef::new(&tx[..len]).unwrap();
+        match rd.attr_reports().unwrap().next().unwrap().unwrap() {
+            AttributeReportRef::Status(s) => {
+                assert_eq!(s.status.status, ImStatus::UnsupportedAccess)
+            }
+            AttributeReportRef::Data(_) => panic!("expected access denial"),
+        }
+    }
+
+    #[test]
+    fn matching_admin_entry_grants_access() {
+        let acl = RefCell::new(AclTable::new());
+        acl.borrow_mut()
+            .add(AclEntry::case_admin(NonZeroU8::new(1).unwrap(), 0x1234))
+            .unwrap();
+        let (mut im, mut mgr, ex) = setup_acl(&acl);
+        assert_eq!(invoke_on(&mut im, &mut mgr, ex), ImStatus::Success);
+        assert!(im.data_model().on_off.is_on());
+    }
+
+    #[test]
+    fn entry_for_other_subject_is_denied() {
+        let acl = RefCell::new(AclTable::new());
+        acl.borrow_mut()
+            .add(AclEntry::case_admin(NonZeroU8::new(1).unwrap(), 0xDEAD))
+            .unwrap();
+        let (mut im, mut mgr, ex) = setup_acl(&acl);
+        assert_eq!(invoke_on(&mut im, &mut mgr, ex), ImStatus::UnsupportedAccess);
+    }
+
+    #[test]
+    fn pase_has_implicit_administer() {
+        let acl = RefCell::new(AclTable::new());
+        // full ACL では PASE は implicit admin(エントリ不要、acl.md §3)。
+        let (mut im, mut mgr, ex) = setup_acl_pase(&acl);
+        assert_eq!(invoke_on(&mut im, &mut mgr, ex), ImStatus::Success);
+        assert!(im.data_model().on_off.is_on());
+    }
+
+    /// ワイヤ表現の ACL エントリを書く(subjects のみ、targets null)。
+    fn write_entry_fields(
+        w: &mut TlvWriter<'_>,
+        tag: &TlvTag,
+        privilege: u8,
+        subject: u64,
+    ) -> crate::error::Result<()> {
+        w.start_struct(tag)?;
+        w.write_u8(&TlvTag::ContextSpecific(1), privilege)?;
+        w.write_u8(&TlvTag::ContextSpecific(2), 2)?; // CASE
+        w.start_array(&TlvTag::ContextSpecific(3))?;
+        w.write_u64(&TlvTag::Anonymous, subject)?;
+        w.end_container()?;
+        w.write_null(&TlvTag::ContextSpecific(4))?;
+        w.end_container()
+    }
+
+    /// WriteRequest を送って先頭 status を返す。
+    fn do_write(
+        im: &mut AclIm<'_>,
+        mgr: &mut SessionManager<2>,
+        ex: ExchangeId,
+        req: &[u8],
+    ) -> ImStatus {
+        let wh = phdr(ImOpCode::WriteRequest.to_u8());
+        let mut tx = [0u8; 256];
+        let a = im.handle(&rxm(&wh, req, ex), &mut tx, mgr, 0).unwrap();
+        let (op, len, _) = parts(a);
+        assert_eq!(op, ImOpCode::WriteResponse.to_u8());
+        let wr = WriteResponseRef::new(&tx[..len]).unwrap();
+        wr.write_responses()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .status
+            .status
+    }
+
+    #[test]
+    fn acl_crud_via_im_write() {
+        let acl = RefCell::new(AclTable::new());
+        acl.borrow_mut()
+            .add(AclEntry::case_admin(NonZeroU8::new(1).unwrap(), 0x1234))
+            .unwrap();
+        let (mut im, mut mgr, ex) = setup_acl(&acl);
+        let path = AttributePath::concrete(EndpointId(0), ClusterId(0x001F), AttributeId(0x0000));
+
+        // ReplaceAll: [admin(0x1234)](自分の admin を書き直す)。
+        let mut req = [0u8; 256];
+        let wlen = encode_write_request(&mut req, WriteRequestHeader::default(), |dw| {
+            dw.push(None, &path, |vw, t| {
+                vw.start_array(t)?;
+                write_entry_fields(vw, &TlvTag::Anonymous, 5, 0x1234)?;
+                vw.end_container()
+            })
+        })
+        .unwrap();
+        assert_eq!(do_write(&mut im, &mut mgr, ex, &req[..wlen]), ImStatus::Success);
+        assert_eq!(acl.borrow().len(), 1);
+
+        // Append(ListIndex null): Operate エントリを追記。
+        let mut append_path = path;
+        append_path.list_append = true;
+        let wlen = encode_write_request(&mut req, WriteRequestHeader::default(), |dw| {
+            dw.push(None, &append_path, |vw, t| {
+                write_entry_fields(vw, t, 3, 0x5678)
+            })
+        })
+        .unwrap();
+        assert_eq!(do_write(&mut im, &mut mgr, ex, &req[..wlen]), ImStatus::Success);
+        assert_eq!(acl.borrow().len(), 2);
+
+        // 読み戻し(fabricFiltered)で 2 エントリ。
+        let mut rreq = [0u8; 64];
+        let rlen = encode_read_request(&mut rreq, true, |p| p.push(&path)).unwrap();
+        let rh = phdr(ImOpCode::ReadRequest.to_u8());
+        let mut tx = [0u8; 512];
+        let a = im
+            .handle(&rxm(&rh, &rreq[..rlen], ex), &mut tx, &mut mgr, 0)
+            .unwrap();
+        let (_, len, _) = parts(a);
+        let rd = ReportDataRef::new(&tx[..len]).unwrap();
+        match rd.attr_reports().unwrap().next().unwrap().unwrap() {
+            AttributeReportRef::Data(d) => {
+                // 配列 → 2 個の構造体。
+                let mut r = d.value();
+                r.read_next().unwrap();
+                let mut structs = 0;
+                let mut depth = 1;
+                while depth > 0 {
+                    let e = r.read_next().unwrap().unwrap();
+                    match e.value {
+                        TlvValue::ContainerStart(crate::tlv::ContainerType::Structure)
+                            if depth == 1 =>
+                        {
+                            structs += 1;
+                            depth += 1;
+                        }
+                        TlvValue::ContainerStart(_) => depth += 1,
+                        TlvValue::ContainerEnd => depth -= 1,
+                        _ => {}
+                    }
+                }
+                assert_eq!(structs, 2);
+            }
+            AttributeReportRef::Status(_) => panic!("expected ACL data"),
+        }
+
+        // subject 0x5678(Operate)で新しい CASE セッションを張ると、
+        // OnOff invoke は通るが ACL write は UnsupportedAccess。
+        let init = SessionInit {
+            peer_addr: addr(),
+            local_node_id: 1,
+            peer_node_id: Some(0x5678),
+            peer_session_id: 2,
+            tx_ctr_start: 1,
+            rx_ctr_start: 0,
+            mode: SessionMode::Case {
+                fabric_idx: NonZeroU8::new(1).unwrap(),
+            },
+            enc_key: [0u8; 16],
+            dec_key: [0u8; 16],
+            att_challenge: [0u8; 16],
+        };
+        let sid2 = mgr.insert(init, 0).unwrap();
+        let ex2 = ExchangeId::from_parts(sid2, 0x2222);
+        let h2 = PayloadHeader {
+            exch_id: 0x2222,
+            ..phdr(ImOpCode::InvokeRequest.to_u8())
+        };
+        let mut ireq = [0u8; 64];
+        let ilen = encode_invoke_request(&mut ireq, InvokeRequestHeader::default(), |cw| {
+            cw.push(
+                &CommandPath::new(EndpointId(1), ClusterId(0x0006), CommandId(0x01)),
+                None,
+                None::<fn(&mut TlvWriter, &TlvTag) -> crate::error::Result<()>>,
+            )
+        })
+        .unwrap();
+        let mut tx2 = [0u8; 128];
+        let a = im
+            .handle(&rxm(&h2, &ireq[..ilen], ex2), &mut tx2, &mut mgr, 0)
+            .unwrap();
+        let (_, len2, _) = parts(a);
+        let ir = InvokeResponseRef::new(&tx2[..len2]).unwrap();
+        match ir.invoke_responses().unwrap().next().unwrap().unwrap() {
+            InvokeResponseRefItem::Status(s) => assert_eq!(s.status.status, ImStatus::Success),
+            _ => panic!(),
+        }
+
+        // ACL write(Administer 必要)は Operate では拒否。
+        let wh2 = PayloadHeader {
+            exch_id: 0x2222,
+            ..phdr(ImOpCode::WriteRequest.to_u8())
+        };
+        let wlen = encode_write_request(&mut req, WriteRequestHeader::default(), |dw| {
+            dw.push(None, &path, |vw, t| {
+                vw.start_array(t)?;
+                vw.end_container()
+            })
+        })
+        .unwrap();
+        let mut tx3 = [0u8; 256];
+        let a = im
+            .handle(&rxm(&wh2, &req[..wlen], ex2), &mut tx3, &mut mgr, 0)
+            .unwrap();
+        let (_, len3, _) = parts(a);
+        let wr = WriteResponseRef::new(&tx3[..len3]).unwrap();
+        assert_eq!(
+            wr.write_responses()
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .status
+                .status,
+            ImStatus::UnsupportedAccess
+        );
+    }
+
+    #[test]
+    fn invoke_effects_bootstrap_admin_and_fabric_removal() {
+        let acl = RefCell::new(AclTable::new());
+        // PASE(implicit admin)からスタブ 0x00 → bootstrap admin エントリ生成。
+        let (mut im, mut mgr, ex) = setup_acl_pase(&acl);
+        let mut req = [0u8; 64];
+        let ilen = encode_invoke_request(&mut req, InvokeRequestHeader::default(), |cw| {
+            cw.push(
+                &CommandPath::new(EndpointId(0), ClusterId(0xFC01), CommandId(0x00)),
+                None,
+                None::<fn(&mut TlvWriter, &TlvTag) -> crate::error::Result<()>>,
+            )
+        })
+        .unwrap();
+        let ih = phdr(ImOpCode::InvokeRequest.to_u8());
+        let mut tx = [0u8; 128];
+        im.handle(&rxm(&ih, &req[..ilen], ex), &mut tx, &mut mgr, 0)
+            .unwrap();
+        assert_eq!(acl.borrow().len(), 1);
+        let expected = AclEntry::case_admin(NonZeroU8::new(1).unwrap(), 0xCAFE);
+        assert_eq!(*acl.borrow().iter().next().unwrap(), expected);
+
+        // スタブ 0x01 → fabric 1 のエントリ連動削除。
+        let ilen = encode_invoke_request(&mut req, InvokeRequestHeader::default(), |cw| {
+            cw.push(
+                &CommandPath::new(EndpointId(0), ClusterId(0xFC01), CommandId(0x01)),
+                None,
+                None::<fn(&mut TlvWriter, &TlvTag) -> crate::error::Result<()>>,
+            )
+        })
+        .unwrap();
+        im.handle(&rxm(&ih, &req[..ilen], ex), &mut tx, &mut mgr, 0)
+            .unwrap();
+        assert_eq!(acl.borrow().len(), 0);
     }
 }

@@ -95,15 +95,39 @@ pub const fn is_global(attr: AttributeId) -> bool {
 // cluster! / device! の内部ヘルパマクロ
 // ==========================================================================
 
-/// 書き込みディスパッチ: `_` は UnsupportedWrite、`(クロージャ)` は `(self, data, acc)` で起動。
+/// 書き込みディスパッチ: `_` は UnsupportedWrite、`(権限, クロージャ)` は `(self, data, acc)` で起動。
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __cluster_write {
     (_, $s:expr, $data:expr, $acc:expr) => {
         Err($crate::im::wire::ImStatus::UnsupportedWrite)
     };
-    (($f:expr), $s:expr, $data:expr, $acc:expr) => {
+    (($wacc:ident, $f:expr), $s:expr, $data:expr, $acc:expr) => {
         ($f)($s, $data, $acc)
+    };
+}
+
+/// 属性の write 権限メタ: `_` は Operate(未使用)、`(権限, クロージャ)` は宣言権限。
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __attr_write_access {
+    (_) => {
+        $crate::dm::meta::Privilege::Operate
+    };
+    (($wacc:ident, $f:expr)) => {
+        $crate::dm::meta::Privilege::$wacc
+    };
+}
+
+/// コマンドの invoke 権限メタ: 注釈なしは Operate。
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __cmd_access {
+    () => {
+        $crate::dm::meta::Privilege::Operate
+    };
+    ($cacc:ident) => {
+        $crate::dm::meta::Privilege::$cacc
     };
 }
 
@@ -152,9 +176,11 @@ macro_rules! __attr_writable {
 ///
 /// 属性行 `$id $Name { access, quality, subscribe, read, write }` から、メタデータ配列の
 /// 該当エントリと read/write の match アームを**同じ宣言**から生成する(整合ズレを防ぐ)。
-/// `read`/`write`/`invoke` の本体は括弧で囲んだクロージャ式で与える(`read` は
-/// `|self, enc|`、`write` は `|self, data, acc|`、`invoke` は `|self, cmd, fields, resp, acc|`)。
+/// `read` の本体は括弧で囲んだクロージャ式 `(|self, enc|)`、`write` は
+/// **`(必要権限, |self, data, acc|)`**(例: `(Administer, |c, d, a| ...)`。data は
+/// [`crate::dm::AttrWrite`])、`invoke` は `(|self, cmd, fields, resp, acc|)` で与える。
 /// `write` に `_`、`invoke` に `_`、`dirty` に `_` を渡すと当該機能を持たないクラスタになる。
+/// accepted 行は `0x00 Name => Administer` のように invoke 権限を注釈できる(既定 Operate)。
 ///
 /// # 例
 ///
@@ -194,7 +220,7 @@ macro_rules! cluster {
                     }
                 ),* $(,)?
             ],
-            accepted: [ $( $cid:literal $cname:ident ),* $(,)? ],
+            accepted: [ $( $cid:literal $cname:ident $( => $cacc:ident )? ),* $(,)? ],
             generated: [ $( $gid:literal ),* $(,)? ],
         }
     ) => {
@@ -214,13 +240,13 @@ macro_rules! cluster {
                                 true,
                                 $crate::__attr_writable!($awm),
                                 $asub,
-                            )
+                            ).with_write_access($crate::__attr_write_access!($awm))
                         ),* ],
                         &[ $(
                             $crate::dm::meta::CommandMeta::new(
                                 $crate::dm::meta::CommandId($cid),
                                 false,
-                                $crate::dm::meta::Privilege::Operate,
+                                $crate::__cmd_access!($( $cacc )?),
                             )
                         ),* ],
                         &[ $( $crate::dm::meta::CommandId($gid) ),* ],
@@ -232,8 +258,9 @@ macro_rules! cluster {
                 &self,
                 attr: $crate::dm::meta::AttributeId,
                 enc: &mut $crate::dm::codec::AttrEncoder<'_, '_>,
+                acc: &$crate::dm::meta::AccessContext,
             ) -> ::core::result::Result<(), $crate::im::wire::ImStatus> {
-                let _ = &enc;
+                let _ = (&enc, acc);
                 match attr.0 {
                     $( $aid => ($aread)(self, enc), )*
                     _ => Err($crate::im::wire::ImStatus::UnsupportedAttribute),
@@ -243,7 +270,7 @@ macro_rules! cluster {
             fn write_attribute(
                 &mut self,
                 attr: $crate::dm::meta::AttributeId,
-                data: $crate::tlv::TlvElement<'_>,
+                data: $crate::dm::AttrWrite<'_>,
                 acc: &$crate::dm::meta::AccessContext,
             ) -> ::core::result::Result<(), $crate::im::wire::ImStatus> {
                 let _ = (&data, acc);

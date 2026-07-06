@@ -943,6 +943,10 @@ impl<C: Crypto, const NF: usize> OpCredsCluster<'_, C, NF> {
 
 ## 10. ACL(アクセス制御)の初期スコープ
 
+> **更新(2026-07-07)**: full ACL(Access Control クラスタ 0x001F + per-entry 照合)を
+> `docs/design/acl.md` として実装済み。本節の最小近似は `DataModel::acl() == None` の
+> デバイス(ACL クラスタを持たない最小構成/テスト)のフォールバックとして残る。
+
 **明示的に絞る**。full ACL クラスタ(Access Control 0x001F の per-subject/per-target エントリ照合)は
 後回しにし、最低限だけを入れる。
 

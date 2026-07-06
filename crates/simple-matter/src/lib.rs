@@ -15,6 +15,7 @@
 /// BLE 無効ビルドには一切コンパイルされない(フットプリント不変、設計 §7)。
 #[cfg(feature = "ble")]
 pub mod btp;
+pub mod acl;
 pub mod buf;
 pub mod cert;
 /// コントローラ(commissioner)側の統合層。`controller` + `rustcrypto` feature 有効時のみ。
