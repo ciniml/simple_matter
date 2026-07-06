@@ -1,0 +1,17 @@
+[package]
+name = "smctl"
+description = "chip-tool-like CLI controller built on simple-matter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "smctl"
+path = "src/main.rs"
+
+[dependencies]
+simple-matter = { path = "../simple-matter", features = ["controller"] }
+# mDNS ソケット(SO_REUSEADDR / マルチキャスト IF 固定)と dual-stack UDP 用。
+socket2 = { version = "0.5", features = ["all"] }
+# OS の CSPRNG。examples の DemoRng(LCG)は製品バイナリには持ち込まない(設計 doc §2.5)。
+getrandom = "0.4"

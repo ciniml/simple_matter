@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/simple-matter", "crates/bloat-check", "crates/simple-matter-ble"]
+members = [
+    "crates/simple-matter",
+    "crates/bloat-check",
+    "crates/simple-matter-ble",
+    "crates/smctl",
+]
 
 [workspace.package]
 version = "0.1.0"
