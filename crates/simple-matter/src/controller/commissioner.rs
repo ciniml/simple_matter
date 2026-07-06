@@ -459,7 +459,7 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
                 None => {}
             },
             Phase::Case => match stack.sc_take_event() {
-                Some(ScEvent::CaseEstablished { session }) => {
+                Some(ScEvent::CaseEstablished { session, .. }) => {
                     self.case_session = Some(session);
                     self.advance(Phase::Complete);
                 }

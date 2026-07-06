@@ -33,6 +33,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use simple_matter::controller::ca::Ca;
 use simple_matter::controller::{
     AttestationPolicy, Commissioner, ControllerCreds, ControllerStack, Phase,
+    CONTROLLER_FABRIC_INDEX,
 };
 use simple_matter::crypto::rustcrypto::RustCrypto;
 use simple_matter::crypto::Rng;
@@ -42,7 +43,7 @@ use simple_matter::dm::meta::{AttributeId, ClusterId, CommandId, EndpointId};
 use simple_matter::im::client::ImClient;
 use simple_matter::im::wire::{AttributePath, AttributeReportRef, CommandPath};
 use simple_matter::im::ImEvent;
-use simple_matter::sc::initiator::ScInitiator;
+use simple_matter::sc::initiator::{ScEvent, ScInitiator};
 use simple_matter::stack::SendDirective;
 use simple_matter::tlv::TlvValue;
 use simple_matter::transport::net::{PeerAddr, MAX_RX_PACKET_SIZE};
@@ -278,8 +279,104 @@ fn run(passcode: u32, peer_addr: SocketAddr) -> Result<(), String> {
         value,
         if value { "ON" } else { "OFF" }
     );
-    println!("[done] commissioning + Toggle + Read succeeded");
+
+    // --- CASE session resumption(secure-channel.md §7.4)---
+    // 同一プロセス内で 2 本目の CASE を張る。ScInitiator が 1 本目のフル CASE で保存した
+    // resumption レコードにより Sigma1 に resumptionID + initiatorResumeMIC が付き、
+    // デバイスが Sigma2_Resume で応じれば証明書検証なしの 1 往復で確立する。
+    settle(&mut stack, &socket, &start, &mut rx, &mut tx)?;
+    let dir = stack
+        .start_case(
+            peer,
+            CONTROLLER_FABRIC_INDEX,
+            DEVICE_NODE_ID,
+            now_ms(&start),
+            &mut tx,
+        )
+        .map_err(|e| format!("start second CASE (resumption): {e:?}"))?;
+    send_dir(&socket, &tx, &dir);
+    println!("[resumption] second CASE started (Sigma1 carries resumptionID)");
+
+    let resumed_session = match drive_until_sc_event(&mut stack, &socket, &start, &mut rx, &mut tx)
+    {
+        Some(ScEvent::CaseEstablished {
+            session,
+            resumed: true,
+        }) => {
+            println!(
+                "[resumption] CASE session RESUMED via Sigma2_Resume (session = {:#x})",
+                session.as_raw()
+            );
+            session
+        }
+        Some(ScEvent::CaseEstablished { resumed: false, .. }) => {
+            return Err("second CASE fell back to full handshake (resumption not taken)".into());
+        }
+        Some(ev) => return Err(format!("second CASE failed: {ev:?}")),
+        None => return Err("second CASE (resumption) timed out".into()),
+    };
+    settle(&mut stack, &socket, &start, &mut rx, &mut tx)?;
+
+    // 再開したセッション上で実際に IM が通ることを Toggle で確認する。
+    let dir = stack
+        .start_invoke(
+            resumed_session,
+            CommandPath::new(ONOFF_EP, ONOFF_CLUSTER, ONOFF_CMD_TOGGLE),
+            |w, t| {
+                w.start_struct(t)?;
+                w.end_container()
+            },
+            now_ms(&start),
+            &mut tx,
+        )
+        .map_err(|e| format!("start Toggle over resumed session: {e:?}"))?;
+    send_dir(&socket, &tx, &dir);
+    match drive_until_im_event(&mut stack, &socket, &start, &mut rx, &mut tx) {
+        Some(ImEvent::InvokeDone { status }) if status.is_success() => {
+            println!("[resumption] Toggle over RESUMED session acknowledged (status = Success)");
+        }
+        Some(ev) => return Err(format!("Toggle over resumed session failed: {ev:?}")),
+        None => return Err("Toggle over resumed session timed out".into()),
+    }
+    settle(&mut stack, &socket, &start, &mut rx, &mut tx)?;
+
+    println!("[done] commissioning + Toggle + Read + CASE resumption succeeded");
     Ok(())
+}
+
+/// SC(CASE/PASE)イベントを 1 件待つ(タイムアウトで `None`)。
+fn drive_until_sc_event(
+    stack: &mut Ctrl<'_>,
+    socket: &UdpSocket,
+    start: &Instant,
+    rx: &mut [u8],
+    tx: &mut [u8],
+) -> Option<ScEvent> {
+    loop {
+        match socket.recv_from(rx) {
+            Ok((n, src)) => {
+                let now = start.elapsed().as_millis() as u64;
+                if let Some(dir) = stack.handle_rx(&mut rx[..n], PeerAddr::Udp(src), now, tx) {
+                    send_dir(socket, tx, &dir);
+                }
+                if let Some(ev) = stack.sc_take_event() {
+                    return Some(ev);
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
+            Err(_) => return None,
+        }
+        let now = start.elapsed().as_millis() as u64;
+        while let Some(dir) = stack.poll(now, tx) {
+            send_dir(socket, tx, &dir);
+        }
+        if let Some(ev) = stack.sc_take_event() {
+            return Some(ev);
+        }
+        if start.elapsed() > OVERALL_TIMEOUT {
+            return None;
+        }
+    }
 }
 
 /// [`Commissioner::drive`] を進捗が止まるまで回し、送信を排出して現フェーズを返す。

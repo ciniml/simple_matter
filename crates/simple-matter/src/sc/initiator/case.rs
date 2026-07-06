@@ -19,6 +19,9 @@ use crate::tlv::{ContainerType, TlvReader, TlvTag, TlvValue, TlvWriter};
 /// MRP `session_parameters`(ctx5)は初期スコープでは省略する(responder [`encode_sigma2`] と
 /// 同じ乖離。optional のため相互運用に影響せず、テストは両側を制御する)。
 ///
+/// `resumption` に `(resumptionID, initiatorResumeMIC)` を渡すと ctx6/ctx7 を付けて
+/// session resumption を要求する(`docs/design/secure-channel.md` §7.4)。
+///
 /// [`encode_sigma2`]: crate::sc::case::responder::encode_sigma2
 pub fn encode_sigma1(
     out: &mut [u8],
@@ -26,6 +29,10 @@ pub fn encode_sigma1(
     initiator_ssid: u16,
     destination_id: &[u8; case::CASE_DEST_ID_LEN],
     eph_pub: &[u8; case::CASE_EPH_PUBLIC_KEY_LEN],
+    resumption: Option<(
+        &[u8; case::CASE_RESUMPTION_ID_LEN],
+        &[u8; case::RESUME_MIC_LEN],
+    )>,
 ) -> Result<usize> {
     let mut w = TlvWriter::new(out);
     w.start_struct(&TlvTag::Anonymous)?;
@@ -33,6 +40,10 @@ pub fn encode_sigma1(
     w.write_u16(&TlvTag::ContextSpecific(2), initiator_ssid)?;
     w.write_bytes(&TlvTag::ContextSpecific(3), destination_id)?;
     w.write_bytes(&TlvTag::ContextSpecific(4), eph_pub)?;
+    if let Some((rid, mic)) = resumption {
+        w.write_bytes(&TlvTag::ContextSpecific(6), rid)?;
+        w.write_bytes(&TlvTag::ContextSpecific(7), mic)?;
+    }
     w.end_container()?;
     Ok(w.len())
 }
@@ -81,6 +92,52 @@ impl<'a> Sigma2<'a> {
             responder_ssid: responder_ssid.ok_or(Error::Decode)?,
             eph_pub: eph_pub.ok_or(Error::Decode)?,
             encrypted2: encrypted2.ok_or(Error::Decode)?,
+        })
+    }
+}
+
+/// Sigma2_Resume(responder → initiator)の解析結果(借用ビュー。§7.4)。
+#[derive(Debug, Clone, Copy)]
+pub struct Sigma2Resume<'a> {
+    /// responder が新規採番した resumptionID(16 バイト)。
+    pub resumption_id: &'a [u8],
+    /// sigma2ResumeMIC(16 バイト)。
+    pub resume_mic: &'a [u8],
+    /// responder が採番したワイヤ session id。
+    pub responder_ssid: u16,
+}
+
+impl<'a> Sigma2Resume<'a> {
+    /// Sigma2_Resume TLV payload を解析する。
+    ///
+    /// MRP `session_parameters`(ctx4)は読み飛ばす。必須フィールド欠落・型不一致は
+    /// [`Error::Decode`]。panic しない。
+    pub fn decode(payload: &'a [u8]) -> Result<Self> {
+        let mut r = TlvReader::new(payload);
+        if r.enter_container()? != ContainerType::Structure {
+            return Err(Error::Decode);
+        }
+        let mut resumption_id = None;
+        let mut resume_mic = None;
+        let mut responder_ssid = None;
+        while let Some(elem) = r.read_next()? {
+            if matches!(elem.value, TlvValue::ContainerEnd) {
+                break;
+            }
+            match elem.tag {
+                TlvTag::ContextSpecific(1) => resumption_id = Some(elem.value.as_bytes()?),
+                TlvTag::ContextSpecific(2) => resume_mic = Some(elem.value.as_bytes()?),
+                TlvTag::ContextSpecific(3) => {
+                    responder_ssid =
+                        Some(u16::try_from(elem.value.as_unsigned()?).map_err(|_| Error::Decode)?);
+                }
+                _ => r.skip(&elem)?,
+            }
+        }
+        Ok(Self {
+            resumption_id: resumption_id.ok_or(Error::Decode)?,
+            resume_mic: resume_mic.ok_or(Error::Decode)?,
+            responder_ssid: responder_ssid.ok_or(Error::Decode)?,
         })
     }
 }
@@ -149,6 +206,15 @@ pub struct CaseInitiator<C: Crypto> {
     pub peer_node_id: u64,
     /// responder が採番したワイヤ session id(commit 時に peer_session_id へ)。
     pub peer_ssid: u16,
+    /// Sigma1 に載せた initiatorRandom(resumption の鍵導出・MIC 検証に用いる。§7.4)。
+    pub initiator_random: [u8; case::CASE_RANDOM_LEN],
+    /// Sigma1 で要求した resumption の旧 resumptionID(要求しなかった場合は [`None`])。
+    ///
+    /// [`Some`] のとき [`CaseInitiator::shared_secret`] は開始時点でレコードの
+    /// SharedSecret に初期化されている(フル Sigma2 が来たら ECDH 結果で上書きされる)。
+    pub attempted_resumption_id: Option<[u8; case::CASE_RESUMPTION_ID_LEN]>,
+    /// フル CASE の Sigma2 TBE2 から取り出した相手採番の resumptionID(commit 時に保存)。
+    pub peer_resumption_id: Option<[u8; case::CASE_RESUMPTION_ID_LEN]>,
 }
 
 #[cfg(test)]
@@ -161,12 +227,35 @@ mod tests {
         let dest = [0x22u8; case::CASE_DEST_ID_LEN];
         let epk = [0x04u8; case::CASE_EPH_PUBLIC_KEY_LEN];
         let mut buf = [0u8; 256];
-        let n = encode_sigma1(&mut buf, &ir, 0x7777, &dest, &epk).unwrap();
+        let n = encode_sigma1(&mut buf, &ir, 0x7777, &dest, &epk, None).unwrap();
         let s1 = crate::sc::case::responder::Sigma1::decode(&buf[..n]).unwrap();
         assert_eq!(s1.initiator_random, &ir);
         assert_eq!(s1.initiator_sessid, 0x7777);
         assert_eq!(s1.destination_id, &dest);
         assert_eq!(s1.initiator_eph_pub_key, &epk);
+        assert!(!s1.has_resumption());
+
+        // resumption フィールド付きも responder デコーダで往復する。
+        let rid = [0x66u8; case::CASE_RESUMPTION_ID_LEN];
+        let mic = [0x77u8; case::RESUME_MIC_LEN];
+        let n2 = encode_sigma1(&mut buf, &ir, 0x7777, &dest, &epk, Some((&rid, &mic))).unwrap();
+        let s1r = crate::sc::case::responder::Sigma1::decode(&buf[..n2]).unwrap();
+        assert!(s1r.has_resumption());
+        assert_eq!(s1r.resumption_id, Some(&rid[..]));
+        assert_eq!(s1r.resume_mic, Some(&mic[..]));
+    }
+
+    #[test]
+    fn sigma2_resume_decode_matches_responder_encoder() {
+        let rid = [0x88u8; case::CASE_RESUMPTION_ID_LEN];
+        let mic = [0x99u8; case::RESUME_MIC_LEN];
+        let mut buf = [0u8; 128];
+        let n =
+            crate::sc::case::responder::encode_sigma2_resume(&mut buf, &rid, &mic, 0x4321).unwrap();
+        let s2r = Sigma2Resume::decode(&buf[..n]).unwrap();
+        assert_eq!(s2r.resumption_id, &rid);
+        assert_eq!(s2r.resume_mic, &mic);
+        assert_eq!(s2r.responder_ssid, 0x4321);
     }
 
     #[test]

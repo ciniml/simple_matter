@@ -56,7 +56,7 @@ pub enum OpCode {
     CaseSigma2 = 0x31,
     /// CASE Sigma3(初期スコープ外)。
     CaseSigma3 = 0x32,
-    /// CASE Sigma2Resume(resumption。初期スコープ外)。
+    /// CASE Sigma2Resume(session resumption。設計 §7.4)。
     CaseSigma2Resume = 0x33,
     /// StatusReport(終端語彙)。
     StatusReport = 0x40,
@@ -108,6 +108,10 @@ pub mod handshake;
 
 #[cfg(feature = "rustcrypto")]
 pub mod pase;
+
+/// CASE session resumption の状態保持(設計 §7.4。メモリ内固定容量ストア)。
+#[cfg(feature = "rustcrypto")]
+pub mod resumption;
 
 /// SC initiator(コントローラ側 PASE / CASE)ハンドラ。
 ///

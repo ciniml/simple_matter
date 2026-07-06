@@ -26,18 +26,23 @@ pub struct Sigma1<'a> {
     pub destination_id: &'a [u8],
     /// initiator のエフェメラル公開鍵(SEC1 非圧縮 65 バイト)。
     pub initiator_eph_pub_key: &'a [u8],
-    /// resumptionID が存在したか(未対応。フルハンドシェイクへフォールバック)。
-    pub has_resumption_id: bool,
-    /// initiatorResumeMIC が存在したか。
-    pub has_resume_mic: bool,
+    /// resumptionID(ctx6・16B。resumption 要求時のみ存在)。
+    pub resumption_id: Option<&'a [u8]>,
+    /// initiatorResumeMIC(ctx7・16B。resumption 要求時のみ存在)。
+    pub resume_mic: Option<&'a [u8]>,
 }
 
 impl<'a> Sigma1<'a> {
+    /// resumption 要求(ctx6/ctx7 とも存在)なら `true`。
+    pub fn has_resumption(&self) -> bool {
+        self.resumption_id.is_some() && self.resume_mic.is_some()
+    }
+
     /// Sigma1 TLV payload を解析する。
     ///
     /// MRP `session_parameters`(ctx5)は読み飛ばす。resumption フィールド(ctx6/ctx7)は
-    /// 存在有無のみ記録し、値は用いない(フルハンドシェイクへフォールバック)。必須
-    /// フィールド欠落・型不一致は [`Error::Decode`]。panic しない。
+    /// 値ごと借用で保持する(§7.4 の照合に用いる)。必須フィールド欠落・型不一致は
+    /// [`Error::Decode`]。panic しない。
     pub fn decode(payload: &'a [u8]) -> Result<Self> {
         let mut r = TlvReader::new(payload);
         if r.enter_container()? != ContainerType::Structure {
@@ -47,8 +52,8 @@ impl<'a> Sigma1<'a> {
         let mut initiator_sessid = None;
         let mut destination_id = None;
         let mut initiator_eph_pub_key = None;
-        let mut has_resumption_id = false;
-        let mut has_resume_mic = false;
+        let mut resumption_id = None;
+        let mut resume_mic = None;
         while let Some(elem) = r.read_next()? {
             if matches!(elem.value, TlvValue::ContainerEnd) {
                 break;
@@ -58,14 +63,8 @@ impl<'a> Sigma1<'a> {
                 TlvTag::ContextSpecific(2) => initiator_sessid = Some(u16_of(&elem.value)?),
                 TlvTag::ContextSpecific(3) => destination_id = Some(elem.value.as_bytes()?),
                 TlvTag::ContextSpecific(4) => initiator_eph_pub_key = Some(elem.value.as_bytes()?),
-                TlvTag::ContextSpecific(6) => {
-                    has_resumption_id = true;
-                    r.skip(&elem)?;
-                }
-                TlvTag::ContextSpecific(7) => {
-                    has_resume_mic = true;
-                    r.skip(&elem)?;
-                }
+                TlvTag::ContextSpecific(6) => resumption_id = Some(elem.value.as_bytes()?),
+                TlvTag::ContextSpecific(7) => resume_mic = Some(elem.value.as_bytes()?),
                 _ => r.skip(&elem)?,
             }
         }
@@ -74,8 +73,8 @@ impl<'a> Sigma1<'a> {
             initiator_sessid: initiator_sessid.ok_or(Error::Decode)?,
             destination_id: destination_id.ok_or(Error::Decode)?,
             initiator_eph_pub_key: initiator_eph_pub_key.ok_or(Error::Decode)?,
-            has_resumption_id,
-            has_resume_mic,
+            resumption_id,
+            resume_mic,
         })
     }
 }
@@ -97,6 +96,26 @@ pub fn encode_sigma2(
     w.write_u16(&TlvTag::ContextSpecific(2), responder_sessid)?;
     w.write_bytes(&TlvTag::ContextSpecific(3), responder_eph_pub_key)?;
     w.write_bytes(&TlvTag::ContextSpecific(4), encrypted2)?;
+    w.end_container()?;
+    Ok(w.len())
+}
+
+/// Sigma2_Resume の外枠 TLV(responder → initiator)を `out` に直列化する(§7.4)。
+///
+/// `{ ctx1: resumptionID(新規採番・16B), ctx2: sigma2ResumeMIC(16B),
+/// ctx3: responderSessionID(u16) }`。MRP `session_parameters`(ctx4)はフル Sigma2 と
+/// 同じ割り切りで省略する(optional)。書き込み長を返す。
+pub fn encode_sigma2_resume(
+    out: &mut [u8],
+    new_resumption_id: &[u8; CASE_RESUMPTION_ID_LEN],
+    resume_mic: &[u8; RESUME_MIC_LEN],
+    responder_sessid: u16,
+) -> Result<usize> {
+    let mut w = TlvWriter::new(out);
+    w.start_struct(&TlvTag::Anonymous)?;
+    w.write_bytes(&TlvTag::ContextSpecific(1), new_resumption_id)?;
+    w.write_bytes(&TlvTag::ContextSpecific(2), resume_mic)?;
+    w.write_u16(&TlvTag::ContextSpecific(3), responder_sessid)?;
     w.end_container()?;
     Ok(w.len())
 }
@@ -158,8 +177,61 @@ mod tests {
         assert_eq!(s1.initiator_sessid, 0x1234);
         assert_eq!(s1.destination_id, &dest);
         assert_eq!(s1.initiator_eph_pub_key, &epk);
-        assert!(s1.has_resumption_id);
-        assert!(s1.has_resume_mic);
+        assert_eq!(s1.resumption_id, Some(&[0xAAu8; 16][..]));
+        assert_eq!(s1.resume_mic, Some(&[0xBBu8; 16][..]));
+        assert!(s1.has_resumption());
+    }
+
+    /// chip-tool 実ワイヤ相当: MRP `session_parameters`(ctx5・ネスト struct)が
+    /// resumption フィールド(ctx6/ctx7)の**前**に挟まっても正しく読める。
+    #[test]
+    fn sigma1_with_mrp_params_before_resumption_fields() {
+        let ir = [0x11u8; CASE_RANDOM_LEN];
+        let dest = [0x22u8; CASE_DEST_ID_LEN];
+        let epk = [0x04u8; CASE_EPH_PUBLIC_KEY_LEN];
+        let mut buf = [0u8; 320];
+        let n = {
+            let mut w = TlvWriter::new(&mut buf);
+            w.start_struct(&TlvTag::Anonymous).unwrap();
+            w.write_bytes(&TlvTag::ContextSpecific(1), &ir).unwrap();
+            w.write_u16(&TlvTag::ContextSpecific(2), 0x1234).unwrap();
+            w.write_bytes(&TlvTag::ContextSpecific(3), &dest).unwrap();
+            w.write_bytes(&TlvTag::ContextSpecific(4), &epk).unwrap();
+            // ctx5: MRP session params(ネスト struct)。
+            w.start_struct(&TlvTag::ContextSpecific(5)).unwrap();
+            w.write_u16(&TlvTag::ContextSpecific(1), 500).unwrap();
+            w.write_u16(&TlvTag::ContextSpecific(2), 300).unwrap();
+            w.write_u16(&TlvTag::ContextSpecific(4), 4000).unwrap();
+            w.end_container().unwrap();
+            w.write_bytes(
+                &TlvTag::ContextSpecific(6),
+                &[0xAAu8; CASE_RESUMPTION_ID_LEN],
+            )
+            .unwrap();
+            w.write_bytes(&TlvTag::ContextSpecific(7), &[0xBBu8; 16])
+                .unwrap();
+            w.end_container().unwrap();
+            w.len()
+        };
+        let s1 = Sigma1::decode(&buf[..n]).unwrap();
+        assert!(s1.has_resumption());
+        assert_eq!(s1.resumption_id, Some(&[0xAAu8; 16][..]));
+    }
+
+    #[test]
+    fn sigma2_resume_encodes_expected_fields() {
+        let rid = [0xCDu8; CASE_RESUMPTION_ID_LEN];
+        let mic = [0xEFu8; RESUME_MIC_LEN];
+        let mut buf = [0u8; 128];
+        let n = encode_sigma2_resume(&mut buf, &rid, &mic, 0xBEEF).unwrap();
+        let mut r = crate::tlv::TlvReader::new(&buf[..n]);
+        r.enter_container().unwrap();
+        let e1 = r.read_next().unwrap().unwrap();
+        assert_eq!(e1.value.as_bytes().unwrap(), &rid);
+        let e2 = r.read_next().unwrap().unwrap();
+        assert_eq!(e2.value.as_bytes().unwrap(), &mic);
+        let e3 = r.read_next().unwrap().unwrap();
+        assert_eq!(e3.value.as_unsigned().unwrap(), 0xBEEF);
     }
 
     #[test]

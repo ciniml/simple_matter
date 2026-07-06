@@ -237,8 +237,14 @@ fn main() -> std::io::Result<()> {
         match socket.recv_from(&mut rx) {
             Ok((n, src)) => {
                 let now = now_ms(&start);
+                // MATTER_DEBUG=2: 受信 datagram の hex ダンプ(プロトコル調査用)。
+                let debug = std::env::var("MATTER_DEBUG").ok();
+                if debug.as_deref() == Some("2") {
+                    let hex: String = rx[..n].iter().map(|b| format!("{b:02x}")).collect();
+                    eprintln!("[rx-hex] {n}B from {src}: {hex}");
+                }
                 let dir = stack.handle_rx(&mut rx[..n], PeerAddr::Udp(src), now, &mut tx);
-                if std::env::var_os("MATTER_DEBUG").is_some() {
+                if debug.is_some() {
                     eprintln!(
                         "[rx] {n}B from {src} -> {}",
                         match &dir {

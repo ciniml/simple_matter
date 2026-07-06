@@ -380,7 +380,7 @@ struct CaseInitiator {
 ```rust
 pub enum ScEvent {
     PaseEstablished { session: SessionId },
-    CaseEstablished { session: SessionId },
+    CaseEstablished { session: SessionId, resumed: bool },  // resumed: §3.6 の resumption 経由か
     Failed { kind: HandshakeKindTag, reason: ScFailReason },  // StatusReport 値 or Timeout
 }
 impl<C: Crypto> ScInitiator<'_, C> {
@@ -392,6 +392,23 @@ impl<C: Crypto> ScInitiator<'_, C> {
 (1 深度イベント + ポーリング)**にする。コールバック(クロージャ登録)を採らないのは、
 no_std でのクロージャ所有・ライフタイムの複雑化を避け、`Commissioner`(§6)が
 「イベント入力 → 次のコマンド出力」の Mealy machine として素直に書けるため。
+
+### 3.6 CASE resumption(initiator 側)
+
+`secure-channel.md` §7.4 の initiator 鏡像。設計の詳細(レコード構造・鍵導出・容量/追い出し)
+は同節を正とし、ここでは initiator 固有の配線だけ記す:
+
+- `ScInitiator` は `ResumptionStore<4>`(メモリ内・FIFO 追い出し)を内包する。公開 API は
+  不変: `start_case` が store を `(fabric_idx, peer_node_id)` で引き、レコードがあれば
+  Sigma1 に resumptionID(ctx6)+ S1RK ベースの initiatorResumeMIC(ctx7)を自動で付ける。
+- 応答分岐: `CaseSigma2Resume`(0x33)なら MIC 検証 → "SessionResumptionKeys" で鍵導出 →
+  commit → 成功 StatusReport を `HandlerAction::Close` で返し
+  `ScEvent::CaseEstablished { resumed: true }`。フル `CaseSigma2` なら従来経路
+  (responder がレコードを失っていた場合の自動フォールバック)。
+- フル CASE 成功時は Sigma2 の TBE2 から resumptionID(ctx4)を取り出して保存、
+  resumption 成功時は受信した新 resumptionID でローテート保存。
+- 永続化は今回スコープ外(プロセス内のみ)。§10-7 の operational 再接続で KVS 接続時に
+  レコードの export/import を足す。
 
 ---
 
@@ -908,8 +925,9 @@ green」を含める。
    必要が出る。現設計は別スタック(ポート分離)で割り切っており、統合には
    ProtocolMux の 4 スロット化(ScResp/ScInit/ImServer/ImClient)が要る。
 7. **operational 再接続**。コミッショニング後にコントローラを再起動した場合の
-   CASE 再確立(operational discovery → start_case)と session resumption
-   (Sigma2Resume。transport-exchange §12-8 / secure-channel §10-5 と連動)。
+   CASE 再確立(operational discovery → start_case)。session resumption(Sigma2Resume)
+   自体は §3.6 / secure-channel §7.4 で実装済み(プロセス内)。再起動をまたぐには
+   resumption レコードと CA 状態の永続化(KVS)が要る。
 8. **失敗時の後始末**。`Failed` 終端でコントローラ側は slot/セッションを破棄するのみで、
    デバイス側の巻き戻しは fail-safe expiry 任せにしている。明示的な
    CloseSession StatusReport 送出や ArmFailSafe(0) での即時解除を送るべきか。

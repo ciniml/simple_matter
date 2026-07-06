@@ -24,12 +24,13 @@ use crate::transport::session::{SessionInit, SessionManager, SessionMode};
 
 use super::case::creds::{Fabric, FabricStore, NocResolver};
 use super::case::responder as case;
-use super::handshake::{CaseCtx, HandshakeKind, HandshakePool, PasePhase};
+use super::handshake::{CaseCtx, CaseResumeCtx, HandshakeKind, HandshakePool, PasePhase};
 use super::pase::{
     build_context, encode_pake2, encode_pbkdf_param_resp, Pake1, Pake3, PbkdfParamReq, KEY_LEN,
     SESSION_KEYS_LEN, SPAKE2P_ITERATION_COUNT, SPAKE2P_SESSION_KEYS_INFO,
 };
-use super::status::{ScStatusCode, StatusReport, PROTO_ID_SECURE_CHANNEL};
+use super::resumption::{ResumptionStore, RESUMPTION_CACHE_LEN};
+use super::status::{GeneralCode, ScStatusCode, StatusReport, PROTO_ID_SECURE_CHANNEL};
 use super::OpCode;
 
 /// PASE セッション確立のタイムアウト(ミリ秒)。60s(`PASE_SESSION_EST_TIMEOUT`)。
@@ -112,6 +113,8 @@ pub struct SecureChannel<'c, C: Crypto, R: Rng, F, const H: usize> {
     config: PaseConfig,
     fabrics: F,
     pool: HandshakePool<H, C::Sha256>,
+    /// CASE session resumption レコード(メモリ内・固定容量。設計 §7.4)。
+    resumptions: ResumptionStore<RESUMPTION_CACHE_LEN>,
 }
 
 impl<'c, C: Crypto, R: Rng, F, const H: usize> SecureChannel<'c, C, R, F, H> {
@@ -136,12 +139,18 @@ impl<'c, C: Crypto, R: Rng, F, const H: usize> SecureChannel<'c, C, R, F, H> {
             config,
             fabrics,
             pool: HandshakePool::new(),
+            resumptions: ResumptionStore::new(),
         }
     }
 
     /// 進行中ハンドシェイク数を返す。
     pub fn handshake_count(&self) -> usize {
         self.pool.len()
+    }
+
+    /// 保持している CASE resumption レコード数を返す(§7.4)。
+    pub fn resumption_count(&self) -> usize {
+        self.resumptions.len()
     }
 
     /// 期限切れ(60s 超過)のハンドシェイク slot を回収し、予約セッションを解放する。
@@ -442,6 +451,234 @@ impl<C: Crypto, R: Rng, F: FabricStore + NocResolver, const H: usize>
         None
     }
 
+    /// Sigma1 の resumption 要求を照合し、成立すれば Sigma2_Resume を返す(§7.4)。
+    ///
+    /// 戻り値 [`None`] は「resumption 不成立 = フル CASE へフォールバック」
+    /// (未知 resumptionID・MIC 不一致・レコードの fabric 消滅・フィールド長不正)。
+    /// [`Some`] は resumption 経路で処理を終えたこと(Sigma2_Resume 応答 or Busy)。
+    fn case_try_resume<const S: usize>(
+        &mut self,
+        rx: &RxMessage<'_>,
+        tx: &mut [u8],
+        sessions: &mut SessionManager<S>,
+        now_ms: u64,
+        sigma1: &case::Sigma1<'_>,
+    ) -> Option<Result<HandlerAction>> {
+        let crypto = self.crypto;
+        let old_rid: &[u8; case::CASE_RESUMPTION_ID_LEN] = sigma1.resumption_id?.try_into().ok()?;
+        let initiator_random: &[u8; case::CASE_RANDOM_LEN] =
+            sigma1.initiator_random.try_into().ok()?;
+        let mic = sigma1.resume_mic?;
+
+        // レコード照合 → fabric 生存確認 → S1RK で MIC 検証。いずれも不成立ならフルへ。
+        let (fabric_index, peer_node_id, shared_secret) = {
+            let record = self.resumptions.find_by_id(old_rid)?;
+            self.fabrics.get(record.fabric_index)?;
+            case::verify_resume_mic(
+                crypto,
+                initiator_random,
+                old_rid,
+                &record.shared_secret,
+                case::SIGMA1_RESUME_KEY_INFO,
+                case::SIGMA1_RESUME_NONCE,
+                mic,
+            )
+            .ok()?;
+            (
+                record.fabric_index,
+                record.peer_node_id,
+                record.shared_secret.clone(),
+            )
+        };
+
+        Some(self.case_resume_open(
+            rx,
+            tx,
+            sessions,
+            now_ms,
+            sigma1.initiator_sessid,
+            initiator_random,
+            old_rid,
+            fabric_index,
+            peer_node_id,
+            shared_secret,
+        ))
+    }
+
+    /// resumption 成立後の Sigma2_Resume 応答を組み立てる(§7.4)。
+    ///
+    /// セッション slot を予約し、新 resumptionID を採番して sigma2ResumeMIC とセッション鍵
+    /// (info = "SessionResumptionKeys")を導出、slot を [`HandshakeKind::CaseResume`] で開く。
+    /// commit は initiator の成功 StatusReport 受信時(chip と同順序)。
+    #[allow(clippy::too_many_arguments)]
+    fn case_resume_open<const S: usize>(
+        &mut self,
+        rx: &RxMessage<'_>,
+        tx: &mut [u8],
+        sessions: &mut SessionManager<S>,
+        now_ms: u64,
+        initiator_sessid: u16,
+        initiator_random: &[u8; case::CASE_RANDOM_LEN],
+        old_rid: &[u8; case::CASE_RESUMPTION_ID_LEN],
+        fabric_index: NonZeroU8,
+        peer_node_id: u64,
+        shared_secret: Zeroizing<[u8; case::SHARED_SECRET_LEN]>,
+    ) -> Result<HandlerAction> {
+        let crypto = self.crypto;
+
+        // 同時ハンドシェイク上限超過 → Busy。
+        if self.pool.is_full() {
+            return self.busy(tx);
+        }
+
+        let peer_addr = match sessions.get(rx.exchange.session()) {
+            Some(s) => s.peer_addr(),
+            None => return Err(Error::InvalidState),
+        };
+        let reserved = match sessions.reserve(peer_addr, now_ms) {
+            Ok(id) => id,
+            Err(_) => return self.busy(tx),
+        };
+        let responder_ssid = match sessions.get(reserved) {
+            Some(s) => s.local_session_id(),
+            None => {
+                sessions.remove(reserved);
+                return Err(Error::InvalidState);
+            }
+        };
+
+        // 新 resumptionID の採番と S2RK ベースの sigma2ResumeMIC。
+        let mut new_rid = [0u8; case::CASE_RESUMPTION_ID_LEN];
+        if self.rng.fill_bytes(&mut new_rid).is_err() {
+            sessions.remove(reserved);
+            return Err(Error::Crypto);
+        }
+        let mut mic = [0u8; case::RESUME_MIC_LEN];
+        if case::compute_resume_mic(
+            crypto,
+            initiator_random,
+            &new_rid,
+            &shared_secret,
+            case::SIGMA2_RESUME_KEY_INFO,
+            case::SIGMA2_RESUME_NONCE,
+            &mut mic,
+        )
+        .is_err()
+        {
+            sessions.remove(reserved);
+            return self.terminal(tx, ScStatusCode::InvalidParameter, &[]);
+        }
+
+        // セッション鍵(salt = initiatorRandom ‖ 旧 resumptionID)。commit まで slot に保持。
+        let mut keys = Zeroizing::new([0u8; case::CASE_SESSION_KEYS_LEN]);
+        if case::derive_resumption_session_keys(
+            crypto,
+            initiator_random,
+            old_rid,
+            &shared_secret,
+            &mut keys,
+        )
+        .is_err()
+        {
+            sessions.remove(reserved);
+            return self.terminal(tx, ScStatusCode::InvalidParameter, &[]);
+        }
+
+        let len = match case::encode_sigma2_resume(tx, &new_rid, &mic, responder_ssid) {
+            Ok(n) => n,
+            Err(_) => {
+                sessions.remove(reserved);
+                return self.terminal(tx, ScStatusCode::InvalidParameter, &[]);
+            }
+        };
+
+        let ctx = CaseResumeCtx {
+            fabric_index,
+            peer_node_id,
+            session_keys: keys,
+            new_resumption_id: new_rid,
+            shared_secret,
+        };
+        if self
+            .pool
+            .open(
+                rx.exchange,
+                reserved,
+                initiator_sessid,
+                now_ms,
+                HandshakeKind::CaseResume(ctx),
+            )
+            .is_err()
+        {
+            sessions.remove(reserved);
+            return self.busy(tx);
+        }
+
+        Ok(HandlerAction::Respond {
+            opcode: OpCode::CaseSigma2Resume as u8,
+            proto_id: PROTO_ID_SECURE_CHANNEL,
+            reliable: true,
+            len,
+        })
+    }
+
+    /// initiator の成功 StatusReport を受けて resumption セッションを commit する(§7.4)。
+    ///
+    /// 失敗時(fabric 消滅・commit 失敗)は予約を解放して黙って終える(応答は返さない)。
+    fn case_resume_commit<const S: usize>(
+        &mut self,
+        sessions: &mut SessionManager<S>,
+        reserved: crate::transport::session::SessionId,
+        peer_session_id: u16,
+        ctx: CaseResumeCtx,
+        now_ms: u64,
+    ) {
+        let local_node_id = match self.fabrics.get(ctx.fabric_index) {
+            Some(f) => f.node_id(),
+            None => {
+                sessions.remove(reserved);
+                return;
+            }
+        };
+        let peer_addr = match sessions.get(reserved) {
+            Some(s) => s.peer_addr(),
+            None => return,
+        };
+        // responder: I2R→dec, R2I→enc, att。
+        let mut dec_key = [0u8; KEY_LEN];
+        let mut enc_key = [0u8; KEY_LEN];
+        let mut att = [0u8; KEY_LEN];
+        dec_key.copy_from_slice(&ctx.session_keys[0..KEY_LEN]);
+        enc_key.copy_from_slice(&ctx.session_keys[KEY_LEN..2 * KEY_LEN]);
+        att.copy_from_slice(&ctx.session_keys[2 * KEY_LEN..3 * KEY_LEN]);
+        let tx_ctr_start = self.initial_tx_ctr();
+        let init = SessionInit {
+            peer_addr,
+            local_node_id,
+            peer_node_id: Some(ctx.peer_node_id),
+            peer_session_id,
+            tx_ctr_start,
+            rx_ctr_start: 0,
+            mode: SessionMode::Case {
+                fabric_idx: ctx.fabric_index,
+            },
+            enc_key,
+            dec_key,
+            att_challenge: att,
+        };
+        if sessions.commit(reserved, init, now_ms).is_err() {
+            sessions.remove(reserved);
+            return;
+        }
+        // レコードを新 resumptionID でローテート保存(SharedSecret は不変)。
+        self.resumptions.save(
+            ctx.fabric_index,
+            ctx.peer_node_id,
+            &ctx.new_resumption_id,
+            &ctx.shared_secret,
+        );
+    }
+
     /// CASE Sigma1 を受けて Sigma2 を返す(§7.1)。
     fn case_open<const S: usize>(
         &mut self,
@@ -458,9 +695,16 @@ impl<C: Crypto, R: Rng, F: FabricStore + NocResolver, const H: usize>
         };
 
         // resumptionID / initiatorResumeMIC は両方存在か両方欠落でなければ不正(Matter 仕様)。
-        // 存在する場合も resumption は未対応でフルハンドシェイクへフォールバックする。
-        if sigma1.has_resumption_id != sigma1.has_resume_mic {
+        if sigma1.resumption_id.is_some() != sigma1.resume_mic.is_some() {
             return self.terminal(tx, ScStatusCode::InvalidParameter, &[]);
+        }
+
+        // resumption 要求(§7.4): レコード照合 + MIC 検証が通れば Sigma2_Resume で応じる。
+        // 不成立(未知 ID・MIC 不一致・fabric 消滅・長さ不正)はフル CASE へフォールバック。
+        if sigma1.has_resumption() {
+            if let Some(action) = self.case_try_resume(rx, tx, sessions, now_ms, &sigma1) {
+                return action;
+            }
         }
 
         let peer_pub: &[u8; case::CASE_EPH_PUBLIC_KEY_LEN] =
@@ -524,7 +768,7 @@ impl<C: Crypto, R: Rng, F: FabricStore + NocResolver, const H: usize>
             return self.terminal(tx, ScStatusCode::InvalidParameter, &[]);
         }
 
-        // responder_random / resumption_id(resumption 未対応だが TBE2 に載せる 16B)。
+        // responder_random / resumption_id(TBE2 に載せ、成功時にレコード保存する 16B)。
         let mut responder_random = [0u8; case::CASE_RANDOM_LEN];
         let mut resumption_id = [0u8; case::CASE_RESUMPTION_ID_LEN];
         if self.rng.fill_bytes(&mut responder_random).is_err()
@@ -634,6 +878,7 @@ impl<C: Crypto, R: Rng, F: FabricStore + NocResolver, const H: usize>
             our_pub_key: our_pub,
             peer_pub_key: *peer_pub,
             tt,
+            resumption_id,
         };
         if self
             .pool
@@ -839,6 +1084,15 @@ impl<C: Crypto, R: Rng, F: FabricStore + NocResolver, const H: usize>
             return self.terminal(tx, ScStatusCode::InvalidParameter, &[]);
         }
 
+        // フル CASE 成功: resumption レコードを保存(TBE2 に載せた resumptionID + ECDH
+        // SharedSecret。§7.4)。
+        self.resumptions.save(
+            ctx.fabric_index,
+            peer_node_id,
+            &ctx.resumption_id,
+            &ctx.shared_secret,
+        );
+
         self.terminal(tx, ScStatusCode::SessionEstablishmentSuccess, &[])
     }
 }
@@ -862,9 +1116,35 @@ impl<C: Crypto, R: Rng, F: FabricStore + NocResolver, const H: usize> ProtocolHa
             OpCode::CaseSigma1 => self.case_open(rx, tx, sessions, now_ms),
             OpCode::CaseSigma3 => self.case_step(rx, tx, sessions, now_ms),
             OpCode::StatusReport => {
-                // 相手からの中断: slot を解放して黙って終える(reserve は on_tick で回収)。
+                // CASE resumption(Sigma2_Resume 送信済み)slot への成功 StatusReport は
+                // commit の合図(§7.4)。それ以外(相手からの中断)は slot を解放して
+                // 黙って終える。
                 if let Some(slot) = self.pool.close(rx.exchange) {
-                    sessions.remove(slot.reserved());
+                    let reserved = slot.reserved();
+                    let peer_session_id = slot.peer_session_id();
+                    match slot.into_case_resume() {
+                        Some(ctx) => {
+                            let success = StatusReport::decode(rx.payload).is_ok_and(|sr| {
+                                sr.general_code == GeneralCode::Success
+                                    && sr.proto_code
+                                        == ScStatusCode::SessionEstablishmentSuccess as u16
+                            });
+                            if success {
+                                self.case_resume_commit(
+                                    sessions,
+                                    reserved,
+                                    peer_session_id,
+                                    ctx,
+                                    now_ms,
+                                );
+                            } else {
+                                sessions.remove(reserved);
+                            }
+                        }
+                        None => {
+                            sessions.remove(reserved);
+                        }
+                    }
                 }
                 Ok(HandlerAction::None)
             }
@@ -2427,8 +2707,8 @@ mod case_tests {
         assert_eq!(sessions.len(), 1);
     }
 
-    /// resumption フィールド付き Sigma1 は(未対応のため)フルハンドシェイクへフォールバック
-    /// し、正常に Sigma2 を返す。
+    /// 未知の resumptionID を載せた Sigma1 はフルハンドシェイクへフォールバックし、
+    /// 正常に Sigma2 を返す(§7.4)。
     #[test]
     fn sigma1_with_resumption_falls_back_to_full_handshake() {
         let crypto = crypto();

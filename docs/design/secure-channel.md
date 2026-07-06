@@ -127,7 +127,7 @@ pub enum OpCode {
     CaseSigma1         = 0x30,   // ← CASE responder 入口
     CaseSigma2         = 0x31,
     CaseSigma3         = 0x32,
-    CaseSigma2Resume   = 0x33,   // resumption。初期スコープ外(§7 でスタブ拒否)
+    CaseSigma2Resume   = 0x33,   // resumption(§7.4)
     StatusReport       = 0x40,
 }
 
@@ -531,13 +531,13 @@ pub struct CommissioningState {
 CASE は運用証明書ベース。fabric/credentials(第4段階)への依存が本質だが、**その依存を
 trait 3 つに閉じる**(§8)ことで、第3段階では PASE を先に縦通し CASE を trait スタブで組む。
 
-### 7.1 状態遷移(テキスト図・resumption は初期スコープ外)
+### 7.1 状態遷移(テキスト図。resumption は §7.4)
 
 ```
  (start)  rx CASE_Sigma1(0x30)  [unsecured session 上]
    │  ・destinationId を全 fabric の { IPK, rootPubKey, fabricId, nodeId } で総当り照合
    │     → 一致 fabric_idx を得る(無ければ NoSharedTrustRoots で終端)
-   │  ・resumptionID/resumeMIC 有 → (初期) 通常 Sigma1 として無視 or Sigma2Resume は未対応
+   │  ・resumptionID/resumeMIC 有 → resumption 照合(§7.4)。不成立はフルへフォールバック
    │  ・ephemeral keypair 生成, responder_random, TT に Sigma1 生バイト投入
    ▼
  ┌───────────┐  tx CASE_Sigma2(0x31, 信頼)  reserve(SessionId)
@@ -589,6 +589,90 @@ Sigma1 の `destinationId` = `HMAC-SHA256(key=IPK, msg=initiatorRandom || rootPu
 fabricId || nodeId)`。responder は自分が属する**全 fabric**についてこれを計算し、一致する
 fabric を選ぶ(rs-matter `casep.rs` の `find_fabric`/destination 照合)。一致なしは
 `NoSharedTrustRoots` で終端。`Crypto::hmac_sha256` で計算できる。
+
+### 7.4 CASE resumption(Sigma1 + resumption → Sigma2_Resume)
+
+Matter 仕様 §4.14.4。フル CASE で確立した `SharedSecret` と `resumptionID` を両側が控え、
+再接続時に証明書鎖検証・署名・ECDH を省いた 1 往復 + StatusReport でセッションを再確立する。
+参照実装 connectedhomeip `CASESession.cpp` と一致させる(定数・salt 構成とも)。
+
+#### 状態保持(SessionResumption record・メモリ内のみ)
+
+`sc/resumption.rs` の固定容量ストア(KVS 永続化は今回スコープ外 = プロセス内メモリのみ。
+将来 KVS 接続時はレコードの直列化を足す):
+
+```rust
+pub struct ResumptionRecord {
+    fabric_index: NonZeroU8,          // 所属 fabric(削除された fabric のレコードは照合失敗)
+    peer_node_id: u64,                // 相手の operational NodeId(fabric スコープ)
+    resumption_id: [u8; 16],          // 現行 resumptionID(セッション確立ごとにローテート)
+    shared_secret: Zeroizing<[u8;32]>,// フル CASE の ECDH SharedSecret(resumption でも不変)
+}
+pub struct ResumptionStore<const N: usize = 4> { /* FixedVec + 挿入順 seq */ }
+```
+
+- **キー**: `(fabric_index, peer_node_id)` で upsert(同一ピアは常に 1 レコード)。
+  responder の入口照合は `resumption_id` の線形探索(N=4 なので総当りで十分)。
+- **容量と追い出し**: 既定 `N = 4` レコード(1 レコード ≈ 60 B、常駐 ~256 B)。満杯時は
+  **挿入順が最も古いレコードを追い出す**(FIFO。u32 単調 seq で判定)。デバイスは通常
+  相手コントローラが 1〜2 なので N=4 で運用上十分、追い出されても影響はフル CASE への
+  フォールバックのみ(機能劣化なし)。
+- 置き場所: responder は `SecureChannel` のフィールド、initiator は `ScInitiator` の
+  フィールド(公開 API 変更なし。コンストラクタで空を生成)。
+
+#### 鍵導出とワイヤ(仕様固定・chip `CASESession.cpp` と一致)
+
+- `S1RK = HKDF-SHA256(salt = initiatorRandom(32) ‖ resumptionID(16), ikm = SharedSecret,
+  info = "Sigma1_Resume", L=16)`。`initiatorResumeMIC` = AES-CCM(S1RK, nonce
+  `"NCASE_SigmaS1"`, 空平文, 空 AAD) の 16B タグ。Sigma1 の ctx6 = resumptionID / ctx7 = MIC。
+- `S2RK`: 同型で salt の resumptionID は **responder が新規採番した resumptionID**、
+  info = `"Sigma2_Resume"`、nonce `"NCASE_SigmaS2"`。
+- **Sigma2_Resume(0x33)** = `{ ctx1: resumptionID(新・16B), ctx2: sigma2ResumeMIC(16B),
+  ctx3: responderSessionID(u16) }`(MRP params ctx4 は省略 = フル Sigma2 と同じ割り切り)。
+- セッション鍵 `I2R‖R2I‖Att = HKDF(salt = initiatorRandom ‖ resumptionID(**旧** = Sigma1 の
+  ctx6), ikm = SharedSecret, info = "SessionResumptionKeys", L=48)`。IPK も TT ハッシュも
+  使わない(resumption 経路にトランスクリプトは無い)。
+
+#### responder 側フロー(`case_open` 内で分岐)
+
+```
+rx Sigma1(ctx6/ctx7 あり)
+  ├─ store を resumptionID で照合 + fabric 生存確認 + S1RK で MIC 検証
+  │    ├─ 成立: reserve → 新 resumptionID 採番 → Sigma2_Resume 送信
+  │    │        slot = HandshakeKind::CaseResume { 導出済みセッション鍵, fabric_idx,
+  │    │               peer_node_id, 新 resumptionID, shared_secret }
+  │    │   rx StatusReport(Success) → commit(Case{fabric_idx}) + store を新 ID でローテート保存
+  │    │   rx StatusReport(失敗) / timeout → reserved 解放(slot 破棄)
+  │    └─ 不成立(未知 ID・MIC 不一致・fabric 消滅): **フル CASE へフォールバック**
+  │        (destinationId 照合から通常経路。エラー終端にしない = 仕様の指示)
+  └─ ctx6/ctx7 の片方のみ → InvalidParameter(従来どおり)
+```
+
+- destinationId は resumption 成立時には照合しない(chip と同じ。fabric はレコードが示す)。
+- フル CASE 成功時(Sigma3 検証通過 → commit 直後)に、Sigma2 の TBE2 へ載せた
+  resumptionID + ECDH SharedSecret を store へ保存する(`CaseCtx` に resumptionID を追加)。
+- responder は Sigma2_Resume 送信後 **initiator の成功 StatusReport を待って** commit する
+  (chip の `kSentSigma2Resume → kFinishedViaResume` と同順序。先 commit しない)。
+
+#### initiator 側フロー(`start_case` / `case_on_sigma2_resume`)
+
+- `start_case` は store を `(fabric_idx, peer_node_id)` で引き、レコードがあれば Sigma1 に
+  ctx6/ctx7 を付けて送る(`CaseInitiator` に initiatorRandom・旧 resumptionID・SharedSecret
+  を控える)。レコードが無ければ従来どおりのフル Sigma1。
+- 応答が **Sigma2_Resume**: S2RK で MIC 検証(salt は受信した新 resumptionID)→
+  "SessionResumptionKeys" でセッション鍵導出 → **commit してから** 成功 StatusReport を
+  `HandlerAction::Close` で返す → store を新 resumptionID でローテート保存 →
+  `ScEvent::CaseEstablished { resumed: true }`。MIC 不一致は Failed(Crypto) で破棄。
+- 応答が **フル Sigma2**(responder が resumption を蹴った): 従来経路がそのまま走る
+  (TT には resumption フィールド込みの Sigma1 生バイトが投入済みなので整合)。
+- フル CASE 成功時は TBE2 から取り出した resumptionID(ctx4)+ SharedSecret を保存する。
+
+#### 仕様との差分/割り切り
+
+- 永続化なし(メモリ内のみ)。プロセス再起動でフル CASE に戻るだけで安全側。
+- Sigma2_Resume の MRP `session_parameters`(ctx4)は送らない(optional。フル Sigma2 と同じ)。
+- CAT(CASE Authenticated Tags)はレコードに保存しない(本実装は ACL の CAT 未対応のため。
+  chip は保存する)。
 
 ---
 
@@ -691,10 +775,9 @@ pub type SecureChannel1<C, F> = SecureChannel<'_, C, F, 1>;  // 通常(PASE/CASE
 4. **Spake2+ プリミティブの crypto 側 API 形**(§6.3)。verifier(w0,L)を responder が
    どう受け取るか(型・所有権)、typestate 境界(verifier → confirm)を crypto と sc の
    どちらに置くか。crypto ピースと要調整。
-5. **resumption(Sigma2Resume)の後付け余地**(§7.1)。初期は Sigma1 の resumptionID を
-   無視して通常 Sigma1 として扱うが、後日 `SessionMode`/`Session` に resumption 復元情報
-   (resumptionID・sharedSecret)を持たせる必要がある(transport-exchange §12-8 と連動)。
-   `HandshakeSlot` を将来 resumption 対応に拡張できる形か事前確認。
+5. ~~**resumption(Sigma2Resume)の後付け余地**(§7.1)~~ → **解決(§7.4 で実装)**。
+   復元情報は `Session` ではなく専用の `ResumptionStore`(`sc/resumption.rs`、メモリ内
+   固定容量)に持たせた。KVS 永続化のみ将来課題として残る。
 6. **PASE の commit タイミングと unsecured exchange の後始末**。Pake3 後、成功 Status を
    運ぶ unsecured exchange と、新 PASE セッションの整理(unsecured session/exchange をいつ
    閉じるか)。相手が即新セッションを使い始める競合(§3.3)への実挙動確認。

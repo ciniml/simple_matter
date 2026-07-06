@@ -39,6 +39,7 @@ use crate::exchange::{ExchangeId, HandlerAction, ProtocolHandler, RxMessage};
 use crate::sc::case::common;
 use crate::sc::case::creds::{Fabric, FabricStore, NocResolver};
 use crate::sc::pase::{build_context, SESSION_KEYS_LEN, SPAKE2P_SESSION_KEYS_INFO};
+use crate::sc::resumption::{ResumptionStore, RESUMPTION_CACHE_LEN};
 use crate::sc::status::{GeneralCode, ScStatusCode, StatusReport, PROTO_ID_SECURE_CHANNEL};
 use crate::sc::OpCode;
 use crate::transport::session::{SessionId, SessionInit, SessionManager, SessionMode};
@@ -86,6 +87,8 @@ pub enum ScEvent {
     CaseEstablished {
         /// 確立したセッションのハンドル。
         session: SessionId,
+        /// session resumption(Sigma2_Resume)経由で確立したなら `true`(§7.4)。
+        resumed: bool,
     },
     /// ハンドシェイクが失敗した。
     Failed {
@@ -133,6 +136,8 @@ pub struct ScInitiator<'c, C: Crypto, R: Rng, F> {
     creds: F,
     hs: Option<InitiatorHandshake<C>>,
     event: Option<ScEvent>,
+    /// CASE session resumption レコード(メモリ内・固定容量。§7.4)。
+    resumptions: ResumptionStore<RESUMPTION_CACHE_LEN>,
 }
 
 impl<'c, C: Crypto, R: Rng, F> ScInitiator<'c, C, R, F> {
@@ -144,7 +149,13 @@ impl<'c, C: Crypto, R: Rng, F> ScInitiator<'c, C, R, F> {
             creds,
             hs: None,
             event: None,
+            resumptions: ResumptionStore::new(),
         }
+    }
+
+    /// 保持している CASE resumption レコード数を返す(§7.4)。
+    pub fn resumption_count(&self) -> usize {
+        self.resumptions.len()
     }
 
     /// 進行中ハンドシェイクがあれば `true`。
@@ -323,7 +334,37 @@ impl<'c, C: Crypto, R: Rng, F: FabricStore> ScInitiator<'c, C, R, F> {
             &mut dest_id,
         )
         .map_err(|_| Error::Crypto)?;
-        let len = case::encode_sigma1(out, &initiator_random, initiator_ssid, &dest_id, &eph_pub)?;
+
+        // resumption レコードがあれば Sigma1 に resumptionID + initiatorResumeMIC を付ける
+        // (§7.4)。MIC 計算に失敗した場合はフル CASE として送る(安全側)。
+        let mut shared_secret = Zeroizing::new([0u8; common::SHARED_SECRET_LEN]);
+        let mut attempted_resumption_id = None;
+        let mut mic = [0u8; common::RESUME_MIC_LEN];
+        if let Some(record) = self.resumptions.find_by_peer(fabric_idx, peer_node_id) {
+            if common::compute_resume_mic(
+                self.crypto,
+                &initiator_random,
+                &record.resumption_id,
+                &record.shared_secret,
+                common::SIGMA1_RESUME_KEY_INFO,
+                common::SIGMA1_RESUME_NONCE,
+                &mut mic,
+            )
+            .is_ok()
+            {
+                attempted_resumption_id = Some(record.resumption_id);
+                *shared_secret = *record.shared_secret;
+            }
+        }
+        let resumption = attempted_resumption_id.as_ref().map(|rid| (rid, &mic));
+        let len = case::encode_sigma1(
+            out,
+            &initiator_random,
+            initiator_ssid,
+            &dest_id,
+            &eph_pub,
+            resumption,
+        )?;
         let mut tt = self.crypto.sha256();
         tt.update(&out[..len]);
         self.hs = Some(InitiatorHandshake {
@@ -334,10 +375,13 @@ impl<'c, C: Crypto, R: Rng, F: FabricStore> ScInitiator<'c, C, R, F> {
                 phase: CasePhase::Sigma1Sent,
                 eph,
                 tt,
-                shared_secret: Zeroizing::new([0u8; common::SHARED_SECRET_LEN]),
+                shared_secret,
                 fabric_idx,
                 peer_node_id,
                 peer_ssid: 0,
+                initiator_random,
+                attempted_resumption_id,
+                peer_resumption_id: None,
             }),
         });
         Ok(len)
@@ -572,7 +616,9 @@ impl<C: Crypto, R: Rng, F: FabricStore + NocResolver> ScInitiator<'_, C, R, F> {
                     _ => break 'blk CaseOutcome::Fail(ScFailReason::Crypto),
                 }
 
-                // 検証通過。Sigma2 を TT に畳む。
+                // 検証通過。相手採番の resumptionID(TBE2 ctx4。commit 時にレコード保存)を
+                // 控え、Sigma2 を TT に畳む。
+                c.peer_resumption_id = common::decode_tbe2_resumption_id(&tbe2[..pt_len]).ok();
                 c.tt.update(rx.payload);
                 let mut tt_s2 = [0u8; common::TT_HASH_LEN];
                 c.tt.clone().finish(&mut tt_s2);
@@ -636,6 +682,154 @@ impl<C: Crypto, R: Rng, F: FabricStore + NocResolver> ScInitiator<'_, C, R, F> {
             }),
             CaseOutcome::Fail(reason) => self.abort(sessions, HandshakeKindTag::Case, reason),
         }
+    }
+
+    /// CASE Sigma2_Resume を検証し、commit して成功 StatusReport を返す(§7.4)。
+    ///
+    /// commit を済ませてから成功 StatusReport を [`HandlerAction::Close`] で返す
+    /// (responder は StatusReport 受信で commit する。chip と同順序)。
+    fn case_on_sigma2_resume<const S: usize>(
+        &mut self,
+        rx: &RxMessage<'_>,
+        tx: &mut [u8],
+        sessions: &mut SessionManager<S>,
+        now_ms: u64,
+    ) -> Result<HandlerAction> {
+        let crypto = self.crypto;
+
+        // 検証フェーズ(hs は借用のまま)。
+        let (new_rid, responder_ssid) = {
+            let h = match &self.hs {
+                Some(h) => h,
+                None => return Ok(HandlerAction::None),
+            };
+            let c = match &h.kind {
+                InitiatorKind::Case(c) => c,
+                _ => return Err(Error::InvalidState),
+            };
+            if c.phase != CasePhase::Sigma1Sent {
+                return Err(Error::InvalidState);
+            }
+            // resumption を要求していないのに Sigma2_Resume が届いた = プロトコル違反。
+            if c.attempted_resumption_id.is_none() {
+                return self.abort(sessions, HandshakeKindTag::Case, ScFailReason::Decode);
+            }
+            let s2r = match case::Sigma2Resume::decode(rx.payload) {
+                Ok(s) => s,
+                Err(_) => {
+                    return self.abort(sessions, HandshakeKindTag::Case, ScFailReason::Decode)
+                }
+            };
+            let new_rid: [u8; common::CASE_RESUMPTION_ID_LEN] = match s2r.resumption_id.try_into() {
+                Ok(r) => r,
+                Err(_) => {
+                    return self.abort(sessions, HandshakeKindTag::Case, ScFailReason::Decode)
+                }
+            };
+            // sigma2ResumeMIC 検証(S2RK。salt の resumptionID は新 ID)。
+            if common::verify_resume_mic(
+                crypto,
+                &c.initiator_random,
+                &new_rid,
+                &c.shared_secret,
+                common::SIGMA2_RESUME_KEY_INFO,
+                common::SIGMA2_RESUME_NONCE,
+                s2r.resume_mic,
+            )
+            .is_err()
+            {
+                return self.abort(sessions, HandshakeKindTag::Case, ScFailReason::Crypto);
+            }
+            (new_rid, s2r.responder_ssid)
+        };
+
+        // commit フェーズ(hs を消費)。
+        let h = self.hs.take().ok_or(Error::InvalidState)?;
+        let reserved = h.reserved;
+        let c = match h.kind {
+            InitiatorKind::Case(c) => c,
+            _ => {
+                sessions.remove(reserved);
+                return Err(Error::InvalidState);
+            }
+        };
+        let old_rid = match c.attempted_resumption_id {
+            Some(r) => r,
+            None => {
+                sessions.remove(reserved);
+                return self.fail(HandshakeKindTag::Case, ScFailReason::Decode);
+            }
+        };
+        let local_node_id = self.creds.get(c.fabric_idx).map(|f| f.node_id());
+        let local_node_id = match local_node_id {
+            Some(v) => v,
+            None => {
+                sessions.remove(reserved);
+                return self.fail(HandshakeKindTag::Case, ScFailReason::Crypto);
+            }
+        };
+        // セッション鍵(salt = initiatorRandom ‖ 旧 resumptionID, "SessionResumptionKeys")。
+        let mut keys = Zeroizing::new([0u8; common::CASE_SESSION_KEYS_LEN]);
+        if common::derive_resumption_session_keys(
+            crypto,
+            &c.initiator_random,
+            &old_rid,
+            &c.shared_secret,
+            &mut keys,
+        )
+        .is_err()
+        {
+            sessions.remove(reserved);
+            return self.fail(HandshakeKindTag::Case, ScFailReason::Crypto);
+        }
+        // initiator: enc = I2R, dec = R2I。
+        let mut enc_key = [0u8; KEY_LEN];
+        let mut dec_key = [0u8; KEY_LEN];
+        let mut att = [0u8; KEY_LEN];
+        enc_key.copy_from_slice(&keys[0..KEY_LEN]);
+        dec_key.copy_from_slice(&keys[KEY_LEN..2 * KEY_LEN]);
+        att.copy_from_slice(&keys[2 * KEY_LEN..3 * KEY_LEN]);
+
+        let peer_addr = match sessions.get(reserved) {
+            Some(s) => s.peer_addr(),
+            None => return Err(Error::InvalidState),
+        };
+        let tx_ctr_start = self.initial_tx_ctr();
+        let init = SessionInit {
+            peer_addr,
+            local_node_id,
+            peer_node_id: Some(c.peer_node_id),
+            peer_session_id: responder_ssid,
+            tx_ctr_start,
+            rx_ctr_start: 0,
+            mode: SessionMode::Case {
+                fabric_idx: c.fabric_idx,
+            },
+            enc_key,
+            dec_key,
+            att_challenge: att,
+        };
+        if sessions.commit(reserved, init, now_ms).is_err() {
+            sessions.remove(reserved);
+            return self.fail(HandshakeKindTag::Case, ScFailReason::Crypto);
+        }
+        // レコードを新 resumptionID でローテート保存(SharedSecret 不変)。
+        self.resumptions
+            .save(c.fabric_idx, c.peer_node_id, &new_rid, &c.shared_secret);
+        self.event = Some(ScEvent::CaseEstablished {
+            session: reserved,
+            resumed: true,
+        });
+
+        // commit 後に成功 StatusReport を送って終端する(responder はこれで commit する)。
+        let sr = StatusReport::new(ScStatusCode::SessionEstablishmentSuccess, &[]);
+        let len = sr.encode(tx)?;
+        Ok(HandlerAction::Close {
+            opcode: OpCode::StatusReport as u8,
+            proto_id: PROTO_ID_SECURE_CHANNEL,
+            reliable: true,
+            len,
+        })
     }
 
     /// 終端 StatusReport を受理する(成功なら commit、失敗なら破棄)。
@@ -810,7 +1004,16 @@ impl<C: Crypto, R: Rng, F: FabricStore + NocResolver> ScInitiator<'_, C, R, F> {
             sessions.remove(reserved);
             return self.fail(HandshakeKindTag::Case, ScFailReason::Crypto);
         }
-        self.event = Some(ScEvent::CaseEstablished { session: reserved });
+        // フル CASE 成功: TBE2 から取り出した相手採番の resumptionID + ECDH SharedSecret を
+        // resumption レコードとして保存する(§7.4)。
+        if let Some(rid) = c.peer_resumption_id {
+            self.resumptions
+                .save(c.fabric_idx, c.peer_node_id, &rid, &c.shared_secret);
+        }
+        self.event = Some(ScEvent::CaseEstablished {
+            session: reserved,
+            resumed: false,
+        });
         Ok(HandlerAction::None)
     }
 
@@ -840,6 +1043,7 @@ impl<C: Crypto, R: Rng, F: FabricStore + NocResolver> ProtocolHandler for ScInit
             OpCode::PbkdfParamResponse => self.pase_on_resp(rx, tx, sessions),
             OpCode::PasePake2 => self.pase_on_pake2(rx, tx, sessions),
             OpCode::CaseSigma2 => self.case_on_sigma2(rx, tx, sessions),
+            OpCode::CaseSigma2Resume => self.case_on_sigma2_resume(rx, tx, sessions, now_ms),
             OpCode::StatusReport => self.on_status(rx, sessions, now_ms),
             // initiator にその他 opcode(Request 系)は届かない。
             _ => Err(Error::InvalidState),

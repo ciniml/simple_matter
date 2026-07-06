@@ -70,6 +70,14 @@ fn peer() -> PeerAddr {
     ))
 }
 
+/// 「再起動後のデバイス」役の別アドレス(unsecured セッションのカウンタ窓を分離する)。
+fn peer2() -> PeerAddr {
+    PeerAddr::Udp(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6)),
+        5540,
+    ))
+}
+
 /// IM プレースホルダ(常に None)。
 struct ImPlaceholder;
 impl ProtocolHandler for ImPlaceholder {
@@ -391,11 +399,12 @@ fn deliver<H: Dispatcher>(
     pool: &mut BufferPool<3, 1600>,
     crypto: &Backend,
     now: u64,
+    peer_addr: PeerAddr,
     wire: &mut [u8],
 ) -> Option<([u8; 1600], usize)> {
     let mut tx = [0u8; 1600];
     let report = mgr
-        .recv(sessions, crypto, peer(), now, wire, &mut tx)
+        .recv(sessions, crypto, peer_addr, now, wire, &mut tx)
         .unwrap();
     if let Some(b) = report.freed_tx {
         pool.release(b);
@@ -446,6 +455,7 @@ fn pump_handshake<HI: Dispatcher, HR: Dispatcher>(
     ex: super::ExchangeId,
     first_opcode: u8,
     payload: &[u8],
+    peer_addr: PeerAddr,
 ) {
     let sent = init_mgr
         .send_reliable(
@@ -477,6 +487,7 @@ fn pump_handshake<HI: Dispatcher, HR: Dispatcher>(
                 resp_pool,
                 crypto,
                 NOW,
+                peer_addr,
                 &mut wire[..wlen],
             )
         } else {
@@ -486,6 +497,7 @@ fn pump_handshake<HI: Dispatcher, HR: Dispatcher>(
                 init_pool,
                 crypto,
                 NOW,
+                peer_addr,
                 &mut wire[..wlen],
             )
         };
@@ -601,6 +613,7 @@ fn full_pase_handshake_initiator_vs_responder() {
         ex,
         OpCode::PbkdfParamRequest as u8,
         &payload[..plen],
+        peer(),
     );
 
     let session = match init_mgr.handler_mut().sc.take_event() {
@@ -658,6 +671,7 @@ fn pase_wrong_passcode_fails_at_pake2_verify() {
         ex,
         OpCode::PbkdfParamRequest as u8,
         &payload[..plen],
+        peer(),
     );
 
     // initiator は PASEPake2 の cB 検証で失敗し Failed を積む。
@@ -820,6 +834,7 @@ fn run_case_handshake(
         ex,
         OpCode::CaseSigma1 as u8,
         &payload[..plen],
+        peer(),
     );
 
     let ev = init_mgr
@@ -842,8 +857,11 @@ fn full_case_handshake_initiator_vs_responder() {
         run_case_handshake(&crypto, &resp_table, &init_table, init_fabric);
 
     let session = match ev {
-        ScEvent::CaseEstablished { session } => session,
-        other => panic!("expected CaseEstablished, got {other:?}"),
+        ScEvent::CaseEstablished {
+            session,
+            resumed: false,
+        } => session,
+        other => panic!("expected CaseEstablished(full), got {other:?}"),
     };
     let is = init_sessions.get(session).unwrap();
     assert!(matches!(is.mode(), SessionMode::Case { .. }));
@@ -857,6 +875,298 @@ fn full_case_handshake_initiator_vs_responder() {
             .any(|s| s.local_session_id() == init_ssid
                 && matches!(s.mode(), SessionMode::Case { .. }))
     );
+}
+
+/// CASE resumption(§7.4): 同一スタック上でフル CASE → 2 本目の CASE を張り、2 本目が
+/// Sigma2_Resume 経路(`resumed: true`)で確立し、鏡像鍵が一致することを確認する。
+#[test]
+fn case_resumption_round_trip() {
+    let crypto = crypto();
+    let ids = build_identities(&crypto);
+    let resp_table = device_table(&crypto, &ids, &[0x33; 32]);
+    let init_table = controller_table(&crypto, &ids);
+    let init_fabric = NonZeroU8::new(1).unwrap();
+
+    // 両スタックを 1 度だけ構築し、2 回のハンドシェイクをまたいで resumption レコードを保つ。
+    let config = PaseConfig::from_passcode(PASSCODE, &SALT, ITERATIONS).unwrap();
+    let resp_creds = TestCreds {
+        table: &resp_table,
+        crypto: &crypto,
+        now: NOW_SECS,
+    };
+    let sc: SecureChannel<'_, Backend, SeqRng, _, 1> =
+        SecureChannel::new(&crypto, SeqRng(0xD00D_3001), config, resp_creds);
+    let mut resp_mgr: ExchangeManager<ProtocolMux<_, ImPlaceholder>, 4> =
+        ExchangeManager::new(ProtocolMux::new(sc, ImPlaceholder));
+    let mut resp_sessions: SessionManager<4> = SessionManager::new();
+    resp_sessions
+        .insert(SessionInit::plaintext(peer(), 0, 1), NOW)
+        .unwrap();
+    let mut resp_pool: BufferPool<3, 1600> = BufferPool::new();
+
+    let init_creds = TestCreds {
+        table: &init_table,
+        crypto: &crypto,
+        now: NOW_SECS,
+    };
+    let init = ScInitiator::new(&crypto, SeqRng(0xBEEF_3002), init_creds);
+    let mut init_mgr: ExchangeManager<ProtocolMux<_, ImPlaceholder>, 4> =
+        ExchangeManager::new(ProtocolMux::new(init, ImPlaceholder));
+    let mut init_sessions: SessionManager<4> = SessionManager::new();
+    let init_unsec = init_sessions
+        .insert(SessionInit::plaintext(peer(), 0, 1), NOW)
+        .unwrap();
+    let mut init_pool: BufferPool<3, 1600> = BufferPool::new();
+
+    // --- 1 本目: フル CASE ---
+    let ex1 = init_mgr.open_initiator(init_unsec).unwrap();
+    let reserved1 = init_sessions.reserve(peer(), NOW).unwrap();
+    let ssid1 = init_sessions.get(reserved1).unwrap().local_session_id();
+    let mut payload = [0u8; 512];
+    let plen = init_mgr
+        .handler_mut()
+        .sc
+        .start_case(
+            ex1,
+            reserved1,
+            ssid1,
+            init_fabric,
+            DEVICE_NODE,
+            &mut payload,
+            NOW,
+        )
+        .unwrap();
+    pump_handshake(
+        &crypto,
+        &mut init_mgr,
+        &mut init_sessions,
+        &mut init_pool,
+        &mut resp_mgr,
+        &mut resp_sessions,
+        &mut resp_pool,
+        ex1,
+        OpCode::CaseSigma1 as u8,
+        &payload[..plen],
+        peer(),
+    );
+    let s1 = match init_mgr.handler_mut().sc.take_event() {
+        Some(ScEvent::CaseEstablished {
+            session,
+            resumed: false,
+        }) => session,
+        other => panic!("expected full CaseEstablished, got {other:?}"),
+    };
+    // フル CASE 完了で両側に resumption レコードが 1 件ずつ保存される。
+    assert_eq!(init_mgr.handler().sc.resumption_count(), 1);
+    assert_eq!(resp_mgr.handler().sc.resumption_count(), 1);
+    assert_mirror_keys(&init_sessions, s1, &resp_sessions, ssid1);
+
+    // --- 2 本目: resumption(Sigma1 に ctx6/ctx7 が付き、Sigma2_Resume で確立)---
+    let ex2 = init_mgr.open_initiator(init_unsec).unwrap();
+    let reserved2 = init_sessions.reserve(peer(), NOW).unwrap();
+    let ssid2 = init_sessions.get(reserved2).unwrap().local_session_id();
+    let plen2 = init_mgr
+        .handler_mut()
+        .sc
+        .start_case(
+            ex2,
+            reserved2,
+            ssid2,
+            init_fabric,
+            DEVICE_NODE,
+            &mut payload,
+            NOW,
+        )
+        .unwrap();
+    pump_handshake(
+        &crypto,
+        &mut init_mgr,
+        &mut init_sessions,
+        &mut init_pool,
+        &mut resp_mgr,
+        &mut resp_sessions,
+        &mut resp_pool,
+        ex2,
+        OpCode::CaseSigma1 as u8,
+        &payload[..plen2],
+        peer(),
+    );
+    let s2 = match init_mgr.handler_mut().sc.take_event() {
+        Some(ScEvent::CaseEstablished {
+            session,
+            resumed: true,
+        }) => session,
+        other => panic!("expected resumed CaseEstablished, got {other:?}"),
+    };
+    let is = init_sessions.get(s2).unwrap();
+    assert!(matches!(is.mode(), SessionMode::Case { .. }));
+    assert_eq!(is.peer_node_id(), Some(DEVICE_NODE));
+    assert_mirror_keys(&init_sessions, s2, &resp_sessions, ssid2);
+    // レコードはローテートされ、件数は 1 のまま(同一ピア upsert)。
+    assert_eq!(init_mgr.handler().sc.resumption_count(), 1);
+    assert_eq!(resp_mgr.handler().sc.resumption_count(), 1);
+    // 責務の後始末: ハンドシェイク slot が両側とも解放されている。
+    assert!(!init_mgr.handler().sc.is_busy());
+    assert_eq!(resp_mgr.handler().sc.handshake_count(), 0);
+}
+
+/// responder がレコードを失った場合(再起動相当 = 新しい SecureChannel)、initiator の
+/// resumption 要求つき Sigma1 に対しフル Sigma2 が返り、フル CASE として確立する
+/// (`resumed: false` フォールバック。§7.4)。
+#[test]
+fn case_resumption_unknown_id_falls_back_to_full() {
+    let crypto = crypto();
+    let ids = build_identities(&crypto);
+    let resp_table = device_table(&crypto, &ids, &[0x33; 32]);
+    let init_table = controller_table(&crypto, &ids);
+    let init_fabric = NonZeroU8::new(1).unwrap();
+
+    // initiator は 2 回のハンドシェイクをまたいで保持。
+    let init_creds = TestCreds {
+        table: &init_table,
+        crypto: &crypto,
+        now: NOW_SECS,
+    };
+    let init = ScInitiator::new(&crypto, SeqRng(0xBEEF_4002), init_creds);
+    let mut init_mgr: ExchangeManager<ProtocolMux<_, ImPlaceholder>, 4> =
+        ExchangeManager::new(ProtocolMux::new(init, ImPlaceholder));
+    let mut init_sessions: SessionManager<4> = SessionManager::new();
+    let init_unsec = init_sessions
+        .insert(SessionInit::plaintext(peer(), 0, 1), NOW)
+        .unwrap();
+    let mut init_pool: BufferPool<3, 1600> = BufferPool::new();
+
+    // --- 1 本目: 1 台目の responder とフル CASE(レコードを作る)---
+    {
+        let config = PaseConfig::from_passcode(PASSCODE, &SALT, ITERATIONS).unwrap();
+        let resp_creds = TestCreds {
+            table: &resp_table,
+            crypto: &crypto,
+            now: NOW_SECS,
+        };
+        let sc: SecureChannel<'_, Backend, SeqRng, _, 1> =
+            SecureChannel::new(&crypto, SeqRng(0xD00D_4001), config, resp_creds);
+        let mut resp_mgr: ExchangeManager<ProtocolMux<_, ImPlaceholder>, 4> =
+            ExchangeManager::new(ProtocolMux::new(sc, ImPlaceholder));
+        let mut resp_sessions: SessionManager<4> = SessionManager::new();
+        resp_sessions
+            .insert(SessionInit::plaintext(peer(), 0, 1), NOW)
+            .unwrap();
+        let mut resp_pool: BufferPool<3, 1600> = BufferPool::new();
+
+        let ex = init_mgr.open_initiator(init_unsec).unwrap();
+        let reserved = init_sessions.reserve(peer(), NOW).unwrap();
+        let ssid = init_sessions.get(reserved).unwrap().local_session_id();
+        let mut payload = [0u8; 512];
+        let plen = init_mgr
+            .handler_mut()
+            .sc
+            .start_case(
+                ex,
+                reserved,
+                ssid,
+                init_fabric,
+                DEVICE_NODE,
+                &mut payload,
+                NOW,
+            )
+            .unwrap();
+        pump_handshake(
+            &crypto,
+            &mut init_mgr,
+            &mut init_sessions,
+            &mut init_pool,
+            &mut resp_mgr,
+            &mut resp_sessions,
+            &mut resp_pool,
+            ex,
+            OpCode::CaseSigma1 as u8,
+            &payload[..plen],
+            peer(),
+        );
+        assert!(matches!(
+            init_mgr.handler_mut().sc.take_event(),
+            Some(ScEvent::CaseEstablished { resumed: false, .. })
+        ));
+        assert_eq!(init_mgr.handler().sc.resumption_count(), 1);
+    }
+
+    // --- 2 本目: レコードを持たない「再起動後の」responder に resumption を試みる ---
+    // 再起動後は unsecured メッセージカウンタも初期化されるため、別アドレス(peer2)として
+    // 現れる想定にし、initiator 側も新しい unsecured セッションで話す(カウンタ窓の分離)。
+    let config = PaseConfig::from_passcode(PASSCODE, &SALT, ITERATIONS).unwrap();
+    let resp_creds = TestCreds {
+        table: &resp_table,
+        crypto: &crypto,
+        now: NOW_SECS,
+    };
+    let sc: SecureChannel<'_, Backend, SeqRng, _, 1> =
+        SecureChannel::new(&crypto, SeqRng(0xD00D_4002), config, resp_creds);
+    let mut resp_mgr: ExchangeManager<ProtocolMux<_, ImPlaceholder>, 4> =
+        ExchangeManager::new(ProtocolMux::new(sc, ImPlaceholder));
+    let mut resp_sessions: SessionManager<4> = SessionManager::new();
+    resp_sessions
+        .insert(SessionInit::plaintext(peer2(), 0, 1), NOW)
+        .unwrap();
+    let mut resp_pool: BufferPool<3, 1600> = BufferPool::new();
+
+    let init_unsec2 = init_sessions
+        .insert(SessionInit::plaintext(peer2(), 0, 1), NOW)
+        .unwrap();
+    let ex2 = init_mgr.open_initiator(init_unsec2).unwrap();
+    let reserved2 = init_sessions.reserve(peer2(), NOW).unwrap();
+    let ssid2 = init_sessions.get(reserved2).unwrap().local_session_id();
+    let mut payload = [0u8; 512];
+    let plen2 = init_mgr
+        .handler_mut()
+        .sc
+        .start_case(
+            ex2,
+            reserved2,
+            ssid2,
+            init_fabric,
+            DEVICE_NODE,
+            &mut payload,
+            NOW,
+        )
+        .unwrap();
+    // resumption レコードがあるので Sigma1 に ctx6/ctx7 が付いている。
+    let s1 = crate::sc::case::responder::Sigma1::decode(&payload[..plen2]).unwrap();
+    assert!(s1.has_resumption());
+
+    pump_handshake(
+        &crypto,
+        &mut init_mgr,
+        &mut init_sessions,
+        &mut init_pool,
+        &mut resp_mgr,
+        &mut resp_sessions,
+        &mut resp_pool,
+        ex2,
+        OpCode::CaseSigma1 as u8,
+        &payload[..plen2],
+        peer2(),
+    );
+    // 未知 resumptionID → フル CASE にフォールバックして確立(resumed: false)。
+    let s2 = match init_mgr.handler_mut().sc.take_event() {
+        Some(ScEvent::CaseEstablished {
+            session,
+            resumed: false,
+        }) => session,
+        other => panic!("expected full-CASE fallback, got {other:?}"),
+    };
+    // 新 responder には CASE セッションが 1 本だけあるはず。鏡像鍵の一致を直接比較する
+    // (両側のセッション ID 採番はもはや同期しないため、ID ではなくモードで引く)。
+    let is = init_sessions.get(s2).expect("initiator session");
+    let rs = resp_sessions
+        .iter()
+        .find(|s| matches!(s.mode(), SessionMode::Case { .. }))
+        .expect("responder CASE session");
+    assert_eq!(is.enc_key().unwrap(), rs.dec_key().unwrap());
+    assert_eq!(is.dec_key().unwrap(), rs.enc_key().unwrap());
+    assert_eq!(is.att_challenge().unwrap(), rs.att_challenge().unwrap());
+    // 新 responder にもフル CASE の完了でレコードが作られる。
+    assert_eq!(resp_mgr.handler().sc.resumption_count(), 1);
 }
 
 /// 改竄された Sigma2(TBEData2 の末尾 = AES-CCM タグを反転)を initiator が暗号的に拒否し、
@@ -947,6 +1257,7 @@ fn case_corrupted_sigma2_is_rejected() {
         &mut resp_pool,
         &crypto,
         NOW,
+        peer(),
         &mut wire[..wlen],
     )
     .expect("responder produced Sigma2");

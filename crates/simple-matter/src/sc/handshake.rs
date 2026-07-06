@@ -81,14 +81,36 @@ pub struct CaseCtx<S: Sha256> {
     pub peer_pub_key: [u8; CASE_EPH_PUBLIC_KEY_LEN],
     /// 進行中のトランスクリプトハッシャ(Sigma1 + Sigma2 を畳んだ状態)。
     pub tt: S,
+    /// Sigma2 の TBEData2 に載せた resumptionID(成功時に resumption レコードとして保存)。
+    pub resumption_id: [u8; super::case::responder::CASE_RESUMPTION_ID_LEN],
+}
+
+/// 往復をまたぐ CASE **resumption** の進行状態(Sigma2_Resume 送信済み →
+/// initiator の成功 StatusReport 待ち。設計 §7.4)。
+///
+/// セッション鍵は Sigma2_Resume 送信時に導出済みで、commit に必要な素材だけを保持する。
+/// 鍵・共有秘密は [`Zeroizing`] で drop 時にゼロ化する。
+pub struct CaseResumeCtx {
+    /// レコードが示す fabric index。
+    pub fabric_index: NonZeroU8,
+    /// 相手の operational NodeId(レコード由来)。
+    pub peer_node_id: u64,
+    /// 導出済みセッション鍵(I2R ‖ R2I ‖ AttestationChallenge = 48B)。
+    pub session_keys: Zeroizing<[u8; 48]>,
+    /// 新規採番した resumptionID(成功時に store をローテート保存する)。
+    pub new_resumption_id: [u8; super::case::responder::CASE_RESUMPTION_ID_LEN],
+    /// レコードの SharedSecret(ローテート保存用。resumption でも不変)。
+    pub shared_secret: Zeroizing<[u8; 32]>,
 }
 
 /// ハンドシェイク種別と、その往復進行状態(設計 §5.1)。
 pub enum HandshakeKind<S: Sha256> {
     /// PASE ハンドシェイク。
     Pase(PasePhase),
-    /// CASE ハンドシェイク。
+    /// CASE(フル)ハンドシェイク。
     Case(CaseCtx<S>),
+    /// CASE resumption(Sigma2_Resume 送信済み。§7.4)。
+    CaseResume(CaseResumeCtx),
 }
 
 /// 1 本のハンドシェイクの一時状態。
@@ -130,7 +152,7 @@ impl<S: Sha256> HandshakeSlot<S> {
     pub fn pase_phase_mut(&mut self) -> Option<&mut PasePhase> {
         match &mut self.kind {
             HandshakeKind::Pase(p) => Some(p),
-            HandshakeKind::Case(_) => None,
+            HandshakeKind::Case(_) | HandshakeKind::CaseResume(_) => None,
         }
     }
 
@@ -151,12 +173,26 @@ impl<S: Sha256> HandshakeSlot<S> {
         }
     }
 
-    /// slot を消費し、CASE 中間状態 [`CaseCtx`] を取り出す(PASE slot では [`None`])。
+    /// slot を消費し、CASE 中間状態 [`CaseCtx`] を取り出す(それ以外の slot では [`None`])。
     pub fn into_case(self) -> Option<CaseCtx<S>> {
         match self.kind {
             HandshakeKind::Case(ctx) => Some(ctx),
-            HandshakeKind::Pase(_) => None,
+            _ => None,
         }
+    }
+
+    /// slot を消費し、CASE resumption 中間状態 [`CaseResumeCtx`] を取り出す
+    /// (それ以外の slot では [`None`])。
+    pub fn into_case_resume(self) -> Option<CaseResumeCtx> {
+        match self.kind {
+            HandshakeKind::CaseResume(ctx) => Some(ctx),
+            _ => None,
+        }
+    }
+
+    /// CASE resumption slot(Sigma2_Resume 送信済み)なら `true`。
+    pub fn is_case_resume(&self) -> bool {
+        matches!(self.kind, HandshakeKind::CaseResume(_))
     }
 }
 

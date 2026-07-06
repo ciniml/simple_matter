@@ -1053,7 +1053,7 @@ async fn establish_case_only(
             .map_err(|e| format!("service_ctrl(case): {e:?}"))?;
         if let Some(ev) = ctrl.sc_take_event() {
             match ev {
-                ScEvent::CaseEstablished { session } => {
+                ScEvent::CaseEstablished { session, .. } => {
                     println!(
                         "[case] ESTABLISHED. operational CASE session = {:#x}",
                         session.as_raw()
