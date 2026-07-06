@@ -8,6 +8,7 @@
 //! ```text
 //!  Pase ─ PaseEstablished ─► ArmFailSafe ─ InvokeDone ─► Attestation(Skip 素通し)
 //!    ─► Csr ─ CSRResponse → parse_csr ─► AddTrustedRoot ─► AddNoc(NOC 発行)
+//!    ─► [AddWifiNetwork ─► ConnectNetwork](set_wifi_credentials 設定時のみ)
 //!    ─► Case ─ CaseEstablished ─► Complete ─ InvokeDone ─► Done { session }
 //!  任意の失敗 ─► Failed { stage, reason }
 //! ```
@@ -36,12 +37,20 @@ use crate::fabric::MAX_CERT_TLV_LEN;
 
 // --- クラスタ / コマンド ID ---
 const CLUSTER_GENERAL_COMMISSIONING: u32 = 0x0030;
+const CLUSTER_NETWORK_COMMISSIONING: u32 = 0x0031;
 const CLUSTER_OPERATIONAL_CREDENTIALS: u32 = 0x003E;
 const CMD_ARM_FAIL_SAFE: u32 = 0x00;
 const CMD_COMMISSIONING_COMPLETE: u32 = 0x04;
 const CMD_CSR_REQUEST: u32 = 0x04;
 const CMD_ADD_NOC: u32 = 0x06;
 const CMD_ADD_TRUSTED_ROOT: u32 = 0x0B;
+const CMD_ADD_OR_UPDATE_WIFI_NETWORK: u32 = 0x02;
+const CMD_CONNECT_NETWORK: u32 = 0x06;
+
+/// [`Commissioner::set_wifi_credentials`] の SSID 最大長(Matter §11.8: 32 バイト)。
+pub const MAX_WIFI_SSID_LEN: usize = 32;
+/// [`Commissioner::set_wifi_credentials`] の資格情報最大長(WPA2/WPA3 パスフレーズ: 64 バイト)。
+pub const MAX_WIFI_CREDENTIALS_LEN: usize = 64;
 
 /// fail-safe タイマの有効秒数(ArmFailSafe に載せる)。
 const FAIL_SAFE_EXPIRY_S: u16 = 120;
@@ -92,6 +101,10 @@ pub enum Phase {
     AddTrustedRoot,
     /// AddNOC 実行中。
     AddNoc,
+    /// AddOrUpdateWiFiNetwork 実行中(Wi-Fi 資格情報設定時のみ、§6.5)。
+    AddWifiNetwork,
+    /// ConnectNetwork 実行中(Wi-Fi 資格情報設定時のみ、§6.5)。
+    ConnectNetwork,
     /// CASE ハンドシェイク中。
     Case,
     /// CommissioningComplete 実行中(CASE 上)。
@@ -132,6 +145,9 @@ impl Phase {
             Phase::Case => 7,
             Phase::Complete => 8,
             Phase::Done { .. } => 9,
+            // Wi-Fi フェーズは後付けのため、既存 stage 番号を保つよう末尾に足す。
+            Phase::AddWifiNetwork => 10,
+            Phase::ConnectNetwork => 11,
             Phase::Failed { stage, .. } => stage,
         }
     }
@@ -172,6 +188,26 @@ pub struct Commissioner<'a, C: Crypto> {
     /// 保留を解除してから CASE を開始する。既定は `false`(従来どおり同一トランスポートで
     /// CASE まで連続実行)。
     suspend_before_case: bool,
+    /// [`set_wifi_credentials`](Self::set_wifi_credentials) で設定した Wi-Fi 資格情報。
+    /// `Some` なら AddNOC 後に AddOrUpdateWiFiNetwork → ConnectNetwork を挿入する。
+    wifi: Option<WifiCreds>,
+}
+
+/// AddOrUpdateWiFiNetwork / ConnectNetwork へ渡す Wi-Fi 資格情報(固定長バッファ)。
+struct WifiCreds {
+    ssid: [u8; MAX_WIFI_SSID_LEN],
+    ssid_len: u8,
+    credentials: [u8; MAX_WIFI_CREDENTIALS_LEN],
+    credentials_len: u8,
+}
+
+impl WifiCreds {
+    fn ssid(&self) -> &[u8] {
+        &self.ssid[..self.ssid_len as usize]
+    }
+    fn credentials(&self) -> &[u8] {
+        &self.credentials[..self.credentials_len as usize]
+    }
 }
 
 impl<'a, C: Crypto> Commissioner<'a, C> {
@@ -194,7 +230,40 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
             device_pubkey: [0u8; 65],
             scratch: [0u8; MAX_CERT_TLV_LEN],
             suspend_before_case: false,
+            wifi: None,
         }
+    }
+
+    /// AddNOC 後に Wi-Fi をプロビジョンする(chip-tool `pairing ble-wifi` 相当、§6.5)。
+    ///
+    /// 設定すると AddNOC 成功後、CASE の前に **同一(PASE)セッション上で**
+    /// AddOrUpdateWiFiNetwork(0x31/0x02: `{0: ssid, 1: credentials}`)→
+    /// ConnectNetwork(0x31/0x06: `{0: networkID = ssid}`)を送る。デバイスは
+    /// ConnectNetwork へ即 Success を返してバックグラウンドで join するため
+    /// (`docs/design/port-esp32-device.md` §E5.2)、呼び出し側は通常
+    /// [`suspend_before_case`](Self::suspend_before_case) と併用し、BLE を閉じて
+    /// 運用 mDNS 解決 → UDP で CASE を再開する。
+    ///
+    /// `ssid` は最大 [`MAX_WIFI_SSID_LEN`]、`credentials` は最大
+    /// [`MAX_WIFI_CREDENTIALS_LEN`] バイト。超過は [`Error::NoSpace`]、
+    /// 空 SSID は [`Error::InvalidState`]。
+    pub fn set_wifi_credentials(&mut self, ssid: &[u8], credentials: &[u8]) -> Result<()> {
+        if ssid.is_empty() {
+            return Err(Error::InvalidState);
+        }
+        if ssid.len() > MAX_WIFI_SSID_LEN || credentials.len() > MAX_WIFI_CREDENTIALS_LEN {
+            return Err(Error::NoSpace);
+        }
+        let mut w = WifiCreds {
+            ssid: [0u8; MAX_WIFI_SSID_LEN],
+            ssid_len: ssid.len() as u8,
+            credentials: [0u8; MAX_WIFI_CREDENTIALS_LEN],
+            credentials_len: credentials.len() as u8,
+        };
+        w.ssid[..ssid.len()].copy_from_slice(ssid);
+        w.credentials[..credentials.len()].copy_from_slice(credentials);
+        self.wifi = Some(w);
+        Ok(())
     }
 
     /// AddNOC 完了後の CASE 開始を保留するようにする(方向 B: BLE→運用 UDP 遷移用)。
@@ -408,6 +477,46 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
                     )
                     .map_err(CommissionError::Stack)
             }
+            Phase::AddWifiNetwork => {
+                let session = self.pase_session.ok_or(CommissionError::Protocol)?;
+                let wifi = self.wifi.as_ref().ok_or(CommissionError::Protocol)?;
+                let ssid = wifi.ssid();
+                let creds = wifi.credentials();
+                stack
+                    .start_invoke(
+                        session,
+                        cmd_path(CLUSTER_NETWORK_COMMISSIONING, CMD_ADD_OR_UPDATE_WIFI_NETWORK),
+                        move |w, t| {
+                            w.start_struct(t)?;
+                            w.write_bytes(&cx(0), ssid)?; // SSID
+                            w.write_bytes(&cx(1), creds)?; // Credentials
+                            w.write_u64(&cx(2), 0)?; // Breadcrumb
+                            w.end_container()
+                        },
+                        now_ms,
+                        tx_out,
+                    )
+                    .map_err(CommissionError::Stack)
+            }
+            Phase::ConnectNetwork => {
+                let session = self.pase_session.ok_or(CommissionError::Protocol)?;
+                let wifi = self.wifi.as_ref().ok_or(CommissionError::Protocol)?;
+                let ssid = wifi.ssid();
+                stack
+                    .start_invoke(
+                        session,
+                        cmd_path(CLUSTER_NETWORK_COMMISSIONING, CMD_CONNECT_NETWORK),
+                        move |w, t| {
+                            w.start_struct(t)?;
+                            w.write_bytes(&cx(0), ssid)?; // NetworkID = SSID
+                            w.write_u64(&cx(1), 0)?; // Breadcrumb
+                            w.end_container()
+                        },
+                        now_ms,
+                        tx_out,
+                    )
+                    .map_err(CommissionError::Stack)
+            }
             Phase::Case => stack
                 .start_case(
                     self.peer,
@@ -525,6 +634,23 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
             // AddTrustedRootCertificate はステータスのみの応答(command 応答ではない)。
             Phase::AddTrustedRoot => self.advance(Phase::AddNoc),
             Phase::AddNoc => match response_status_code(stack.im_result()) {
+                Ok(0) => self.advance(if self.wifi.is_some() {
+                    Phase::AddWifiNetwork
+                } else {
+                    Phase::Case
+                }),
+                Ok(code) => self.enter_failed(CommissionError::Status(code)),
+                Err(_) => self.enter_failed(CommissionError::Protocol),
+            },
+            // NetworkConfigResponse / ConnectNetworkResponse とも cx0 = networkingStatus
+            //(0 = Success、§11.8.5.1)。ConnectNetwork は「即 Success + バックグラウンド
+            // join」方式(デバイス側 doc §E5.2)なので、join 完了はここでは待たない。
+            Phase::AddWifiNetwork => match response_status_code(stack.im_result()) {
+                Ok(0) => self.advance(Phase::ConnectNetwork),
+                Ok(code) => self.enter_failed(CommissionError::Status(code)),
+                Err(_) => self.enter_failed(CommissionError::Protocol),
+            },
+            Phase::ConnectNetwork => match response_status_code(stack.im_result()) {
                 Ok(0) => self.advance(Phase::Case),
                 Ok(code) => self.enter_failed(CommissionError::Status(code)),
                 Err(_) => self.enter_failed(CommissionError::Protocol),

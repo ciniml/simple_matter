@@ -215,9 +215,15 @@ fn print_commissionable(node: &simple_matter::discovery::client::DiscoveredCommi
 /// `<compressedFabricId>-<nodeId>._matter._tcp.local` の SRV を解決し、
 /// デバイスの (アドレス, ポート) を返す。
 ///
-/// chip の Minimal mDNS は 5353 を掴む(avahi とも競合)ため、**QU(unicast-response)
-/// ビット + エフェメラルポート**で応答を自ポートへのユニキャストで受ける
-/// (RFC 6762 §5.4)。マルチキャスト announce も拾えるよう group join も行う。
+/// ソケットは browse と同じ platform 分岐([`open_mdns_browse_socket`])を使う:
+///
+/// - **Unix**: 5353 共有 bind(QM)。マルチキャスト応答に加えて**デバイスの定期
+///   announce(30 秒間隔 + 起動時バースト)を受動的に拾える**。Wi-Fi AP / IGMP
+///   snooping スイッチがホスト→デバイス方向のマルチキャストを落とす環境では
+///   クエリ自体が届かないことがあり(実測: E5 NanoC6 + 家庭用 AP)、announce の
+///   受動受信が唯一の到達経路になる。エフェメラルポートの QU ソケットは
+///   announce(UDP dst 5353)を受けられないため使わない。
+/// - **Windows**: 5353 は Dnscache が掴むため QU + エフェメラルポート(W3)。
 pub fn resolve_operational(
     ca: &Ca<Backend>,
     node_id: u64,
@@ -226,7 +232,7 @@ pub fn resolve_operational(
     let trace = std::env::var_os("SM_MDNS_TRACE").is_some();
     let compressed = ca.compressed_fabric_id_bytes();
 
-    let (socket, qu) = open_mdns_query_socket().ok_or("open mDNS query socket failed")?;
+    let (socket, qu) = open_mdns_browse_socket().ok_or("open mDNS query socket failed")?;
     let mut query = [0u8; 128];
     let qlen = MdnsClient::build_resolve_operational(&mut query, &compressed, node_id, qu)
         .map_err(|e| format!("build_resolve_operational: {e:?}"))?;
@@ -321,11 +327,13 @@ fn open_mdns_browse_socket() -> Option<(UdpSocket, bool)> {
     }
 }
 
-/// mDNS 解決用ソケット(エフェメラルポート + QU)。戻りの `bool` は QU モード(常に true)。
+/// mDNS 解決用ソケット(エフェメラルポート + QU、Windows 用)。戻りの `bool` は
+/// QU モード(常に true)。
 ///
 /// 仮想アダプタ(WSL/Hyper-V/VPN)が多い環境ではインターフェース未指定だと
 /// マルチキャストの送信/join が LAN 以外の既定 IF に張り付くことがあるため、
 /// デフォルトルートのローカル IPv4 で LAN 向き IF に明示的に固定する。
+#[cfg(not(unix))]
 fn open_mdns_query_socket() -> Option<(UdpSocket, bool)> {
     let if_ip = default_route_local_ipv4().unwrap_or(Ipv4Addr::UNSPECIFIED);
     let socket = socket2::Socket::new(
@@ -351,6 +359,7 @@ fn open_mdns_query_socket() -> Option<(UdpSocket, bool)> {
 
 /// デフォルトルートのローカル IPv4 を推定する(外部宛 UDP の `local_addr` から。
 /// 実際にはパケットを送らない)。マルチキャストの送信/join インターフェース固定用。
+#[cfg(not(unix))]
 fn default_route_local_ipv4() -> Option<Ipv4Addr> {
     let s = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
     s.connect((Ipv4Addr::new(8, 8, 8, 8), 53)).ok()?;

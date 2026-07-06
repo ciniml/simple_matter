@@ -10,6 +10,12 @@
 //!   ([`Commissioner::suspend_before_case`])し、BLE を閉じて運用 mDNS 解決 →
 //!   CASE → CommissioningComplete を **UDP 上で**完走させる(chip-lighting-app は
 //!   AddNOC 受理後に自ら BLE を閉じるため。ble-commissioner の `--udp-handoff` 相当)。
+//! - `pairing ble-wifi`(`wifi = Some`): chip-tool `pairing ble-wifi` 相当。AddNOC 後、
+//!   **同 BLE(PASE)セッション上で** AddOrUpdateWiFiNetwork → ConnectNetwork を送り
+//!   (コアの [`Commissioner::set_wifi_credentials`] フェーズ)、以降は方向 B と同じく
+//!   BLE を閉じて運用 mDNS 解決 → CASE → CommissioningComplete を UDP で完走する。
+//!   デバイスは ConnectNetwork に即 Success を返してバックグラウンドで join するため、
+//!   mDNS 解決は Wi-Fi association + DHCP を見込んだ長めのタイムアウトでリトライする。
 //!
 //! アダプタは `SM_BLE_ADAPTER=hciN` で指定できる。`SM_BTP_TRACE=1` で BTP フラグメントを
 //! トレースする。tokio(current_thread)はこのモジュール内でのみ使う(設計 doc §2.4)。
@@ -38,20 +44,26 @@ use crate::OsRng;
 
 /// BLE フェーズ(handshake + コミッショニング)の全体タイムアウト。BLE は UDP より遅い。
 const BLE_TIMEOUT: Duration = Duration::from_secs(90);
-/// 運用 mDNS 解決のタイムアウト(handoff では必須解決)。
-const RESOLVE_TIMEOUT: Duration = Duration::from_secs(20);
+/// 運用 mDNS 解決のタイムアウト(handoff では必須解決)。クエリが届かない環境でも
+/// デバイスの定期 announce(30 秒間隔)を 1 回は拾える長さを取る。
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(35);
+/// `ble-wifi` での運用 mDNS 解決タイムアウト。デバイスの Wi-Fi association(認証
+/// リトライ込みで実測 ~25 秒かかることがある)+ DHCP + 運用 mDNS 開始を待ち、さらに
+/// クエリが届かない環境でも定期 announce(30 秒間隔)を 1 回は拾えるだけの長さを取る。
+const WIFI_RESOLVE_TIMEOUT: Duration = Duration::from_secs(60);
 /// フル BLE パスでの best-effort 運用解決のタイムアウト(失敗しても致命ではない)。
 const RESOLVE_BEST_EFFORT: Duration = Duration::from_secs(10);
 /// 運用 UDP フェーズ(CASE + CommissioningComplete)の全体タイムアウト。
 const UDP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// `pairing ble` / `pairing ble-handoff` のエントリポイント。
+/// `pairing ble` / `pairing ble-handoff` / `pairing ble-wifi` のエントリポイント。
 pub fn pair_ble(
     g: &Globals,
     node_id: u64,
     passcode: u32,
     discriminator: Option<u16>,
     handoff: bool,
+    wifi: Option<(String, String)>,
 ) -> Result<(), String> {
     let state = StateDir::open(&g.state_dir)?;
     let crypto = simple_matter::crypto::rustcrypto::RustCrypto::new(OsRng);
@@ -76,6 +88,7 @@ pub fn pair_ble(
         passcode,
         discriminator,
         handoff,
+        wifi.as_ref().map(|(s, p)| (s.as_bytes(), p.as_bytes())),
     ))?;
 
     // 発行済み serial を CA 状態に反映し、アドレス帳へ記帳する。
@@ -107,6 +120,7 @@ pub fn pair_ble(
 }
 
 /// BLE 上のコミッショニング本体。記帳すべき運用アドレス(未解決なら port=0 の sentinel)を返す。
+#[allow(clippy::too_many_arguments)]
 async fn run_ble(
     crypto: &Backend,
     ca: &Ca<Backend>,
@@ -114,7 +128,11 @@ async fn run_ble(
     passcode: u32,
     discriminator: Option<u16>,
     handoff: bool,
+    wifi: Option<(&[u8], &[u8])>,
 ) -> Result<SocketAddr, String> {
+    // ble-wifi はデバイスが Wi-Fi join 後に IP 到達可能になるため、CASE 以降は必ず
+    // 運用 UDP で行う(handoff と同じ保留遷移)。
+    let udp_case = handoff || wifi.is_some();
     let ctrl_creds = simple_matter::controller::ControllerCreds::new(ca, crypto, 0);
     let sc_init = ScInitiator::new(crypto, OsRng, ctrl_creds);
     let mut ctrl: Ctrl =
@@ -190,15 +208,23 @@ async fn run_ble(
     // --- コミッショニング(BLE 上)---
     let mut txc = [0u8; MAX_RX_PACKET_SIZE];
     let mut comm = Commissioner::new(ca, crypto, AttestationPolicy::Skip);
-    if handoff {
+    if udp_case {
         comm.suspend_before_case();
+    }
+    if let Some((ssid, password)) = wifi {
+        comm.set_wifi_credentials(ssid, password)
+            .map_err(|e| format!("set_wifi_credentials: {e:?}"))?;
+        crate::json::info!(
+            "[commission] wifi provisioning enabled (ssid={:?})",
+            String::from_utf8_lossy(ssid)
+        );
     }
     comm.commission(peer, passcode, node_id, now_ms(&start))
         .map_err(|e| format!("commission() rejected: {e:?}"))?;
     crate::json::info!("[commission] starting (device node_id={node_id:#018x})");
 
     let outcome = drive_commission_ble(
-        &mut comm, handoff, &mut gatt, &mut btp, &mut ctrl, peer, conn, mtu, &start, &mut frag,
+        &mut comm, udp_case, &mut gatt, &mut btp, &mut ctrl, peer, conn, mtu, &start, &mut frag,
         &mut txc,
     )
     .await?;
@@ -223,14 +249,26 @@ async fn run_ble(
             }
         }
         BleOutcome::PausedBeforeCase => {
-            // 方向 B: BLE を閉じ、運用 mDNS で解決、CASE→CommissioningComplete を UDP で。
+            // 方向 B / ble-wifi: BLE を閉じ、運用 mDNS で解決、CASE→CommissioningComplete を
+            // UDP で。ble-wifi ではデバイスの Wi-Fi join / DHCP / 運用 mDNS 開始を待つため
+            // 解決タイムアウトを長めに取る(クエリは 2 秒間隔でリトライされる)。
             crate::json::info!(
-                "[handoff] AddNOC complete; closing BLE, switching to operational UDP"
+                "[handoff] BLE commissioning phases complete; closing BLE, \
+                 switching to operational UDP"
             );
             // chip は AddNOC 受理後に自ら BLE を閉じるので、失敗は無視する。
             let _ = gatt.disconnect(conn).await;
 
-            let device_addr = mdns::resolve_operational(ca, node_id, RESOLVE_TIMEOUT)?;
+            let resolve_timeout = if wifi.is_some() {
+                crate::json::info!(
+                    "[wifi] waiting for device to join WiFi and start operational mDNS \
+                     (up to {WIFI_RESOLVE_TIMEOUT:?})..."
+                );
+                WIFI_RESOLVE_TIMEOUT
+            } else {
+                RESOLVE_TIMEOUT
+            };
+            let device_addr = mdns::resolve_operational(ca, node_id, resolve_timeout)?;
             crate::json::info!("[handoff] operational node resolved at {device_addr}");
 
             let socket = open_dual_stack_udp().map_err(|e| format!("bind udp socket: {e}"))?;
@@ -336,13 +374,14 @@ fn deadline_sleep(btp: &Btp<6>, now: u64) -> Duration {
     }
 }
 
-/// BLE 上でコミッショニングを駆動する。`handoff` が真なら AddNOC 完了(Phase::Case 到達)で
-/// 保留して [`BleOutcome::PausedBeforeCase`] を返す。偽なら CASE→Complete まで BLE で完走し
+/// BLE 上でコミッショニングを駆動する。`udp_case` が真なら BLE 上の最終フェーズ完了
+/// (AddNOC、ble-wifi では続く ConnectNetwork までで Phase::Case 到達)で保留して
+/// [`BleOutcome::PausedBeforeCase`] を返す。偽なら CASE→Complete まで BLE で完走し
 /// [`BleOutcome::Done`] を返す。
 #[allow(clippy::too_many_arguments)]
 async fn drive_commission_ble(
     comm: &mut Commissioner<'_, Backend>,
-    handoff: bool,
+    udp_case: bool,
     gatt: &mut BtleplugCentral,
     btp: &mut Btp<6>,
     ctrl: &mut Ctrl<'_>,
@@ -393,10 +432,11 @@ async fn drive_commission_ble(
             }
         }
 
-        // 方向 B: AddNOC 完了で CASE が保留された(sigma1 未送出)。ここで BLE を降りる。
-        if handoff && matches!(comm.phase(), Phase::Case) {
+        // 方向 B / ble-wifi: BLE 上の最終フェーズ完了で CASE が保留された(sigma1 未送出)。
+        // ここで BLE を降りる。
+        if udp_case && matches!(comm.phase(), Phase::Case) {
             crate::json::info!(
-                "[commission] AddNOC accepted; CASE suspended for operational UDP handoff"
+                "[commission] BLE phases accepted; CASE suspended for operational UDP handoff"
             );
             return Ok(BleOutcome::PausedBeforeCase);
         }

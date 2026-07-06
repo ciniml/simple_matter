@@ -70,6 +70,8 @@ pub enum Cmd {
         target: Target,
     },
     /// BLE コミッショニング(`handoff` = 方向 B: AddNOC 後に運用 UDP へ遷移)。
+    /// `wifi = Some((ssid, password))` は `pairing ble-wifi`: AddNOC 後に同 BLE 上で
+    /// Wi-Fi をプロビジョンし、CASE 以降を運用 UDP で行う(handoff 相当の遷移込み)。
     /// feature `ble` 無効ビルドでもパースは通し、実行時にエラーを返す。
     #[cfg_attr(not(feature = "ble"), allow(dead_code))]
     PairBle {
@@ -77,6 +79,7 @@ pub enum Cmd {
         passcode: u32,
         discriminator: Option<u16>,
         handoff: bool,
+        wifi: Option<(String, String)>,
     },
     DiscoverCommissionable {
         discriminator: Option<u16>,
@@ -251,7 +254,8 @@ pub fn dispatch(g: &Globals, cmd: Cmd) -> Result<(), String> {
             passcode,
             discriminator,
             handoff,
-        } => crate::runner::ble::pair_ble(g, node, passcode, discriminator, handoff),
+            wifi,
+        } => crate::runner::ble::pair_ble(g, node, passcode, discriminator, handoff, wifi),
         #[cfg(not(feature = "ble"))]
         Cmd::PairBle { .. } => {
             Err("BLE support is not compiled in; rebuild with `--features ble`".into())
@@ -338,12 +342,43 @@ fn parse_pairing(args: &[String]) -> Result<Cmd, String> {
                 passcode: parse_passcode(&rest[1])?,
                 discriminator,
                 handoff: sub == "ble-handoff",
+                wifi: None,
+            })
+        }
+        "ble-wifi" => {
+            // pairing ble-wifi <node-id> <passcode> <ssid> <password> [discriminator]
+            let rest = &args[1..];
+            if rest.len() < 4 || rest.len() > 5 {
+                return Err(
+                    "usage: smctl pairing ble-wifi <node-id> <passcode> <ssid> <password> \
+                     [discriminator]"
+                        .into(),
+                );
+            }
+            let ssid = rest[2].clone();
+            let password = rest[3].clone();
+            if ssid.is_empty() || ssid.len() > 32 {
+                return Err(format!("invalid ssid (1..=32 bytes): {ssid:?}"));
+            }
+            if password.len() > 64 {
+                return Err("invalid wifi password (max 64 bytes)".into());
+            }
+            let discriminator = match rest.get(4) {
+                Some(d) => Some(parse_disc(d)?),
+                None => None,
+            };
+            Ok(Cmd::PairBle {
+                node: parse_u64(&rest[0])?,
+                passcode: parse_passcode(&rest[1])?,
+                discriminator,
+                handoff: false,
+                wifi: Some((ssid, password)),
             })
         }
         "list" => Ok(Cmd::PairingList),
         _ => Err(
-            "usage: smctl pairing <onnetwork|onnetwork-long|address|ble|ble-handoff|list> ... \
-             (see `smctl help`)"
+            "usage: smctl pairing <onnetwork|onnetwork-long|address|ble|ble-handoff|ble-wifi|\
+             list> ... (see `smctl help`)"
                 .into(),
         ),
     }
@@ -696,6 +731,8 @@ USAGE:
   smctl pairing address         <node-id> <passcode> <ip> [port]
   smctl pairing ble             <node-id> <passcode> [discriminator]   (CASE over BLE)
   smctl pairing ble-handoff     <node-id> <passcode> [discriminator]   (AddNOC over BLE -> CASE over UDP)
+  smctl pairing ble-wifi        <node-id> <passcode> <ssid> <password> [discriminator]
+                                (BLE commissioning + WiFi provisioning -> CASE over UDP)
   smctl pairing list
   smctl discover commissionable [--discriminator N]
   smctl discover operational <node-id>
@@ -728,7 +765,7 @@ OPTIONS:
 ENVIRONMENT:
   SM_MDNS_TRACE=1     trace mDNS queries/answers on stderr
   SM_BTP_TRACE=1      trace BTP fragments on stderr (BLE)
-  SM_BLE_ADAPTER=hciN BLE adapter for pairing ble/ble-handoff
+  SM_BLE_ADAPTER=hciN BLE adapter for pairing ble/ble-handoff/ble-wifi
 
 CLUSTERS:"
     );
@@ -828,6 +865,61 @@ mod tests {
             } => assert_eq!(sa.port(), MATTER_PORT),
             _ => panic!("wrong parse"),
         }
+    }
+
+    #[test]
+    fn pairing_ble_variants() {
+        let (_, cmd) = parse_ok("pairing ble 1 20202021 3840");
+        assert!(matches!(
+            cmd,
+            Cmd::PairBle {
+                node: 1,
+                passcode: 20202021,
+                discriminator: Some(3840),
+                handoff: false,
+                wifi: None,
+            }
+        ));
+        let (_, cmd) = parse_ok("pairing ble-handoff 1 20202021");
+        assert!(matches!(
+            cmd,
+            Cmd::PairBle {
+                handoff: true,
+                discriminator: None,
+                wifi: None,
+                ..
+            }
+        ));
+        // ble-wifi: ssid/password 必須、discriminator は省略可。
+        let (_, cmd) = parse_ok("pairing ble-wifi 1 20202021 iotap hogeFugapiyo 3840");
+        match cmd {
+            Cmd::PairBle {
+                node: 1,
+                passcode: 20202021,
+                discriminator: Some(3840),
+                handoff: false,
+                wifi: Some((ssid, pw)),
+            } => {
+                assert_eq!(ssid, "iotap");
+                assert_eq!(pw, "hogeFugapiyo");
+            }
+            _ => panic!("wrong parse"),
+        }
+        let (_, cmd) = parse_ok("pairing ble-wifi 1 20202021 iotap hogeFugapiyo");
+        assert!(matches!(
+            cmd,
+            Cmd::PairBle {
+                discriminator: None,
+                wifi: Some(_),
+                ..
+            }
+        ));
+        assert!(parse_err("pairing ble-wifi 1 20202021 iotap").starts_with("usage:"));
+        assert!(parse_err(&format!(
+            "pairing ble-wifi 1 20202021 {} pw",
+            "s".repeat(33)
+        ))
+        .contains("invalid ssid"));
     }
 
     #[test]

@@ -75,7 +75,8 @@ impl Rng for SeqRng {
 type Crb = RustCrypto<SeqRng>;
 type Dac = TestDacProvider<Crb>;
 type Op<'s> = OpCredsCluster<Crb, Dac, 5, &'s RefCell<FabricTable<Crb, 5>>>;
-type TestStack<'s> = MatterStack<'s, Crb, SeqRng, Dev<'s>, 5, 4, 4, 8, 1, 2, 3, 8>;
+type TestStack<'s, N = NetworkCommissioning> =
+    MatterStack<'s, Crb, SeqRng, Dev<'s, N>, 5, 4, 4, 8, 1, 2, 3, 8>;
 
 const PASSCODE: u32 = 20202021;
 const ITERATIONS: u32 = 1000;
@@ -120,10 +121,12 @@ static EP0_PARTS: &[EndpointId] = &[EndpointId(1)];
 static EP1_PARTS: &[EndpointId] = &[];
 
 /// On/Off ライトデバイス。OpCreds は外部所有の `RefCell<FabricTable>` を共有する(CASE と共用)。
-struct Dev<'s> {
+/// NetworkCommissioning クラスタは差し替え可能(既定 Ethernet、Wi-Fi コミッショニング
+/// テストでは `NetworkCommissioningWifi`)。
+struct Dev<'s, N: ServerCluster = NetworkCommissioning> {
     basic: BasicInformationCluster,
     gc: GeneralCommissioning,
-    net: NetworkCommissioning,
+    net: N,
     opcreds: Op<'s>,
     desc0: DescriptorCluster,
     onoff: OnOffCluster,
@@ -131,7 +134,7 @@ struct Dev<'s> {
 }
 
 // device! マクロはライフタイム付きデバイスに使えないため DataModel を手書きする(乖離)。
-impl DataModel for Dev<'_> {
+impl<N: ServerCluster> DataModel for Dev<'_, N> {
     fn endpoints(&self) -> &[EndpointMeta] {
         static EPS: &[EndpointMeta] = &[
             EndpointMeta::new(EndpointId(0), EP0_DT, EP0_SERVERS),
@@ -183,12 +186,17 @@ impl DataModel for Dev<'_> {
 }
 
 fn build_device(fabrics: &RefCell<FabricTable<Crb, 5>>) -> Dev<'_> {
+    build_device_with(fabrics, NetworkCommissioning::new(b"eth0"))
+}
+
+/// NetworkCommissioning クラスタ差し替え版(Wi-Fi コミッショニングのテスト用)。
+fn build_device_with<N: ServerCluster>(fabrics: &RefCell<FabricTable<Crb, 5>>, net: N) -> Dev<'_, N> {
     let dac_crypto = RustCrypto::new(SeqRng(0xDAC0_0001));
     let dac = TestDacProvider::new(&dac_crypto).unwrap();
     Dev {
         basic: BasicInformationCluster::new(&CFG),
         gc: GeneralCommissioning::default_config(),
-        net: NetworkCommissioning::new(b"eth0"),
+        net,
         opcreds: OpCredsCluster::new_shared(fabrics, RustCrypto::new(SeqRng(0x00C0_0001)), dac),
         desc0: DescriptorCluster::new(EndpointId(0), EP0_DT, EP0_SERVERS, &[], EP0_PARTS),
         onoff: OnOffCluster::new(),
@@ -1212,9 +1220,9 @@ mod controller_e2e {
     /// 1 パケットを宛先の handle_rx に渡し、応答が続く限り相互に ping-pong する。
     ///
     /// `to_device=true` は controller→device の向き。応答が `None`(終端)になったら戻る。
-    fn ping_pong(
+    fn ping_pong<N: ServerCluster>(
         ctrl: &mut Ctrl<'_>,
-        dev: &mut TestStack<'_>,
+        dev: &mut TestStack<'_, N>,
         now: u64,
         first: &[u8],
         mut to_device: bool,
@@ -1243,7 +1251,7 @@ mod controller_e2e {
     }
 
     /// 時間を進めながら両スタックを poll し、standalone ACK / 再送を流し切って静穏化する。
-    fn flush(ctrl: &mut Ctrl<'_>, dev: &mut TestStack<'_>, base_now: u64) {
+    fn flush<N: ServerCluster>(ctrl: &mut Ctrl<'_>, dev: &mut TestStack<'_, N>, base_now: u64) {
         let mut now = base_now;
         for _ in 0..16 {
             now += 400;
@@ -1269,9 +1277,9 @@ mod controller_e2e {
     }
 
     /// controller 発の 1 送信(`dir` のバイト列は `tx`)を device へ届け、応答を往復し、ACK を流す。
-    fn deliver_and_settle(
+    fn deliver_and_settle<N: ServerCluster>(
         ctrl: &mut Ctrl<'_>,
-        dev: &mut TestStack<'_>,
+        dev: &mut TestStack<'_, N>,
         now: u64,
         tx: &[u8],
         len: usize,
@@ -1486,6 +1494,102 @@ mod controller_e2e {
             Some(false),
             "report carries the toggled OnOff value"
         );
+    }
+
+    /// Wi-Fi コミッショニング(`pairing ble-wifi` のコアフロー): `set_wifi_credentials`
+    /// を設定した `Commissioner` が AddNOC 後に **同一 PASE セッション上で**
+    /// AddOrUpdateWiFiNetwork → ConnectNetwork を送り、デバイス側
+    /// `NetworkCommissioningWifi` のドライバに join が渡り、その後 CASE →
+    /// CommissioningComplete まで完走することを検証する。
+    #[test]
+    fn controller_end_to_end_wifi_provisioning() {
+        use crate::dm::clusters::NetworkCommissioningWifi;
+        use crate::wifi::{WifiDriver, WifiStatus};
+
+        let crypto = RustCrypto::new(SeqRng(0xC0FF_EE00_9876_5432));
+        let fabrics: RefCell<FabricTable<Crb, 5>> = RefCell::new(FabricTable::new());
+
+        // --- デバイス側: NetworkCommissioning を Wi-Fi 版(NullWifiDriver シム)に差し替え ---
+        let config = PaseConfig::from_passcode(PASSCODE, &SALT, ITERATIONS).unwrap();
+        let dev_creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
+        let sc = SecureChannel::new(&crypto, SeqRng(0x5C00_0002), config, dev_creds);
+        let im = InteractionModel::new(build_device_with(&fabrics, NetworkCommissioningWifi::new()));
+        let mut dev: TestStack<'_, NetworkCommissioningWifi> = MatterStack::new(&crypto, sc, im);
+
+        // --- コントローラ側 ---
+        let ca = Ca::<Crb>::generate(
+            &crypto,
+            &mut SeqRng(0xCA00_0003),
+            FABRIC_ID,
+            COMM_NODE,
+            0xFFF1,
+            0,
+        )
+        .expect("Ca::generate");
+        let ctrl_creds = ControllerCreds::new(&ca, &crypto, 0);
+        let sc_init = ScInitiator::new(&crypto, SeqRng(0x1C00_0004), ctrl_creds);
+        let mut ctrl: Ctrl = ControllerStack::new(&crypto, sc_init, ImClient::new());
+
+        let mut comm = Commissioner::new(&ca, &crypto, AttestationPolicy::Skip);
+        comm.set_wifi_credentials(b"iotap", b"hogeFugapiyo")
+            .expect("set_wifi_credentials");
+        comm.commission(peer(), PASSCODE, DEVICE_NODE, NOW).unwrap();
+
+        let mut tx = [0u8; 1700];
+        let mut final_phase = comm.phase();
+        let (mut saw_add_wifi, mut saw_connect) = (false, false);
+        for _ in 0..60 {
+            let out = comm.drive(&mut ctrl, NOW, &mut tx);
+            final_phase = out.phase;
+            match out.phase {
+                Phase::AddWifiNetwork => saw_add_wifi = true,
+                Phase::ConnectNetwork => saw_connect = true,
+                _ => {}
+            }
+            if let Some(d) = out.send {
+                deliver_and_settle(&mut ctrl, &mut dev, NOW, &tx, d.len);
+            }
+            match out.phase {
+                Phase::Done { .. } | Phase::Failed { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(
+            matches!(final_phase, Phase::Done { .. }),
+            "wifi commissioning did not complete: {final_phase:?}"
+        );
+        assert!(saw_add_wifi, "AddWifiNetwork phase was driven");
+        assert!(saw_connect, "ConnectNetwork phase was driven");
+
+        // デバイス側: Wi-Fi ドライバに join が渡っている(NullWifiDriver は即 Connected)。
+        assert_eq!(
+            dev.device().net.driver().status(),
+            WifiStatus::Connected,
+            "device wifi driver received ConnectNetwork"
+        );
+        // fabric も従来どおり生えている。
+        assert_eq!(fabrics.borrow().len(), 1, "device fabric added");
+    }
+
+    /// `set_wifi_credentials` の境界: SSID 32 / credentials 64 バイトまで受理、超過は拒否。
+    #[test]
+    fn set_wifi_credentials_validates_lengths() {
+        use crate::controller::{MAX_WIFI_CREDENTIALS_LEN, MAX_WIFI_SSID_LEN};
+
+        let crypto = RustCrypto::new(SeqRng(1));
+        let ca = Ca::<Crb>::generate(&crypto, &mut SeqRng(2), FABRIC_ID, COMM_NODE, 0xFFF1, 0)
+            .expect("Ca::generate");
+        let mut comm = Commissioner::new(&ca, &crypto, AttestationPolicy::Skip);
+        assert!(comm
+            .set_wifi_credentials(&[0x41; MAX_WIFI_SSID_LEN], &[0x42; MAX_WIFI_CREDENTIALS_LEN])
+            .is_ok());
+        assert!(comm
+            .set_wifi_credentials(&[0x41; MAX_WIFI_SSID_LEN + 1], b"pw")
+            .is_err());
+        assert!(comm
+            .set_wifi_credentials(b"ssid", &[0x42; MAX_WIFI_CREDENTIALS_LEN + 1])
+            .is_err());
+        assert!(comm.set_wifi_credentials(b"", b"pw").is_err());
     }
 
     /// 送信ファネルの MRP 格下げ(§3.3)を公開 API で観測する。BTP(BLE)ピアへの

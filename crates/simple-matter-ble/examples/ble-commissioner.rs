@@ -1103,6 +1103,8 @@ fn report_phase(phase: Phase) {
         Phase::Csr => "CSRRequest",
         Phase::AddTrustedRoot => "AddTrustedRootCertificate",
         Phase::AddNoc => "AddNOC",
+        Phase::AddWifiNetwork => "AddOrUpdateWiFiNetwork",
+        Phase::ConnectNetwork => "ConnectNetwork",
         Phase::Case => "CASE handshake",
         Phase::Complete => "CommissioningComplete",
         Phase::Done { .. } => "Done",

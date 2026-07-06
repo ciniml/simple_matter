@@ -76,6 +76,10 @@ smctl pairing onnetwork-long <node-id> <passcode> <discriminator>
 smctl pairing address    <node-id> <passcode> <ip> [port]     # アドレス直指定
 smctl pairing ble        <node-id> <passcode> [discriminator] # BLE 上で CASE まで連続
 smctl pairing ble-handoff <node-id> <passcode> [discriminator] # 方向 B(AddNOC→運用UDP)
+smctl pairing ble-wifi   <node-id> <passcode> <ssid> <password> [discriminator]
+                                     # chip-tool 相当: BLE で AddNOC + WiFi プロビジョン
+                                     # (AddOrUpdateWiFiNetwork→ConnectNetwork)→ BLE close
+                                     # → 運用 mDNS 解決 → CASE over UDP → Complete
 smctl pairing list                                            # アドレス帳の一覧
 
 # 発見のみ
@@ -457,7 +461,7 @@ cluster_def! {
 | G7 | 複数 fabric(`FabricTable<C,1>`) | `--fabric` | パス設計のみ先取り(§7.3) |
 | G8 | mDNS ブラウズが IPv4 のみ | `discover`、IPv6 only 機器 | 将来(コア + runner) |
 | G9 | ノード削除(RemoveFabric)の高レベル化 | `pairing unpair` | `any invoke`(0x3E/0x0A)で代替可。C3 で opcreds テーブル収載により名前でも可能 |
-| G10 | WiFi credentials の実投入(デバイス側シム) | `pairing ble-wifi` 相当 | network-commissioning コマンド送出は可能。実 join はデバイス側 E5 以降 |
+| G10 | ~~WiFi credentials の実投入(デバイス側シム)~~ **解消済み(2026-07-07)** | `pairing ble-wifi` | コア `Commissioner::set_wifi_credentials` が AddNOC 後に AddOrUpdateWiFiNetwork(0x31/0x02)→ConnectNetwork(0x31/0x06)フェーズを挿入。E5 NanoC6 実機で BLE→WiFi join→運用 mDNS→CASE over UDP→Complete→onoff toggle を検証済み。運用 mDNS 解決は Unix では 5353 共有 bind(定期 announce の受動受信。AP がホスト→デバイス方向マルチキャストを落とす環境対策)、Windows は QU + エフェメラル(W3)のまま |
 
 いずれも smctl の骨格(§2〜§5)には影響せず、解消され次第コマンドを足すだけの
 位置に置いてある。

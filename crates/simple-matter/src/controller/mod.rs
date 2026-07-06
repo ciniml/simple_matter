@@ -823,7 +823,10 @@ impl<
     }
 }
 
-pub use commissioner::{AttestationPolicy, CommissionError, Commissioner, DriveOutcome, Phase};
+pub use commissioner::{
+    AttestationPolicy, CommissionError, Commissioner, DriveOutcome, Phase,
+    MAX_WIFI_CREDENTIALS_LEN, MAX_WIFI_SSID_LEN,
+};
 
 #[cfg(test)]
 mod tests;
