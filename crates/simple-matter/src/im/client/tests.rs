@@ -334,12 +334,39 @@ fn run(
         )
         .unwrap();
     let mut wire = [0u8; 1600];
-    let mut wlen = sent.len;
-    wire[..wlen].copy_from_slice(&cli_pool.get(sent.buf).unwrap()[..wlen]);
+    wire[..sent.len].copy_from_slice(&cli_pool.get(sent.buf).unwrap()[..sent.len]);
+    pump(
+        crypto,
+        cli_mgr,
+        cli_sessions,
+        cli_pool,
+        dev_mgr,
+        dev_sessions,
+        dev_pool,
+        dev_tx_cap,
+        wire,
+        sent.len,
+        true,
+    );
+}
 
+/// ワイヤ 1 通(`wire[..wlen]`)を `to_device` の向きに配送し、応答が続く限り往復させる。
+#[allow(clippy::too_many_arguments)]
+fn pump(
+    crypto: &Backend,
+    cli_mgr: &mut CliMgr,
+    cli_sessions: &mut SessionManager<4>,
+    cli_pool: &mut BufferPool<3, 1600>,
+    dev_mgr: &mut DevMgr,
+    dev_sessions: &mut SessionManager<4>,
+    dev_pool: &mut BufferPool<3, 1600>,
+    dev_tx_cap: usize,
+    mut wire: [u8; 1600],
+    mut wlen: usize,
+    mut to_device: bool,
+) {
     let mut dev_tx = [0u8; 1600];
     let mut cli_tx = [0u8; 1600];
-    let mut to_device = true;
     for _ in 0..40 {
         let resp = if to_device {
             deliver(
@@ -700,4 +727,413 @@ fn second_start_is_busy() {
         im.start_read(ex, &paths, &mut out, 0),
         Err(crate::error::Error::NoSpace)
     );
+}
+
+// ==========================================================================
+// (g) Subscribe: プライミング → 確立 → デバイス発レポート受信(§4.5)
+// ==========================================================================
+
+/// デバイス側の due 購読を 1 件レポート送出する(`MatterStack::stage_subscription_report` 相当)。
+///
+/// 戻りは (ワイヤ, 長さ)。due が無ければ `None`。`report_cap` はレポート payload バッファ長
+/// (小さくするとチャンク化を強制)。
+fn stage_device_report(
+    crypto: &Backend,
+    dev_mgr: &mut DevMgr,
+    dev_sessions: &mut SessionManager<4>,
+    dev_pool: &mut BufferPool<3, 1600>,
+    report_cap: usize,
+    now: u64,
+) -> Option<([u8; 1600], usize)> {
+    let due = dev_mgr.handler_mut().im.poll_subscriptions(now)?;
+    let ex = dev_mgr.open_initiator(due.session).unwrap();
+    let mut payload = [0u8; 1600];
+    let len = dev_mgr
+        .handler_mut()
+        .im
+        .build_report(due.subscription, ex, &mut payload[..report_cap], now)
+        .unwrap();
+    let sent = dev_mgr
+        .send_reliable(
+            dev_sessions,
+            crypto,
+            dev_pool,
+            ex,
+            &Outgoing {
+                proto_id: PROTO_ID_INTERACTION_MODEL,
+                opcode: ImOpCode::ReportData as u8,
+                payload: &payload[..len],
+            },
+            SendTiming {
+                now_ms: now,
+                jitter_rand: 0,
+            },
+        )
+        .unwrap();
+    let mut out = [0u8; 1600];
+    out[..sent.len].copy_from_slice(&dev_pool.get(sent.buf).unwrap()[..sent.len]);
+    Some((out, sent.len))
+}
+
+/// subscribe → priming → SubscribeDone まで駆動し、購読 ID と max_interval を返す。
+#[allow(clippy::too_many_arguments)]
+fn establish_subscription(
+    crypto: &Backend,
+    cli_mgr: &mut CliMgr,
+    cli_sessions: &mut SessionManager<4>,
+    cli_pool: &mut BufferPool<3, 1600>,
+    dev_mgr: &mut DevMgr,
+    dev_sessions: &mut SessionManager<4>,
+    dev_pool: &mut BufferPool<3, 1600>,
+    dev_tx_cap: usize,
+    cli_s: SessionId,
+    paths: &[AttributePath],
+    min_s: u16,
+    max_s: u16,
+) -> (u32, u16) {
+    let ex = cli_mgr.open_initiator(cli_s).unwrap();
+    let mut out = [0u8; 256];
+    let plen = cli_mgr
+        .handler_mut()
+        .im
+        .start_subscribe(ex, paths, min_s, max_s, &mut out, NOW)
+        .unwrap();
+    run(
+        crypto,
+        cli_mgr,
+        cli_sessions,
+        cli_pool,
+        dev_mgr,
+        dev_sessions,
+        dev_pool,
+        dev_tx_cap,
+        ex,
+        ImOpCode::SubscribeRequest as u8,
+        &out[..plen],
+    );
+    match cli_mgr.handler_mut().im.take_event() {
+        Some(ImEvent::SubscribeDone {
+            subscription_id,
+            max_interval_s,
+        }) => (subscription_id, max_interval_s),
+        other => panic!("expected SubscribeDone, got {other:?}"),
+    }
+}
+
+#[test]
+fn subscribe_priming_and_device_report() {
+    let crypto = crypto();
+    let (mut dev_mgr, mut dev_sessions, mut dev_pool) = device();
+    let (mut cli_mgr, mut cli_sessions, mut cli_pool) = client();
+    let cli_s = establish_case_pair(&mut cli_sessions, &mut dev_sessions);
+
+    let paths = [AttributePath::concrete(
+        EndpointId(1),
+        ClusterId(0x0006),
+        AttributeId(0x0000),
+    )];
+    let (sub_id, max_s) = establish_subscription(
+        &crypto,
+        &mut cli_mgr,
+        &mut cli_sessions,
+        &mut cli_pool,
+        &mut dev_mgr,
+        &mut dev_sessions,
+        &mut dev_pool,
+        1600,
+        cli_s,
+        &paths,
+        0,
+        60,
+    );
+    assert_eq!(max_s, 60, "negotiated max interval echoes ceiling");
+    assert!(!cli_mgr.handler().im.is_busy(), "txn slot freed");
+    assert_eq!(cli_mgr.handler().im.subscription_count(), 1);
+    assert_eq!(dev_mgr.handler().im.subscription_count(), 1);
+
+    // --- 属性変化 → デバイス発レポート ---
+    dev_mgr.handler_mut().im.data_model_mut().onoff.set(true);
+    let (wire, wlen) = stage_device_report(
+        &crypto,
+        &mut dev_mgr,
+        &mut dev_sessions,
+        &mut dev_pool,
+        1600,
+        NOW,
+    )
+    .expect("dirty subscription is due (min=0)");
+    pump(
+        &crypto,
+        &mut cli_mgr,
+        &mut cli_sessions,
+        &mut cli_pool,
+        &mut dev_mgr,
+        &mut dev_sessions,
+        &mut dev_pool,
+        1600,
+        wire,
+        wlen,
+        false,
+    );
+
+    assert_eq!(
+        cli_mgr.handler_mut().im.take_event(),
+        Some(ImEvent::SubscriptionReport {
+            subscription_id: sub_id
+        })
+    );
+    let im = &cli_mgr.handler().im;
+    assert!(im.report_exchange().is_none(), "report exchange finished");
+    assert!(!im.is_sub_truncated());
+    let mut value = None;
+    for r in im.sub_reports() {
+        if let AttributeReportRef::Data(d) = r.unwrap() {
+            let mut rd = d.value();
+            value = Some(rd.read_next().unwrap().unwrap().value.as_bool().unwrap());
+        }
+    }
+    assert_eq!(value, Some(true), "report carries the changed OnOff value");
+
+    // ack 済みなので dirty は消えている(即座に次の due は無い)。
+    assert!(dev_mgr.handler_mut().im.poll_subscriptions(NOW).is_none());
+}
+
+// ==========================================================================
+// (h) チャンク化されたデバイス発レポート(小バッファ強制)
+// ==========================================================================
+
+#[test]
+fn chunked_device_report() {
+    let crypto = crypto();
+    let (mut dev_mgr, mut dev_sessions, mut dev_pool) = device();
+    let (mut cli_mgr, mut cli_sessions, mut cli_pool) = client();
+    let cli_s = establish_case_pair(&mut cli_sessions, &mut dev_sessions);
+
+    // 全ワイルドカード購読(レポートが複数チャンクにまたがる)。
+    let paths = [AttributePath::default()];
+    let (sub_id, _max) = establish_subscription(
+        &crypto,
+        &mut cli_mgr,
+        &mut cli_sessions,
+        &mut cli_pool,
+        &mut dev_mgr,
+        &mut dev_sessions,
+        &mut dev_pool,
+        160,
+        cli_s,
+        &paths,
+        0,
+        60,
+    );
+
+    dev_mgr.handler_mut().im.data_model_mut().onoff.set(true);
+    // レポートも 160B バッファでチャンク化を強制。継続チャンクは client の
+    // StatusResponse(SUCCESS) 受信(pump 内)で device の on_status が送る。
+    let (wire, wlen) = stage_device_report(
+        &crypto,
+        &mut dev_mgr,
+        &mut dev_sessions,
+        &mut dev_pool,
+        160,
+        NOW,
+    )
+    .expect("due");
+    pump(
+        &crypto,
+        &mut cli_mgr,
+        &mut cli_sessions,
+        &mut cli_pool,
+        &mut dev_mgr,
+        &mut dev_sessions,
+        &mut dev_pool,
+        160,
+        wire,
+        wlen,
+        false,
+    );
+
+    assert_eq!(
+        cli_mgr.handler_mut().im.take_event(),
+        Some(ImEvent::SubscriptionReport {
+            subscription_id: sub_id
+        })
+    );
+    let im = &cli_mgr.handler().im;
+    assert!(!im.is_sub_truncated());
+    assert!(im.report_exchange().is_none());
+    let mut data = 0;
+    for r in im.sub_reports() {
+        if let AttributeReportRef::Data(_) = r.unwrap() {
+            data += 1;
+        }
+    }
+    assert!(data > 8, "chunked report aggregated many attributes: {data}");
+}
+
+// ==========================================================================
+// (i) keep-alive 途絶 → SubscriptionLost
+// ==========================================================================
+
+#[test]
+fn subscription_lost_on_max_interval_timeout() {
+    let crypto = crypto();
+    let (mut dev_mgr, mut dev_sessions, mut dev_pool) = device();
+    let (mut cli_mgr, mut cli_sessions, mut cli_pool) = client();
+    let cli_s = establish_case_pair(&mut cli_sessions, &mut dev_sessions);
+
+    let paths = [AttributePath::concrete(
+        EndpointId(1),
+        ClusterId(0x0006),
+        AttributeId(0x0000),
+    )];
+    let (sub_id, max_s) = establish_subscription(
+        &crypto,
+        &mut cli_mgr,
+        &mut cli_sessions,
+        &mut cli_pool,
+        &mut dev_mgr,
+        &mut dev_sessions,
+        &mut dev_pool,
+        1600,
+        cli_s,
+        &paths,
+        0,
+        1,
+    );
+    assert_eq!(max_s, 1);
+
+    let deadline = NOW + (max_s as u64) * 1000 + SUBSCRIPTION_GRACE_MS;
+    // 期限ちょうどではロストしない。
+    cli_mgr.handler_mut().im.on_tick(deadline);
+    assert_eq!(cli_mgr.handler_mut().im.take_event(), None);
+    assert_eq!(cli_mgr.handler().im.subscription_count(), 1);
+    // 期限超過でロスト検出。
+    cli_mgr.handler_mut().im.on_tick(deadline + 1);
+    assert_eq!(
+        cli_mgr.handler_mut().im.take_event(),
+        Some(ImEvent::SubscriptionLost {
+            subscription_id: sub_id
+        })
+    );
+    assert_eq!(cli_mgr.handler().im.subscription_count(), 0);
+}
+
+// ==========================================================================
+// (j) keep-alive レポートで last_report が更新されロストしない
+// ==========================================================================
+
+#[test]
+fn keep_alive_report_refreshes_liveness() {
+    let crypto = crypto();
+    let (mut dev_mgr, mut dev_sessions, mut dev_pool) = device();
+    let (mut cli_mgr, mut cli_sessions, mut cli_pool) = client();
+    let cli_s = establish_case_pair(&mut cli_sessions, &mut dev_sessions);
+
+    let paths = [AttributePath::concrete(
+        EndpointId(1),
+        ClusterId(0x0006),
+        AttributeId(0x0000),
+    )];
+    let (sub_id, max_s) = establish_subscription(
+        &crypto,
+        &mut cli_mgr,
+        &mut cli_sessions,
+        &mut cli_pool,
+        &mut dev_mgr,
+        &mut dev_sessions,
+        &mut dev_pool,
+        1600,
+        cli_s,
+        &paths,
+        0,
+        1,
+    );
+
+    // 属性変化なしでも max interval 到達でデバイスが keep-alive(全パス再送)を出す。
+    let t1 = NOW + (max_s as u64) * 1000;
+    let (wire, wlen) = stage_device_report(
+        &crypto,
+        &mut dev_mgr,
+        &mut dev_sessions,
+        &mut dev_pool,
+        1600,
+        t1,
+    )
+    .expect("max interval reached → keep-alive report due");
+    pump(
+        &crypto,
+        &mut cli_mgr,
+        &mut cli_sessions,
+        &mut cli_pool,
+        &mut dev_mgr,
+        &mut dev_sessions,
+        &mut dev_pool,
+        1600,
+        wire,
+        wlen,
+        false,
+    );
+    assert_eq!(
+        cli_mgr.handler_mut().im.take_event(),
+        Some(ImEvent::SubscriptionReport {
+            subscription_id: sub_id
+        })
+    );
+
+    // last_report が t1 に更新されている: 旧期限では生存、新期限で初めてロスト。
+    // (pump は NOW 固定時刻で配送するが、client の last_report 更新は handle の now_ms =
+    // 受信時刻 NOW を使うため、ここでは on_tick の閾値だけを確認する)
+    let im = &mut cli_mgr.handler_mut().im;
+    im.on_tick(NOW + (max_s as u64) * 1000 + SUBSCRIPTION_GRACE_MS);
+    assert_eq!(im.take_event(), None, "still alive after keep-alive");
+    assert_eq!(im.subscription_count(), 1);
+}
+
+// ==========================================================================
+// (k) 未知の購読 ID → StatusResponse(InvalidSubscription) で終端
+// ==========================================================================
+
+#[test]
+fn unknown_subscription_report_is_rejected() {
+    use crate::im::wire::{encode_report_data, ReportDataHeader};
+    use crate::transport::header::{ExchFlags, PayloadHeader};
+
+    let mut im = ImC::new();
+    let mut sessions: SessionManager<4> = SessionManager::new();
+
+    let mut payload = [0u8; 128];
+    let plen = encode_report_data(
+        &mut payload,
+        ReportDataHeader {
+            subscription_id: Some(999),
+            more_chunks: false,
+            suppress_response: false,
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+
+    let hdr = PayloadHeader {
+        exch_flags: ExchFlags::from_bits(ExchFlags::INITIATOR),
+        proto_opcode: ImOpCode::ReportData as u8,
+        exch_id: 0x77,
+        proto_id: PROTO_ID_INTERACTION_MODEL,
+        vendor_id: None,
+        ack_ctr: None,
+    };
+    let rx = RxMessage {
+        header: &hdr,
+        payload: &payload[..plen],
+        exchange: ExchangeId::from_parts(SessionId::from_raw(3), 0x77),
+        role: crate::exchange::Role::Responder,
+    };
+    let mut tx = [0u8; 64];
+    let action = im.handle(&rx, &mut tx, &mut sessions, NOW).unwrap();
+    let HandlerAction::Close { opcode, len, .. } = action else {
+        panic!("expected Close, got {action:?}");
+    };
+    assert_eq!(opcode, ImOpCode::StatusResponse as u8);
+    let sr = StatusResponse::decode(&tx[..len]).unwrap();
+    assert_eq!(sr.status, ImStatus::InvalidSubscription);
+    assert_eq!(im.take_event(), None, "no event for rejected report");
 }

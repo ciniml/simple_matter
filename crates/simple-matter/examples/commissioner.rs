@@ -13,16 +13,20 @@
 //! # 使い方
 //!
 //! ```text
-//! commissioner <passcode> [<ip> <port>]
+//! commissioner <passcode> [<ip> <port>] [--subscribe]
 //! ```
 //!
 //! - `ip` / `port` 省略時は **mDNS ブラウズ**(`_matterc._udp.local` の PTR クエリを
 //!   224.0.0.251:5353 に送り、最初に発見した commissionable ノードを採用)。
 //! - 明示時はそのアドレスへ直接 PASE を開始する(相互運用試験の主経路)。
+//! - `--subscribe`: コミッショニング完了後、CASE resumption デモの代わりに **Subscribe デモ**
+//!   (`docs/design/controller.md` §4.5)を実行する。OnOff 属性を購読 → 同一 CASE セッションで
+//!   Toggle を invoke → デバイス発の変化レポート受信 → keep-alive レポート受信、まで確認する。
 //!
 //! 実行例(別プロセスで `onoff-light` を起動しておく):
 //! ```text
 //! cargo run --release --example commissioner --features controller -- 20202021 127.0.0.1 5540
+//! cargo run --release --example commissioner --features controller -- 20202021 127.0.0.1 5540 --subscribe
 //! ```
 
 use std::io::ErrorKind;
@@ -103,11 +107,13 @@ impl Rng for DemoRng {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    let subscribe = args.iter().any(|a| a == "--subscribe");
+    args.retain(|a| a != "--subscribe");
     let passcode = match args.get(1).and_then(|s| s.parse::<u32>().ok()) {
         Some(p) => p,
         None => {
-            eprintln!("usage: commissioner <passcode> [<ip> <port>]");
+            eprintln!("usage: commissioner <passcode> [<ip> <port>] [--subscribe]");
             return ExitCode::FAILURE;
         }
     };
@@ -136,7 +142,7 @@ fn main() -> ExitCode {
         }
     };
 
-    match run(passcode, peer_addr) {
+    match run(passcode, peer_addr, subscribe) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
             eprintln!("[fatal] {msg}");
@@ -145,8 +151,9 @@ fn main() -> ExitCode {
     }
 }
 
-/// コミッショニング → Toggle → Read を 1 本のソケットで駆動する。
-fn run(passcode: u32, peer_addr: SocketAddr) -> Result<(), String> {
+/// コミッショニング → Toggle → Read(→ Subscribe デモ or CASE resumption)を 1 本の
+/// ソケットで駆動する。
+fn run(passcode: u32, peer_addr: SocketAddr, subscribe: bool) -> Result<(), String> {
     // --- コントローラの資格情報(新規 CA)---
     let crypto = RustCrypto::new(DemoRng::from_time());
     let ca = Ca::<Backend>::generate(
@@ -279,6 +286,14 @@ fn run(passcode: u32, peer_addr: SocketAddr) -> Result<(), String> {
         value,
         if value { "ON" } else { "OFF" }
     );
+
+    // --- Subscribe デモ(controller.md §4.5、`--subscribe` 指定時)---
+    // 購読確立後は keep-alive 途絶検出のため next_deadline が常に立ち settle() が終端しない
+    // ので、resumption デモとは排他にする。
+    if subscribe {
+        settle(&mut stack, &socket, &start, &mut rx, &mut tx)?;
+        return run_subscribe_demo(&mut stack, &socket, &start, case_session, &mut rx, &mut tx);
+    }
 
     // --- CASE session resumption(secure-channel.md §7.4)---
     // 同一プロセス内で 2 本目の CASE を張る。ScInitiator が 1 本目のフル CASE で保存した
@@ -438,6 +453,175 @@ fn drive_until_im_event(
             return None;
         }
     }
+}
+
+/// Subscribe デモの最小/最大レポート間隔(秒)。
+const SUB_MIN_INTERVAL_S: u16 = 0;
+const SUB_MAX_INTERVAL_S: u16 = 10;
+
+/// Subscribe デモ(controller.md §4.5.5 の CLI 推奨パターン)。
+///
+/// 1. OnOff 属性を購読(プライミング → SubscribeResponse)。
+/// 2. **同一 CASE セッション上で自分で Toggle を invoke** → デバイス発の変化レポートを受信。
+/// 3. さらに keep-alive レポート(maxInterval 周期)を 1 件受信して終了。
+///    途中で SubscriptionLost(keep-alive 途絶)が出たら失敗。
+fn run_subscribe_demo(
+    stack: &mut Ctrl<'_>,
+    socket: &UdpSocket,
+    start: &Instant,
+    case_session: SessionId,
+    rx: &mut [u8],
+    tx: &mut [u8],
+) -> Result<(), String> {
+    // 1) 購読を張る。
+    let dir = stack
+        .start_subscribe(
+            case_session,
+            &[AttributePath::concrete(ONOFF_EP, ONOFF_CLUSTER, ONOFF_ATTR)],
+            SUB_MIN_INTERVAL_S,
+            SUB_MAX_INTERVAL_S,
+            start.elapsed().as_millis() as u64,
+            tx,
+        )
+        .map_err(|e| format!("start_subscribe: {e:?}"))?;
+    send_dir(socket, tx, &dir);
+    println!(
+        "[subscribe] SubscribeRequest sent (min={SUB_MIN_INTERVAL_S}s max={SUB_MAX_INTERVAL_S}s)"
+    );
+
+    let until = Instant::now() + Duration::from_secs(10);
+    let (sub_id, max_s) = match wait_im_event(stack, socket, start, rx, tx, until) {
+        Some(ImEvent::SubscribeDone {
+            subscription_id,
+            max_interval_s,
+        }) => (subscription_id, max_interval_s),
+        Some(ev) => return Err(format!("subscribe failed: {ev:?}")),
+        None => return Err("subscribe timed out (no SubscribeResponse)".into()),
+    };
+    println!("[subscribe] ESTABLISHED: subscription_id={sub_id} max_interval={max_s}s");
+
+    // 2) 同一 CASE セッションで Toggle を invoke し、変化レポートを待つ。
+    let dir = stack
+        .start_invoke(
+            case_session,
+            CommandPath::new(ONOFF_EP, ONOFF_CLUSTER, ONOFF_CMD_TOGGLE),
+            |w, t| {
+                w.start_struct(t)?;
+                w.end_container()
+            },
+            start.elapsed().as_millis() as u64,
+            tx,
+        )
+        .map_err(|e| format!("start Toggle while subscribed: {e:?}"))?;
+    send_dir(socket, tx, &dir);
+    println!("[subscribe] Toggle sent on the same CASE session");
+
+    let until = Instant::now() + Duration::from_secs(10);
+    let mut got_invoke = false;
+    let mut got_report = false;
+    while !(got_invoke && got_report) {
+        match wait_im_event(stack, socket, start, rx, tx, until) {
+            Some(ImEvent::InvokeDone { status }) if status.is_success() => {
+                println!("[subscribe] Toggle acknowledged (status = Success)");
+                got_invoke = true;
+            }
+            Some(ImEvent::SubscriptionReport { subscription_id }) => {
+                if subscription_id != sub_id {
+                    return Err(format!("report for unexpected subscription {subscription_id}"));
+                }
+                let v = sub_report_onoff_value(stack);
+                println!(
+                    "[subscribe] CHANGE REPORT received: OnOff = {:?} (subscription_id={subscription_id})",
+                    v
+                );
+                got_report = true;
+            }
+            Some(ImEvent::SubscriptionLost { subscription_id }) => {
+                return Err(format!("subscription {subscription_id} lost"));
+            }
+            Some(ev) => return Err(format!("unexpected IM event: {ev:?}")),
+            None => return Err("timed out waiting for change report".into()),
+        }
+    }
+
+    // 3) keep-alive レポート(maxInterval 周期)を 1 件待つ。SubscriptionLost が先に出たら
+    //    デバイスが keep-alive を送っていない = 失敗。
+    println!("[subscribe] waiting for a keep-alive report (~{max_s}s)...");
+    let until = Instant::now() + Duration::from_millis((max_s as u64) * 1000 + 8_000);
+    match wait_im_event(stack, socket, start, rx, tx, until) {
+        Some(ImEvent::SubscriptionReport { subscription_id }) => {
+            let v = sub_report_onoff_value(stack);
+            println!(
+                "[subscribe] KEEP-ALIVE REPORT received: OnOff = {v:?} (subscription_id={subscription_id})"
+            );
+        }
+        Some(ImEvent::SubscriptionLost { subscription_id }) => {
+            return Err(format!(
+                "subscription {subscription_id} lost while waiting for keep-alive"
+            ));
+        }
+        Some(ev) => return Err(format!("unexpected IM event: {ev:?}")),
+        None => return Err("timed out waiting for keep-alive report".into()),
+    }
+
+    println!("[done] commissioning + subscribe + change report + keep-alive succeeded");
+    Ok(())
+}
+
+/// IM イベントを 1 件、絶対期限 `until` まで待つ(受信 + poll を回し続ける)。
+fn wait_im_event(
+    stack: &mut Ctrl<'_>,
+    socket: &UdpSocket,
+    start: &Instant,
+    rx: &mut [u8],
+    tx: &mut [u8],
+    until: Instant,
+) -> Option<ImEvent> {
+    loop {
+        if let Some(ev) = stack.im_take_event() {
+            return Some(ev);
+        }
+        if Instant::now() > until {
+            return None;
+        }
+        match socket.recv_from(rx) {
+            Ok((n, src)) => {
+                let now = start.elapsed().as_millis() as u64;
+                if let Some(dir) = stack.handle_rx(&mut rx[..n], PeerAddr::Udp(src), now, tx) {
+                    send_dir(socket, tx, &dir);
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
+            Err(_) => return None,
+        }
+        let now = start.elapsed().as_millis() as u64;
+        while let Some(dir) = stack.poll(now, tx) {
+            send_dir(socket, tx, &dir);
+        }
+    }
+}
+
+/// 直近の購読レポートから OnOff 属性の bool 値を取り出す。
+fn sub_report_onoff_value(stack: &Ctrl<'_>) -> Option<bool> {
+    for report in stack.sub_reports() {
+        if let Ok(AttributeReportRef::Data(d)) = report {
+            let is_onoff = d
+                .path
+                .to_concrete()
+                .map(|c| c.attribute.0 == ONOFF_ATTR.0)
+                .unwrap_or(false);
+            if !is_onoff {
+                continue;
+            }
+            let mut v = d.value();
+            if let Ok(Some(e)) = v.read_next() {
+                if let TlvValue::Boolean(b) = e.value {
+                    return Some(b);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// 応答を受け切り、MRP 再送・standalone ACK を含めて完全に静穏化するまでネットワークを回す。

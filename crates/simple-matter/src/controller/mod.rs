@@ -204,9 +204,35 @@ impl<
         self.mgr.handler().im.read_reports()
     }
 
-    /// 次に [`poll`](Self::poll) すべき最も早い絶対時刻(MRP 再送/ACK)。
+    /// 直近の購読レポート本文(AttributeReportIB 連結の生 TLV、§4.5.4)。
+    pub fn im_sub_report(&self) -> &[u8] {
+        self.mgr.handler().im.sub_report()
+    }
+
+    /// 直近の購読レポートを [`AttributeReportRef`](crate::im::wire::AttributeReportRef) 列で
+    /// 走査する(§4.5.4)。
+    pub fn sub_reports(&self) -> AttrReports<'_> {
+        self.mgr.handler().im.sub_reports()
+    }
+
+    /// 確立済み購読数(client 側テーブル)。
+    pub fn subscription_count(&self) -> usize {
+        self.mgr.handler().im.subscription_count()
+    }
+
+    /// 次に [`poll`](Self::poll) すべき最も早い絶対時刻(MRP 再送/ACK + 購読ロスト検出)。
+    ///
+    /// 購読確立後は keep-alive 途絶検出(§4.5.3)のため常に `Some` になる(呼び出し側の
+    /// タイマがレポート途絶時にも [`poll`](Self::poll) を起こし、`drive_ticks` →
+    /// [`ImClient::on_tick`] がロストを検出する)。
     pub fn next_deadline(&self, _now_ms: u64) -> Option<u64> {
-        self.mgr.next_deadline()
+        let a = self.mgr.next_deadline();
+        let b = self.mgr.handler().im.next_sub_deadline();
+        match (a, b) {
+            (Some(x), Some(y)) => Some(x.min(y)),
+            (x, None) => x,
+            (None, y) => y,
+        }
     }
 
     /// 時間駆動の内部掃引(ハンドシェイク/トランザクションのタイムアウト掃除)。
@@ -278,7 +304,9 @@ impl<
         if let Some(ex) = report.exchange {
             let sc_active = self.mgr.handler().sc.active_exchange();
             let im_active = self.mgr.handler().im.active_exchange();
-            if Some(ex) != sc_active && Some(ex) != im_active {
+            // チャンク継続中のデバイス発レポート exchange は閉じない(§4.5)。
+            let im_report = self.mgr.handler().im.report_exchange();
+            if Some(ex) != sc_active && Some(ex) != im_active && Some(ex) != im_report {
                 self.mgr.mark_closing(ex);
             }
         }
@@ -511,6 +539,45 @@ impl<
             ex,
             PROTO_ID_INTERACTION_MODEL,
             ImOpCode::WriteRequest.to_u8(),
+            len,
+            now_ms,
+            tx_out,
+        )
+    }
+
+    /// 確立済み `session` 上で Subscribe を開始する(§4.5)。
+    ///
+    /// プライミング完了で [`ImEvent::SubscribeDone`]、以降デバイス発レポートごとに
+    /// [`ImEvent::SubscriptionReport`](本文は [`sub_reports`](Self::sub_reports))、
+    /// keep-alive 途絶で [`ImEvent::SubscriptionLost`] が積まれる。
+    pub fn start_subscribe(
+        &mut self,
+        session: SessionId,
+        paths: &[AttributePath],
+        min_interval_floor_s: u16,
+        max_interval_ceiling_s: u16,
+        now_ms: u64,
+        tx_out: &mut [u8],
+    ) -> Result<SendDirective> {
+        let ex = self.mgr.open_initiator(session)?;
+        let len = match self.mgr.handler_mut().im.start_subscribe(
+            ex,
+            paths,
+            min_interval_floor_s,
+            max_interval_ceiling_s,
+            &mut self.resp,
+            now_ms,
+        ) {
+            Ok(l) => l,
+            Err(e) => {
+                let _ = self.mgr.close(ex);
+                return Err(e);
+            }
+        };
+        self.send_started(
+            ex,
+            PROTO_ID_INTERACTION_MODEL,
+            ImOpCode::SubscribeRequest.to_u8(),
             len,
             now_ms,
             tx_out,

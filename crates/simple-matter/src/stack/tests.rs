@@ -1397,6 +1397,95 @@ mod controller_e2e {
             }
         }
         assert!(found_true, "controller reads back OnOff = true over CASE");
+
+        // --- Subscribe: 同一 CASE セッションで OnOff を購読(設計 §4.5)---
+        let dir = ctrl
+            .start_subscribe(
+                case_session,
+                &[AttributePath::concrete(
+                    EndpointId(1),
+                    ClusterId(0x0006),
+                    AttributeId(0x0000),
+                )],
+                0,  // min interval floor
+                60, // max interval ceiling
+                NOW,
+                &mut tx,
+            )
+            .expect("start subscribe");
+        deliver_and_settle(&mut ctrl, &mut dev, NOW, &tx, dir.len);
+        let sub_id = match ctrl.im_take_event() {
+            Some(ImEvent::SubscribeDone {
+                subscription_id,
+                max_interval_s,
+            }) => {
+                assert_eq!(max_interval_s, 60, "negotiated max interval");
+                subscription_id
+            }
+            other => panic!("expected SubscribeDone, got {other:?}"),
+        };
+        assert_eq!(ctrl.subscription_count(), 1, "client subscription table");
+        assert_eq!(dev.im().subscription_count(), 1, "device subscription slot");
+        // 購読確立後はロスト検出のため controller の deadline が常に立つ。
+        assert!(ctrl.next_deadline(NOW).is_some());
+
+        // --- 同一 CASE セッション上で自分で Toggle → デバイス発レポートが飛ぶ ---
+        let t1 = NOW + 1000;
+        let dir = ctrl
+            .start_invoke(
+                case_session,
+                CommandPath::new(EndpointId(1), ClusterId(0x0006), CommandId(0x02)), // Toggle
+                |w, t| {
+                    w.start_struct(t)?;
+                    w.end_container()
+                },
+                t1,
+                &mut tx,
+            )
+            .expect("start Toggle while subscribed");
+        deliver_and_settle(&mut ctrl, &mut dev, t1, &tx, dir.len);
+        assert!(!dev.device().onoff.is_on(), "toggled true → false");
+
+        // deliver_and_settle 内の flush(dev.poll)で購読レポートが排出され、controller が
+        // 受理済みのはず。イベントを収集して InvokeDone とレポートの両方を確認する。
+        let mut invoke_done = false;
+        let mut report_sub = None;
+        while let Some(ev) = ctrl.im_take_event() {
+            match ev {
+                ImEvent::InvokeDone { status } => {
+                    assert_eq!(status, ImStatus::Success);
+                    invoke_done = true;
+                }
+                ImEvent::SubscriptionReport { subscription_id } => {
+                    report_sub = Some(subscription_id);
+                }
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert!(invoke_done, "Toggle acknowledged");
+        assert_eq!(
+            report_sub,
+            Some(sub_id),
+            "device-initiated subscription report received"
+        );
+        let mut reported = None;
+        for r in ctrl.sub_reports() {
+            if let Ok(AttributeReportRef::Data(d)) = r {
+                if d.path.to_concrete().map(|c| c.attribute.0) == Some(0x0000) {
+                    let mut v = d.value();
+                    if let Ok(Some(e)) = v.read_next() {
+                        if let TlvValue::Boolean(b) = e.value {
+                            reported = Some(b);
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            reported,
+            Some(false),
+            "report carries the toggled OnOff value"
+        );
     }
 
     /// 送信ファネルの MRP 格下げ(§3.3)を公開 API で観測する。BTP(BLE)ピアへの

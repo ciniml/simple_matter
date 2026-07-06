@@ -545,7 +545,11 @@ impl TimedRequest {
 // SubscribeResponse(OpCode 0x04)
 // ==========================================================================
 
-/// SubscribeResponse メッセージ(`{ subscription_id: u32(0), max_interval_s: u16(1), imRevision }`)。
+/// SubscribeResponse メッセージ(`{ subscription_id: u32(0), max_interval_s: u16(2), imRevision }`)。
+///
+/// MaxInterval のタグは仕様(および chip の `SubscribeResponseMessage::kMaxInterval`)どおり
+/// **context 2**(context 1 は欠番)。旧実装は誤って context 1 に書いていたため、decode は
+/// 2 → 1 の順でフォールバックする(後方互換)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubscribeResponse {
     /// 購読 ID。
@@ -568,15 +572,20 @@ impl SubscribeResponse {
         let mut w = TlvWriter::new(tx);
         w.start_struct(&TlvTag::Anonymous)?;
         w.write_u32(&TlvTag::ContextSpecific(0), self.subscription_id)?;
-        w.write_u16(&TlvTag::ContextSpecific(1), self.max_interval_s)?;
+        w.write_u16(&TlvTag::ContextSpecific(2), self.max_interval_s)?;
         end_msg(&mut w)
     }
 
     /// メッセージバイト列をデコードする。
     pub fn decode(msg: &[u8]) -> Result<Self> {
+        let max_interval_s = match field_u16(msg, 2)? {
+            Some(v) => v,
+            // 旧実装(context 1)との後方互換。
+            None => field_u16(msg, 1)?.ok_or(Error::Decode)?,
+        };
         Ok(Self {
             subscription_id: field_u32(msg, 0)?.ok_or(Error::Decode)?,
-            max_interval_s: field_u16(msg, 1)?.ok_or(Error::Decode)?,
+            max_interval_s,
         })
     }
 }

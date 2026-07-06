@@ -487,6 +487,8 @@ impl<const RESULT: usize> ImClient<RESULT> {
 
 ### 4.3 Subscribe クライアントのスコープ
 
+(2026-07 追記: 本節の「将来の注意」は §4.5 として設計・実装済み。)
+
 コミッショニングに Subscribe は不要なため**初期スコープでは Read/Write/Invoke のみ**を
 実装し、Subscribe は型(`ClientTxn::Subscribe`)と経路だけ確保する。理由と将来の注意:
 
@@ -525,6 +527,133 @@ impl<const RESULT: usize> ImClient<RESULT> {
 コマンド応答(NOCSRElements / NOCResponse 等)の**意味的デコード**は `Commissioner`
 (§6)側のヘルパが行う(`ImClient` は IM の枠組みまで、クラスタ知識は持たない —
 デバイス側で `im::wire` が `dm` を知らないのと同じ規律)。
+
+### 4.5 Subscribe クライアント(確立後レポート受信、2026-07 追加)
+
+§4.3 の予約を実装に昇格する。対象は **controller 側の購読の全ライフサイクル**:
+SubscribeRequest 送信 → プライミング受理 → SubscribeResponse → デバイス発の
+定期/変化レポート受信 + StatusResponse 応答 → maxInterval 超過(keep-alive 途絶)の検出。
+
+#### 4.5.1 デバイス(responder)実装との契約(`im::engine` の実挙動を正とする)
+
+既存 responder 実装(`im/engine.rs` + `MatterStack::stage_subscription_report`)が送るものを
+precisely 記す。client はこの契約の鏡像である:
+
+1. **プライミング**(client 開始 exchange 上、受信駆動):
+   - SubscribeRequest 受理でデバイスは `max_neg = max(max_req, min_req, 1)` に**ネゴシエート**し
+     購読 slot(`Priming`)+ ReadTxn を確保。パス数は device 側 `PATHS` に**切り詰め**られる
+     (超過分は黙って落ちる)。
+   - プライミング ReportData には **SubscriptionID を付けない**(`ReportChunkBuilder::new(tx, None)`)。
+     各チャンクは `SuppressResponse=false`、途中チャンクのみ `MoreChunkedMessages=true`。
+   - client は各チャンクに `StatusResponse(SUCCESS)` を返す。**最終チャンクへの StatusResponse** を
+     受けたデバイスが `SubscribeResponse { subscription_id, max_interval=max_neg }` を返し
+     (`HandlerAction::Close`)、購読を Active 化・`last_report=now` とする。
+2. **定期/変化レポート**(デバイス発の**新規 exchange**、デバイスが `open_initiator`):
+   - due 条件: `dirty && now >= last_report + min` または `now >= last_report + max`
+     (keep-alive は空でなく**購読パス全体の再送**)。
+   - ReportData の**全チャンクに SubscriptionID が付く**(`build_report` / 継続 `on_status` とも
+     `Some(id)`)。`SuppressResponse=false`。client は各チャンクに `StatusResponse(SUCCESS)` を返す
+     (最終チャンクにも返す。デバイスはこれを ACK として `last_report` を更新)。
+   - デバイス側は MRP 再送上限到達(`PollAction::Failed`)やセッション断で購読を破棄する。
+     client への明示通知は無い(= client 側は **maxInterval 超過で検出**するしかない)。
+
+#### 4.5.2 client 側の状態機械と容量
+
+```rust
+// im/client.rs(追加分)
+pub const MAX_CLIENT_SUBSCRIPTIONS: usize = 4;     // 同時購読数(容量 const)
+pub const SUBSCRIPTION_GRACE_MS: u64 = 5_000;      // maxInterval 超過→ロスト判定の猶予
+
+struct ClientSub { id: u32, session: SessionId, max_interval_s: u16, last_report_ms: u64 }
+struct ReportRx  { exchange: ExchangeId, subscription_id: u32 }   // 受信中レポート(1 本)
+
+pub struct ImClient<const RESULT: usize> {
+    // 既存: txn / event / result …
+    subs: FixedVec<ClientSub, MAX_CLIENT_SUBSCRIPTIONS>,
+    report_rx: Option<ReportRx>,          // チャンク継続中のデバイス発レポート
+    sub_result: [u8; RESULT],             // 直近レポートの AttributeReportIB 連結(txn の result と分離)
+    sub_result_len: usize, sub_truncated: bool,
+    sub_event: Option<ImEvent>,           // 購読系イベントの 1 深度 slot(txn イベントと分離)
+}
+```
+
+- **容量は型パラメータでなく module const**。const generic 追加は `ControllerStack` /
+  example / ble-commissioner まで型シグネチャが波及する。CLI 用途は既定 4 で足りる
+  (1 エントリ 24B、`ReportRx` 込みでも +数百 B)。
+- **`sub_result` は txn の `result` と別バッファ**。購読レポートは進行中トランザクション
+  (Toggle 等)と**任意のタイミングで交錯**するため、共有すると `begin()` のリセットで壊れる。
+  保持は「最新レポート 1 件」のみ(新レポート到着で上書き。溢れは `sub_truncated`)。
+- **イベントも別 slot**(`sub_event`)。`take_event` は txn イベント優先で 1 件ずつ返す。
+  取り出し前に次レポートが来たら上書き(データは最新が残るので CLI 用途では無害)。
+
+`ImClient::handle` の分岐(既存の「進行中 txn の exchange 以外は drop」を緩める唯一の点):
+
+```
+handle(rx):
+  rx.exchange == txn.exchange      → 既存経路(Read/Write/Invoke/Subscribe プライミング)
+  rx.role == Responder && ReportData → on_device_report(§4.5.1-2 の受理)
+  それ以外                          → silent drop
+```
+
+`on_device_report`: SubscriptionID を `subs` と照合し、
+未知 ID(残留購読・デバイス再起動後の亡霊)は `StatusResponse(InvalidSubscription)` + `Close`
+(chip はこれで購読を破棄する)。既知なら AttributeReports(context 1)を `sub_result` へ
+追記コピーし `last_report_ms = now`、`More=true` なら `Respond(StatusResponse(SUCCESS))` で
+継続(`report_rx` 保持)、最終チャンクで `Close(StatusResponse(SUCCESS))` +
+`sub_event = SubscriptionReport { subscription_id }`。
+
+#### 4.5.3 keep-alive / タイムアウト
+
+- ロスト判定: `now > last_report + max_interval*1000 + SUBSCRIPTION_GRACE_MS` で購読を破棄し
+  `SubscriptionLost { subscription_id }` を積む(`on_tick`、`ControllerStack::drive_ticks` から
+  毎 `handle_rx`/`poll` で呼ばれる)。
+- `ImClient::next_sub_deadline()`(全購読のロスト期限の min)を
+  `ControllerStack::next_deadline` に min 合成する。呼び出し側の単一 select タイマが
+  レポート途絶時にも poll を起こし、ロストを検出できる。
+- 明示的な unsubscribe は初期スコープ外(CLI は購読を破棄したければセッションを閉じる/
+  プロセスを終える。デバイス側は MRP 失敗 or maxInterval keep-alive の宛先不在で自然回収)。
+
+#### 4.5.4 イベントと API(増分)
+
+```rust
+pub enum ImEvent {
+    // 既存 …
+    SubscribeDone { subscription_id: u32, max_interval_s: u16 },  // max_interval_s を追加
+    SubscriptionReport { subscription_id: u32 },  // sub_report()/sub_reports() で本文
+    SubscriptionLost { subscription_id: u32 },    // maxInterval+猶予 超過(keep-alive 途絶)
+}
+impl ImClient {
+    pub fn sub_report(&self) -> &[u8];            // 直近レポートの生 TLV(AttributeReportIB 連結)
+    pub fn sub_reports(&self) -> AttrReports<'_>; // 走査(read_reports と同型)
+    pub fn subscription_count(&self) -> usize;
+    pub fn report_exchange(&self) -> Option<ExchangeId>;  // 統合層の exchange 回収判定用
+    pub fn next_sub_deadline(&self) -> Option<u64>;
+}
+impl ControllerStack {
+    pub fn start_subscribe(&mut self, session, paths, min_interval_floor_s,
+        max_interval_ceiling_s, now_ms, tx_out) -> Result<SendDirective>;
+    pub fn sub_reports(&self) -> AttrReports<'_>;
+    pub fn im_sub_report(&self) -> &[u8];
+}
+```
+
+`ControllerStack::handle_rx` の exchange 回収判定(完了 exchange の `mark_closing`)に
+`report_exchange()` を加える(チャンク継続中のレポート exchange を閉じない)。
+
+#### 4.5.5 CLI(`smctl subscribe`)からの推奨パターン
+
+```
+start_subscribe(session, paths, min, max) → 送出
+loop select { rx → handle_rx; timer(next_deadline) → poll } しつつ:
+  take_event():
+    SubscribeDone { id, max }      → 「established」を表示、以降待ち受け
+    SubscriptionReport { id }      → sub_reports() を走査してパス+値を表示(継続)
+    SubscriptionLost { id }        → 終了 or 再購読(exit code 非 0)
+    Failed { status }              → プライミング失敗として終了
+```
+
+購読を張ったまま同一セッションで Invoke/Read/Write を並行発行できる
+(txn slot と購読受理は独立。ただし txn は従来どおり同時 1 本)。
 
 ---
 
