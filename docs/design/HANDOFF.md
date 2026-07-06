@@ -10,7 +10,7 @@
 BLE コミッショニングは chip-tool 相互運用まで達成済み。**方向 B も完結**(我々の
 ble-commissioner → chip-lighting-app: BLE コミッショニング→BLE close→運用 mDNS 解決→
 CASE over UDP→CommissioningComplete→Toggle、2026-07-06 Linux 実機)。
-移植は **Windows: W0-W3 完了
+移植は **Windows: W0-W4 全完了(W4 = Windows exe から chip-lighting-app への direction-B フルパス、2026-07-06)**、旧記述: W0-W3 完了
 (W3 は mDNS ディスカバリ込みで実機フル完走、2026-07-05)**、
 **ESP32-C6: E1〜E4 実機確認済み(E4 = fabric 永続化、リブート後に `--operational` で
 CASE 再確立+Toggle、2026-07-06)。次は E5(実 WiFi join + UDP/mDNS)**。
@@ -182,7 +182,6 @@ CASE 再確立+Toggle、2026-07-06)。次は E5(実 WiFi join + UDP/mDNS)**。
    PC 側 ble-commissioner の CA 永続化(`ca-state.bin`)+ `--operational` モード。
    PC 側の罠: BlueZ は過去ブートの FFF6 広告をキャッシュし stale アドレスへの
    connect が失敗する → `bluetoothctl remove`(ports/esp32/README.md 参照)。
-2. **W4**: chip デバイス相手のフルパス(commissioner 側の BLE→UDP 運用遷移の実装が前提)。
 3. **方向 B 完結**: 我々の commissioner → chip-lighting-app の AddNOC 後、BLE を閉じて
    運用 mDNS→CASE over UDP→CommissioningComplete(現状 AddNOC まで実証済み)。
 

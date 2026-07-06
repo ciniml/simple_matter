@@ -256,7 +256,7 @@ IF 固定 + トレース版 exe を Windows 実機で実行した結果、**FW �
 | **W1: BLE スモーク** ✅(2026-07-05 実機確認) | Windows 実機で `ble-commissioner.exe` を実行し R1/R2 とも問題なし | `[btp] established` が出る(SM_BTP_TRACE で確認) | S(問題なければ)〜M(btleplug パッチ要の場合) |
 | **W2: BLE コミッショニング** ✅(2026-07-05 実機確認) | Windows 実機の `ble-commissioner.exe` → Linux 側 `ble-onoff-light` に対し、PASE→AddNOC→CASE→CommissioningComplete→OnOff Toggle まで**フル完走**(デバイス側で属性反映・正常切断を確認)。fragment=20(btleplug が MTU 非公開のため)で 115 フラグメント往復 | commissioner ログで AddNOC 完了 | S |
 | **W3: mDNS/UDP** ✅(2026-07-05 実機フル確認) | Windows `commissioner.exe 20202021`(IP 指定なし)で **mDNS ブラウズ→発見→UDP フルコミッショニング→Toggle→Read 完走**。当初 mDNS が 35 秒タイムアウトした真因は**マルチキャスト送信/join の IF 未指定**(仮想アダプタが既定 IF に張り付くとクエリが LAN に出ない)で、LAN 向き IF への明示固定で解決(§3.2c)。QU ユニキャスト応答・REUSEPORT→REUSEADDR・browse 再クエリ+35 秒 window・`SM_MDNS_TRACE` トレースも実装済み | `[discovery] found ...` → フル完走 ✅ | M |
-| **W4: フルパス** | BLE→UDP 遷移(commissioner 側の運用遷移が実装され次第)を Windows で chip-lighting-app 相手に | chip デバイスへのフルコミッショニング + Toggle | M(遷移実装自体は別トラック) |
+| **W4: フルパス** ✅(2026-07-06 実機確認) | Windows `ble-commissioner.exe 20202021 3840 --udp-handoff` → Linux 上の chip-lighting-app に対し、**BLE コミッショニング→AddNOC→BLE close→運用 mDNS 解決(QU モード)→CASE over UDP→CommissioningComplete→Toggle 完走**。BLE(W2)と mDNS/UDP(W3)の両パスを 1 フローで使う direction-B の Windows 版 | chip デバイスへのフルコミッショニング + Toggle ✅ | M |
 
 **総工数感: M**(R1/R2 が素直に通れば W0-W2 は小さく、mDNS 共存が主戦場)。
 
