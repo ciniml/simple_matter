@@ -295,6 +295,18 @@ impl<C: Crypto> Ca<C> {
         &self.creds
     }
 
+    /// この fabric の compressed fabric id(big-endian 8 バイト)。
+    ///
+    /// 運用 mDNS のインスタンス名 `<compressedFabricId>-<nodeId>._matter._tcp.local` を
+    /// 組み立てて相手デバイスを解決するために使う(方向 B: BLE→運用 UDP 遷移)。
+    pub fn compressed_fabric_id_bytes(&self) -> [u8; crate::fabric::COMPRESSED_FABRIC_ID_LEN] {
+        self.creds
+            .iter()
+            .next()
+            .map(|e| *e.compressed_fabric_id_bytes())
+            .unwrap_or([0u8; crate::fabric::COMPRESSED_FABRIC_ID_LEN])
+    }
+
     // ----------------------------------------------------------------------
     // persistence 用 accessor(`docs/design/port-esp32-device.md` §E4.6)。
     // 秘密鍵の取り出しは CA 状態の保存のためにのみ使うこと。

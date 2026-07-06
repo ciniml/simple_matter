@@ -132,7 +132,23 @@ pub struct ControllerStack<
     resp: [u8; MAX_PACKET_SIZE],
     /// 非セキュアメッセージの source Node ID に使うエフェメラル ID(非 0)。
     ephemeral_node_id: u64,
+    /// 次に確保する unsecured(平文)セッションの送信カウンタ初期値。
+    ///
+    /// Matter Core Spec §4.5.1.1 の「Global Unencrypted Message Counter」は 1 ノードに 1 本で
+    /// 単調増加する。本実装のカウンタはセッションごとだが、非セキュアメッセージの source Node
+    /// ID は全 unsecured セッションで同一([`ephemeral_node_id`](Self::ephemeral_node_id))のため、
+    /// 新しい unsecured セッションのカウンタが 1 に戻るとデバイス側のリプレイ窓に「重複」と判定
+    /// される(BLE で PASE→AddNOC、その後別トランスポート = 運用 UDP で CASE を張る方向 B で
+    /// 顕在化: CASE Sigma1 が M:1 で送られ、BLE PASE で観測済みの M:1 と衝突する)。そこで
+    /// unsecured セッションの初期カウンタを跨いで単調に進め、セッション間で衝突しないよう十分な
+    /// ストライドを空ける。初期値 1・ストライド 256(PASE の非セキュアメッセージは 3 通のみ、
+    /// 再送は同一カウンタなので 256 の間隔で衝突しない)。
+    next_unsecured_tx_ctr: u32,
 }
+
+/// unsecured セッションを新規確保するたびに [`ControllerStack::next_unsecured_tx_ctr`] を
+/// 進めるストライド(§4.5.1.1 の単調性を跨セッションで担保する)。
+const UNSECURED_CTR_STRIDE: u32 = 256;
 
 impl<
         's,
@@ -157,6 +173,9 @@ impl<
             tx_pool: BufferPool::new(),
             resp: [0u8; MAX_PACKET_SIZE],
             ephemeral_node_id,
+            // 既存の単一 unsecured セッション経路(PASE→CASE 同一ピア)では従来どおり M:1 から
+            // 始まる。跨トランスポートで 2 本目を張ったときだけ 257,... と続く。
+            next_unsecured_tx_ctr: 1,
         }
     }
 
@@ -516,7 +535,10 @@ impl<
         if let Some(id) = existing {
             return Ok(id);
         }
-        let mut init = SessionInit::plaintext(peer, 0, 1);
+        // 跨セッションで単調な送信カウンタを与える(§4.5.1.1、フィールド doc 参照)。
+        let tx_ctr_start = self.next_unsecured_tx_ctr;
+        self.next_unsecured_tx_ctr = self.next_unsecured_tx_ctr.wrapping_add(UNSECURED_CTR_STRIDE);
+        let mut init = SessionInit::plaintext(peer, 0, tx_ctr_start);
         // initiator 側は自身のエフェメラル Node ID を source として名乗る
         // (chip 系デバイスの非セキュアパケット検証を満たす)。
         init.local_node_id = self.ephemeral_node_id;

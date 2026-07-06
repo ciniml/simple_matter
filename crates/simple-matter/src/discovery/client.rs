@@ -32,7 +32,12 @@ use crate::transport::session::fixed::FixedVec;
 use super::dns::{Name, QueryWriter, Response, T_A, T_AAAA, T_PTR, T_SRV, T_TXT};
 
 /// 発見結果 1 件が保持するアドレスの最大数(A / AAAA)。
-pub const MAX_ADDRS: usize = 2;
+///
+/// chip のノードは 1 ホストにつき IPv4(A)1 件 + IPv6(AAAA)複数件(link-local /
+/// 1 つ以上の global)を広告することがある。到達可能なアドレス(特に IPv4)が先頭 2 件から
+/// 溢れて捨てられると解決先が到達不能になりうる(方向 B の運用解決で実測)。全アドレスを
+/// 取りこぼさないよう広めに取り、選択は呼び出し側に委ねる。
+pub const MAX_ADDRS: usize = 6;
 
 /// 発見した commissionable ノードのインスタンス名の最大バイト長(dotted 表記)。
 pub const INSTANCE_CAP: usize = 64;

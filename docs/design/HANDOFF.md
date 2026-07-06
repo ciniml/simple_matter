@@ -7,7 +7,10 @@
 
 ## 1. 現在地(1 行サマリ)
 
-BLE コミッショニングは chip-tool 相互運用まで達成済み。移植は **Windows: W0-W3 完了
+BLE コミッショニングは chip-tool 相互運用まで達成済み。**方向 B も完結**(我々の
+ble-commissioner → chip-lighting-app: BLE コミッショニング→BLE close→運用 mDNS 解決→
+CASE over UDP→CommissioningComplete→Toggle、2026-07-06 Linux 実機)。
+移植は **Windows: W0-W3 完了
 (W3 は mDNS ディスカバリ込みで実機フル完走、2026-07-05)**、
 **ESP32-C6: E1〜E4 実機確認済み(E4 = fabric 永続化、リブート後に `--operational` で
 CASE 再確立+Toggle、2026-07-06)。次は E5(実 WiFi join + UDP/mDNS)**。

@@ -164,6 +164,14 @@ pub struct Commissioner<'a, C: Crypto> {
     case_session: Option<SessionId>,
     device_pubkey: [u8; 65],
     scratch: [u8; MAX_CERT_TLV_LEN],
+    /// `true` の間、AddNOC 完了後の [`Phase::Case`] 開始(sigma1 送出)を保留する。
+    ///
+    /// BLE で AddNOC まで進めたあと、CASE を**別トランスポート(運用 UDP)**で行う
+    /// 「方向 B」フロー用。呼び出し側は `drive` が `Phase::Case` を送信なしで返した時点で
+    /// トランスポートを切り替え([`set_peer`](Self::set_peer))、[`resume`](Self::resume)で
+    /// 保留を解除してから CASE を開始する。既定は `false`(従来どおり同一トランスポートで
+    /// CASE まで連続実行)。
+    suspend_before_case: bool,
 }
 
 impl<'a, C: Crypto> Commissioner<'a, C> {
@@ -185,7 +193,32 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
             case_session: None,
             device_pubkey: [0u8; 65],
             scratch: [0u8; MAX_CERT_TLV_LEN],
+            suspend_before_case: false,
         }
+    }
+
+    /// AddNOC 完了後の CASE 開始を保留するようにする(方向 B: BLE→運用 UDP 遷移用)。
+    ///
+    /// [`commission`](Self::commission) の前後どちらでも呼べる。有効にすると `drive` は
+    /// [`Phase::Case`] に到達しても sigma1 を送出せず、送信なしで `Phase::Case` を返す。
+    /// 呼び出し側はそこで [`set_peer`](Self::set_peer) により運用アドレスへ切り替え、
+    /// [`resume`](Self::resume) で保留を解除する。
+    pub fn suspend_before_case(&mut self) {
+        self.suspend_before_case = true;
+    }
+
+    /// [`suspend_before_case`](Self::suspend_before_case) の保留を解除し、次の `drive` で
+    /// CASE(sigma1)を開始できるようにする。
+    pub fn resume(&mut self) {
+        self.suspend_before_case = false;
+    }
+
+    /// 以後のトランザクション(主に CASE の sigma1)の宛先ピアを差し替える。
+    ///
+    /// AddNOC まで BLE、CASE 以降を運用 UDP で行う方向 B フロー用。`Phase::Case` の
+    /// `start_case` は本メソッドで設定したピアを使う。
+    pub fn set_peer(&mut self, peer: PeerAddr) {
+        self.peer = peer;
     }
 
     /// コミッショニングを開始する(Idle 以外では [`Error::InvalidState`] = Busy、§6.1)。
@@ -241,6 +274,15 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
                     self.awaiting = false;
                 }
             }
+        }
+
+        // 方向 B: AddNOC 完了後、CASE 開始(sigma1)を保留する。呼び出し側が
+        // トランスポートを運用 UDP に切り替え `resume()` するまで送信を出さない。
+        if self.suspend_before_case && matches!(self.phase, Phase::Case) && !self.awaiting {
+            return DriveOutcome {
+                phase: self.phase,
+                send: None,
+            };
         }
 
         if self.awaiting {
