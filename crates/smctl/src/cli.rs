@@ -763,3 +763,149 @@ CLUSTERS:"
   smctl batch demo.txt                         # subscribe + toggle in one process"
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(s: &str) -> Vec<String> {
+        s.split_whitespace().map(str::to_string).collect()
+    }
+
+    fn parse_ok(s: &str) -> (Globals, Cmd) {
+        parse(&argv(s), &Globals::defaults()).expect(s)
+    }
+
+    fn parse_err(s: &str) -> String {
+        match parse(&argv(s), &Globals::defaults()) {
+            Ok(_) => panic!("expected error for {s:?}"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn pairing_onnetwork() {
+        let (_, cmd) = parse_ok("pairing onnetwork 1 20202021");
+        match cmd {
+            Cmd::Pair {
+                node,
+                passcode,
+                target: Target::Browse(None),
+            } => {
+                assert_eq!(node, 1);
+                assert_eq!(passcode, 20202021);
+            }
+            _ => panic!("wrong parse"),
+        }
+    }
+
+    #[test]
+    fn pairing_onnetwork_long_and_address() {
+        let (_, cmd) = parse_ok("pairing onnetwork-long 2 20202021 3840");
+        assert!(matches!(
+            cmd,
+            Cmd::Pair {
+                node: 2,
+                target: Target::Browse(Some(3840)),
+                ..
+            }
+        ));
+        let (_, cmd) = parse_ok("pairing address 3 20202021 192.168.1.5 5541");
+        match cmd {
+            Cmd::Pair {
+                node: 3,
+                target: Target::Addr(sa),
+                ..
+            } => assert_eq!(sa, "192.168.1.5:5541".parse().unwrap()),
+            _ => panic!("wrong parse"),
+        }
+        // port omitted -> MATTER_PORT
+        let (_, cmd) = parse_ok("pairing address 3 20202021 10.0.0.1");
+        match cmd {
+            Cmd::Pair {
+                target: Target::Addr(sa),
+                ..
+            } => assert_eq!(sa.port(), MATTER_PORT),
+            _ => panic!("wrong parse"),
+        }
+    }
+
+    #[test]
+    fn global_flags_anywhere() {
+        let (g, cmd) = parse_ok("--state-dir /tmp/x onoff toggle 7 1 --timeout 5 --json");
+        assert_eq!(g.state_dir, PathBuf::from("/tmp/x"));
+        assert_eq!(g.timeout, Duration::from_secs(5));
+        assert!(g.json);
+        match cmd {
+            Cmd::Invoke {
+                node,
+                ep,
+                cluster,
+                command,
+                ref fields,
+                raw_fields: None,
+            } => {
+                assert_eq!((node, ep), (7, 1));
+                assert_eq!(cluster, ClusterId(0x0006));
+                assert_eq!(command, CommandId(0x02));
+                assert!(fields.is_empty());
+            }
+            _ => panic!("wrong parse"),
+        }
+    }
+
+    #[test]
+    fn cluster_read_by_name() {
+        let (_, cmd) = parse_ok("onoff read on-off 1 1");
+        assert!(matches!(
+            cmd,
+            Cmd::Read {
+                node: 1,
+                ep: 1,
+                cluster: ClusterId(0x0006),
+                attr: Some(AttributeId(0x0000)),
+            }
+        ));
+    }
+
+    #[test]
+    fn any_read_and_invoke_by_id() {
+        let (_, cmd) = parse_ok("any read 1 0 0x0028 1");
+        assert!(matches!(
+            cmd,
+            Cmd::Read {
+                cluster: ClusterId(0x0028),
+                attr: Some(AttributeId(1)),
+                ..
+            }
+        ));
+        let (_, cmd) = parse_ok("any read 1 0 0x0006 *");
+        assert!(matches!(cmd, Cmd::Read { attr: None, .. }));
+        let (_, cmd) = parse_ok("any invoke 1 1 0x0006 0x02");
+        assert!(matches!(
+            cmd,
+            Cmd::Invoke {
+                cluster: ClusterId(0x0006),
+                command: CommandId(0x02),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn errors_are_reported() {
+        assert!(parse_err("bogus-cluster toggle 1 1").contains("unknown command or cluster"));
+        assert!(parse_err("onoff read bogus-attr 1 1").contains("unknown attribute"));
+        assert!(parse_err("onoff bogus-cmd 1 1").contains("unknown command"));
+        assert!(parse_err("pairing onnetwork 1").starts_with("usage:"));
+        assert!(parse_err("--frobnicate onoff toggle 1 1").contains("unknown option"));
+        assert!(parse_err("pairing onnetwork x 20202021").contains("invalid"));
+    }
+
+    #[test]
+    fn help_paths() {
+        assert!(matches!(parse_ok("").1, Cmd::Help));
+        assert!(matches!(parse_ok("help").1, Cmd::Help));
+        assert!(matches!(parse_ok("--help").1, Cmd::Help));
+    }
+}

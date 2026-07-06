@@ -141,7 +141,9 @@ async fn run_ble(
         .map_err(|e| format!("scan: {e:?}"))?;
     crate::json::info!(
         "[ble] found device: discriminator={} vid={:#06x} pid={:#06x}",
-        target.discriminator, target.vendor_id, target.product_id
+        target.discriminator,
+        target.vendor_id,
+        target.product_id
     );
     let (conn, mtu) = gatt
         .connect(&target)
@@ -222,7 +224,9 @@ async fn run_ble(
         }
         BleOutcome::PausedBeforeCase => {
             // 方向 B: BLE を閉じ、運用 mDNS で解決、CASE→CommissioningComplete を UDP で。
-            crate::json::info!("[handoff] AddNOC complete; closing BLE, switching to operational UDP");
+            crate::json::info!(
+                "[handoff] AddNOC complete; closing BLE, switching to operational UDP"
+            );
             // chip は AddNOC 受理後に自ら BLE を閉じるので、失敗は無視する。
             let _ = gatt.disconnect(conn).await;
 
@@ -391,7 +395,9 @@ async fn drive_commission_ble(
 
         // 方向 B: AddNOC 完了で CASE が保留された(sigma1 未送出)。ここで BLE を降りる。
         if handoff && matches!(comm.phase(), Phase::Case) {
-            crate::json::info!("[commission] AddNOC accepted; CASE suspended for operational UDP handoff");
+            crate::json::info!(
+                "[commission] AddNOC accepted; CASE suspended for operational UDP handoff"
+            );
             return Ok(BleOutcome::PausedBeforeCase);
         }
 
