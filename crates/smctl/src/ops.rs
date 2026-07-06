@@ -1,34 +1,32 @@
 //! 高レベル操作(設計 doc §3): resolve → connect → execute の 3 段に正規化する。
 //!
-//! - `pairing`: mDNS ブラウズ or アドレス直指定 → [`Commissioner::commission`] を駆動 →
-//!   CA 保存 + アドレス帳記帳。
-//! - 運用コマンド: アドレス帳のキャッシュアドレスへまず CASE を試み、失敗したら
-//!   operational mDNS で再解決 → 帳を更新([`with_case_session`])。
+//! C2 で実行モデルを「1 プロセス 1 コマンド」から [`Exec`](単一プロセス内でスタック・
+//! ソケット・CASE セッション・購読を共有する実行コンテキスト)へ一般化した。
 //!
-//! 1 プロセス 1 コマンドの実行モデル(chip-tool と同じ)。
+//! - 単発コマンド([`run_single`]): Exec を作って 1 コマンド実行して捨てる(C1 と同じ挙動)。
+//! - バッチ([`crate::batch`]): 1 つの Exec で全行を順に実行する。ノードごとの CASE
+//!   セッションはキャッシュされ、`subscribe` は非ブロッキングに購読を張り、以後の行の
+//!   実行中もデバイス発レポートを逐次表示する(chip-tool の「別プロセス実行で購読が
+//!   破棄される」問題の同一セッション化による解消)。
 
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 use simple_matter::controller::ca::Ca;
-use simple_matter::controller::{
-    AttestationPolicy, Commissioner, ControllerCreds, Phase, CONTROLLER_FABRIC_INDEX,
-};
-use simple_matter::crypto::rustcrypto::RustCrypto;
+use simple_matter::controller::{AttestationPolicy, Commissioner, Phase, CONTROLLER_FABRIC_INDEX};
+use simple_matter::dm::meta::{AttributeId, ClusterId, CommandId, EndpointId};
 use simple_matter::error::Result as MResult;
 use simple_matter::im::client::ImClient;
 use simple_matter::im::wire::{AttributePath, AttributeReportRef, CommandPath};
 use simple_matter::im::ImEvent;
-use simple_matter::sc::initiator::{ScEvent, ScInitiator};
+use simple_matter::sc::initiator::ScEvent;
 use simple_matter::tlv::{ContainerType, TlvElement, TlvReader, TlvTag, TlvValue, TlvWriter};
 use simple_matter::transport::net::{PeerAddr, MAX_RX_PACKET_SIZE};
 use simple_matter::transport::session::SessionId;
 
-use crate::cli::Globals;
-use crate::clusters::{self, AttrDef, ClusterDef, CmdDef, ValueKind};
-use crate::runner::udp::{
-    drive_until_sc_event, open_dual_stack_udp, pump_commissioner, send_dir, settle, wait_im_event,
-};
+use crate::cli::{Cmd, Globals};
+use crate::clusters::{self, ValueKind};
+use crate::runner::udp::{open_dual_stack_udp, pump_commissioner, send_dir};
 use crate::runner::{mdns, Backend, Ctrl};
 use crate::state::{ca as ca_state, nodes, StateDir};
 use crate::OsRng;
@@ -41,8 +39,16 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(20);
 const CACHED_CASE_TIMEOUT: Duration = Duration::from_secs(5);
 /// コマンド完了後に ACK を流し切るための静穏化の上限。
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+/// 「静穏」とみなす期限の遠さ(ミリ秒)。
+///
+/// 購読確立後は keep-alive 途絶検出のため [`Ctrl::next_deadline`] が常に `Some`
+/// (maxInterval + 5 秒猶予 ≧ 5 秒先)を返すので、`None` を静穏条件にできない。
+/// MRP の再送/ACK 期限は近傍(数百 ms)に来るため、「残る期限がこれより遠い」を
+/// もって送受信が静穏化したとみなす。
+const QUIET_HORIZON_MS: u64 = 1500;
 
 /// `pairing` の対象指定。
+#[derive(Clone)]
 pub enum Target {
     /// mDNS ブラウズ(discriminator で絞り込み可)。
     Browse(Option<u16>),
@@ -50,116 +56,21 @@ pub enum Target {
     Addr(SocketAddr),
 }
 
-// ==========================================================================
-// pairing
-// ==========================================================================
-
-/// コミッショニング(pairing onnetwork / onnetwork-long / address)。
-///
-/// 成功時に CA 状態(発行済み serial)を保存し、アドレス帳に記帳する。
-pub fn pair(g: &Globals, node_id: u64, passcode: u32, target: Target) -> Result<(), String> {
+/// 単発コマンドの実行(1 プロセス 1 コマンド、C1 と同じモデル)。
+pub fn run_single(g: &Globals, cmd: Cmd) -> Result<(), String> {
     let state = StateDir::open(&g.state_dir)?;
-    let peer_addr = match target {
-        Target::Addr(a) => {
-            println!("[target] using explicit address {a}");
-            a
-        }
-        Target::Browse(disc) => {
-            println!("[discovery] browsing _matterc._udp.local via mDNS...");
-            mdns::browse_commissionable(disc, g.timeout.max(BROWSE_TIMEOUT_MIN))?
-        }
-    };
-
-    let crypto = RustCrypto::new(OsRng);
+    let crypto = simple_matter::crypto::rustcrypto::RustCrypto::new(OsRng);
+    // pairing は CA が無ければ生成する。運用コマンドは既存 CA を要求する。
     let ca = {
         let _lock = state.lock()?;
-        ca_state::load_or_create(&state.ca_path(), &crypto)?
+        match cmd {
+            Cmd::Pair { .. } => ca_state::load_or_create(&state.ca_path(), &crypto)?,
+            _ => ca_state::load(&state.ca_path(), &crypto)?
+                .ok_or("no CA state; commission a device first (`smctl pairing ...`)")?,
+        }
     };
-    println!(
-        "[ca] fabric_id={:#018x} controller_node_id={:#018x}",
-        ca.fabric_id(),
-        ca.controller_node_id()
-    );
-
-    let ctrl_creds = ControllerCreds::new(&ca, &crypto, 0);
-    let sc_init = ScInitiator::new(&crypto, OsRng, ctrl_creds);
-    let mut stack: Ctrl =
-        simple_matter::controller::ControllerStack::new(&crypto, sc_init, ImClient::new());
-    let mut comm = Commissioner::new(&ca, &crypto, AttestationPolicy::Skip);
-
-    let socket = open_socket()?;
-    let start = Instant::now();
-    let deadline = start + g.timeout;
-    let mut tx = [0u8; MAX_RX_PACKET_SIZE];
-    let mut rx = [0u8; MAX_RX_PACKET_SIZE];
-    let mut last_phase = Phase::Idle;
-
-    comm.commission(
-        PeerAddr::Udp(peer_addr),
-        passcode,
-        node_id,
-        start.elapsed().as_millis() as u64,
-    )
-    .map_err(|e| format!("commission() rejected: {e:?}"))?;
-    println!("[commission] starting to {peer_addr} (device node_id={node_id:#x})");
-
-    let case_session: SessionId = loop {
-        if Instant::now() > deadline {
-            return Err(format!("commissioning timed out in phase {last_phase:?}"));
-        }
-        let phase = pump_commissioner(
-            &mut comm,
-            &mut stack,
-            &socket,
-            start.elapsed().as_millis() as u64,
-            &mut tx,
-        );
-        if phase != last_phase {
-            report_phase(phase);
-            last_phase = phase;
-        }
-        match phase {
-            Phase::Done { session } => break session,
-            Phase::Failed { stage, reason } => {
-                return Err(format!("commissioning failed at stage {stage}: {reason:?}"));
-            }
-            _ => {}
-        }
-        // 発行したトランザクションの応答を受け切り、standalone ACK も含めて静穏化させて
-        // から次フェーズへ進む(デバイスの IM responder は同時 1 トランザクションのため)。
-        settle(&mut stack, &socket, &start, &mut rx, &mut tx, deadline)?;
-    };
-    println!(
-        "[commission] COMPLETE. operational CASE session = {:#x}",
-        case_session.as_raw()
-    );
-    let _ = settle(
-        &mut stack,
-        &socket,
-        &start,
-        &mut rx,
-        &mut tx,
-        Instant::now() + FLUSH_TIMEOUT,
-    );
-
-    // 発行済み serial を CA 状態に反映し、アドレス帳へ記帳する。
-    {
-        let _lock = state.lock()?;
-        ca_state::save(&state.ca_path(), &ca)?;
-        nodes::upsert(
-            &state.nodes_path(),
-            nodes::NodeEntry {
-                node_id,
-                label: g.label.clone().unwrap_or_default(),
-                last_addr: peer_addr,
-            },
-        )?;
-    }
-    println!(
-        "[pairing] node {node_id} recorded at {peer_addr} (state: {})",
-        g.state_dir.display()
-    );
-    Ok(())
+    let mut exec = Exec::new(g.clone(), state, &crypto, &ca, false)?;
+    exec.run(&cmd)
 }
 
 /// `pairing list`: アドレス帳の一覧表示。
@@ -175,324 +86,750 @@ pub fn pairing_list(g: &Globals) -> Result<(), String> {
     }
     println!("{:<12} {:<24} label", "node-id", "last-addr");
     for e in entries {
-        println!(
-            "{:<12} {:<24} {}",
-            e.node_id,
-            e.last_addr.to_string(),
-            e.label
-        );
+        let addr = if e.last_addr.port() == 0 {
+            "(unresolved)".to_string()
+        } else {
+            e.last_addr.to_string()
+        };
+        println!("{:<12} {:<24} {}", e.node_id, addr, e.label);
     }
     Ok(())
 }
 
-// ==========================================================================
-// 運用コマンド(CASE 接続 + execute)
-// ==========================================================================
+/// `discover commissionable`: ブラウズ期間中に見つかった commissionable ノードを一覧表示。
+pub fn discover_commissionable(g: &Globals, discriminator: Option<u16>) -> Result<(), String> {
+    let n = mdns::browse_commissionable_list(discriminator, g.timeout)?;
+    if n == 0 {
+        return Err("no commissionable device found (is the device in commissioning mode?)".into());
+    }
+    println!("[discover] {n} commissionable node(s) found");
+    Ok(())
+}
 
-/// 保存済み CA + アドレス帳で対象ノードへ CASE を確立し、`f` を実行する。
-///
-/// キャッシュアドレスへの CASE が [`CACHED_CASE_TIMEOUT`] 内に確立しなければ、
-/// operational mDNS で再解決して張り直し、成功したら帳のアドレスを更新する。
-fn with_case_session<F>(g: &Globals, node_id: u64, f: F) -> Result<(), String>
-where
-    F: FnOnce(
-        &mut Ctrl<'_>,
-        &UdpSocket,
-        &Instant,
-        SessionId,
-        &mut [u8],
-        &mut [u8],
-    ) -> Result<(), String>,
-{
+/// `discover operational <node-id>`: 保存済み CA の fabric で運用アドレスを解決して表示。
+pub fn discover_operational(g: &Globals, node_id: u64) -> Result<(), String> {
     let state = StateDir::open(&g.state_dir)?;
-    let crypto = RustCrypto::new(OsRng);
-    let (ca, entry) = {
+    let crypto = simple_matter::crypto::rustcrypto::RustCrypto::new(OsRng);
+    let ca = {
         let _lock = state.lock()?;
-        let ca = ca_state::load(&state.ca_path(), &crypto)?
-            .ok_or("no CA state; commission a device first (`smctl pairing ...`)")?;
-        let entries = nodes::load(&state.nodes_path())?;
-        let entry = entries
-            .into_iter()
-            .find(|e| e.node_id == node_id)
-            .ok_or_else(|| format!("node {node_id} not in address book (`smctl pairing list`)"))?;
-        (ca, entry)
+        ca_state::load(&state.ca_path(), &crypto)?
+            .ok_or("no CA state; commission a device first (`smctl pairing ...`)")?
     };
-
-    let socket = open_socket()?;
-    let start = Instant::now();
-    let mut tx = [0u8; MAX_RX_PACKET_SIZE];
-    let mut rx = [0u8; MAX_RX_PACKET_SIZE];
-
-    // 1) キャッシュアドレスへ CASE を試みる。
-    let cached = entry.last_addr;
-    let (mut stack, session, used_addr) = match try_case(
-        &ca,
-        &crypto,
-        &socket,
-        &start,
-        cached,
-        node_id,
-        CACHED_CASE_TIMEOUT.min(g.timeout),
-        &mut rx,
-        &mut tx,
-    ) {
-        Ok((stack, session)) => (stack, session, cached),
-        Err(e) => {
-            // 2) mDNS で運用アドレスを再解決して張り直す。
-            eprintln!("[case] cached address {cached} failed ({e}); re-resolving via mDNS");
-            let resolved = mdns::resolve_operational(&ca, node_id, RESOLVE_TIMEOUT)?;
-            eprintln!("[case] operational node resolved at {resolved}");
-            let (stack, session) = try_case(
-                &ca, &crypto, &socket, &start, resolved, node_id, g.timeout, &mut rx, &mut tx,
-            )?;
-            (stack, session, resolved)
-        }
-    };
-    settle(
-        &mut stack,
-        &socket,
-        &start,
-        &mut rx,
-        &mut tx,
-        Instant::now() + g.timeout,
-    )?;
-
-    if used_addr != cached {
-        let _lock = state.lock()?;
-        nodes::update_addr(&state.nodes_path(), node_id, used_addr)?;
-    }
-
-    f(&mut stack, &socket, &start, session, &mut rx, &mut tx)
+    let addr = mdns::resolve_operational(&ca, node_id, g.timeout.min(RESOLVE_TIMEOUT))?;
+    println!("[discover] operational node {node_id:#x} at {addr}");
+    Ok(())
 }
 
-/// 1 回の CASE 試行。失敗・タイムアウトでスタックごと破棄する(再試行は作り直す)。
-#[allow(clippy::too_many_arguments)]
-fn try_case<'a>(
-    ca: &'a Ca<Backend>,
+// ==========================================================================
+// Exec: 単一プロセス内でスタック / CASE セッション / 購読を共有する実行コンテキスト
+// ==========================================================================
+
+/// CASE 試行の失敗理由。
+enum CaseAttempt {
+    /// 期限内に決着しなかった(ハンドシェイク slot は使用中のまま)。
+    Timeout,
+    /// 明示的な失敗(開始拒否・SC エラーイベント・IO エラー)。
+    Failed(String),
+}
+
+impl CaseAttempt {
+    fn into_message(self, addr: SocketAddr) -> String {
+        match self {
+            CaseAttempt::Timeout => format!("CASE to {addr} timed out"),
+            CaseAttempt::Failed(e) => e,
+        }
+    }
+}
+
+/// 確立済み購読の記録(バッチ終了時の要約用)。
+struct SubStat {
+    id: u32,
+    node: u64,
+    reports: u64,
+    lost: bool,
+}
+
+/// 実行コンテキスト。
+///
+/// バッチでは 1 個の `Exec` が全行を実行する。CASE セッションは `(node_id, SessionId)`
+/// でキャッシュされ、購読レポートはどの操作の待ち時間中でも逐次表示される。
+pub struct Exec<'a> {
+    /// 有効な共通オプション(バッチでは行ごとの `--timeout`/`--label` 上書きを反映)。
+    g: Globals,
+    state: StateDir,
     crypto: &'a Backend,
-    socket: &UdpSocket,
-    start: &Instant,
-    addr: SocketAddr,
-    node_id: u64,
-    timeout: Duration,
-    rx: &mut [u8],
-    tx: &mut [u8],
-) -> Result<(Ctrl<'a>, SessionId), String> {
-    let ctrl_creds = ControllerCreds::new(ca, crypto, 0);
-    let sc_init = ScInitiator::new(crypto, OsRng, ctrl_creds);
-    let mut stack: Ctrl<'a> =
-        simple_matter::controller::ControllerStack::new(crypto, sc_init, ImClient::new());
-    let dir = stack
-        .start_case(
-            PeerAddr::Udp(addr),
-            CONTROLLER_FABRIC_INDEX,
-            node_id,
-            start.elapsed().as_millis() as u64,
-            tx,
-        )
-        .map_err(|e| format!("start_case: {e:?}"))?;
-    send_dir(socket, tx, &dir);
-    match drive_until_sc_event(&mut stack, socket, start, rx, tx, Instant::now() + timeout) {
-        Some(ScEvent::CaseEstablished { session, resumed }) => {
-            eprintln!(
-                "[case] ESTABLISHED to {addr} (session={:#x}{})",
-                session.as_raw(),
-                if resumed { ", resumed" } else { "" }
-            );
-            Ok((stack, session))
-        }
-        Some(ev) => Err(format!("CASE failed: {ev:?}")),
-        None => Err(format!("CASE to {addr} timed out after {timeout:?}")),
-    }
+    ca: &'a Ca<Backend>,
+    stack: Ctrl<'a>,
+    socket: UdpSocket,
+    start: Instant,
+    rx: [u8; MAX_RX_PACKET_SIZE],
+    tx: [u8; MAX_RX_PACKET_SIZE],
+    /// ノードごとの確立済み CASE セッション。
+    cases: Vec<(u64, SessionId)>,
+    /// 確立済み購読(要約用)。
+    subs: Vec<SubStat>,
+    /// バッチモードか(`subscribe` の非ブロッキング化)。
+    batch: bool,
 }
 
-/// 名前ベースの属性 Read。
-pub fn read_attr(
-    g: &Globals,
-    node_id: u64,
-    ep: u16,
-    def: &ClusterDef,
-    attr: &AttrDef,
-) -> Result<(), String> {
-    with_case_session(g, node_id, |stack, socket, start, session, rx, tx| {
-        let path =
-            AttributePath::concrete(simple_matter::dm::meta::EndpointId(ep), def.id, attr.id);
-        let dir = stack
-            .start_read(session, &[path], start.elapsed().as_millis() as u64, tx)
+impl<'a> Exec<'a> {
+    /// スタックとソケットを確保する。
+    pub fn new(
+        g: Globals,
+        state: StateDir,
+        crypto: &'a Backend,
+        ca: &'a Ca<Backend>,
+        batch: bool,
+    ) -> Result<Self, String> {
+        let socket = open_dual_stack_udp().map_err(|e| format!("bind controller socket: {e}"))?;
+        socket
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .map_err(|e| format!("set_read_timeout: {e}"))?;
+        let ctrl_creds = simple_matter::controller::ControllerCreds::new(ca, crypto, 0);
+        let sc_init = simple_matter::sc::initiator::ScInitiator::new(crypto, OsRng, ctrl_creds);
+        let stack: Ctrl<'a> =
+            simple_matter::controller::ControllerStack::new(crypto, sc_init, ImClient::new());
+        Ok(Self {
+            g,
+            state,
+            crypto,
+            ca,
+            stack,
+            socket,
+            start: Instant::now(),
+            rx: [0u8; MAX_RX_PACKET_SIZE],
+            tx: [0u8; MAX_RX_PACKET_SIZE],
+            cases: Vec::new(),
+            subs: Vec::new(),
+            batch,
+        })
+    }
+
+    /// バッチの行ごとの共通オプション(`--timeout`/`--label` 上書き)を反映する。
+    pub fn set_globals_for_line(&mut self, g: Globals) {
+        self.g = g;
+    }
+
+    /// 1 コマンドを実行する(単発・バッチ共通のディスパッチ)。
+    pub fn run(&mut self, cmd: &Cmd) -> Result<(), String> {
+        match cmd {
+            Cmd::Pair {
+                node,
+                passcode,
+                target,
+            } => self.pair(*node, *passcode, target),
+            Cmd::Read {
+                node,
+                ep,
+                cluster,
+                attr,
+            } => self.read(*node, *ep, *cluster, *attr),
+            Cmd::Write {
+                node,
+                ep,
+                cluster,
+                attr,
+                kind,
+                value,
+            } => self.write(*node, *ep, *cluster, *attr, *kind, value.clone()),
+            Cmd::Invoke {
+                node,
+                ep,
+                cluster,
+                command,
+                fields,
+                raw_fields,
+            } => self.invoke(
+                *node,
+                *ep,
+                *cluster,
+                *command,
+                fields.clone(),
+                raw_fields.clone(),
+            ),
+            Cmd::Subscribe {
+                node,
+                ep,
+                cluster,
+                attr,
+                min_s,
+                max_s,
+            } => self.subscribe(*node, *ep, *cluster, *attr, *min_s, *max_s),
+            Cmd::Wait { secs } => self.wait(*secs),
+            // 以下はコンテキスト非依存(バッチ内でも独立に動く)。
+            Cmd::PairingList => pairing_list(&self.g),
+            Cmd::DiscoverCommissionable { discriminator } => {
+                discover_commissionable(&self.g, *discriminator)
+            }
+            Cmd::DiscoverOperational { node } => discover_operational(&self.g, *node),
+            Cmd::Help => {
+                crate::cli::print_help();
+                Ok(())
+            }
+            Cmd::PairBle { .. } => Err("pairing ble/ble-handoff cannot run inside a batch \
+                 (run it as a standalone command first)"
+                .into()),
+            Cmd::Batch { .. } => Err("nested batch is not supported".into()),
+        }
+    }
+
+    /// バッチ終了時の要約(購読ごとの受信レポート数)。
+    pub fn summarize(&self) {
+        if self.subs.is_empty() {
+            return;
+        }
+        println!(
+            "[summary] shutting down {} subscription(s):",
+            self.subs.len()
+        );
+        for s in &self.subs {
+            println!(
+                "  sub={} node={} reports-received={}{}",
+                s.id,
+                s.node,
+                s.reports,
+                if s.lost { " (LOST)" } else { "" }
+            );
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
+
+    // ----------------------------------------------------------------------
+    // イベントポンプ(購読レポートの逐次表示込み)
+    // ----------------------------------------------------------------------
+
+    /// 受信 1 回(最長 50ms)+ poll 排出。
+    fn step_io(&mut self) -> Result<(), String> {
+        match self.socket.recv_from(&mut self.rx) {
+            Ok((n, src)) => {
+                let now = self.now_ms();
+                if let Some(dir) =
+                    self.stack
+                        .handle_rx(&mut self.rx[..n], PeerAddr::Udp(src), now, &mut self.tx)
+                {
+                    send_dir(&self.socket, &self.tx, &dir);
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(format!("recv: {e}")),
+        }
+        let now = self.now_ms();
+        while let Some(dir) = self.stack.poll(now, &mut self.tx) {
+            send_dir(&self.socket, &self.tx, &dir);
+        }
+        Ok(())
+    }
+
+    /// 購読系イベントを処理する(レポート表示 + 要約カウント)。
+    fn on_sub_event(&mut self, ev: ImEvent) {
+        match ev {
+            ImEvent::SubscriptionReport { subscription_id } => {
+                let ts = self.start.elapsed().as_secs();
+                print_reports(
+                    self.stack.sub_reports(),
+                    &format!("[report +{ts}s sub={subscription_id}] "),
+                );
+                if let Some(s) = self.subs.iter_mut().find(|s| s.id == subscription_id) {
+                    s.reports += 1;
+                }
+            }
+            ImEvent::SubscriptionLost { subscription_id } => {
+                eprintln!(
+                    "[subscribe] subscription {subscription_id} LOST \
+                     (no report within max interval + grace)"
+                );
+                if let Some(s) = self.subs.iter_mut().find(|s| s.id == subscription_id) {
+                    s.lost = true;
+                }
+            }
+            other => eprintln!("[warn] unexpected IM event: {other:?}"),
+        }
+    }
+
+    /// 溜まっている IM イベントを購読系として排出する(トランザクション待ちの外で使う)。
+    fn drain_events(&mut self) {
+        while let Some(ev) = self.stack.im_take_event() {
+            self.on_sub_event(ev);
+        }
+    }
+
+    /// トランザクション系 IM イベントを 1 件待つ。購読レポートは表示して待ち続ける。
+    fn wait_txn_event(&mut self, until: Instant) -> Result<Option<ImEvent>, String> {
+        loop {
+            while let Some(ev) = self.stack.im_take_event() {
+                match ev {
+                    ImEvent::SubscriptionReport { .. } | ImEvent::SubscriptionLost { .. } => {
+                        self.on_sub_event(ev)
+                    }
+                    other => return Ok(Some(other)),
+                }
+            }
+            if Instant::now() > until {
+                return Ok(None);
+            }
+            self.step_io()?;
+        }
+    }
+
+    /// SC(CASE/PASE)イベントを 1 件待つ。待機中も購読レポートは流し続ける。
+    fn wait_sc_event(&mut self, until: Instant) -> Result<Option<ScEvent>, String> {
+        loop {
+            if let Some(ev) = self.stack.sc_take_event() {
+                return Ok(Some(ev));
+            }
+            self.drain_events();
+            if Instant::now() > until {
+                return Ok(None);
+            }
+            self.step_io()?;
+        }
+    }
+
+    /// MRP 再送・standalone ACK を流し切って静穏化する。
+    ///
+    /// 購読確立後は `next_deadline` が keep-alive 途絶検出のため常に `Some` なので、
+    /// 「残る期限が [`QUIET_HORIZON_MS`] より遠い」を静穏条件にする(examples の
+    /// `settle` の購読対応版)。
+    fn quiesce(&mut self, until: Instant) -> Result<(), String> {
+        loop {
+            self.step_io()?;
+            // ここでは IM イベントを取り出さない: pairing 中は InvokeDone 等が
+            // Commissioner の駆動材料であり、横取りするとフェーズ機械が止まる。
+            // 購読イベントは専用 slot(最新 1 件)に留まり、次の wait/操作で排出される。
+            let now = self.now_ms();
+            let quiet = match self.stack.next_deadline(now) {
+                None => true,
+                Some(t) => {
+                    self.stack.subscription_count() > 0 && t.saturating_sub(now) > QUIET_HORIZON_MS
+                }
+            };
+            if quiet {
+                return Ok(());
+            }
+            if Instant::now() > until {
+                return Err("settle timed out (device unresponsive)".into());
+            }
+        }
+    }
+
+    /// コマンド完了後の ACK 流し切り(best effort)。
+    fn flush(&mut self) {
+        let _ = self.quiesce(Instant::now() + FLUSH_TIMEOUT);
+    }
+
+    // ----------------------------------------------------------------------
+    // pairing(UDP)
+    // ----------------------------------------------------------------------
+
+    /// コミッショニング(pairing onnetwork / onnetwork-long / address)。
+    ///
+    /// 成功時に CA 状態(発行済み serial)を保存し、アドレス帳に記帳する。確立した
+    /// 運用 CASE セッションはキャッシュされ、同一バッチ内の後続コマンドが再利用する。
+    fn pair(&mut self, node_id: u64, passcode: u32, target: &Target) -> Result<(), String> {
+        let peer_addr = match target {
+            Target::Addr(a) => {
+                println!("[target] using explicit address {a}");
+                *a
+            }
+            Target::Browse(disc) => {
+                println!("[discovery] browsing _matterc._udp.local via mDNS...");
+                mdns::browse_commissionable(*disc, self.g.timeout.max(BROWSE_TIMEOUT_MIN))?
+            }
+        };
+        println!(
+            "[ca] fabric_id={:#018x} controller_node_id={:#018x}",
+            self.ca.fabric_id(),
+            self.ca.controller_node_id()
+        );
+
+        let mut comm = Commissioner::new(self.ca, self.crypto, AttestationPolicy::Skip);
+        let deadline = Instant::now() + self.g.timeout;
+        let mut last_phase = Phase::Idle;
+
+        comm.commission(PeerAddr::Udp(peer_addr), passcode, node_id, self.now_ms())
+            .map_err(|e| format!("commission() rejected: {e:?}"))?;
+        println!("[commission] starting to {peer_addr} (device node_id={node_id:#x})");
+
+        let case_session: SessionId = loop {
+            if Instant::now() > deadline {
+                return Err(format!("commissioning timed out in phase {last_phase:?}"));
+            }
+            let now = self.now_ms();
+            let phase =
+                pump_commissioner(&mut comm, &mut self.stack, &self.socket, now, &mut self.tx);
+            if phase != last_phase {
+                report_phase(phase);
+                last_phase = phase;
+            }
+            match phase {
+                Phase::Done { session } => break session,
+                Phase::Failed { stage, reason } => {
+                    return Err(format!("commissioning failed at stage {stage}: {reason:?}"));
+                }
+                _ => {}
+            }
+            // 発行したトランザクションの応答を受け切り、standalone ACK も含めて静穏化させて
+            // から次フェーズへ進む(デバイスの IM responder は同時 1 トランザクションのため)。
+            self.quiesce(deadline)?;
+        };
+        println!(
+            "[commission] COMPLETE. operational CASE session = {:#x}",
+            case_session.as_raw()
+        );
+        self.flush();
+
+        // 発行済み serial を CA 状態に反映し、アドレス帳へ記帳する。
+        {
+            let _lock = self.state.lock()?;
+            ca_state::save(&self.state.ca_path(), self.ca)?;
+            nodes::upsert(
+                &self.state.nodes_path(),
+                nodes::NodeEntry {
+                    node_id,
+                    label: self.g.label.clone().unwrap_or_default(),
+                    last_addr: peer_addr,
+                },
+            )?;
+        }
+        println!(
+            "[pairing] node {node_id} recorded at {peer_addr} (state: {})",
+            self.g.state_dir.display()
+        );
+        self.cases.retain(|(n, _)| *n != node_id);
+        self.cases.push((node_id, case_session));
+        Ok(())
+    }
+
+    // ----------------------------------------------------------------------
+    // CASE セッションの取得(キャッシュ → キャッシュアドレス → mDNS 再解決)
+    // ----------------------------------------------------------------------
+
+    /// ノードへの CASE セッションを返す(プロセス内キャッシュ優先)。
+    fn case_session(&mut self, node_id: u64) -> Result<SessionId, String> {
+        if let Some(&(_, s)) = self.cases.iter().find(|(n, _)| *n == node_id) {
+            return Ok(s);
+        }
+        let entry = {
+            let _lock = self.state.lock()?;
+            nodes::load(&self.state.nodes_path())?
+                .into_iter()
+                .find(|e| e.node_id == node_id)
+                .ok_or_else(|| {
+                    format!("node {node_id} not in address book (`smctl pairing list`)")
+                })?
+        };
+
+        // 1) キャッシュアドレスへ CASE を試みる(未解決 sentinel はスキップ)。
+        let cached = entry.last_addr;
+        let deadline = Instant::now() + self.g.timeout;
+        let mut got: Option<(SessionId, SocketAddr)> = None;
+        let mut pending_to: Option<SocketAddr> = None; // 送出済みで未決着の Sigma1 の宛先
+        if cached.port() != 0 {
+            match self.try_case(cached, node_id, CACHED_CASE_TIMEOUT.min(self.g.timeout)) {
+                Ok(s) => got = Some((s, cached)),
+                Err(CaseAttempt::Timeout) => {
+                    // ハンドシェイク slot は使用中のまま(コアの HANDSHAKE_TIMEOUT は 60 秒)。
+                    pending_to = Some(cached);
+                    eprintln!(
+                        "[case] cached address {cached} not responding; re-resolving via mDNS"
+                    );
+                }
+                Err(CaseAttempt::Failed(e)) => {
+                    eprintln!("[case] cached address {cached} failed ({e}); re-resolving via mDNS")
+                }
+            }
+        }
+        // 2) mDNS で運用アドレスを再解決して張り直す。
+        let (session, used_addr) = match got {
+            Some(x) => x,
+            None => {
+                let resolved = mdns::resolve_operational(self.ca, node_id, RESOLVE_TIMEOUT)?;
+                eprintln!("[case] operational node resolved at {resolved}");
+                let s = if pending_to == Some(resolved) {
+                    // アドレスは正しかった(デバイスが一時的に無応答なだけ)。新規
+                    // ハンドシェイクは張れない(slot 使用中)ので、進行中の Sigma1 の
+                    // MRP 再送に賭けて同じハンドシェイクを待ち続ける。
+                    eprintln!("[case] address unchanged; keep waiting on the in-flight handshake");
+                    self.await_case(resolved, deadline)
+                        .map_err(|e| e.into_message(resolved))?
+                } else {
+                    if pending_to.is_some() {
+                        // 別アドレスへ張り直したいが slot が塞がっている。前のハンドシェイクの
+                        // 失敗確定(タイムアウト掃除)を待ってから開始する。
+                        eprintln!(
+                            "[case] waiting for the previous handshake attempt to be reaped..."
+                        );
+                        let _ = self.await_case(cached, deadline);
+                    }
+                    self.try_case(
+                        resolved,
+                        node_id,
+                        deadline.saturating_duration_since(Instant::now()),
+                    )
+                    .map_err(|e| e.into_message(resolved))?
+                };
+                (s, resolved)
+            }
+        };
+        self.quiesce(Instant::now() + self.g.timeout)?;
+
+        if used_addr != cached {
+            let _lock = self.state.lock()?;
+            nodes::update_addr(&self.state.nodes_path(), node_id, used_addr)?;
+        }
+        self.cases.push((node_id, session));
+        Ok(session)
+    }
+
+    /// 1 回の CASE 試行(Sigma1 送出 + 決着待ち)。
+    ///
+    /// タイムアウトした場合、ハンドシェイク slot は使用中のまま残る(コアの
+    /// `HANDSHAKE_TIMEOUT_MS` = 60 秒の掃除待ち)ことに注意。呼び出し側は
+    /// [`CaseAttempt::Timeout`] を見て「同じハンドシェイクを待ち続ける」か
+    /// 「掃除を待ってから張り直す」かを選ぶ。
+    fn try_case(
+        &mut self,
+        addr: SocketAddr,
+        node_id: u64,
+        timeout: Duration,
+    ) -> Result<SessionId, CaseAttempt> {
+        let now = self.now_ms();
+        let dir = self
+            .stack
+            .start_case(
+                PeerAddr::Udp(addr),
+                CONTROLLER_FABRIC_INDEX,
+                node_id,
+                now,
+                &mut self.tx,
+            )
+            .map_err(|e| CaseAttempt::Failed(format!("start_case: {e:?}")))?;
+        send_dir(&self.socket, &self.tx, &dir);
+        self.await_case(addr, Instant::now() + timeout)
+    }
+
+    /// 送出済みハンドシェイクの決着(確立 / 失敗 / 期限)を待つ。
+    fn await_case(&mut self, addr: SocketAddr, until: Instant) -> Result<SessionId, CaseAttempt> {
+        match self.wait_sc_event(until).map_err(CaseAttempt::Failed)? {
+            Some(ScEvent::CaseEstablished { session, resumed }) => {
+                eprintln!(
+                    "[case] ESTABLISHED to {addr} (session={:#x}{})",
+                    session.as_raw(),
+                    if resumed { ", resumed" } else { "" }
+                );
+                Ok(session)
+            }
+            Some(ev) => Err(CaseAttempt::Failed(format!("CASE failed: {ev:?}"))),
+            None => Err(CaseAttempt::Timeout),
+        }
+    }
+
+    /// 操作タイムアウト時にノードのセッションキャッシュを無効化して Err を返す。
+    fn op_timeout(&mut self, node_id: u64, what: &str) -> Result<(), String> {
+        self.cases.retain(|(n, _)| *n != node_id);
+        Err(format!(
+            "{what} timed out (session invalidated; retry will re-establish CASE)"
+        ))
+    }
+
+    // ----------------------------------------------------------------------
+    // 運用コマンド(read / write / invoke / subscribe / wait)
+    // ----------------------------------------------------------------------
+
+    /// 属性 Read(`attr = None` は属性ワイルドカード)。
+    fn read(
+        &mut self,
+        node_id: u64,
+        ep: u16,
+        cluster: ClusterId,
+        attr: Option<AttributeId>,
+    ) -> Result<(), String> {
+        let session = self.case_session(node_id)?;
+        let path = AttributePath {
+            endpoint: Some(EndpointId(ep)),
+            cluster: Some(cluster),
+            attribute: attr,
+            list_index: None,
+            enable_tag_compression: false,
+        };
+        let now = self.now_ms();
+        let dir = self
+            .stack
+            .start_read(session, &[path], now, &mut self.tx)
             .map_err(|e| format!("start_read: {e:?}"))?;
-        send_dir(socket, tx, &dir);
-        match wait_im_event(stack, socket, start, rx, tx, Instant::now() + g.timeout) {
+        send_dir(&self.socket, &self.tx, &dir);
+        match self.wait_txn_event(Instant::now() + self.g.timeout)? {
             Some(ImEvent::ReadDone) => {}
             Some(ev) => return Err(format!("read failed: {ev:?}")),
-            None => return Err("read timed out".into()),
+            None => return self.op_timeout(node_id, "read"),
         }
-        print_reports(stack.read_reports(), "");
-        flush(stack, socket, start, rx, tx);
+        print_reports(self.stack.read_reports(), "");
+        self.flush();
         Ok(())
-    })
-}
+    }
 
-/// 名前ベースの属性 Write。
-pub fn write_attr(
-    g: &Globals,
-    node_id: u64,
-    ep: u16,
-    def: &ClusterDef,
-    attr: &AttrDef,
-    value: Parsed,
-) -> Result<(), String> {
-    with_case_session(g, node_id, |stack, socket, start, session, rx, tx| {
-        let path =
-            AttributePath::concrete(simple_matter::dm::meta::EndpointId(ep), def.id, attr.id);
-        let kind = attr.kind;
-        let dir = stack
+    /// 属性 Write。
+    fn write(
+        &mut self,
+        node_id: u64,
+        ep: u16,
+        cluster: ClusterId,
+        attr: AttributeId,
+        kind: ValueKind,
+        value: Parsed,
+    ) -> Result<(), String> {
+        let session = self.case_session(node_id)?;
+        let path = AttributePath::concrete(EndpointId(ep), cluster, attr);
+        let now = self.now_ms();
+        let dir = self
+            .stack
             .start_write(
                 session,
                 &path,
                 move |w, t| write_value(w, t, kind, &value),
-                start.elapsed().as_millis() as u64,
-                tx,
+                now,
+                &mut self.tx,
             )
             .map_err(|e| format!("start_write: {e:?}"))?;
-        send_dir(socket, tx, &dir);
-        match wait_im_event(stack, socket, start, rx, tx, Instant::now() + g.timeout) {
+        send_dir(&self.socket, &self.tx, &dir);
+        match self.wait_txn_event(Instant::now() + self.g.timeout)? {
             Some(ImEvent::WriteDone { status }) if status.is_success() => {
-                println!("[write] {}/{} OK", def.name, attr.name);
+                println!("[write] {} OK", format_concrete(cluster, Some(attr), ep));
             }
             Some(ev) => return Err(format!("write failed: {ev:?}")),
-            None => return Err("write timed out".into()),
+            None => return self.op_timeout(node_id, "write"),
         }
-        flush(stack, socket, start, rx, tx);
+        self.flush();
         Ok(())
-    })
-}
+    }
 
-/// 名前ベースのコマンド Invoke(フィールドは `(tag, kind, value)` のリスト)。
-pub fn invoke_cmd(
-    g: &Globals,
-    node_id: u64,
-    ep: u16,
-    def: &ClusterDef,
-    cmd: &CmdDef,
-    fields: Vec<(u8, ValueKind, Parsed)>,
-) -> Result<(), String> {
-    with_case_session(g, node_id, |stack, socket, start, session, rx, tx| {
-        let path = CommandPath::new(simple_matter::dm::meta::EndpointId(ep), def.id, cmd.id);
-        let dir = stack
+    /// コマンド Invoke。`raw_fields` があればコマンドフィールド全体を生 TLV から転写する。
+    fn invoke(
+        &mut self,
+        node_id: u64,
+        ep: u16,
+        cluster: ClusterId,
+        command: CommandId,
+        fields: Vec<(u8, ValueKind, Parsed)>,
+        raw_fields: Option<Vec<u8>>,
+    ) -> Result<(), String> {
+        let session = self.case_session(node_id)?;
+        let path = CommandPath::new(EndpointId(ep), cluster, command);
+        let now = self.now_ms();
+        let dir = self
+            .stack
             .start_invoke(
                 session,
                 path,
-                move |w, t| {
-                    w.start_struct(t)?;
-                    for (tag, kind, v) in &fields {
-                        write_value(w, &TlvTag::ContextSpecific(*tag), *kind, v)?;
+                move |w, t| match &raw_fields {
+                    Some(raw) => transcode_tlv(w, t, raw),
+                    None => {
+                        w.start_struct(t)?;
+                        for (tag, kind, v) in &fields {
+                            write_value(w, &TlvTag::ContextSpecific(*tag), *kind, v)?;
+                        }
+                        w.end_container()
                     }
-                    w.end_container()
                 },
-                start.elapsed().as_millis() as u64,
-                tx,
+                now,
+                &mut self.tx,
             )
             .map_err(|e| format!("start_invoke: {e:?}"))?;
-        send_dir(socket, tx, &dir);
-        match wait_im_event(stack, socket, start, rx, tx, Instant::now() + g.timeout) {
+        send_dir(&self.socket, &self.tx, &dir);
+        match self.wait_txn_event(Instant::now() + self.g.timeout)? {
             Some(ImEvent::InvokeDone { status }) if status.is_success() => {
-                println!("[invoke] {} {} OK (status = Success)", def.name, cmd.name);
+                println!(
+                    "[invoke] {} cmd {:#04x} OK (status = Success)",
+                    format_concrete(cluster, None, ep),
+                    command.0
+                );
             }
             Some(ev) => return Err(format!("invoke failed: {ev:?}")),
-            None => return Err("invoke timed out".into()),
+            None => return self.op_timeout(node_id, "invoke"),
         }
-        flush(stack, socket, start, rx, tx);
+        self.flush();
         Ok(())
-    })
-}
+    }
 
-/// 属性 Subscribe(常駐モード、controller.md §4.5.5 の CLI 推奨パターン)。
-///
-/// プライミング完了(SubscribeDone)後、デバイス発レポートを受信するたびに表示し続ける。
-/// SubscriptionLost(keep-alive 途絶)で非 0 終了。Ctrl-C で停止するまで動き続ける。
-pub fn subscribe_attr(
-    g: &Globals,
-    node_id: u64,
-    ep: u16,
-    def: &ClusterDef,
-    attr: &AttrDef,
-    min_s: u16,
-    max_s: u16,
-) -> Result<(), String> {
-    with_case_session(g, node_id, |stack, socket, start, session, rx, tx| {
-        let path =
-            AttributePath::concrete(simple_matter::dm::meta::EndpointId(ep), def.id, attr.id);
-        let dir = stack
-            .start_subscribe(
-                session,
-                &[path],
-                min_s,
-                max_s,
-                start.elapsed().as_millis() as u64,
-                tx,
-            )
+    /// 属性 Subscribe。
+    ///
+    /// - 単発モード: 常駐(レポートを表示し続け、SubscriptionLost で非 0 終了)。
+    /// - バッチモード: プライミング完了で戻る(非ブロッキング)。以後のレポートは
+    ///   後続コマンドの待ち時間・`wait` 中に逐次表示される。
+    fn subscribe(
+        &mut self,
+        node_id: u64,
+        ep: u16,
+        cluster: ClusterId,
+        attr: AttributeId,
+        min_s: u16,
+        max_s: u16,
+    ) -> Result<(), String> {
+        let session = self.case_session(node_id)?;
+        let path = AttributePath::concrete(EndpointId(ep), cluster, attr);
+        let now = self.now_ms();
+        let dir = self
+            .stack
+            .start_subscribe(session, &[path], min_s, max_s, now, &mut self.tx)
             .map_err(|e| format!("start_subscribe: {e:?}"))?;
-        send_dir(socket, tx, &dir);
+        send_dir(&self.socket, &self.tx, &dir);
         println!("[subscribe] SubscribeRequest sent (min={min_s}s max={max_s}s)");
 
-        let (sub_id, neg_max) =
-            match wait_im_event(stack, socket, start, rx, tx, Instant::now() + g.timeout) {
-                Some(ImEvent::SubscribeDone {
-                    subscription_id,
-                    max_interval_s,
-                }) => (subscription_id, max_interval_s),
-                Some(ev) => return Err(format!("subscribe failed: {ev:?}")),
-                None => return Err("subscribe timed out (no SubscribeResponse)".into()),
-            };
+        let (sub_id, neg_max) = match self.wait_txn_event(Instant::now() + self.g.timeout)? {
+            Some(ImEvent::SubscribeDone {
+                subscription_id,
+                max_interval_s,
+            }) => (subscription_id, max_interval_s),
+            Some(ev) => return Err(format!("subscribe failed: {ev:?}")),
+            None => return self.op_timeout(node_id, "subscribe"),
+        };
+        self.subs.push(SubStat {
+            id: sub_id,
+            node: node_id,
+            reports: 0,
+            lost: false,
+        });
         println!(
-            "[subscribe] ESTABLISHED: subscription_id={sub_id} max_interval={neg_max}s \
-             (Ctrl-C to stop)"
+            "[subscribe] ESTABLISHED: subscription_id={sub_id} max_interval={neg_max}s{}",
+            if self.batch { "" } else { " (Ctrl-C to stop)" }
         );
+        if self.batch {
+            return Ok(()); // 非ブロッキング: レポートは以後のポンプで表示される。
+        }
 
-        // レポートを受信し続ける(keep-alive 途絶 = SubscriptionLost で非 0 終了)。
+        // 常駐モード: レポートを受信し続ける(SubscriptionLost で非 0 終了)。
         loop {
-            match wait_im_event(
-                stack,
-                socket,
-                start,
-                rx,
-                tx,
-                Instant::now() + Duration::from_secs(3600),
-            ) {
-                Some(ImEvent::SubscriptionReport { subscription_id }) => {
-                    let ts = start.elapsed().as_secs();
-                    print_reports(
-                        stack.sub_reports(),
-                        &format!("[report +{ts}s sub={subscription_id}] "),
-                    );
-                }
-                Some(ImEvent::SubscriptionLost { subscription_id }) => {
+            self.step_io()?;
+            self.drain_events();
+            if let Some(s) = self.subs.iter().find(|s| s.id == sub_id) {
+                if s.lost {
                     return Err(format!(
-                        "subscription {subscription_id} LOST (no report within max interval + grace)"
+                        "subscription {sub_id} LOST (no report within max interval + grace)"
                     ));
                 }
-                Some(ev) => return Err(format!("unexpected IM event: {ev:?}")),
-                None => {} // 1 時間の枠を延長して待ち続ける
             }
         }
-    })
-}
+    }
 
-/// コマンド完了後の ACK 流し切り(best effort)。
-fn flush(stack: &mut Ctrl<'_>, socket: &UdpSocket, start: &Instant, rx: &mut [u8], tx: &mut [u8]) {
-    let _ = settle(stack, socket, start, rx, tx, Instant::now() + FLUSH_TIMEOUT);
-}
-
-fn open_socket() -> Result<UdpSocket, String> {
-    let socket = open_dual_stack_udp().map_err(|e| format!("bind controller socket: {e}"))?;
-    socket
-        .set_read_timeout(Some(Duration::from_millis(50)))
-        .map_err(|e| format!("set_read_timeout: {e}"))?;
-    Ok(socket)
+    /// `wait <sec>`: 指定時間、購読レポートを受信・表示しながら待つ(バッチ組み込み)。
+    fn wait(&mut self, secs: f64) -> Result<(), String> {
+        println!("[wait] {secs}s (receiving subscription reports)...");
+        let until = Instant::now() + Duration::from_secs_f64(secs);
+        while Instant::now() < until {
+            self.step_io()?;
+            self.drain_events();
+        }
+        Ok(())
+    }
 }
 
 /// フェーズ遷移を人間可読に表示する。
-fn report_phase(phase: Phase) {
+pub(crate) fn report_phase(phase: Phase) {
     let name = match phase {
         Phase::Idle => "Idle",
         Phase::Pase => "PASE handshake",
@@ -523,6 +860,9 @@ pub enum Parsed {
     Float(f64),
     Str(String),
     Bytes(Vec<u8>),
+    /// エンコード済み TLV 要素 1 個(`tlv:<hex>`)。トップレベルのタグは書き込み時に
+    /// 付け替え、内側は保存する(hex TLV 経路、設計 doc §1.3)。
+    RawTlv(Vec<u8>),
 }
 
 /// 文字列リテラルを [`ValueKind`] に従ってパースする(設計 doc §5.2)。
@@ -563,10 +903,49 @@ pub fn parse_literal(kind: ValueKind, s: &str) -> Result<Parsed, String> {
             let hex = s.strip_prefix("hex:").unwrap_or(s);
             Ok(Parsed::Bytes(parse_hex(hex).map_err(|_| err("hex"))?))
         }
-        ValueKind::Raw => Err("raw-typed values cannot be entered by name; \
-             use `any` (planned for C2) with hex TLV"
-            .into()),
+        ValueKind::Raw => {
+            Err("raw-typed values cannot be entered by name; use `any` with `tlv:<hex>`".into())
+        }
     }
+}
+
+/// `<type>:<value>` 形式の型付きリテラルをパースする(`any` サブコマンド用)。
+///
+/// 型: `bool` `u8..u64` `i8..i64` `f32` `f64` `str` `hex`(byte string)
+/// `tlv`(エンコード済み TLV 要素の hex、Raw)。`null` は型プレフィクス不要。
+pub fn parse_typed_literal(s: &str) -> Result<(ValueKind, Parsed), String> {
+    if s == "null" {
+        return Ok((ValueKind::Raw, Parsed::Null));
+    }
+    let (ty, val) = s
+        .split_once(':')
+        .ok_or_else(|| format!("expected <type>:<value> literal (e.g. bool:true), got {s:?}"))?;
+    let kind = match ty {
+        "bool" => ValueKind::Bool,
+        "u8" => ValueKind::U8,
+        "u16" => ValueKind::U16,
+        "u32" => ValueKind::U32,
+        "u64" => ValueKind::U64,
+        "i8" => ValueKind::I8,
+        "i16" => ValueKind::I16,
+        "i32" => ValueKind::I32,
+        "i64" => ValueKind::I64,
+        "f32" => ValueKind::F32,
+        "f64" => ValueKind::F64,
+        "str" => ValueKind::Utf8,
+        "hex" => ValueKind::Bytes,
+        "tlv" => {
+            let bytes = parse_hex(val).map_err(|_| format!("invalid tlv hex literal: {val:?}"))?;
+            return Ok((ValueKind::Raw, Parsed::RawTlv(bytes)));
+        }
+        _ => {
+            return Err(format!(
+                "unknown value type {ty:?} (known: bool u8 u16 u32 u64 i8 i16 i32 i64 \
+                 f32 f64 str hex tlv, or `null`)"
+            ))
+        }
+    };
+    Ok((kind, parse_literal(kind, val)?))
 }
 
 /// `0x` 前置の 16 進または 10 進の u64。
@@ -606,7 +985,49 @@ fn write_value(w: &mut TlvWriter, tag: &TlvTag, kind: ValueKind, v: &Parsed) -> 
         (ValueKind::F64, Parsed::Float(x)) => w.write_f64(tag, *x),
         (ValueKind::Utf8, Parsed::Str(s)) => w.write_utf8(tag, s),
         (ValueKind::Bytes, Parsed::Bytes(b)) => w.write_bytes(tag, b),
+        (ValueKind::Raw, Parsed::RawTlv(b)) => transcode_tlv(w, tag, b),
         _ => Err(simple_matter::Error::InvalidState),
+    }
+}
+
+/// エンコード済み TLV 要素 1 個を `tag` に付け替えて `w` へ転写する。
+///
+/// コンテナは再帰転写し、内側のタグは保存する(`TlvWriter` に raw コピー API が
+/// 無いためのデコード → 再エンコード。コア無改造の担保)。
+fn transcode_tlv(w: &mut TlvWriter, tag: &TlvTag, raw: &[u8]) -> MResult<()> {
+    let mut r = TlvReader::new(raw);
+    let e = r.read_next()?.ok_or(simple_matter::Error::Decode)?;
+    transcode_element(w, tag, &e, &mut r)
+}
+
+fn transcode_element(
+    w: &mut TlvWriter,
+    tag: &TlvTag,
+    e: &TlvElement,
+    r: &mut TlvReader,
+) -> MResult<()> {
+    match e.value {
+        TlvValue::Boolean(b) => w.write_bool(tag, b),
+        TlvValue::UnsignedInteger(v) => w.write_u64(tag, v),
+        TlvValue::SignedInteger(v) => w.write_i64(tag, v),
+        TlvValue::Float(v) => w.write_f32(tag, v),
+        TlvValue::Double(v) => w.write_f64(tag, v),
+        TlvValue::Utf8String(s) => w.write_utf8(tag, s),
+        TlvValue::ByteString(b) => w.write_bytes(tag, b),
+        TlvValue::Null => w.write_null(tag),
+        TlvValue::ContainerStart(t) => {
+            w.start_container(tag, t)?;
+            loop {
+                let c = r.read_next()?.ok_or(simple_matter::Error::Decode)?;
+                if matches!(c.value, TlvValue::ContainerEnd) {
+                    break;
+                }
+                let ctag = c.tag;
+                transcode_element(w, &ctag, &c, r)?;
+            }
+            w.end_container()
+        }
+        TlvValue::ContainerEnd => Err(simple_matter::Error::Decode),
     }
 }
 
@@ -614,10 +1035,27 @@ fn write_value(w: &mut TlvWriter, tag: &TlvTag, kind: ValueKind, v: &Parsed) -> 
 // レポート表示(名前テーブルは可読性を足すだけ。無くても生 TLV ダンプで常に成立)
 // ==========================================================================
 
+/// クラスタ/属性を名前テーブル付きで整形する(ログ用)。
+fn format_concrete(cluster: ClusterId, attr: Option<AttributeId>, ep: u16) -> String {
+    let cname = clusters::by_id(cluster)
+        .map(|d| d.name.to_string())
+        .unwrap_or_else(|| format!("{:#06x}", cluster.0));
+    match attr {
+        Some(a) => {
+            let aname = clusters::by_id(cluster)
+                .and_then(|d| d.attr_by_id(a))
+                .map(|d| d.name.to_string())
+                .unwrap_or_else(|| format!("{:#06x}", a.0));
+            format!("ep{ep} {cname}/{aname}")
+        }
+        None => format!("ep{ep} {cname}"),
+    }
+}
+
 /// 属性レポート列を 1 行ずつ表示する。
-fn print_reports<'a, I>(reports: I, prefix: &str)
+fn print_reports<'r, I>(reports: I, prefix: &str)
 where
-    I: Iterator<Item = MResult<AttributeReportRef<'a>>>,
+    I: Iterator<Item = MResult<AttributeReportRef<'r>>>,
 {
     let mut n = 0;
     for report in reports {

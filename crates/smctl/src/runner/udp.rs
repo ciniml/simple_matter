@@ -3,14 +3,15 @@
 //! sans-IO のコアはソケットに触れない。この層がバイト列と時刻の受け渡し
 //! (受信 → `handle_rx`、期限 → `poll`、進行 → `Commissioner::drive`)を担う。
 
+#[cfg(feature = "ble")]
 use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
+#[cfg(feature = "ble")]
 use std::time::Instant;
 
 use simple_matter::controller::{Commissioner, Phase};
-use simple_matter::im::ImEvent;
-use simple_matter::sc::initiator::ScEvent;
 use simple_matter::stack::SendDirective;
+#[cfg(feature = "ble")]
 use simple_matter::transport::net::PeerAddr;
 
 use super::{Backend, Ctrl};
@@ -75,6 +76,10 @@ pub fn pump_commissioner(
 /// `next_deadline` が `None`(保留中の再送/ACK なし)になったら静穏とみなす。
 /// フェーズ間・トランザクション間で必ず呼び、前応答の ACK を確実にデバイスへ届けてから
 /// 次の新規 exchange を開始する(デバイス側 IM responder は同時 1 トランザクションのため)。
+///
+/// UDP 経路の [`Exec`](crate::ops::Exec) は購読対応版の `quiesce` を使うため、
+/// 現在の利用者は BLE handoff の運用 UDP フェーズのみ。
+#[cfg(feature = "ble")]
 pub fn settle(
     stack: &mut Ctrl<'_>,
     socket: &UdpSocket,
@@ -106,72 +111,6 @@ pub fn settle(
         }
         if Instant::now() > until {
             return Err("settle timed out (device unresponsive)".into());
-        }
-    }
-}
-
-/// SC(CASE/PASE)イベントを 1 件、絶対期限 `until` まで待つ(タイムアウトで `None`)。
-pub fn drive_until_sc_event(
-    stack: &mut Ctrl<'_>,
-    socket: &UdpSocket,
-    start: &Instant,
-    rx: &mut [u8],
-    tx: &mut [u8],
-    until: Instant,
-) -> Option<ScEvent> {
-    loop {
-        if let Some(ev) = stack.sc_take_event() {
-            return Some(ev);
-        }
-        if Instant::now() > until {
-            return None;
-        }
-        match socket.recv_from(rx) {
-            Ok((n, src)) => {
-                let now = start.elapsed().as_millis() as u64;
-                if let Some(dir) = stack.handle_rx(&mut rx[..n], PeerAddr::Udp(src), now, tx) {
-                    send_dir(socket, tx, &dir);
-                }
-            }
-            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
-            Err(_) => return None,
-        }
-        let now = start.elapsed().as_millis() as u64;
-        while let Some(dir) = stack.poll(now, tx) {
-            send_dir(socket, tx, &dir);
-        }
-    }
-}
-
-/// IM イベントを 1 件、絶対期限 `until` まで待つ(受信 + poll を回し続ける)。
-pub fn wait_im_event(
-    stack: &mut Ctrl<'_>,
-    socket: &UdpSocket,
-    start: &Instant,
-    rx: &mut [u8],
-    tx: &mut [u8],
-    until: Instant,
-) -> Option<ImEvent> {
-    loop {
-        if let Some(ev) = stack.im_take_event() {
-            return Some(ev);
-        }
-        if Instant::now() > until {
-            return None;
-        }
-        match socket.recv_from(rx) {
-            Ok((n, src)) => {
-                let now = start.elapsed().as_millis() as u64;
-                if let Some(dir) = stack.handle_rx(&mut rx[..n], PeerAddr::Udp(src), now, tx) {
-                    send_dir(socket, tx, &dir);
-                }
-            }
-            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
-            Err(_) => return None,
-        }
-        let now = start.elapsed().as_millis() as u64;
-        while let Some(dir) = stack.poll(now, tx) {
-            send_dir(socket, tx, &dir);
         }
     }
 }

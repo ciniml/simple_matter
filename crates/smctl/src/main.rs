@@ -1,12 +1,16 @@
 //! `smctl` — chip-tool 風の CLI コントローラ(`docs/design/cli-controller.md`)。
 //!
-//! フェーズ C1: UDP pairing(mDNS ブラウズ / アドレス直指定)+ 名前ベースの
-//! クラスタ操作(on-off / basic-information)+ Subscribe(レポート常駐表示)。
+//! - C1: UDP pairing(mDNS ブラウズ / アドレス直指定)+ 名前ベースのクラスタ操作
+//!   (on-off / basic-information)+ Subscribe(レポート常駐表示)。
+//! - C2: `any read/write/invoke`(ID 直指定 + 型付きリテラル + hex TLV)、`discover`、
+//!   BLE pairing(feature `ble`: `pairing ble` / `pairing ble-handoff`)、
+//!   バッチ実行(`smctl batch <file|->`、単一プロセスで CASE セッションと購読を共有)。
 //!
 //! 開発・自作デバイス用ツールであり、attestation は検証しない(`AttestationPolicy::Skip`)。
 
 use std::process::ExitCode;
 
+mod batch;
 mod cli;
 mod clusters;
 mod ops;

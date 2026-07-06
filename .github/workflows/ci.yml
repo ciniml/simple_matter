@@ -74,3 +74,10 @@ jobs:
         run: cargo check -p simple-matter --features controller --example commissioner
       - name: Clippy (commissioner)
         run: cargo clippy -p simple-matter-ble --features commissioner -- -D warnings
+      # smctl(CLI コントローラ、docs/design/cli-controller.md)。Linux は test ジョブの
+      # workspace 一括(--all-features)でビルド/クリッピ済みなので、ここでは Windows
+      # ネイティブでの BLE feature 込みビルドを検証する(bluer 非依存の担保)。
+      - name: Build smctl (BLE feature)
+        run: cargo build -p smctl --features ble
+      - name: Clippy smctl (BLE feature)
+        run: cargo clippy -p smctl --features ble -- -D warnings

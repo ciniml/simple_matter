@@ -9,7 +9,7 @@ use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 use simple_matter::controller::ca::Ca;
-use simple_matter::discovery::client::MdnsClient;
+use simple_matter::discovery::client::{CommissionableSet, Ingest, MdnsClient};
 use simple_matter::discovery::{MATTER_PORT, MDNS_IPV4, MDNS_PORT};
 
 use super::Backend;
@@ -99,6 +99,90 @@ pub fn browse_commissionable(
     Err(format!(
         "no commissionable device found within {timeout:?} (is the device in commissioning mode?)"
     ))
+}
+
+/// `discover commissionable`: ブラウズ期間いっぱい待ち、見つかった commissionable ノードを
+/// 発見のたびに 1 行ずつ表示して総数を返す(重複はインスタンス名で除去)。
+///
+/// [`browse_commissionable`](最初の 1 台で打ち切り)の一覧版。
+pub fn browse_commissionable_list(
+    discriminator: Option<u16>,
+    timeout: Duration,
+) -> Result<usize, String> {
+    let trace = std::env::var_os("SM_MDNS_TRACE").is_some();
+    let (socket, qu) = open_mdns_browse_socket().ok_or("open mDNS browse socket failed")?;
+
+    let mut query = [0u8; 128];
+    let qlen = match discriminator {
+        Some(d) => MdnsClient::build_browse_discriminator(&mut query, d, qu),
+        None => MdnsClient::build_browse_commissionable(&mut query, qu),
+    }
+    .map_err(|e| format!("build mDNS query: {e:?}"))?;
+
+    eprintln!(
+        "[discover] browsing _matterc._udp.local for {timeout:?} \
+         (discriminator filter: {})...",
+        discriminator
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "none".into())
+    );
+
+    let mut set: CommissionableSet<16> = CommissionableSet::default();
+    let start = Instant::now();
+    let mut last_query = Instant::now() - MDNS_REQUERY_INTERVAL;
+    let mut rx = [0u8; 1500];
+    while start.elapsed() < timeout {
+        if last_query.elapsed() >= MDNS_REQUERY_INTERVAL {
+            let _ = socket.send_to(&query[..qlen], (MDNS_IPV4, MDNS_PORT));
+            last_query = Instant::now();
+        }
+        match socket.recv_from(&mut rx) {
+            Ok((n, src)) => {
+                let ingest = match discriminator {
+                    Some(d) => set.ingest_filtered(&rx[..n], d),
+                    None => set.ingest(&rx[..n]),
+                };
+                if trace {
+                    eprintln!("[mdns-trace] rx {n}B from {src} ingest={ingest:?}");
+                }
+                if ingest == Ingest::Added {
+                    if let Some(node) = set.iter().last() {
+                        print_commissionable(node);
+                    }
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
+            Err(e) => return Err(format!("mDNS recv: {e}")),
+        }
+    }
+    Ok(set.len())
+}
+
+/// commissionable ノード 1 件を 1 行で表示する。
+fn print_commissionable(node: &simple_matter::discovery::client::DiscoveredCommissionable) {
+    let instance = String::from_utf8_lossy(node.instance()).into_owned();
+    let disc = node
+        .discriminator
+        .map(|d| d.to_string())
+        .unwrap_or_else(|| "?".into());
+    let vp = node
+        .vendor_product
+        .map(|(v, p)| format!("{v:#06x}/{p:#06x}"))
+        .unwrap_or_else(|| "?".into());
+    let cm = node
+        .commissioning_mode
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| "?".into());
+    let port = if node.port != 0 {
+        node.port
+    } else {
+        MATTER_PORT
+    };
+    let addrs: Vec<String> = node.addrs.iter().map(|a| a.to_string()).collect();
+    println!(
+        "[found] {instance}  discriminator={disc} vid/pid={vp} cm={cm} port={port} addrs=[{}]",
+        addrs.join(", ")
+    );
 }
 
 /// `<compressedFabricId>-<nodeId>._matter._tcp.local` の SRV を解決し、

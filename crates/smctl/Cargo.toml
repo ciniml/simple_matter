@@ -15,3 +15,18 @@ simple-matter = { path = "../simple-matter", features = ["controller"] }
 socket2 = { version = "0.5", features = ["all"] }
 # OS の CSPRNG。examples の DemoRng(LCG)は製品バイナリには持ち込まない(設計 doc §2.5)。
 getrandom = "0.4"
+
+# BLE 経路(feature "ble")。btleplug central は simple-matter-ble 経由で使う。
+# bluer(デバイス側 peripheral・Linux 限定)には依存しない(設計 doc §2.1)ため、
+# Windows へも cargo-xwin でそのままクロスビルドできる。
+simple-matter-ble = { path = "../simple-matter-ble", features = ["commissioner"], optional = true }
+# btleplug が tokio を要求するため、feature "ble" 有効時のみ current_thread ランタイムを持つ
+# (設計 doc §2.4)。UDP 経路は同期 std::net のまま。
+tokio = { version = "1", features = ["rt", "time", "macros"], optional = true }
+
+[features]
+# BLE コミッショニング(`pairing ble` / `pairing ble-handoff`)。
+# 既定 off: UDP のみの利用では BLE スタック(btleplug/tokio)を引かない
+# (設計 doc §2.1 は「既定 on」だが、CI と Windows クロスビルドの依存を明示的に
+# 選択できるよう opt-in とした)。
+ble = ["dep:simple-matter-ble", "dep:tokio"]
