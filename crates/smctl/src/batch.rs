@@ -88,7 +88,7 @@ pub fn run(g: &Globals, source: &str) -> Result<(), String> {
 
     let total = program.len();
     for (step, (lineno, lg, cmd)) in program.into_iter().enumerate() {
-        println!("[batch {}/{total}] line {lineno}", step + 1);
+        crate::json::info!("[batch {}/{total}] line {lineno}", step + 1);
         exec.set_globals_for_line(lg);
         exec.run(&cmd).map_err(|e| {
             exec.summarize();
@@ -99,7 +99,7 @@ pub fn run(g: &Globals, source: &str) -> Result<(), String> {
     // 3) EOF: 購読の受信数を要約して終了(購読はプロセス終了で破棄される。
     //    デバイス側は keep-alive 途絶で購読を掃除する)。
     exec.summarize();
-    println!("[batch] done ({total} command(s))");
+    crate::json::info!("[batch] done ({total} command(s))");
     Ok(())
 }
 

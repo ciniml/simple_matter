@@ -158,9 +158,36 @@ pub fn browse_commissionable_list(
     Ok(set.len())
 }
 
-/// commissionable ノード 1 件を 1 行で表示する。
+/// commissionable ノード 1 件を 1 行で表示する(`--json` では 1 行 JSON)。
 fn print_commissionable(node: &simple_matter::discovery::client::DiscoveredCommissionable) {
     let instance = String::from_utf8_lossy(node.instance()).into_owned();
+    if crate::json::enabled() {
+        let port = if node.port != 0 {
+            node.port
+        } else {
+            MATTER_PORT
+        };
+        let addrs: Vec<String> = node
+            .addrs
+            .iter()
+            .map(|a| format!("\"{}\"", crate::json::escape(&a.to_string())))
+            .collect();
+        let mut o = crate::json::Obj::new("commissionable")
+            .str("instance", &instance)
+            .num("port", port)
+            .raw("addrs", &format!("[{}]", addrs.join(",")));
+        if let Some(d) = node.discriminator {
+            o = o.num("discriminator", d);
+        }
+        if let Some((v, p)) = node.vendor_product {
+            o = o.num("vendorId", v).num("productId", p);
+        }
+        if let Some(cm) = node.commissioning_mode {
+            o = o.num("commissioningMode", cm);
+        }
+        o.emit();
+        return;
+    }
     let disc = node
         .discriminator
         .map(|d| d.to_string())

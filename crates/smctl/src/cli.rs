@@ -28,6 +28,8 @@ pub struct Globals {
     pub label: Option<String>,
     /// `discover commissionable --discriminator N` のフィルタ。
     pub discriminator: Option<u16>,
+    /// 機械可読 JSON 出力(1 行 1 オブジェクト)。情報行は stderr へ逃がす。
+    pub json: bool,
 }
 
 impl Globals {
@@ -38,6 +40,7 @@ impl Globals {
             timeout: DEFAULT_TIMEOUT,
             label: None,
             discriminator: None,
+            json: false,
         }
     }
 }
@@ -49,6 +52,7 @@ impl Clone for Globals {
             timeout: self.timeout,
             label: self.label.clone(),
             discriminator: self.discriminator,
+            json: self.json,
         }
     }
 }
@@ -160,6 +164,7 @@ fn parse_globals(args: &[String], base: &Globals) -> Result<(Globals, Vec<String
                     .map_err(|_| format!("invalid --discriminator: {v:?}"))?;
                 g.discriminator = Some(d);
             }
+            "--json" => g.json = true,
             "-h" | "--help" => {
                 pos.clear();
                 pos.push("help".to_string());
@@ -227,6 +232,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
 
 /// 単発コマンドのディスパッチ。
 pub fn dispatch(g: &Globals, cmd: Cmd) -> Result<(), String> {
+    crate::json::set_mode(g.json);
     match cmd {
         Cmd::Help => {
             print_help();
@@ -714,6 +720,10 @@ OPTIONS:
   --timeout <sec>       overall operation timeout (default 30)
   --label <text>        label recorded in the address book on pairing
   --discriminator <n>   filter for `discover commissionable`
+  --json                machine-readable output: one JSON object per line on
+                        stdout (read/write/invoke/subscribe reports/discover);
+                        human-readable progress moves to stderr. Works in
+                        batch mode too (per-line override allowed)
 
 ENVIRONMENT:
   SM_MDNS_TRACE=1     trace mDNS queries/answers on stderr

@@ -5,6 +5,9 @@
 //! - C2: `any read/write/invoke`(ID 直指定 + 型付きリテラル + hex TLV)、`discover`、
 //!   BLE pairing(feature `ble`: `pairing ble` / `pairing ble-handoff`)、
 //!   バッチ実行(`smctl batch <file|->`、単一プロセスで CASE セッションと購読を共有)。
+//! - C3: クラスタテーブル拡充(identify / level-control / descriptor /
+//!   general-commissioning / network-commissioning / administrator-commissioning /
+//!   operational-credentials)と `--json`(1 行 1 オブジェクトの機械可読出力)。
 //!
 //! 開発・自作デバイス用ツールであり、attestation は検証しない(`AttestationPolicy::Skip`)。
 
@@ -13,6 +16,7 @@ use std::process::ExitCode;
 mod batch;
 mod cli;
 mod clusters;
+mod json;
 mod ops;
 mod runner;
 mod state;

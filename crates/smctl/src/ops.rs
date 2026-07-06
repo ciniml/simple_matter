@@ -26,6 +26,7 @@ use simple_matter::transport::session::SessionId;
 
 use crate::cli::{Cmd, Globals};
 use crate::clusters::{self, ValueKind};
+use crate::json::{self, info, Obj};
 use crate::runner::udp::{open_dual_stack_udp, pump_commissioner, send_dir};
 use crate::runner::{mdns, Backend, Ctrl};
 use crate::state::{ca as ca_state, nodes, StateDir};
@@ -81,17 +82,25 @@ pub fn pairing_list(g: &Globals) -> Result<(), String> {
         nodes::load(&state.nodes_path())?
     };
     if entries.is_empty() {
-        println!("(no paired nodes; run `smctl pairing onnetwork <node-id> <passcode>`)");
+        info!("(no paired nodes; run `smctl pairing onnetwork <node-id> <passcode>`)");
         return Ok(());
     }
-    println!("{:<12} {:<24} label", "node-id", "last-addr");
+    info!("{:<12} {:<24} label", "node-id", "last-addr");
     for e in entries {
         let addr = if e.last_addr.port() == 0 {
             "(unresolved)".to_string()
         } else {
             e.last_addr.to_string()
         };
-        println!("{:<12} {:<24} {}", e.node_id, addr, e.label);
+        if json::enabled() {
+            let mut o = Obj::new("node").num("nodeId", e.node_id);
+            if e.last_addr.port() != 0 {
+                o = o.str("addr", &e.last_addr.to_string());
+            }
+            o.str("label", &e.label).emit();
+        } else {
+            println!("{:<12} {:<24} {}", e.node_id, addr, e.label);
+        }
     }
     Ok(())
 }
@@ -102,7 +111,7 @@ pub fn discover_commissionable(g: &Globals, discriminator: Option<u16>) -> Resul
     if n == 0 {
         return Err("no commissionable device found (is the device in commissioning mode?)".into());
     }
-    println!("[discover] {n} commissionable node(s) found");
+    info!("[discover] {n} commissionable node(s) found");
     Ok(())
 }
 
@@ -116,7 +125,14 @@ pub fn discover_operational(g: &Globals, node_id: u64) -> Result<(), String> {
             .ok_or("no CA state; commission a device first (`smctl pairing ...`)")?
     };
     let addr = mdns::resolve_operational(&ca, node_id, g.timeout.min(RESOLVE_TIMEOUT))?;
-    println!("[discover] operational node {node_id:#x} at {addr}");
+    if json::enabled() {
+        Obj::new("operational")
+            .num("nodeId", node_id)
+            .str("addr", &addr.to_string())
+            .emit();
+    } else {
+        println!("[discover] operational node {node_id:#x} at {addr}");
+    }
     Ok(())
 }
 
@@ -205,8 +221,9 @@ impl<'a> Exec<'a> {
         })
     }
 
-    /// バッチの行ごとの共通オプション(`--timeout`/`--label` 上書き)を反映する。
+    /// バッチの行ごとの共通オプション(`--timeout`/`--label`/`--json` 上書き)を反映する。
     pub fn set_globals_for_line(&mut self, g: Globals) {
+        crate::json::set_mode(g.json);
         self.g = g;
     }
 
@@ -278,12 +295,12 @@ impl<'a> Exec<'a> {
         if self.subs.is_empty() {
             return;
         }
-        println!(
+        info!(
             "[summary] shutting down {} subscription(s):",
             self.subs.len()
         );
         for s in &self.subs {
-            println!(
+            info!(
                 "  sub={} node={} reports-received={}{}",
                 s.id,
                 s.node,
@@ -333,12 +350,19 @@ impl<'a> Exec<'a> {
                 print_reports(
                     self.stack.sub_reports(),
                     &format!("[report +{ts}s sub={subscription_id}] "),
+                    "report",
+                    Some(subscription_id),
                 );
                 if let Some(s) = self.subs.iter_mut().find(|s| s.id == subscription_id) {
                     s.reports += 1;
                 }
             }
             ImEvent::SubscriptionLost { subscription_id } => {
+                if json::enabled() {
+                    Obj::new("subscription-lost")
+                        .num("subscriptionId", subscription_id)
+                        .emit();
+                }
                 eprintln!(
                     "[subscribe] subscription {subscription_id} LOST \
                      (no report within max interval + grace)"
@@ -433,15 +457,15 @@ impl<'a> Exec<'a> {
     fn pair(&mut self, node_id: u64, passcode: u32, target: &Target) -> Result<(), String> {
         let peer_addr = match target {
             Target::Addr(a) => {
-                println!("[target] using explicit address {a}");
+                info!("[target] using explicit address {a}");
                 *a
             }
             Target::Browse(disc) => {
-                println!("[discovery] browsing _matterc._udp.local via mDNS...");
+                info!("[discovery] browsing _matterc._udp.local via mDNS...");
                 mdns::browse_commissionable(*disc, self.g.timeout.max(BROWSE_TIMEOUT_MIN))?
             }
         };
-        println!(
+        info!(
             "[ca] fabric_id={:#018x} controller_node_id={:#018x}",
             self.ca.fabric_id(),
             self.ca.controller_node_id()
@@ -453,7 +477,7 @@ impl<'a> Exec<'a> {
 
         comm.commission(PeerAddr::Udp(peer_addr), passcode, node_id, self.now_ms())
             .map_err(|e| format!("commission() rejected: {e:?}"))?;
-        println!("[commission] starting to {peer_addr} (device node_id={node_id:#x})");
+        info!("[commission] starting to {peer_addr} (device node_id={node_id:#x})");
 
         let case_session: SessionId = loop {
             if Instant::now() > deadline {
@@ -477,7 +501,7 @@ impl<'a> Exec<'a> {
             // から次フェーズへ進む(デバイスの IM responder は同時 1 トランザクションのため)。
             self.quiesce(deadline)?;
         };
-        println!(
+        info!(
             "[commission] COMPLETE. operational CASE session = {:#x}",
             case_session.as_raw()
         );
@@ -496,7 +520,7 @@ impl<'a> Exec<'a> {
                 },
             )?;
         }
-        println!(
+        info!(
             "[pairing] node {node_id} recorded at {peer_addr} (state: {})",
             self.g.state_dir.display()
         );
@@ -668,7 +692,7 @@ impl<'a> Exec<'a> {
             Some(ev) => return Err(format!("read failed: {ev:?}")),
             None => return self.op_timeout(node_id, "read"),
         }
-        print_reports(self.stack.read_reports(), "");
+        print_reports(self.stack.read_reports(), "", "read", None);
         self.flush();
         Ok(())
     }
@@ -698,8 +722,25 @@ impl<'a> Exec<'a> {
             .map_err(|e| format!("start_write: {e:?}"))?;
         send_dir(&self.socket, &self.tx, &dir);
         match self.wait_txn_event(Instant::now() + self.g.timeout)? {
-            Some(ImEvent::WriteDone { status }) if status.is_success() => {
-                println!("[write] {} OK", format_concrete(cluster, Some(attr), ep));
+            Some(ImEvent::WriteDone { status }) => {
+                if json::enabled() {
+                    Obj::new("write")
+                        .num("node", node_id)
+                        .num("endpoint", ep)
+                        .num("cluster", cluster.0)
+                        .num("attribute", attr.0)
+                        .str("status", &format!("{status:?}"))
+                        .num("statusCode", status.to_u8())
+                        .emit();
+                } else if status.is_success() {
+                    println!("[write] {} OK", format_concrete(cluster, Some(attr), ep));
+                }
+                if !status.is_success() {
+                    return Err(format!(
+                        "write {} failed: status {status:?}",
+                        format_concrete(cluster, Some(attr), ep)
+                    ));
+                }
             }
             Some(ev) => return Err(format!("write failed: {ev:?}")),
             None => return self.op_timeout(node_id, "write"),
@@ -742,12 +783,30 @@ impl<'a> Exec<'a> {
             .map_err(|e| format!("start_invoke: {e:?}"))?;
         send_dir(&self.socket, &self.tx, &dir);
         match self.wait_txn_event(Instant::now() + self.g.timeout)? {
-            Some(ImEvent::InvokeDone { status }) if status.is_success() => {
-                println!(
-                    "[invoke] {} cmd {:#04x} OK (status = Success)",
-                    format_concrete(cluster, None, ep),
-                    command.0
-                );
+            Some(ImEvent::InvokeDone { status }) => {
+                if json::enabled() {
+                    Obj::new("invoke")
+                        .num("node", node_id)
+                        .num("endpoint", ep)
+                        .num("cluster", cluster.0)
+                        .num("command", command.0)
+                        .str("status", &format!("{status:?}"))
+                        .num("statusCode", status.to_u8())
+                        .emit();
+                } else if status.is_success() {
+                    println!(
+                        "[invoke] {} cmd {:#04x} OK (status = Success)",
+                        format_concrete(cluster, None, ep),
+                        command.0
+                    );
+                }
+                if !status.is_success() {
+                    return Err(format!(
+                        "invoke {} cmd {:#04x} failed: status {status:?}",
+                        format_concrete(cluster, None, ep),
+                        command.0
+                    ));
+                }
             }
             Some(ev) => return Err(format!("invoke failed: {ev:?}")),
             None => return self.op_timeout(node_id, "invoke"),
@@ -778,7 +837,7 @@ impl<'a> Exec<'a> {
             .start_subscribe(session, &[path], min_s, max_s, now, &mut self.tx)
             .map_err(|e| format!("start_subscribe: {e:?}"))?;
         send_dir(&self.socket, &self.tx, &dir);
-        println!("[subscribe] SubscribeRequest sent (min={min_s}s max={max_s}s)");
+        info!("[subscribe] SubscribeRequest sent (min={min_s}s max={max_s}s)");
 
         let (sub_id, neg_max) = match self.wait_txn_event(Instant::now() + self.g.timeout)? {
             Some(ImEvent::SubscribeDone {
@@ -794,7 +853,17 @@ impl<'a> Exec<'a> {
             reports: 0,
             lost: false,
         });
-        println!(
+        if json::enabled() {
+            Obj::new("subscribe")
+                .num("node", node_id)
+                .num("endpoint", ep)
+                .num("cluster", cluster.0)
+                .num("attribute", attr.0)
+                .num("subscriptionId", sub_id)
+                .num("maxIntervalS", neg_max)
+                .emit();
+        }
+        info!(
             "[subscribe] ESTABLISHED: subscription_id={sub_id} max_interval={neg_max}s{}",
             if self.batch { "" } else { " (Ctrl-C to stop)" }
         );
@@ -818,7 +887,7 @@ impl<'a> Exec<'a> {
 
     /// `wait <sec>`: 指定時間、購読レポートを受信・表示しながら待つ(バッチ組み込み)。
     fn wait(&mut self, secs: f64) -> Result<(), String> {
-        println!("[wait] {secs}s (receiving subscription reports)...");
+        info!("[wait] {secs}s (receiving subscription reports)...");
         let until = Instant::now() + Duration::from_secs_f64(secs);
         while Instant::now() < until {
             self.step_io()?;
@@ -843,7 +912,7 @@ pub(crate) fn report_phase(phase: Phase) {
         Phase::Done { .. } => "Done",
         Phase::Failed { .. } => "Failed",
     };
-    println!("[phase] {name}");
+    info!("[phase] {name}");
 }
 
 // ==========================================================================
@@ -1053,13 +1122,40 @@ fn format_concrete(cluster: ClusterId, attr: Option<AttributeId>, ep: u16) -> St
 }
 
 /// 属性レポート列を 1 行ずつ表示する。
-fn print_reports<'r, I>(reports: I, prefix: &str)
+///
+/// `--json` では人間可読行の代わりにレポート毎の 1 行 JSON
+/// (`event` = `"read"` | `"report"`、購読なら `subscriptionId` 付き)を出す。
+fn print_reports<'r, I>(reports: I, prefix: &str, event: &str, sub_id: Option<u32>)
 where
     I: Iterator<Item = MResult<AttributeReportRef<'r>>>,
 {
     let mut n = 0;
     for report in reports {
         n += 1;
+        if json::enabled() {
+            let mut o = Obj::new(event);
+            if let Some(id) = sub_id {
+                o = o.num("subscriptionId", id);
+            }
+            match report {
+                Ok(AttributeReportRef::Data(d)) => {
+                    let mut r = d.value();
+                    let value = json_next_value(&mut r).unwrap_or_else(|| "null".into());
+                    json_path(o, &d.path).raw("value", &value).emit();
+                }
+                Ok(AttributeReportRef::Status(s)) => {
+                    o = json_path(o, &s.path)
+                        .str("status", &format!("{:?}", s.status.status))
+                        .num("statusCode", s.status.status.to_u8());
+                    if let Some(cs) = s.status.cluster_status {
+                        o = o.num("clusterStatus", cs);
+                    }
+                    o.emit();
+                }
+                Err(e) => o.str("error", &format!("undecodable report: {e:?}")).emit(),
+            }
+            continue;
+        }
         match report {
             Ok(AttributeReportRef::Data(d)) => {
                 let path = format_path(&d.path);
@@ -1074,8 +1170,91 @@ where
             Err(e) => println!("{prefix}<undecodable report: {e:?}>"),
         }
     }
-    if n == 0 {
+    if n == 0 && !json::enabled() {
         println!("{prefix}(no attribute reports)");
+    }
+}
+
+/// 属性パスを JSON オブジェクトのフィールド群として追記する。
+///
+/// 数値 ID は常に出し、名前(`clusterName`/`attributeName`)はテーブルにあるときだけ
+/// 添える(表示同様、テーブルは可読性を足すだけ)。ワイルドカード成分は省略する。
+fn json_path(mut o: Obj, path: &AttributePath) -> Obj {
+    if let Some(ep) = path.endpoint {
+        o = o.num("endpoint", ep.0);
+    }
+    if let Some(c) = path.cluster {
+        o = o.num("cluster", c.0);
+        let def = clusters::by_id(c);
+        if let Some(def) = def {
+            o = o.str("clusterName", def.name);
+        }
+        if let Some(a) = path.attribute {
+            o = o.num("attribute", a.0);
+            if let Some(name) = def.and_then(|d| d.attr_by_id(a)).map(|a| a.name) {
+                o = o.str("attributeName", name);
+            }
+        }
+    } else if let Some(a) = path.attribute {
+        o = o.num("attribute", a.0);
+    }
+    o
+}
+
+/// TLV の次の 1 要素を JSON 値に変換する(コンテナは再帰)。
+///
+/// 対応: bool/整数/浮動小数(非有限は `null`)/utf8/byte string(`"hex:..."` 文字列)/
+/// null。struct は context タグ番号をキーにしたオブジェクト、array/list は配列。
+fn json_next_value(r: &mut TlvReader) -> Option<String> {
+    let e = r.read_next().ok()??;
+    Some(json_element(r, &e))
+}
+
+fn json_element(r: &mut TlvReader, e: &TlvElement) -> String {
+    match e.value {
+        TlvValue::Boolean(b) => b.to_string(),
+        TlvValue::UnsignedInteger(v) => v.to_string(),
+        TlvValue::SignedInteger(v) => v.to_string(),
+        TlvValue::Float(v) if v.is_finite() => v.to_string(),
+        TlvValue::Double(v) if v.is_finite() => v.to_string(),
+        TlvValue::Float(_) | TlvValue::Double(_) => "null".into(),
+        TlvValue::Utf8String(s) => format!("\"{}\"", json::escape(s)),
+        TlvValue::ByteString(b) => {
+            let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+            format!("\"hex:{hex}\"")
+        }
+        TlvValue::Null => "null".into(),
+        TlvValue::ContainerStart(t) => {
+            let object = matches!(t, ContainerType::Structure);
+            let mut parts = Vec::new();
+            let mut idx = 0u32;
+            loop {
+                match r.read_next() {
+                    Ok(Some(c)) if matches!(c.value, TlvValue::ContainerEnd) => break,
+                    Ok(Some(c)) => {
+                        let body = json_element(r, &c);
+                        if object {
+                            // struct のキーは context タグ番号(無タグは通し番号)。
+                            let key = match c.tag {
+                                TlvTag::ContextSpecific(n) => n.to_string(),
+                                _ => idx.to_string(),
+                            };
+                            parts.push(format!("\"{}\":{body}", json::escape(&key)));
+                        } else {
+                            parts.push(body);
+                        }
+                        idx += 1;
+                    }
+                    _ => break,
+                }
+            }
+            if object {
+                format!("{{{}}}", parts.join(","))
+            } else {
+                format!("[{}]", parts.join(","))
+            }
+        }
+        TlvValue::ContainerEnd => "null".into(),
     }
 }
 

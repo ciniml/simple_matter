@@ -7,8 +7,15 @@
 
 use simple_matter::dm::meta::{AttributeId, ClusterId, CommandId};
 
+pub mod administrator_commissioning;
 pub mod basic_information;
+pub mod descriptor;
+pub mod general_commissioning;
+pub mod identify;
+pub mod level_control;
+pub mod network_commissioning;
 pub mod on_off;
+pub mod operational_credentials;
 
 /// 値の型(表示とリテラルパースの両方に使う)。TLV のワイヤ型と 1:1。
 ///
@@ -109,8 +116,18 @@ impl ClusterDef {
     }
 }
 
-/// クラスタレジストリ。新クラスタ対応はここに 1 行足すだけ(設計 doc §5.2)。
-pub static CLUSTERS: &[&ClusterDef] = &[&on_off::DEF, &basic_information::DEF];
+/// クラスタレジストリ。新クラスタ対応はここに 1 行足すだけ(設計 doc §5.2)。ID 昇順。
+pub static CLUSTERS: &[&ClusterDef] = &[
+    &identify::DEF,                    // 0x0003
+    &on_off::DEF,                      // 0x0006
+    &level_control::DEF,               // 0x0008
+    &descriptor::DEF,                  // 0x001D
+    &basic_information::DEF,           // 0x0028
+    &general_commissioning::DEF,       // 0x0030
+    &network_commissioning::DEF,       // 0x0031
+    &administrator_commissioning::DEF, // 0x003C
+    &operational_credentials::DEF,     // 0x003E
+];
 
 /// クラスタを名前で引く。
 pub fn by_name(name: &str) -> Option<&'static ClusterDef> {
