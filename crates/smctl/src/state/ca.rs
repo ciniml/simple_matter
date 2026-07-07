@@ -127,7 +127,12 @@ pub fn load(path: &Path, crypto: &Backend) -> Result<Option<Ca<Backend>>, String
 /// CA を復元、無ければ新規生成して保存する。
 pub fn load_or_create(path: &Path, crypto: &Backend) -> Result<Ca<Backend>, String> {
     if let Some(ca) = load(path, crypto)? {
-        eprintln!("[ca] restored from {}", path.display());
+        crate::log::logf!(
+            crate::log::Level::Info,
+            "ctl",
+            "ca: restored from {}",
+            path.display()
+        );
         return Ok(ca);
     }
     let ca = Ca::<Backend>::generate(
@@ -140,6 +145,11 @@ pub fn load_or_create(path: &Path, crypto: &Backend) -> Result<Ca<Backend>, Stri
     )
     .map_err(|e| format!("CA generate failed: {e:?}"))?;
     save(path, &ca)?;
-    eprintln!("[ca] generated new CA; state saved to {}", path.display());
+    crate::log::logf!(
+        crate::log::Level::Info,
+        "ctl",
+        "ca: generated new CA; state saved to {}",
+        path.display()
+    );
     Ok(ca)
 }

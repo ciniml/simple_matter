@@ -19,9 +19,12 @@ mod batch;
 mod cli;
 mod clusters;
 mod json;
+mod log;
 mod ops;
 mod runner;
 mod state;
+mod tlvfmt;
+mod wire;
 
 /// OS の CSPRNG による [`Rng`](simple_matter::crypto::Rng) 実装(設計 doc §2.5)。
 ///

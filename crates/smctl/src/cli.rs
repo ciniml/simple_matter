@@ -42,6 +42,9 @@ pub struct Globals {
     /// ユニキャスト送信し、応答の A/AAAA でなく**クエリ宛先 IP** を接続先に採用する。
     /// discover commissionable/operational・pairing onnetwork[-long]・CASE 再解決に効く。
     pub at: Option<Vec<IpAddr>>,
+    /// `--log-level <l>` / `-v`(debug)/ `-vv`(trace)。`None` なら環境変数
+    /// `SMCTL_LOG` → 既定 info の順で解決する(設計 doc §9.1)。
+    pub log_level: Option<crate::log::Level>,
 }
 
 impl Globals {
@@ -57,6 +60,7 @@ impl Globals {
             timed_ms: None,
             paa_trust_store_path: None,
             at: None,
+            log_level: None,
         }
     }
 }
@@ -73,6 +77,7 @@ impl Clone for Globals {
             timed_ms: self.timed_ms,
             paa_trust_store_path: self.paa_trust_store_path.clone(),
             at: self.at.clone(),
+            log_level: self.log_level,
         }
     }
 }
@@ -237,6 +242,14 @@ fn parse_globals(args: &[String], base: &Globals) -> Result<(Globals, Vec<String
                 }
                 g.at = Some(ips);
             }
+            "--log-level" => {
+                let v = it
+                    .next()
+                    .ok_or("--log-level requires a value (error|warn|info|debug|trace)")?;
+                g.log_level = Some(crate::log::Level::parse(v)?);
+            }
+            "-v" => g.log_level = Some(crate::log::Level::Debug),
+            "-vv" => g.log_level = Some(crate::log::Level::Trace),
             "-h" | "--help" => {
                 pos.clear();
                 pos.push("help".to_string());
@@ -306,6 +319,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
 /// 単発コマンドのディスパッチ。
 pub fn dispatch(g: &Globals, cmd: Cmd) -> Result<(), String> {
     crate::json::set_mode(g.json);
+    crate::log::init(crate::log::resolve(g.log_level));
     match cmd {
         Cmd::Help => {
             print_help();
@@ -874,6 +888,11 @@ VALUE LITERALS (any):
 OPTIONS:
   --state-dir <dir>     state directory (default ~/.smctl)
   --timeout <sec>       overall operation timeout (default 30)
+  --log-level <level>   error|warn|info|debug|trace (default info); logs go to
+                        stderr with [<ms>][<layer>] tags (dis/udp/ble/btp/ex/sc/
+                        im/tlv). debug adds per-message transport + IM logs,
+                        trace adds TLV/hex payload dumps
+  -v / -vv              shorthand for --log-level debug / trace
   --label <text>        label recorded in the address book on pairing
   --discriminator <n>   filter for `discover commissionable`
   --at <ip>[,<ip>...]   resolve over VPN by unicast mDNS instead of multicast:
@@ -895,8 +914,9 @@ OPTIONS:
                         batch mode too (per-line override allowed)
 
 ENVIRONMENT:
-  SM_MDNS_TRACE=1     trace mDNS queries/answers on stderr
-  SM_BTP_TRACE=1      trace BTP fragments on stderr (BLE)
+  SMCTL_LOG=<level>   default log level (overridden by --log-level/-v/-vv)
+  SM_MDNS_TRACE=1     force mDNS trace only (subsumed by --log-level trace)
+  SM_BTP_TRACE=1      force BTP fragment trace only (subsumed by trace)
   SM_BLE_ADAPTER=hciN BLE adapter for pairing ble/ble-handoff/ble-wifi
 
 CLUSTERS:"
@@ -1180,6 +1200,21 @@ mod tests {
         assert!(parse_err("--at nope discover commissionable").contains("invalid --at ip"));
         // 値なしはエラー。
         assert!(parse_err("--at").contains("--at requires"));
+    }
+
+    #[test]
+    fn log_level_flags() {
+        use crate::log::Level;
+        let (g, _) = parse_ok("onoff toggle 1 1");
+        assert_eq!(g.log_level, None);
+        let (g, _) = parse_ok("-v onoff toggle 1 1");
+        assert_eq!(g.log_level, Some(Level::Debug));
+        let (g, _) = parse_ok("onoff toggle 1 1 -vv");
+        assert_eq!(g.log_level, Some(Level::Trace));
+        let (g, _) = parse_ok("--log-level warn onoff toggle 1 1");
+        assert_eq!(g.log_level, Some(Level::Warn));
+        assert!(parse_err("--log-level bogus onoff toggle 1 1").contains("invalid log level"));
+        assert!(parse_err("--log-level").contains("--log-level requires"));
     }
 
     #[test]

@@ -71,8 +71,10 @@ pub fn pair_ble(
         let _lock = state.lock()?;
         ca_state::load_or_create(&state.ca_path(), &crypto)?
     };
-    crate::json::info!(
-        "[ca] fabric_id={:#018x} controller_node_id={:#018x}",
+    crate::log::logf!(
+        crate::log::Level::Info,
+        "ctl",
+        "ca: fabric_id={:#018x} controller_node_id={:#018x}",
         ca.fabric_id(),
         ca.controller_node_id()
     );
@@ -143,9 +145,16 @@ async fn run_ble(
     let mut gatt = BtleplugCentral::with_adapter(adapter_name.as_deref())
         .await
         .map_err(|e| format!("BtleplugCentral::with_adapter: {e:?} (is BlueZ running?)"))?;
-    crate::json::info!("[ble] adapter: {}", gatt.adapter_info().await);
-    crate::json::info!(
-        "[ble] scanning for 0xFFF6 commissionable (discriminator={})...",
+    crate::log::logf!(
+        crate::log::Level::Info,
+        "ble",
+        "adapter: {}",
+        gatt.adapter_info().await
+    );
+    crate::log::logf!(
+        crate::log::Level::Info,
+        "ble",
+        "scanning for 0xFFF6 commissionable (discriminator={})...",
         discriminator
             .map(|d| d.to_string())
             .unwrap_or_else(|| "any".into())
@@ -157,8 +166,10 @@ async fn run_ble(
         })
         .await
         .map_err(|e| format!("scan: {e:?}"))?;
-    crate::json::info!(
-        "[ble] found device: discriminator={} vid={:#06x} pid={:#06x}",
+    crate::log::logf!(
+        crate::log::Level::Info,
+        "ble",
+        "found device: discriminator={} vid={:#06x} pid={:#06x}",
         target.discriminator,
         target.vendor_id,
         target.product_id
@@ -167,7 +178,12 @@ async fn run_ble(
         .connect(&target)
         .await
         .map_err(|e| format!("connect: {e:?}"))?;
-    crate::json::info!("[ble] connected (conn={} att_mtu={mtu:?})", conn.0);
+    crate::log::logf!(
+        crate::log::Level::Info,
+        "ble",
+        "connected (conn={} att_mtu={mtu:?})",
+        conn.0
+    );
 
     let peer = PeerAddr::Ble(conn);
     let start = Instant::now();
@@ -199,8 +215,10 @@ async fn run_ble(
                 .map_err(|e| format!("process_incoming(handshake): {e:?}"))?;
         }
     }
-    crate::json::info!(
-        "[btp] established: fragment={} window={}",
+    crate::log::logf!(
+        crate::log::Level::Info,
+        "btp",
+        "established: fragment={} window={}",
         btp.fragment_size(),
         btp.window()
     );
@@ -214,14 +232,20 @@ async fn run_ble(
     if let Some((ssid, password)) = wifi {
         comm.set_wifi_credentials(ssid, password)
             .map_err(|e| format!("set_wifi_credentials: {e:?}"))?;
-        crate::json::info!(
-            "[commission] wifi provisioning enabled (ssid={:?})",
+        crate::log::logf!(
+            crate::log::Level::Info,
+            "ctl",
+            "wifi provisioning enabled (ssid={:?})",
             String::from_utf8_lossy(ssid)
         );
     }
     comm.commission(peer, passcode, node_id, now_ms(&start))
         .map_err(|e| format!("commission() rejected: {e:?}"))?;
-    crate::json::info!("[commission] starting (device node_id={node_id:#018x})");
+    crate::log::logf!(
+        crate::log::Level::Info,
+        "ctl",
+        "starting (device node_id={node_id:#018x})"
+    );
 
     let outcome = drive_commission_ble(
         &mut comm, udp_case, &mut gatt, &mut btp, &mut ctrl, peer, conn, mtu, &start, &mut frag,
@@ -235,15 +259,27 @@ async fn run_ble(
             gatt.disconnect(conn)
                 .await
                 .map_err(|e| format!("disconnect: {e:?}"))?;
-            crate::json::info!("[done] commissioning succeeded (all over BLE); disconnected");
+            crate::log::logf!(
+                crate::log::Level::Info,
+                "ctl",
+                "commissioning succeeded (all over BLE); disconnected"
+            );
             // 運用は UDP で行うので、運用 mDNS を best effort で解決して記帳する。
             match mdns::resolve_operational(ca, node_id, RESOLVE_BEST_EFFORT) {
                 Ok(addr) => {
-                    crate::json::info!("[pairing] operational node resolved at {addr}");
+                    crate::log::logf!(
+                        crate::log::Level::Info,
+                        "dis",
+                        "operational node resolved at {addr}"
+                    );
                     Ok(addr)
                 }
                 Err(e) => {
-                    eprintln!("[pairing] operational mDNS not resolved yet ({e})");
+                    crate::log::logf!(
+                        crate::log::Level::Warn,
+                        "dis",
+                        "operational mDNS not resolved yet ({e})"
+                    );
                     Ok(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0))
                 }
             }
@@ -252,16 +288,20 @@ async fn run_ble(
             // 方向 B / ble-wifi: BLE を閉じ、運用 mDNS で解決、CASE→CommissioningComplete を
             // UDP で。ble-wifi ではデバイスの Wi-Fi join / DHCP / 運用 mDNS 開始を待つため
             // 解決タイムアウトを長めに取る(クエリは 2 秒間隔でリトライされる)。
-            crate::json::info!(
-                "[handoff] BLE commissioning phases complete; closing BLE, \
+            crate::log::logf!(
+                crate::log::Level::Info,
+                "ctl",
+                "BLE commissioning phases complete; closing BLE, \
                  switching to operational UDP"
             );
             // chip は AddNOC 受理後に自ら BLE を閉じるので、失敗は無視する。
             let _ = gatt.disconnect(conn).await;
 
             let resolve_timeout = if wifi.is_some() {
-                crate::json::info!(
-                    "[wifi] waiting for device to join WiFi and start operational mDNS \
+                crate::log::logf!(
+                    crate::log::Level::Info,
+                    "ctl",
+                    "waiting for device to join WiFi and start operational mDNS \
                      (up to {WIFI_RESOLVE_TIMEOUT:?})..."
                 );
                 WIFI_RESOLVE_TIMEOUT
@@ -269,7 +309,11 @@ async fn run_ble(
                 RESOLVE_TIMEOUT
             };
             let device_addr = mdns::resolve_operational(ca, node_id, resolve_timeout)?;
-            crate::json::info!("[handoff] operational node resolved at {device_addr}");
+            crate::log::logf!(
+                crate::log::Level::Info,
+                "ctl",
+                "operational node resolved at {device_addr}"
+            );
 
             let socket = open_dual_stack_udp().map_err(|e| format!("bind udp socket: {e}"))?;
             socket
@@ -280,8 +324,10 @@ async fn run_ble(
             comm.resume();
 
             let session = drive_commission_udp(&mut comm, &mut ctrl, &socket, &start)?;
-            crate::json::info!(
-                "[done] direction-B complete: BLE commissioning -> BLE close -> mDNS -> \
+            crate::log::logf!(
+                crate::log::Level::Info,
+                "ctl",
+                "direction-B complete: BLE commissioning -> BLE close -> mDNS -> \
                  CASE over UDP (session={:#x}) -> CommissioningComplete",
                 session.as_raw()
             );
@@ -302,11 +348,16 @@ fn now_ms(start: &Instant) -> u64 {
     start.elapsed().as_millis() as u64
 }
 
-/// `SM_BTP_TRACE=1` でフラグメントの先頭バイト(flags/ack/seq)をトレースする。
+/// BTP フラグメントの先頭バイト(flags/ack/seq)をトレースする。
+/// `--log-level trace` または後方互換の `SM_BTP_TRACE=1` で有効(設計 doc §9.1)。
 fn trace(dir: &str, frag: &[u8]) {
-    if std::env::var_os("SM_BTP_TRACE").is_some() {
+    if std::env::var_os("SM_BTP_TRACE").is_some() || crate::log::enabled(crate::log::Level::Trace) {
         let h: Vec<String> = frag.iter().take(5).map(|b| format!("{b:02x}")).collect();
-        eprintln!("[btp {dir}] len={} {}", frag.len(), h.join(" "));
+        crate::log::force(
+            crate::log::Level::Trace,
+            "btp",
+            format_args!("{dir} len={} {}", frag.len(), h.join(" ")),
+        );
     }
 }
 
@@ -344,13 +395,16 @@ async fn service_ctrl(
     let mut sdu = [0u8; MAX_RX_PACKET_SIZE];
     let mut txc = [0u8; MAX_RX_PACKET_SIZE];
     while let Some(slen) = take_sdu(btp, &mut sdu) {
+        crate::wire::log_rx("ble", &sdu[..slen], "btp");
         if let Some(d) = ctrl.handle_rx(&mut sdu[..slen], peer, now, &mut txc) {
+            crate::wire::log_tx("ble", &txc[..d.len], "btp");
             btp.send(&txc[..d.len], now)?;
             flush_c1(gatt, btp, conn, mtu, now).await?;
         }
     }
     // 閉じた exchange の回収(ble-btp.md §11-4)。BTP では再送/ACK は生じないが poll は必須。
     while let Some(d) = ctrl.poll(now, &mut txc) {
+        crate::wire::log_tx("ble", &txc[..d.len], "btp");
         btp.send(&txc[..d.len], now)?;
         flush_c1(gatt, btp, conn, mtu, now).await?;
     }
@@ -408,6 +462,7 @@ async fn drive_commission_ble(
                 last_phase = out.phase;
             }
             if let Some(d) = out.send {
+                crate::wire::log_tx("ble", &txc[..d.len], "btp");
                 btp.send(&txc[..d.len], now)
                     .map_err(|e| format!("btp.send: {e:?}"))?;
                 flush_c1(gatt, btp, conn, mtu, now)
@@ -416,8 +471,10 @@ async fn drive_commission_ble(
             }
             match out.phase {
                 Phase::Done { session } => {
-                    crate::json::info!(
-                        "[commission] COMPLETE. operational CASE session = {:#x}",
+                    crate::log::logf!(
+                        crate::log::Level::Info,
+                        "ctl",
+                        "COMPLETE. operational CASE session = {:#x}",
                         session.as_raw()
                     );
                     return Ok(BleOutcome::Done(session));
@@ -435,8 +492,10 @@ async fn drive_commission_ble(
         // 方向 B / ble-wifi: BLE 上の最終フェーズ完了で CASE が保留された(sigma1 未送出)。
         // ここで BLE を降りる。
         if udp_case && matches!(comm.phase(), Phase::Case) {
-            crate::json::info!(
-                "[commission] BLE phases accepted; CASE suspended for operational UDP handoff"
+            crate::log::logf!(
+                crate::log::Level::Info,
+                "ctl",
+                "BLE phases accepted; CASE suspended for operational UDP handoff"
             );
             return Ok(BleOutcome::PausedBeforeCase);
         }
@@ -498,8 +557,10 @@ fn drive_commission_udp(
         }
         match phase {
             Phase::Done { session } => {
-                crate::json::info!(
-                    "[commission] COMPLETE over UDP. operational CASE session = {:#x}",
+                crate::log::logf!(
+                    crate::log::Level::Info,
+                    "ctl",
+                    "COMPLETE over UDP. operational CASE session = {:#x}",
                     session.as_raw()
                 );
                 // 最後の応答/ACK を流し切ってから返す。

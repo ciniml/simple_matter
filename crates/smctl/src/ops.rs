@@ -27,6 +27,7 @@ use simple_matter::transport::session::SessionId;
 use crate::cli::{Cmd, Globals};
 use crate::clusters::{self, ValueKind};
 use crate::json::{self, info, Obj};
+use crate::log::{logf, Level};
 use crate::runner::udp::{open_dual_stack_udp, pump_commissioner, send_dir};
 use crate::runner::{mdns, Backend, Ctrl};
 use crate::state::{ca as ca_state, nodes, resume, StateDir};
@@ -243,6 +244,7 @@ impl<'a> Exec<'a> {
     /// バッチの行ごとの共通オプション(`--timeout`/`--label`/`--json` 上書き)を反映する。
     pub fn set_globals_for_line(&mut self, g: Globals) {
         crate::json::set_mode(g.json);
+        crate::log::init(crate::log::resolve(g.log_level));
         self.g = g;
     }
 
@@ -349,6 +351,7 @@ impl<'a> Exec<'a> {
     fn step_io(&mut self) -> Result<(), String> {
         match self.socket.recv_from(&mut self.rx) {
             Ok((n, src)) => {
+                crate::wire::log_rx("udp", &self.rx[..n], &src.to_string());
                 let now = self.now_ms();
                 if let Some(dir) =
                     self.stack
@@ -390,15 +393,17 @@ impl<'a> Exec<'a> {
                         .num("subscriptionId", subscription_id)
                         .emit();
                 }
-                eprintln!(
-                    "[subscribe] subscription {subscription_id} LOST \
+                logf!(
+                    Level::Warn,
+                    "im",
+                    "subscription {subscription_id} LOST \
                      (no report within max interval + grace)"
                 );
                 if let Some(s) = self.subs.iter_mut().find(|s| s.id == subscription_id) {
                     s.lost = true;
                 }
             }
-            other => eprintln!("[warn] unexpected IM event: {other:?}"),
+            other => logf!(Level::Warn, "im", "unexpected IM event: {other:?}"),
         }
     }
 
@@ -486,12 +491,16 @@ impl<'a> Exec<'a> {
             Target::Addr(a) => {
                 // fe80 リテラルは scope_id 補完(mdns-ipv6.md §3 の規則)。
                 let a = mdns::fill_link_local_scope(*a);
-                info!("[target] using explicit address {a}");
+                logf!(Level::Info, "dis", "using explicit address {a}");
                 a
             }
             Target::Browse(disc) => match &self.g.at {
                 Some(targets) => {
-                    info!("[discovery] resolving commissionable via unicast mDNS (--at)...");
+                    logf!(
+                        Level::Info,
+                        "dis",
+                        "resolving commissionable via unicast mDNS (--at)..."
+                    );
                     mdns::browse_commissionable_at(
                         *disc,
                         targets,
@@ -499,13 +508,19 @@ impl<'a> Exec<'a> {
                     )?
                 }
                 None => {
-                    info!("[discovery] browsing _matterc._udp.local via mDNS...");
+                    logf!(
+                        Level::Info,
+                        "dis",
+                        "browsing _matterc._udp.local via mDNS..."
+                    );
                     mdns::browse_commissionable(*disc, self.g.timeout.max(BROWSE_TIMEOUT_MIN))?
                 }
             },
         };
-        info!(
-            "[ca] fabric_id={:#018x} controller_node_id={:#018x}",
+        logf!(
+            Level::Info,
+            "ctl",
+            "ca: fabric_id={:#018x} controller_node_id={:#018x}",
             self.ca.fabric_id(),
             self.ca.controller_node_id()
         );
@@ -515,11 +530,17 @@ impl<'a> Exec<'a> {
         let paa_owned: Vec<Vec<u8>> = self.paa_store.clone();
         let paa_slices: Vec<&[u8]> = paa_owned.iter().map(Vec::as_slice).collect();
         let policy = if paa_slices.is_empty() {
-            info!("[attestation] skipped (no --paa-trust-store-path)");
+            logf!(
+                Level::Info,
+                "ctl",
+                "attestation skipped (no --paa-trust-store-path)"
+            );
             AttestationPolicy::Skip
         } else {
-            info!(
-                "[attestation] verifying DAC chain against {} PAA cert(s)",
+            logf!(
+                Level::Info,
+                "ctl",
+                "attestation: verifying DAC chain against {} PAA cert(s)",
                 paa_slices.len()
             );
             AttestationPolicy::Verify {
@@ -532,7 +553,11 @@ impl<'a> Exec<'a> {
 
         comm.commission(PeerAddr::Udp(peer_addr), passcode, node_id, self.now_ms())
             .map_err(|e| format!("commission() rejected: {e:?}"))?;
-        info!("[commission] starting to {peer_addr} (device node_id={node_id:#x})");
+        logf!(
+            Level::Info,
+            "ctl",
+            "commissioning start: {peer_addr} (device node_id={node_id:#x})"
+        );
 
         let case_session: SessionId = loop {
             if Instant::now() > deadline {
@@ -556,8 +581,10 @@ impl<'a> Exec<'a> {
             // から次フェーズへ進む(デバイスの IM responder は同時 1 トランザクションのため)。
             self.quiesce(deadline)?;
         };
-        info!(
-            "[commission] COMPLETE. operational CASE session = {:#x}",
+        logf!(
+            Level::Info,
+            "ctl",
+            "commissioning COMPLETE. operational CASE session = {:#x}",
             case_session.as_raw()
         );
         self.flush();
@@ -619,7 +646,11 @@ impl<'a> Exec<'a> {
                     &m.resumption_id,
                     &m.shared_secret,
                 );
-                info!("[case] resumption material loaded; will attempt session resumption");
+                logf!(
+                    Level::Info,
+                    "sc",
+                    "resumption material loaded; will attempt session resumption"
+                );
             }
         }
 
@@ -636,12 +667,18 @@ impl<'a> Exec<'a> {
                 Err(CaseAttempt::Timeout) => {
                     // ハンドシェイク slot は使用中のまま(コアの HANDSHAKE_TIMEOUT は 60 秒)。
                     pending_to = Some(cached);
-                    eprintln!(
-                        "[case] cached address {cached} not responding; re-resolving via mDNS"
+                    logf!(
+                        Level::Warn,
+                        "sc",
+                        "cached address {cached} not responding; re-resolving via mDNS"
                     );
                 }
                 Err(CaseAttempt::Failed(e)) => {
-                    eprintln!("[case] cached address {cached} failed ({e}); re-resolving via mDNS")
+                    logf!(
+                        Level::Warn,
+                        "sc",
+                        "cached address {cached} failed ({e}); re-resolving via mDNS"
+                    );
                 }
             }
         }
@@ -650,20 +687,30 @@ impl<'a> Exec<'a> {
             Some(x) => x,
             None => {
                 let resolved = self.reresolve_operational(node_id, &entry)?;
-                eprintln!("[case] operational node resolved at {resolved}");
+                logf!(
+                    Level::Info,
+                    "dis",
+                    "operational node resolved at {resolved}"
+                );
                 let s = if pending_to == Some(resolved) {
                     // アドレスは正しかった(デバイスが一時的に無応答なだけ)。新規
                     // ハンドシェイクは張れない(slot 使用中)ので、進行中の Sigma1 の
                     // MRP 再送に賭けて同じハンドシェイクを待ち続ける。
-                    eprintln!("[case] address unchanged; keep waiting on the in-flight handshake");
+                    logf!(
+                        Level::Info,
+                        "sc",
+                        "address unchanged; keep waiting on the in-flight handshake"
+                    );
                     self.await_case(resolved, deadline)
                         .map_err(|e| e.into_message(resolved))?
                 } else {
                     if pending_to.is_some() {
                         // 別アドレスへ張り直したいが slot が塞がっている。前のハンドシェイクの
                         // 失敗確定(タイムアウト掃除)を待ってから開始する。
-                        eprintln!(
-                            "[case] waiting for the previous handshake attempt to be reaped..."
+                        logf!(
+                            Level::Info,
+                            "sc",
+                            "waiting for the previous handshake attempt to be reaped..."
                         );
                         let _ = self.await_case(cached, deadline);
                     }
@@ -697,7 +744,11 @@ impl<'a> Exec<'a> {
                         shared_secret: secret,
                     },
                 )?;
-                info!("[case] resumption material saved for node {node_id}");
+                logf!(
+                    Level::Info,
+                    "sc",
+                    "resumption material saved for node {node_id}"
+                );
             }
         }
         self.cases.push((node_id, session));
@@ -721,13 +772,21 @@ impl<'a> Exec<'a> {
         // last_addr ホストへの QU 直叩き(短めの窓)を先に試す。
         if entry.last_addr.port() != 0 {
             let ip = entry.last_addr.ip();
-            eprintln!("[case] trying unicast mDNS re-resolution to cached host {ip}");
+            logf!(
+                Level::Info,
+                "dis",
+                "trying unicast mDNS re-resolution to cached host {ip}"
+            );
             if let Ok(addr) =
                 mdns::resolve_operational_at(self.ca, node_id, &[ip], RERESOLVE_AT_TIMEOUT)
             {
                 return Ok(addr);
             }
-            eprintln!("[case] unicast re-resolution failed; falling back to multicast mDNS");
+            logf!(
+                Level::Info,
+                "dis",
+                "unicast re-resolution failed; falling back to multicast mDNS"
+            );
         }
         mdns::resolve_operational(self.ca, node_id, RESOLVE_TIMEOUT)
     }
@@ -747,6 +806,20 @@ impl<'a> Exec<'a> {
         // fe80 リンクローカル(nodes.tlv は scope を保存しない・再解決分は解決時に付与済み)
         // へは scope_id を補完してから接続する(design §3)。
         let addr = mdns::fill_link_local_scope(addr);
+        let resuming = self
+            .stack
+            .resumption_export(CONTROLLER_FABRIC_INDEX, node_id)
+            .is_some();
+        logf!(
+            Level::Debug,
+            "sc",
+            "CASE start to {addr}: sending Sigma1{}",
+            if resuming {
+                " (with resumptionID + resumeMIC)"
+            } else {
+                ""
+            }
+        );
         let now = self.now_ms();
         let dir = self
             .stack
@@ -766,10 +839,16 @@ impl<'a> Exec<'a> {
     fn await_case(&mut self, addr: SocketAddr, until: Instant) -> Result<SessionId, CaseAttempt> {
         match self.wait_sc_event(until).map_err(CaseAttempt::Failed)? {
             Some(ScEvent::CaseEstablished { session, resumed }) => {
-                eprintln!(
-                    "[case] ESTABLISHED to {addr} (session={:#x}{})",
+                logf!(
+                    Level::Info,
+                    "sc",
+                    "CASE ESTABLISHED to {addr} (session={:#x}{})",
                     session.as_raw(),
-                    if resumed { ", resumed" } else { "" }
+                    if resumed {
+                        ", resumed via Sigma2Resume"
+                    } else {
+                        ", full handshake (Sigma1/2/3)"
+                    }
                 );
                 Ok(session)
             }
@@ -807,6 +886,13 @@ impl<'a> Exec<'a> {
             list_append: false,
             enable_tag_compression: false,
         };
+        logf!(
+            Level::Debug,
+            "im",
+            "ReadRequest node={node_id} path: {}{}",
+            annotate_path(ep, cluster, attr, None),
+            if attr.is_none() { " (wildcard)" } else { "" }
+        );
         let now = self.now_ms();
         let dir = self
             .stack
@@ -814,7 +900,9 @@ impl<'a> Exec<'a> {
             .map_err(|e| format!("start_read: {e:?}"))?;
         send_dir(&self.socket, &self.tx, &dir);
         match self.wait_txn_event(Instant::now() + self.g.timeout)? {
-            Some(ImEvent::ReadDone) => {}
+            Some(ImEvent::ReadDone) => {
+                logf!(Level::Debug, "im", "ReportData received (read complete)");
+            }
             Some(ev) => return Err(format!("read failed: {ev:?}")),
             None => return self.op_timeout(node_id, "read"),
         }
@@ -835,6 +923,12 @@ impl<'a> Exec<'a> {
     ) -> Result<(), String> {
         let session = self.case_session(node_id)?;
         let path = AttributePath::concrete(EndpointId(ep), cluster, attr);
+        logf!(
+            Level::Debug,
+            "im",
+            "WriteRequest node={node_id} path: {} value={value:?}",
+            annotate_path(ep, cluster, Some(attr), None)
+        );
         let now = self.now_ms();
         let dir = self
             .stack
@@ -849,6 +943,12 @@ impl<'a> Exec<'a> {
         send_dir(&self.socket, &self.tx, &dir);
         match self.wait_txn_event(Instant::now() + self.g.timeout)? {
             Some(ImEvent::WriteDone { status }) => {
+                logf!(
+                    Level::Debug,
+                    "im",
+                    "WriteResponse status={status:?} path: {}",
+                    annotate_path(ep, cluster, Some(attr), None)
+                );
                 if json::enabled() {
                     Obj::new("write")
                         .num("node", node_id)
@@ -892,6 +992,21 @@ impl<'a> Exec<'a> {
     ) -> Result<(), String> {
         let session = self.case_session(node_id)?;
         let path = CommandPath::new(EndpointId(ep), cluster, command);
+        logf!(
+            Level::Debug,
+            "im",
+            "InvokeRequest node={node_id} path: {}{}{}",
+            annotate_path(ep, cluster, None, Some(command)),
+            if fields.is_empty() && raw_fields.is_none() {
+                ""
+            } else {
+                " (with command fields)"
+            },
+            match timed_ms {
+                Some(ms) => format!(" [timed, {ms}ms window]"),
+                None => String::new(),
+            }
+        );
         let now = self.now_ms();
         let write_fields = move |w: &mut TlvWriter<'_>, t: &TlvTag| match &raw_fields {
             Some(raw) => transcode_tlv(w, t, raw),
@@ -916,6 +1031,12 @@ impl<'a> Exec<'a> {
         send_dir(&self.socket, &self.tx, &dir);
         match self.wait_txn_event(Instant::now() + self.g.timeout)? {
             Some(ImEvent::InvokeDone { status }) => {
+                logf!(
+                    Level::Debug,
+                    "im",
+                    "InvokeResponse status={status:?} path: {}",
+                    annotate_path(ep, cluster, None, Some(command))
+                );
                 if json::enabled() {
                     Obj::new("invoke")
                         .num("node", node_id)
@@ -1050,6 +1171,12 @@ impl<'a> Exec<'a> {
     ) -> Result<(), String> {
         let session = self.case_session(node_id)?;
         let path = AttributePath::concrete(EndpointId(ep), cluster, attr);
+        logf!(
+            Level::Debug,
+            "im",
+            "SubscribeRequest node={node_id} path: {} min={min_s}s max={max_s}s",
+            annotate_path(ep, cluster, Some(attr), None)
+        );
         let now = self.now_ms();
         let dir = self
             .stack
@@ -1062,7 +1189,15 @@ impl<'a> Exec<'a> {
             Some(ImEvent::SubscribeDone {
                 subscription_id,
                 max_interval_s,
-            }) => (subscription_id, max_interval_s),
+            }) => {
+                logf!(
+                    Level::Debug,
+                    "im",
+                    "SubscribeResponse subscription_id={subscription_id} \
+                     max_interval={max_interval_s}s"
+                );
+                (subscription_id, max_interval_s)
+            }
             Some(ev) => return Err(format!("subscribe failed: {ev:?}")),
             None => return self.op_timeout(node_id, "subscribe"),
         };
@@ -1221,22 +1356,55 @@ fn verhoeff_check_digit(digits: &str) -> u8 {
 }
 
 pub(crate) fn report_phase(phase: Phase) {
-    let name = match phase {
-        Phase::Idle => "Idle",
-        Phase::Pase => "PASE handshake",
-        Phase::ArmFailSafe => "ArmFailSafe",
-        Phase::Attestation => "Attestation",
-        Phase::Csr => "CSRRequest",
-        Phase::AddTrustedRoot => "AddTrustedRootCertificate",
-        Phase::AddNoc => "AddNOC",
-        Phase::AddWifiNetwork => "AddOrUpdateWiFiNetwork",
-        Phase::ConnectNetwork => "ConnectNetwork",
-        Phase::Case => "CASE handshake",
-        Phase::Complete => "CommissioningComplete",
-        Phase::Done { .. } => "Done",
-        Phase::Failed { .. } => "Failed",
+    // タグはフェーズの主レイヤに合わせる: PASE/CASE = Secure Channel、
+    // クラスタコマンド群 = Interaction Model、開始/終了 = コントローラ。
+    let (tag, name) = match phase {
+        Phase::Idle => ("ctl", "Idle"),
+        Phase::Pase => ("sc", "PASE handshake (PBKDFParamRequest -> Pake1/2/3)"),
+        Phase::ArmFailSafe => ("im", "ArmFailSafe"),
+        Phase::Attestation => ("im", "Attestation"),
+        Phase::Csr => ("im", "CSRRequest"),
+        Phase::AddTrustedRoot => ("im", "AddTrustedRootCertificate"),
+        Phase::AddNoc => ("im", "AddNOC"),
+        Phase::AddWifiNetwork => ("im", "AddOrUpdateWiFiNetwork"),
+        Phase::ConnectNetwork => ("im", "ConnectNetwork"),
+        Phase::Case => ("sc", "CASE handshake (Sigma1 -> Sigma2/3 or Sigma2Resume)"),
+        Phase::Complete => ("im", "CommissioningComplete"),
+        Phase::Done { .. } => ("ctl", "Done"),
+        Phase::Failed { .. } => ("ctl", "Failed"),
     };
-    info!("[phase] {name}");
+    logf!(Level::Info, tag, "phase: {name}");
+}
+
+/// `[im]` ログ用のパス注釈: `endpoint=1 cluster=onoff(0x0006) attribute=on-off(0x0000)`。
+///
+/// クラスタテーブル([`clusters::CLUSTERS`])収載分は名前を添え、未収載は ID hex のみ。
+pub(crate) fn annotate_path(
+    ep: u16,
+    cluster: ClusterId,
+    attr: Option<AttributeId>,
+    cmd: Option<CommandId>,
+) -> String {
+    let def = clusters::by_id(cluster);
+    let mut s = format!("endpoint={ep} cluster=");
+    match def {
+        Some(d) => s.push_str(&format!("{}({:#06x})", d.name, cluster.0)),
+        None => s.push_str(&format!("{:#06x}", cluster.0)),
+    }
+    if let Some(a) = attr {
+        match def.and_then(|d| d.attr_by_id(a)) {
+            Some(ad) => s.push_str(&format!(" attribute={}({:#06x})", ad.name, a.0)),
+            None => s.push_str(&format!(" attribute={:#06x}", a.0)),
+        }
+    }
+    if let Some(c) = cmd {
+        let name = def.and_then(|d| d.cmds.iter().find(|x| x.id == c));
+        match name {
+            Some(cd) => s.push_str(&format!(" command={}({:#04x})", cd.name, c.0)),
+            None => s.push_str(&format!(" command={:#04x}", c.0)),
+        }
+    }
+    s
 }
 
 // ==========================================================================
@@ -1456,6 +1624,27 @@ where
     let mut n = 0;
     for report in reports {
         n += 1;
+        // レイヤログ(stderr): ReportData のパスと値構造。stdout の結果表示とは独立。
+        match &report {
+            Ok(AttributeReportRef::Data(d)) => {
+                logf!(Level::Debug, "im", "ReportData {}", format_path(&d.path));
+                if crate::log::enabled(Level::Debug) {
+                    for l in crate::tlvfmt::pretty(d.data) {
+                        logf!(Level::Debug, "tlv", "  {l}");
+                    }
+                }
+            }
+            Ok(AttributeReportRef::Status(s)) => {
+                logf!(
+                    Level::Debug,
+                    "im",
+                    "ReportData {} status={:?}",
+                    format_path(&s.path),
+                    s.status.status
+                );
+            }
+            Err(_) => {}
+        }
         if json::enabled() {
             let mut o = Obj::new(event);
             if let Some(id) = sub_id {

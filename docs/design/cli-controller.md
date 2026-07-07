@@ -465,3 +465,87 @@ cluster_def! {
 
 いずれも smctl の骨格(§2〜§5)には影響せず、解消され次第コマンドを足すだけの
 位置に置いてある。
+
+---
+
+## 9. ログ機能(chip-tool 相当の通信ログ、2026-07-07)
+
+**目標**: Windows 向け chip-tool 代替として、pairing / read / write / invoke の
+通信過程を chip-tool([EM][SC][IM][DMG][DIS][BLE] タグ)並みの粒度で、
+レベル分け + 人間可読の構造化パース表示で stderr へ出す。
+
+### 9.1 ログレベルと指定方法
+
+`error < warn < info < debug < trace` の 5 レベル(既定 **info**)。
+
+- CLI: `--log-level <error|warn|info|debug|trace>`、短縮 `-v`(= debug)/`-vv`(= trace)。
+- 環境変数: `SMCTL_LOG=<level>`(CLI 指定が優先)。
+- 後方互換: `SM_MDNS_TRACE=1` / `SM_BTP_TRACE=1` は該当レイヤのみ trace 相当を強制
+  (グローバルレベルに関わらず出す)。逆に `-vv` はライブラリ側トレース
+  (`simple-matter-ble` の `SM_BLE_TRACE`)も env 経由で有効化する。
+- バッチでは行ごとの `--log-level` 上書きを許す(`--json` と同じ扱い)。
+
+出力は**すべて stderr**(stdout は結果と `--json` の JSON Lines 専用のまま)。
+書式は `[<起動からの ms>][<tag>] メッセージ`(ms は右詰め 6 桁以上)。warn/error は
+タグの後に `warn:` / `error:` を付ける。ANSI 色は使わない(Windows コンソール互換の
+無色フォールバックに一本化。VT 有効化の分岐を持たない)。
+
+### 9.2 レイヤタグ
+
+| tag | レベル | 内容 |
+|---|---|---|
+| `[dis]` | info: 発見・解決の判断 / trace: mDNS クエリ送出・受信パケットごとの parse/ingest 結果 | mDNS ブラウズ/運用解決(QU/QM、`--at` 経路含む) |
+| `[udp]` | debug: 送受ごとに `tx/rx <size>B -> <addr>` + PacketHeader 要約(session/ctr/src/dst)/ trace: ペイロード hex | UDP トランスポート |
+| `[ble]` `[btp]` | info: scan/connect/BTP 確立 / trace: BTP フラグメント先頭バイト(旧 `SM_BTP_TRACE` と同形式) | BLE トランスポート |
+| `[ex]` | debug: 非暗号メッセージの PayloadHeader(exch id、I/A/R フラグ、ack counter、プロトコル/opcode 名)。暗号化後は PacketHeader の ctr 反復から `(retx)` を注釈 | exchange/MRP |
+| `[sc]` | info: PASE/CASE のフェーズと確立(resumed 有無、セッション ID)/ debug: Sigma1 送出時の resumption 素材有無 / trace: 非暗号 SC ペイロードの TLV ダンプ | Secure Channel の意味レベル |
+| `[im]` | debug: Read/Write/Invoke/Subscribe の要求パス(クラスタ/属性/コマンド名注釈付き)と応答ステータス、ReportData のパス | Interaction Model の意味レベル |
+| `[tlv]` | debug: 属性値・コマンドフィールドのプリティプリント(インデント付き構造表示) | ペイロード構造 |
+
+構造化パース表示の例(`smctl -v onoff toggle 1 1`、実出力):
+
+```text
+[   311][im] InvokeRequest node=1 path: endpoint=1 cluster=onoff(0x0006) command=toggle(0x02)
+[   311][udp] tx 59B -> 192.168.2.14:5540 session=0x0003 ctr=108150459 (encrypted)
+[   348][udp] rx 67B <- [::ffff:192.168.2.14]:5540 session=0x0001 ctr=4676326 (encrypted)
+[   348][im] InvokeResponse status=Success path: endpoint=1 cluster=onoff(0x0006) command=toggle(0x02)
+```
+
+Read の値と非暗号 SC ペイロードは `[tlv]`/`[sc]` でプリティプリント(クラスタ
+テーブル未収載は ID hex + 生 TLV 構造のインデント表示。テーブルは§5 のレジストリを
+引く)。`-vv` での resumption 付き CASE の実出力:
+
+```text
+[    21][sc] CASE start to 192.168.2.14:5540: sending Sigma1 (with resumptionID + resumeMIC)
+[    23][ex] tx exch=0x0001 flags=IR SC:CASE:Sigma1
+[    23][sc]   AnonymousTag: struct {
+[    23][sc]     1: hex:b55a2c28eb556dcdba6920e9723906a1.. (32B)
+[    23][sc]     2: 1 (unsigned)
+[    23][sc]     6: hex:4d20a4f22e1e8ab24b689295f6246f8b (16B)
+[    23][sc]     7: hex:06f0c18c319f32d3f860f6b783b7b763 (16B)
+[    23][sc]   }
+[    40][ex] rx exch=0x0001 flags=RA ack=1 SC:CASE:Sigma2Resume
+[    41][sc] CASE ESTABLISHED to 192.168.2.14:5540 (session=0x1, resumed via Sigma2Resume)
+[   281][im] ReportData ep1 onoff/on-off (0x0006/0x0000)
+[   281][tlv]   2: true
+```
+
+### 9.3 実装位置(コア無改造)
+
+- **`smctl/src/log.rs`**: レベル(AtomicU8)+ 起動時刻 + `logf!(level, tag, ...)`
+  マクロ。`force()`(env による per-layer 強制)も提供。
+- **`smctl/src/tlvfmt.rs`**: TLV プリティプリンタ。コアの公開 `TlvReader` を使い
+  smctl 側に実装(コアの no_std / sans-IO を汚さない)。
+- **`smctl/src/wire.rs`**: ワイヤ観測。送受バイト列から公開 `PacketHeader::decode` /
+  `PayloadHeader::decode`(非暗号時のみ)をパースして `[udp]`/`[ex]`/`[sc]` 行を出す。
+  暗号化ペイロードは復号しない(復号後の意味は `[sc]`/`[im]` のイベント観測で出す)。
+- フック位置: `runner/udp.rs::send_dir`(tx)、`ops.rs::step_io` / `runner/udp.rs::settle`
+  (rx)、`runner/ble.rs`(BTP SDU/フラグメント)、`runner/mdns.rs`(dis)、
+  `ops.rs`(im/sc の意味レベル)。
+- **コア API 増分: なし**(`transport::header` は既に公開。TLV/イベントも既存公開 API)。
+
+### 9.4 ゲート
+
+単体(レベル解決・TLV プリティプリンタの既知バイト列)+ 既存全テスト green +
+clippy 0 + E2E(onoff-light 相手に `-v`/`-vv` で pairing/toggle/read、BLE 経路 1 本、
+`--json` の stdout 非汚染)+ Windows クロスビルド(`--features ble`)green。

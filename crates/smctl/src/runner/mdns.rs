@@ -14,6 +14,27 @@ use simple_matter::discovery::{MATTER_PORT, MDNS_IPV4, MDNS_IPV6, MDNS_PORT};
 
 use super::Backend;
 
+/// mDNS トレースの有効判定: `--log-level trace` または後方互換の `SM_MDNS_TRACE=1`
+/// (設計 doc §9.1。env はグローバルレベルに関わらずこのレイヤのみ強制する)。
+fn mdns_trace() -> bool {
+    std::env::var_os("SM_MDNS_TRACE").is_some() || crate::log::enabled(crate::log::Level::Trace)
+}
+
+/// `[dis]` トレース行([`mdns_trace`] 判定済みの箇所で使う。env 強制に対応するため
+/// グローバルレベルを再判定しない)。
+macro_rules! dis_trace {
+    ($($arg:tt)*) => {
+        crate::log::force(crate::log::Level::Trace, "dis", format_args!($($arg)*))
+    };
+}
+
+/// `[dis]` info 行。
+macro_rules! dis_info {
+    ($($arg:tt)*) => {
+        crate::log::logf!(crate::log::Level::Info, "dis", $($arg)*)
+    };
+}
+
 /// ブラウズ中にクエリを再送する間隔。
 const MDNS_REQUERY_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -132,7 +153,7 @@ pub fn browse_commissionable(
     discriminator: Option<u16>,
     timeout: Duration,
 ) -> Result<SocketAddr, String> {
-    let trace = std::env::var_os("SM_MDNS_TRACE").is_some();
+    let trace = mdns_trace();
     let socks = MdnsSockets::open().ok_or("open mDNS browse socket failed")?;
 
     let build = |buf: &mut [u8; 128], qu: bool| match discriminator {
@@ -149,7 +170,7 @@ pub fn browse_commissionable(
             socks.send_query(build);
             last_query = Instant::now();
             if trace {
-                eprintln!("[mdns-trace] browse query sent");
+                dis_trace!("browse query sent");
             }
         }
         match socks.recv(&mut rx) {
@@ -157,8 +178,8 @@ pub fn browse_commissionable(
                 let parsed = MdnsClient::parse_commissionable(&rx[..n]);
                 if trace {
                     let fam = if src.is_ipv6() { "v6" } else { "v4" };
-                    eprintln!(
-                        "[mdns-trace] rx {n}B from {src} ({fam}) parse={}",
+                    dis_trace!(
+                        "rx {n}B from {src} ({fam}) parse={}",
                         if parsed.is_some() {
                             "commissionable"
                         } else {
@@ -191,9 +212,7 @@ pub fn browse_commissionable(
                         .map(|d| d.to_string())
                         .unwrap_or_else(|| "?".into());
                     let addr = socket_addr_with_scope(ip, port, socks.v6_scope);
-                    eprintln!(
-                        "[discovery] found commissionable node at {addr} (discriminator={disc})"
-                    );
+                    dis_info!("found commissionable node at {addr} (discriminator={disc})");
                     return Ok(addr);
                 }
             }
@@ -213,7 +232,7 @@ pub fn browse_commissionable_list(
     discriminator: Option<u16>,
     timeout: Duration,
 ) -> Result<usize, String> {
-    let trace = std::env::var_os("SM_MDNS_TRACE").is_some();
+    let trace = mdns_trace();
     let socks = MdnsSockets::open().ok_or("open mDNS browse socket failed")?;
 
     let build = |buf: &mut [u8; 128], qu: bool| match discriminator {
@@ -221,8 +240,8 @@ pub fn browse_commissionable_list(
         None => MdnsClient::build_browse_commissionable(buf, qu),
     };
 
-    eprintln!(
-        "[discover] browsing _matterc._udp.local for {timeout:?} \
+    dis_info!(
+        "browsing _matterc._udp.local for {timeout:?} \
          (discriminator filter: {})...",
         discriminator
             .map(|d| d.to_string())
@@ -246,7 +265,7 @@ pub fn browse_commissionable_list(
                 };
                 if trace {
                     let fam = if src.is_ipv6() { "v6" } else { "v4" };
-                    eprintln!("[mdns-trace] rx {n}B from {src} ({fam}) ingest={ingest:?}");
+                    dis_trace!("rx {n}B from {src} ({fam}) ingest={ingest:?}");
                 }
                 if ingest == Ingest::Added {
                     if let Some(node) = set.iter().last() {
@@ -343,15 +362,15 @@ pub fn resolve_operational(
     node_id: u64,
     timeout: Duration,
 ) -> Result<SocketAddr, String> {
-    let trace = std::env::var_os("SM_MDNS_TRACE").is_some();
+    let trace = mdns_trace();
     let compressed = ca.compressed_fabric_id_bytes();
 
     let socks = MdnsSockets::open().ok_or("open mDNS query socket failed")?;
     let build = |buf: &mut [u8; 128], qu: bool| {
         MdnsClient::build_resolve_operational(buf, &compressed, node_id, qu)
     };
-    eprintln!(
-        "[discovery] resolving _matter._tcp for {:016X}-{node_id:016X}...",
+    dis_info!(
+        "resolving _matter._tcp for {:016X}-{node_id:016X}...",
         u64::from_be_bytes(compressed)
     );
 
@@ -363,7 +382,7 @@ pub fn resolve_operational(
             socks.send_query(build);
             last_query = Instant::now();
             if trace {
-                eprintln!("[mdns-trace] operational query sent");
+                dis_trace!("operational query sent");
             }
         }
         match socks.recv(&mut rx) {
@@ -371,8 +390,8 @@ pub fn resolve_operational(
                 let parsed = MdnsClient::parse_operational(&rx[..n], &compressed, node_id);
                 if trace {
                     let fam = if src.is_ipv6() { "v6" } else { "v4" };
-                    eprintln!(
-                        "[mdns-trace] rx {n}B from {src} ({fam}) parse={}",
+                    dis_trace!(
+                        "rx {n}B from {src} ({fam}) parse={}",
                         if parsed.is_some() {
                             "operational"
                         } else {
@@ -512,14 +531,14 @@ pub fn resolve_operational_at(
     targets: &[IpAddr],
     timeout: Duration,
 ) -> Result<SocketAddr, String> {
-    let trace = std::env::var_os("SM_MDNS_TRACE").is_some();
+    let trace = mdns_trace();
     let compressed = ca.compressed_fabric_id_bytes();
     let socks = UnicastAt::open(targets)?;
     let build = |buf: &mut [u8; 128]| {
         MdnsClient::build_resolve_operational(buf, &compressed, node_id, true)
     };
-    eprintln!(
-        "[discovery] resolving _matter._tcp for {:016X}-{node_id:016X} via unicast mDNS \
+    dis_info!(
+        "resolving _matter._tcp for {:016X}-{node_id:016X} via unicast mDNS \
          (at {} host(s))...",
         u64::from_be_bytes(compressed),
         targets.len()
@@ -533,18 +552,15 @@ pub fn resolve_operational_at(
             socks.send_query(build);
             last_query = Instant::now();
             if trace {
-                eprintln!(
-                    "[mdns-trace] (at) operational query sent to {} host(s)",
-                    targets.len()
-                );
+                dis_trace!("(at) operational query sent to {} host(s)", targets.len());
             }
         }
         match socks.recv(&mut rx) {
             Some((n, src)) => {
                 let parsed = MdnsClient::parse_operational(&rx[..n], &compressed, node_id);
                 if trace {
-                    eprintln!(
-                        "[mdns-trace] (at) rx {n}B from {src} parse={}",
+                    dis_trace!(
+                        "(at) rx {n}B from {src} parse={}",
                         if parsed.is_some() {
                             "operational"
                         } else {
@@ -554,7 +570,7 @@ pub fn resolve_operational_at(
                 }
                 if let Some(node) = parsed {
                     let addr = socks.adopt(src, node.port);
-                    eprintln!("[discovery] (at) operational node adopted at {addr}");
+                    dis_info!("(at) operational node adopted at {addr}");
                     return Ok(addr);
                 }
             }
@@ -573,7 +589,7 @@ pub fn browse_commissionable_at(
     targets: &[IpAddr],
     timeout: Duration,
 ) -> Result<SocketAddr, String> {
-    let trace = std::env::var_os("SM_MDNS_TRACE").is_some();
+    let trace = mdns_trace();
     let socks = UnicastAt::open(targets)?;
     let build = |buf: &mut [u8; 128]| match discriminator {
         Some(d) => MdnsClient::build_browse_discriminator(buf, d, true),
@@ -588,18 +604,15 @@ pub fn browse_commissionable_at(
             socks.send_query(build);
             last_query = Instant::now();
             if trace {
-                eprintln!(
-                    "[mdns-trace] (at) browse query sent to {} host(s)",
-                    targets.len()
-                );
+                dis_trace!("(at) browse query sent to {} host(s)", targets.len());
             }
         }
         match socks.recv(&mut rx) {
             Some((n, src)) => {
                 let parsed = MdnsClient::parse_commissionable(&rx[..n]);
                 if trace {
-                    eprintln!(
-                        "[mdns-trace] (at) rx {n}B from {src} parse={}",
+                    dis_trace!(
+                        "(at) rx {n}B from {src} parse={}",
                         if parsed.is_some() {
                             "commissionable"
                         } else {
@@ -618,9 +631,7 @@ pub fn browse_commissionable_at(
                     .map(|d| d.to_string())
                     .unwrap_or_else(|| "?".into());
                 let addr = socks.adopt(src, node.port);
-                eprintln!(
-                    "[discovery] (at) found commissionable node at {addr} (discriminator={disc})"
-                );
+                dis_info!("(at) found commissionable node at {addr} (discriminator={disc})");
                 return Ok(addr);
             }
             None => std::thread::sleep(MDNS_POLL_SLEEP),
@@ -638,14 +649,14 @@ pub fn browse_commissionable_list_at(
     targets: &[IpAddr],
     timeout: Duration,
 ) -> Result<usize, String> {
-    let trace = std::env::var_os("SM_MDNS_TRACE").is_some();
+    let trace = mdns_trace();
     let socks = UnicastAt::open(targets)?;
     let build = |buf: &mut [u8; 128]| match discriminator {
         Some(d) => MdnsClient::build_browse_discriminator(buf, d, true),
         None => MdnsClient::build_browse_commissionable(buf, true),
     };
-    eprintln!(
-        "[discover] unicast mDNS browse (at {} host(s)) for {timeout:?} \
+    dis_info!(
+        "unicast mDNS browse (at {} host(s)) for {timeout:?} \
          (discriminator filter: {})...",
         targets.len(),
         discriminator
@@ -669,7 +680,7 @@ pub fn browse_commissionable_list_at(
                     None => set.ingest(&rx[..n]),
                 };
                 if trace {
-                    eprintln!("[mdns-trace] (at) rx {n}B from {src} ingest={ingest:?}");
+                    dis_trace!("(at) rx {n}B from {src} ingest={ingest:?}");
                 }
                 if ingest == Ingest::Added {
                     if let Some(node) = set.iter().last() {

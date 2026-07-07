@@ -41,6 +41,7 @@ fn map_to_v6(addr: SocketAddr) -> SocketAddr {
 /// [`SendDirective`] を宛先 UDP に送出する(宛先が解決できないものは黙って捨てる)。
 pub fn send_dir(socket: &UdpSocket, tx: &[u8], dir: &SendDirective) {
     if let Some(addr) = dir.addr.socket_addr() {
+        crate::wire::log_tx("udp", &tx[..dir.len], &addr.to_string());
         let _ = socket.send_to(&tx[..dir.len], map_to_v6(addr));
     }
 }
@@ -91,6 +92,7 @@ pub fn settle(
     loop {
         match socket.recv_from(rx) {
             Ok((n, src)) => {
+                crate::wire::log_rx("udp", &rx[..n], &src.to_string());
                 let now = start.elapsed().as_millis() as u64;
                 if let Some(dir) = stack.handle_rx(&mut rx[..n], PeerAddr::Udp(src), now, tx) {
                     send_dir(socket, tx, &dir);
