@@ -110,7 +110,10 @@ static CLUSTER_NAMES: &[(u32, &str)] = &[
     (0x042B, "FormaldehydeConcentrationMeasurement"),
     (0x042C, "Pm1ConcentrationMeasurement"),
     (0x042D, "Pm10ConcentrationMeasurement"),
-    (0x042E, "TotalVolatileOrganicCompoundsConcentrationMeasurement"),
+    (
+        0x042E,
+        "TotalVolatileOrganicCompoundsConcentrationMeasurement",
+    ),
     (0x042F, "RadonConcentrationMeasurement"),
     (0x0503, "WakeOnLan"),
     (0x0504, "Channel"),

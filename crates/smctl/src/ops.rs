@@ -1947,9 +1947,6 @@ mod annotate_tests {
             format_concrete(ClusterId(0x0006), Some(AttributeId(0x0000)), 1),
             "ep1 onoff/on-off"
         );
-        assert_eq!(
-            format_concrete(ClusterId(0xFC01), None, 2),
-            "ep2 0xfc01"
-        );
+        assert_eq!(format_concrete(ClusterId(0xFC01), None, 2), "ep2 0xfc01");
     }
 }

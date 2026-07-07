@@ -136,14 +136,14 @@ const DIM: &str = "\x1b[2m";
 /// レイヤタグの色(chip-tool のカテゴリ色風にタグを識別しやすくする)。
 fn tag_color(tag: &str) -> &'static str {
     match tag {
-        "sc" => "\x1b[35m",           // magenta: Secure Channel
-        "im" => "\x1b[32m",           // green:   Interaction Model
-        "tlv" => "\x1b[34m",          // blue:    ペイロード構造
-        "ex" => "\x1b[36m",           // cyan:    exchange/MRP
-        "udp" => "\x1b[94m",          // bright blue
-        "ble" | "btp" => "\x1b[95m",  // bright magenta
-        "dis" => "\x1b[96m",          // bright cyan
-        "ctl" => "\x1b[1m",           // bold:    コントローラ進行
+        "sc" => "\x1b[35m",          // magenta: Secure Channel
+        "im" => "\x1b[32m",          // green:   Interaction Model
+        "tlv" => "\x1b[34m",         // blue:    ペイロード構造
+        "ex" => "\x1b[36m",          // cyan:    exchange/MRP
+        "udp" => "\x1b[94m",         // bright blue
+        "ble" | "btp" => "\x1b[95m", // bright magenta
+        "dis" => "\x1b[96m",         // bright cyan
+        "ctl" => "\x1b[1m",          // bold:    コントローラ進行
         _ => "",
     }
 }
@@ -234,7 +234,11 @@ pub fn init_file(path: &Path) {
     match File::options().create(true).append(true).open(path) {
         Ok(f) => {
             if FILE.set(Mutex::new(f)).is_err() {
-                logf!(Level::Warn, "ctl", "--log-file already set; keeping the first file");
+                logf!(
+                    Level::Warn,
+                    "ctl",
+                    "--log-file already set; keeping the first file"
+                );
             }
         }
         Err(e) => {
@@ -262,7 +266,10 @@ fn file_line(line: &str) {
     };
     if writeln!(f, "{line}").is_err() && !FILE_ERR.swap(true, Ordering::Relaxed) {
         // ファイルには書けないので stderr のみ(emit 経由だと再帰する)。
-        eprintln!("[{:>6}][ctl] warn: log file write failed; file logging degraded", ms());
+        eprintln!(
+            "[{:>6}][ctl] warn: log file write failed; file logging degraded",
+            ms()
+        );
     }
 }
 
@@ -306,12 +313,7 @@ pub fn write(l: Level, tag: &str, args: std::fmt::Arguments<'_>) {
 /// per-layer 強制トレース(`SM_MDNS_TRACE` / `SM_BTP_TRACE`)用: stderr へは
 /// 「env で強制された or グローバルレベルが trace」のときだけ、ファイルへは常に出す。
 pub fn trace_forced(env_forced: bool, tag: &str, args: std::fmt::Arguments<'_>) {
-    emit(
-        Level::Trace,
-        tag,
-        args,
-        env_forced || enabled(Level::Trace),
-    );
+    emit(Level::Trace, tag, args, env_forced || enabled(Level::Trace));
 }
 
 /// レイヤタグ付きログ。`logf!(Level::Debug, "im", "...")`。
