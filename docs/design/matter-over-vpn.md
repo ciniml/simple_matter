@@ -271,6 +271,34 @@ CLI 化は未着手(V2 後半、必要時)。
 5. tailscale の direct↔DERP 切替中にセッションが生き残るか(送信元アドレスは
    100.x のまま不変のはずなので、セッション同定は保たれる — 推論)。
 
+### 6.1 実測結果(2026-07-08、実 WireGuard 対向)
+
+構成: ホスト `wg_test`(10.0.0.1/24、port 51820、MTU 1420)↔ docker コンテナ
+(`--cap-add NET_ADMIN`、ubuntu 24.04 + wireguard-tools、wg0 = 10.0.0.2/24、
+endpoint 172.17.0.1:51820 = docker ブリッジ越し、persistent-keepalive 5)。
+デバイス = onoff-light バイナリをコンテナへマウントして実行、コントローラ =
+ホストの smctl。ホスト側 peer 設定は特権 host-netns コンテナから
+`wg set wg_test peer …`(スクリプトは scratchpad vpn/run-device.sh 方式)。
+
+- **項目 1/2(pairing + QU ユニキャスト)= 検証済み**: `smctl --at 10.0.0.2
+  pairing onnetwork` が `(at) found commissionable node at 10.0.0.2:5540`
+  (= デバイスが wg 越しの QU ユニキャストクエリにユニキャスト応答)→
+  フルコミッショニング COMPLETE → `onoff toggle` Success(デバイス側
+  `[onoff] light is now ON`)。V1(--at 直送)の設計どおり動作。
+- **項目 3(MTU 1280)= 検証済み**: wg0 を MTU 1280 に落としてフレッシュ
+  コミッショニング + toggle とも**完走**。本スタックの最大ワイヤメッセージは
+  実測 **508 B**(CASE Sigma2、自前 CA の NOC/ICAC 構成)で 1280 に大きな余裕。
+  参考プローブ: DF 付き ping は IP 1280 B ちょうどまで通り 1281 B で
+  "Message too long"(期待どおり)、DF 無し 1400 B ペイロードは inner IPv4
+  フラグメンテーションで通過(wg トンネルは inner 断片化を素通し)。つまり
+  仮に 1280 超のメッセージを送っても DF を立てない UDP なら断片化で届く。
+- 未実施(将来): tailscale direct/DERP(項目 1 の tailscale 側、項目 4 の
+  MRP 偽再送、項目 5)。wg は RTT ~0.2 ms のローカル対向のため MRP 調整の
+  評価対象にならない。
+- 運用メモ: ホスト `wg_test` に古い stale peer(10.0.0.2 宛、77 日前)が
+  残っていたため検証中は差し替えた(検証後に復元)。docker ブリッジ NAT
+  越えのため handshake はコンテナ側から開始する(persistent-keepalive 必須)。
+
 ## 7. 参照
 
 - 実測ログ・手順: 本書 §2(2026-07-07、開発機。socket レベルのみ)
