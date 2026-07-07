@@ -349,12 +349,14 @@ fn now_ms(start: &Instant) -> u64 {
 }
 
 /// BTP フラグメントの先頭バイト(flags/ack/seq)をトレースする。
-/// `--log-level trace` または後方互換の `SM_BTP_TRACE=1` で有効(設計 doc §9.1)。
+/// `--log-level trace` または後方互換の `SM_BTP_TRACE=1` で stderr へ、`--log-file` が
+/// あればファイルへも出す(設計 doc §9.1/§9.5)。
 fn trace(dir: &str, frag: &[u8]) {
-    if std::env::var_os("SM_BTP_TRACE").is_some() || crate::log::enabled(crate::log::Level::Trace) {
+    let env_forced = std::env::var_os("SM_BTP_TRACE").is_some();
+    if env_forced || crate::log::wants(crate::log::Level::Trace) {
         let h: Vec<String> = frag.iter().take(5).map(|b| format!("{b:02x}")).collect();
-        crate::log::force(
-            crate::log::Level::Trace,
+        crate::log::trace_forced(
+            env_forced,
             "btp",
             format_args!("{dir} len={} {}", frag.len(), h.join(" ")),
         );

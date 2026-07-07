@@ -487,8 +487,9 @@ cluster_def! {
 
 出力は**すべて stderr**(stdout は結果と `--json` の JSON Lines 専用のまま)。
 書式は `[<起動からの ms>][<tag>] メッセージ`(ms は右詰め 6 桁以上)。warn/error は
-タグの後に `warn:` / `error:` を付ける。ANSI 色は使わない(Windows コンソール互換の
-無色フォールバックに一本化。VT 有効化の分岐を持たない)。
+タグの後に `warn:` / `error:` を付ける。ANSI 色は第 2 弾(§9.5)で導入した:
+TTY 検出で自動有効、パイプ/ファイルでは常に無色(初版の「無色一本化」は
+「非 TTY では必ず無色」として引き継ぐ)。
 
 ### 9.2 レイヤタグ
 
@@ -533,7 +534,8 @@ Read の値と非暗号 SC ペイロードは `[tlv]`/`[sc]` でプリティプ�
 ### 9.3 実装位置(コア無改造)
 
 - **`smctl/src/log.rs`**: レベル(AtomicU8)+ 起動時刻 + `logf!(level, tag, ...)`
-  マクロ。`force()`(env による per-layer 強制)も提供。
+  マクロ。`trace_forced()`(env による per-layer 強制。旧 `force()`、§9.5 で
+  ログファイル対応に整理)も提供。
 - **`smctl/src/tlvfmt.rs`**: TLV プリティプリンタ。コアの公開 `TlvReader` を使い
   smctl 側に実装(コアの no_std / sans-IO を汚さない)。
 - **`smctl/src/wire.rs`**: ワイヤ観測。送受バイト列から公開 `PacketHeader::decode` /
@@ -549,3 +551,63 @@ Read の値と非暗号 SC ペイロードは `[tlv]`/`[sc]` でプリティプ�
 単体(レベル解決・TLV プリティプリンタの既知バイト列)+ 既存全テスト green +
 clippy 0 + E2E(onoff-light 相手に `-v`/`-vv` で pairing/toggle/read、BLE 経路 1 本、
 `--json` の stdout 非汚染)+ Windows クロスビルド(`--features ble`)green。
+
+### 9.5 第 2 弾: 色付け・ログファイル・クラスタ名注釈(2026-07-07)
+
+**色付け**(`--color <auto|always|never>`、既定 auto):
+
+- auto は stderr の TTY 検出(`std::io::IsTerminal`)で自動有効。パイプ/リダイレクト
+  では無色。慣例に従い `NO_COLOR`(非空)で無効化、`SMCTL_FORCE_COLOR=1` で非 TTY
+  でも強制(パイプ越しの色検証にも使う)。判定ロジックは純関数
+  `log::color_decision()` に切り出して単体テストする。
+- 配色(chip-tool のカテゴリ色風にレイヤを識別): error=赤・warn=黄(メッセージ
+  本文)、タイムスタンプ=dim、タグは `[sc]`=magenta、`[im]`=green、`[tlv]`=blue、
+  `[ex]`=cyan、`[udp]`=bright blue、`[ble]`/`[btp]`=bright magenta、
+  `[dis]`=bright cyan、`[ctl]`=bold。
+- **Windows 10+ の VT 処理**: 色有効化時に `SetConsoleMode` で
+  `ENABLE_VIRTUAL_TERMINAL_PROCESSING` を立てる。**依存 crate は追加しない**:
+  必要なのは kernel32 の 3 関数(`GetStdHandle`/`GetConsoleMode`/`SetConsoleMode`)
+  だけなので、windows-sys を引くより `#[cfg(windows)]` の extern ブロック直書き
+  (約 30 行)が小さい、が判断根拠。有効化に失敗したら auto は無色へフォールバック、
+  always は指示どおり色を出す。
+
+**ログファイル**(`--log-file <path>`):
+
+- stderr と並行出力。ファイルは**常に無色・全レベル(trace 相当)**で追記記録し、
+  画面は `--log-level`/`--color` の設定どおり(画面 info でもファイルには
+  hex ダンプまで残る → 再現困難な実機トラブルの事後解析用)。
+- open/write 失敗は warn して**実行は継続**(ログ機構がツールを止めない。
+  write 失敗の warn は 1 回に抑制)。
+- 実装: `log::wants(l) = enabled(l) || file_enabled()` を行組み立ての早期 return
+  ゲートに使い、`logf!` がレベル外の行をファイルのみへ流す。`SM_MDNS_TRACE` /
+  `SM_BTP_TRACE` の per-layer 強制は `log::trace_forced(env_forced, ..)` に整理
+  (stderr へは env 強制 or グローバル trace のとき、ファイルへは常に)。
+- 制約: ライブラリ側が env トレース(`SM_BLE_TRACE`)で直接 stderr へ書く行は
+  ファイルに入らない(smctl のログ機構を通らないため)。バッチでは
+  `--log-file`/`--color` はプロセス起動時(`smctl batch` 自体の指定)のみ有効。
+
+**クラスタ名注釈**(`clusters/names.rs`):
+
+- クラスタレジストリ(§5、フル定義 9 クラスタ)未収載の ID にも、Matter 1.x
+  標準クラスタの **ID→名前だけの注釈テーブル**(110 件超、ID 昇順 + 二分探索)で
+  `[im]`/`[tlv]` ログと `any read` の表示に `0x0033(GeneralDiagnostics)` の形で
+  名前を添える。属性は **global 属性(0xFFF8〜0xFFFD)のみ**名前解決
+  (`0xfffb(AttributeList)`)。フル定義(型付き・kebab-case 名で CLI から操作可)は
+  従来どおりレジストリ収載分のみ。
+- 表記を意図的に変えている: レジストリ収載 = `onoff(0x0006)`(名前が主)、
+  名前注釈のみ = `0x0033(GeneralDiagnostics)`(ID が主、仕様名 CamelCase)。
+  どちらのテーブルで解決されたかがログから読み取れる。
+
+実出力例(`-v any read 1 0 0x0033 0xfffb`、デバイス側に 0x0033 が無い場合):
+
+```text
+[   258][im] ReadRequest node=1 path: endpoint=0 cluster=0x0033(GeneralDiagnostics) attribute=0xfffb(AttributeList)
+[   278][im] ReportData ep0 0x0033(GeneralDiagnostics)/0xfffb(AttributeList) status=UnsupportedCluster
+```
+
+ゲート実績(2026-07-07): 単体(色判定マトリクス・names 引き・ログファイル書き込み
++CLI フラグ)で smctl 41、コア 394、clippy 0。E2E は onoff-light 相手に
+`-vv --log-file` で pairing/read(TTY で色付き 17 行 / パイプで ESC 0 件 /
+ファイル無色・trace 全量 43 行 vs 画面 info 2 行)、`any read 0x0033` の
+UnsupportedCluster 注釈、`--log-file` open 失敗の warn 継続を確認。
+Windows クロスビルド(`cargo xwin`、`--features ble`)green。

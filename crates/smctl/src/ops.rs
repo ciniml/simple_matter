@@ -1378,7 +1378,10 @@ pub(crate) fn report_phase(phase: Phase) {
 
 /// `[im]` ログ用のパス注釈: `endpoint=1 cluster=onoff(0x0006) attribute=on-off(0x0000)`。
 ///
-/// クラスタテーブル([`clusters::CLUSTERS`])収載分は名前を添え、未収載は ID hex のみ。
+/// クラスタテーブル([`clusters::CLUSTERS`])収載分は名前を添え、未収載でも標準
+/// クラスタなら名前だけの注釈テーブル([`clusters::names`])で
+/// `cluster=0x0033(GeneralDiagnostics)` のように補う(§9.5)。属性はレジストリ →
+/// global 属性名(0xFFF8〜0xFFFD)の順で解決する。
 pub(crate) fn annotate_path(
     ep: u16,
     cluster: ClusterId,
@@ -1389,12 +1392,18 @@ pub(crate) fn annotate_path(
     let mut s = format!("endpoint={ep} cluster=");
     match def {
         Some(d) => s.push_str(&format!("{}({:#06x})", d.name, cluster.0)),
-        None => s.push_str(&format!("{:#06x}", cluster.0)),
+        None => match clusters::names::cluster_name(cluster) {
+            Some(n) => s.push_str(&format!("{:#06x}({n})", cluster.0)),
+            None => s.push_str(&format!("{:#06x}", cluster.0)),
+        },
     }
     if let Some(a) = attr {
         match def.and_then(|d| d.attr_by_id(a)) {
             Some(ad) => s.push_str(&format!(" attribute={}({:#06x})", ad.name, a.0)),
-            None => s.push_str(&format!(" attribute={:#06x}", a.0)),
+            None => match clusters::names::global_attr_name(a) {
+                Some(n) => s.push_str(&format!(" attribute={:#06x}({n})", a.0)),
+                None => s.push_str(&format!(" attribute={:#06x}", a.0)),
+            },
         }
     }
     if let Some(c) = cmd {
@@ -1596,17 +1605,24 @@ fn transcode_element(
 // レポート表示(名前テーブルは可読性を足すだけ。無くても生 TLV ダンプで常に成立)
 // ==========================================================================
 
-/// クラスタ/属性を名前テーブル付きで整形する(ログ用)。
+/// クラスタ/属性を名前テーブル付きで整形する(ログ用)。レジストリ未収載の標準
+/// クラスタ/global 属性は名前注釈テーブル([`clusters::names`])で `0xID(Name)` 表記。
 fn format_concrete(cluster: ClusterId, attr: Option<AttributeId>, ep: u16) -> String {
     let cname = clusters::by_id(cluster)
         .map(|d| d.name.to_string())
-        .unwrap_or_else(|| format!("{:#06x}", cluster.0));
+        .unwrap_or_else(|| match clusters::names::cluster_name(cluster) {
+            Some(n) => format!("{:#06x}({n})", cluster.0),
+            None => format!("{:#06x}", cluster.0),
+        });
     match attr {
         Some(a) => {
             let aname = clusters::by_id(cluster)
                 .and_then(|d| d.attr_by_id(a))
                 .map(|d| d.name.to_string())
-                .unwrap_or_else(|| format!("{:#06x}", a.0));
+                .unwrap_or_else(|| match clusters::names::global_attr_name(a) {
+                    Some(n) => format!("{:#06x}({n})", a.0),
+                    None => format!("{:#06x}", a.0),
+                });
             format!("ep{ep} {cname}/{aname}")
         }
         None => format!("ep{ep} {cname}"),
@@ -1628,7 +1644,7 @@ where
         match &report {
             Ok(AttributeReportRef::Data(d)) => {
                 logf!(Level::Debug, "im", "ReportData {}", format_path(&d.path));
-                if crate::log::enabled(Level::Debug) {
+                if crate::log::wants(Level::Debug) {
                     for l in crate::tlvfmt::pretty(d.data) {
                         logf!(Level::Debug, "tlv", "  {l}");
                     }
@@ -1772,6 +1788,9 @@ fn json_element(r: &mut TlvReader, e: &TlvElement) -> String {
 }
 
 /// 属性パスを `cluster/attr (0xNNNN/0xNNNN) ep=N` 形式で表示する(名前はテーブルから)。
+///
+/// レジストリ未収載でも、標準クラスタ名と global 属性名は名前注釈テーブル
+/// ([`clusters::names`])から `0x0033(GeneralDiagnostics)` の形で補う(§9.5)。
 fn format_path(path: &AttributePath) -> String {
     let ep = path
         .endpoint
@@ -1790,14 +1809,21 @@ fn format_path(path: &AttributePath) -> String {
         },
         None => (None, None),
     };
-    let cid = path
-        .cluster
-        .map(|c| format!("{:#06x}", c.0))
-        .unwrap_or_else(|| "*".into());
-    let aid = path
-        .attribute
-        .map(|a| format!("{:#06x}", a.0))
-        .unwrap_or_else(|| "*".into());
+    // 数値 ID 表記。レジストリで名前が引けなかった成分は名前注釈テーブルで補う。
+    let cid = match path.cluster {
+        Some(c) => match clusters::names::cluster_name(c).filter(|_| cname.is_none()) {
+            Some(n) => format!("{:#06x}({n})", c.0),
+            None => format!("{:#06x}", c.0),
+        },
+        None => "*".into(),
+    };
+    let aid = match path.attribute {
+        Some(a) => match clusters::names::global_attr_name(a).filter(|_| aname.is_none()) {
+            Some(n) => format!("{:#06x}({n})", a.0),
+            None => format!("{:#06x}", a.0),
+        },
+        None => "*".into(),
+    };
     match (cname, aname) {
         (Some(c), Some(a)) => format!("ep{ep} {c}/{a} ({cid}/{aid})"),
         (Some(c), None) => format!("ep{ep} {c}/{aid}"),
@@ -1876,5 +1902,54 @@ mod admin_tests {
         for _ in 0..32 {
             assert!(passcode_is_valid(random_passcode().unwrap()));
         }
+    }
+}
+
+#[cfg(test)]
+mod annotate_tests {
+    use super::*;
+
+    #[test]
+    fn annotate_path_uses_registry_then_names_table() {
+        // レジストリ収載: kebab-case 名(従来どおり)。
+        assert_eq!(
+            annotate_path(1, ClusterId(0x0006), Some(AttributeId(0x0000)), None),
+            "endpoint=1 cluster=onoff(0x0006) attribute=on-off(0x0000)"
+        );
+        // レジストリ未収載の標準クラスタ: 名前注釈テーブルで 0xID(Name) 表記(§9.5)。
+        assert_eq!(
+            annotate_path(0, ClusterId(0x0033), None, None),
+            "endpoint=0 cluster=0x0033(GeneralDiagnostics)"
+        );
+        // global 属性はレジストリ収載/未収載どちらでも名前が付く。
+        assert_eq!(
+            annotate_path(0, ClusterId(0x0033), Some(AttributeId(0xFFFB)), None),
+            "endpoint=0 cluster=0x0033(GeneralDiagnostics) attribute=0xfffb(AttributeList)"
+        );
+        assert_eq!(
+            annotate_path(1, ClusterId(0x0006), Some(AttributeId(0xFFFD)), None),
+            "endpoint=1 cluster=onoff(0x0006) attribute=0xfffd(ClusterRevision)"
+        );
+        // 完全未知(vendor 域)は hex のみ。
+        assert_eq!(
+            annotate_path(2, ClusterId(0xFC01), Some(AttributeId(0x1234)), None),
+            "endpoint=2 cluster=0xfc01 attribute=0x1234"
+        );
+    }
+
+    #[test]
+    fn format_concrete_uses_names_table() {
+        assert_eq!(
+            format_concrete(ClusterId(0x0033), Some(AttributeId(0xFFFB)), 0),
+            "ep0 0x0033(GeneralDiagnostics)/0xfffb(AttributeList)"
+        );
+        assert_eq!(
+            format_concrete(ClusterId(0x0006), Some(AttributeId(0x0000)), 1),
+            "ep1 onoff/on-off"
+        );
+        assert_eq!(
+            format_concrete(ClusterId(0xFC01), None, 2),
+            "ep2 0xfc01"
+        );
     }
 }

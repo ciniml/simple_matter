@@ -14,17 +14,21 @@ use simple_matter::discovery::{MATTER_PORT, MDNS_IPV4, MDNS_IPV6, MDNS_PORT};
 
 use super::Backend;
 
-/// mDNS トレースの有効判定: `--log-level trace` または後方互換の `SM_MDNS_TRACE=1`
-/// (設計 doc §9.1。env はグローバルレベルに関わらずこのレイヤのみ強制する)。
+/// mDNS トレースの有効判定: `--log-level trace`、後方互換の `SM_MDNS_TRACE=1`、
+/// または `--log-file`(ファイルは常に trace 全量を記録する。設計 doc §9.1/§9.5)。
 fn mdns_trace() -> bool {
-    std::env::var_os("SM_MDNS_TRACE").is_some() || crate::log::enabled(crate::log::Level::Trace)
+    std::env::var_os("SM_MDNS_TRACE").is_some() || crate::log::wants(crate::log::Level::Trace)
 }
 
-/// `[dis]` トレース行([`mdns_trace`] 判定済みの箇所で使う。env 強制に対応するため
-/// グローバルレベルを再判定しない)。
+/// `[dis]` トレース行([`mdns_trace`] 判定済みの箇所で使う)。stderr へは env 強制
+/// またはグローバル trace のとき、ログファイルへは常に出す([`crate::log::trace_forced`])。
 macro_rules! dis_trace {
     ($($arg:tt)*) => {
-        crate::log::force(crate::log::Level::Trace, "dis", format_args!($($arg)*))
+        crate::log::trace_forced(
+            std::env::var_os("SM_MDNS_TRACE").is_some(),
+            "dis",
+            format_args!($($arg)*),
+        )
     };
 }
 

@@ -45,6 +45,10 @@ pub struct Globals {
     /// `--log-level <l>` / `-v`(debug)/ `-vv`(trace)。`None` なら環境変数
     /// `SMCTL_LOG` → 既定 info の順で解決する(設計 doc §9.1)。
     pub log_level: Option<crate::log::Level>,
+    /// `--color <auto|always|never>`(既定 auto = stderr の TTY 検出。設計 doc §9.5)。
+    pub color: crate::log::ColorMode,
+    /// `--log-file <path>`: stderr と並行してファイルへ追記する(常に無色・trace 全量)。
+    pub log_file: Option<PathBuf>,
 }
 
 impl Globals {
@@ -61,6 +65,8 @@ impl Globals {
             paa_trust_store_path: None,
             at: None,
             log_level: None,
+            color: crate::log::ColorMode::Auto,
+            log_file: None,
         }
     }
 }
@@ -78,6 +84,8 @@ impl Clone for Globals {
             paa_trust_store_path: self.paa_trust_store_path.clone(),
             at: self.at.clone(),
             log_level: self.log_level,
+            color: self.color,
+            log_file: self.log_file.clone(),
         }
     }
 }
@@ -250,6 +258,16 @@ fn parse_globals(args: &[String], base: &Globals) -> Result<(Globals, Vec<String
             }
             "-v" => g.log_level = Some(crate::log::Level::Debug),
             "-vv" => g.log_level = Some(crate::log::Level::Trace),
+            "--color" => {
+                let v = it
+                    .next()
+                    .ok_or("--color requires a value (auto|always|never)")?;
+                g.color = crate::log::ColorMode::parse(v)?;
+            }
+            "--log-file" => {
+                let v = it.next().ok_or("--log-file requires a path")?;
+                g.log_file = Some(PathBuf::from(v));
+            }
             "-h" | "--help" => {
                 pos.clear();
                 pos.push("help".to_string());
@@ -320,6 +338,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
 pub fn dispatch(g: &Globals, cmd: Cmd) -> Result<(), String> {
     crate::json::set_mode(g.json);
     crate::log::init(crate::log::resolve(g.log_level));
+    crate::log::init_color(g.color);
+    if let Some(path) = &g.log_file {
+        crate::log::init_file(path);
+    }
     match cmd {
         Cmd::Help => {
             print_help();
@@ -893,6 +915,15 @@ OPTIONS:
                         im/tlv). debug adds per-message transport + IM logs,
                         trace adds TLV/hex payload dumps
   -v / -vv              shorthand for --log-level debug / trace
+  --color <mode>        auto|always|never (default auto): colorize stderr logs
+                        when it is a TTY (chip-tool style: error=red, warn=yellow,
+                        layer tags colored). auto honors NO_COLOR and
+                        SMCTL_FORCE_COLOR; on Windows 10+ VT processing is
+                        enabled automatically
+  --log-file <path>     also append logs to <path> (always uncolored and at
+                        trace verbosity regardless of --log-level; the screen
+                        keeps its own level/color). open/write failures warn
+                        and execution continues
   --label <text>        label recorded in the address book on pairing
   --discriminator <n>   filter for `discover commissionable`
   --at <ip>[,<ip>...]   resolve over VPN by unicast mDNS instead of multicast:
@@ -915,6 +946,9 @@ OPTIONS:
 
 ENVIRONMENT:
   SMCTL_LOG=<level>   default log level (overridden by --log-level/-v/-vv)
+  NO_COLOR=1          disable colors in --color auto mode
+  SMCTL_FORCE_COLOR=1 force colors in --color auto mode even when stderr is
+                      not a TTY
   SM_MDNS_TRACE=1     force mDNS trace only (subsumed by --log-level trace)
   SM_BTP_TRACE=1      force BTP fragment trace only (subsumed by trace)
   SM_BLE_ADAPTER=hciN BLE adapter for pairing ble/ble-handoff/ble-wifi
@@ -1215,6 +1249,22 @@ mod tests {
         assert_eq!(g.log_level, Some(Level::Warn));
         assert!(parse_err("--log-level bogus onoff toggle 1 1").contains("invalid log level"));
         assert!(parse_err("--log-level").contains("--log-level requires"));
+    }
+
+    #[test]
+    fn color_and_log_file_flags() {
+        use crate::log::ColorMode;
+        let (g, _) = parse_ok("onoff toggle 1 1");
+        assert_eq!(g.color, ColorMode::Auto);
+        assert_eq!(g.log_file, None);
+        let (g, _) = parse_ok("--color never onoff toggle 1 1");
+        assert_eq!(g.color, ColorMode::Never);
+        let (g, _) = parse_ok("onoff toggle 1 1 --color always --log-file /tmp/smctl.log");
+        assert_eq!(g.color, ColorMode::Always);
+        assert_eq!(g.log_file, Some(PathBuf::from("/tmp/smctl.log")));
+        assert!(parse_err("--color tty onoff toggle 1 1").contains("invalid color mode"));
+        assert!(parse_err("--color").contains("--color requires"));
+        assert!(parse_err("--log-file").contains("--log-file requires"));
     }
 
     #[test]

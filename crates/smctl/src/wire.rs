@@ -44,7 +44,8 @@ pub fn log_rx(transport: &'static str, buf: &[u8], src: &str) {
 }
 
 fn log_msg(transport: &'static str, tx: bool, buf: &[u8], peer: &str) {
-    if !crate::log::enabled(Level::Debug) {
+    // stderr のレベル判定に加え、`--log-file`(常に trace 全量)も観測を要求する。
+    if !crate::log::wants(Level::Debug) {
         return;
     }
     let (dir, arrow) = if tx { ("tx", "->") } else { ("rx", "<-") };
@@ -119,7 +120,7 @@ fn log_msg(transport: &'static str, tx: bool, buf: &[u8], peer: &str) {
             );
             // SC ハンドシェイク(PBKDF/PASE/Sigma)の TLV ペイロードは trace で構造表示。
             let payload_off = hdr_len + pb.parsed_as_slice().len();
-            if crate::log::enabled(Level::Trace)
+            if crate::log::wants(Level::Trace)
                 && ph.proto_id == PROTO_SC
                 && (0x20..=0x33).contains(&ph.proto_opcode)
                 && buf.len() > payload_off
@@ -132,7 +133,7 @@ fn log_msg(transport: &'static str, tx: bool, buf: &[u8], peer: &str) {
     }
 
     // trace: パケット全体の hex ダンプ。
-    if crate::log::enabled(Level::Trace) {
+    if crate::log::wants(Level::Trace) {
         logf!(Level::Trace, transport, "  {}", hex(buf));
     }
 }

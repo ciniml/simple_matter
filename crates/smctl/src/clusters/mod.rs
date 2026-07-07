@@ -13,6 +13,7 @@ pub mod descriptor;
 pub mod general_commissioning;
 pub mod identify;
 pub mod level_control;
+pub mod names;
 pub mod network_commissioning;
 pub mod on_off;
 pub mod operational_credentials;
