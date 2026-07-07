@@ -9,7 +9,9 @@
 //!   general-commissioning / network-commissioning / administrator-commissioning /
 //!   operational-credentials)と `--json`(1 行 1 オブジェクトの機械可読出力)。
 //!
-//! 開発・自作デバイス用ツールであり、attestation は検証しない(`AttestationPolicy::Skip`)。
+//! 開発・自作デバイス用ツール。attestation は既定でスキップするが、
+//! `--paa-trust-store-path <dir>` 指定時は DAC チェーン + attestation 署名 + nonce を
+//! 検証する(`AttestationPolicy::Verify`)。
 
 use std::process::ExitCode;
 

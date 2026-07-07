@@ -232,6 +232,11 @@ impl<
         self.mgr.handler().im.result()
     }
 
+    /// Rng から `dest` を満たす(コミッショナの attestation nonce 払い出し用)。
+    pub fn fill_random(&mut self, dest: &mut [u8]) -> Result<()> {
+        self.mgr.handler_mut().sc.fill_random(dest)
+    }
+
     /// 直近 Read 結果を [`AttributeReportRef`](crate::im::wire::AttributeReportRef) 列で走査する。
     pub fn read_reports(&self) -> AttrReports<'_> {
         self.mgr.handler().im.read_reports()
@@ -869,7 +874,7 @@ impl<
 }
 
 pub use commissioner::{
-    AttestationPolicy, CommissionError, Commissioner, DriveOutcome, Phase,
+    AttestationError, AttestationPolicy, CommissionError, Commissioner, DriveOutcome, Phase,
     MAX_WIFI_CREDENTIALS_LEN, MAX_WIFI_SSID_LEN,
 };
 

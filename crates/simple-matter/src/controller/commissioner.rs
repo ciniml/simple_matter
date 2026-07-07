@@ -18,7 +18,8 @@
 //! `send`(あれば)を送出、`phase` を進捗として観測する(§6.2)。
 
 use crate::cert::parse_csr;
-use crate::crypto::{Crypto, Rng};
+use crate::cert::x509::{parse_x509, verify_signed_by};
+use crate::crypto::{Crypto, P256PublicKey, Rng};
 use crate::dm::meta::{ClusterId, EndpointId};
 use crate::error::{Error, Result};
 use crate::im::client::ImEvent;
@@ -42,6 +43,13 @@ const CLUSTER_OPERATIONAL_CREDENTIALS: u32 = 0x003E;
 const CMD_ARM_FAIL_SAFE: u32 = 0x00;
 const CMD_COMMISSIONING_COMPLETE: u32 = 0x04;
 const CMD_CSR_REQUEST: u32 = 0x04;
+const CMD_ATTESTATION_REQUEST: u32 = 0x00;
+const CMD_CERT_CHAIN_REQUEST: u32 = 0x02;
+
+/// CertificateChainRequest の certificateType(§11.17.5.3)。
+const CERT_TYPE_DAC: u8 = 1;
+/// CertificateChainRequest の certificateType(PAI)。
+const CERT_TYPE_PAI: u8 = 2;
 const CMD_ADD_NOC: u32 = 0x06;
 const CMD_ADD_TRUSTED_ROOT: u32 = 0x0B;
 const CMD_ADD_OR_UPDATE_WIFI_NETWORK: u32 = 0x02;
@@ -58,11 +66,43 @@ const FAIL_SAFE_EXPIRY_S: u16 = 120;
 /// CSRRequest の nonce(自作デバイス・自己整合テスト向けに固定。デバイスは署名対象として扱う)。
 const CSR_NONCE: [u8; 32] = [0x5Au8; 32];
 
-/// attestation の扱い(§6.4)。
+/// attestation の扱い(§6.4、`docs/design/attestation.md` §3)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AttestationPolicy {
+pub enum AttestationPolicy<'a> {
     /// DAC/PAI/CD を取得も検証もしない(自作デバイス・開発フローの既定)。
     Skip,
+    /// DAC チェーン(DAC←PAI←PAA)+ attestation 署名 + nonce エコーを検証する。
+    ///
+    /// `paa_store` は信頼する PAA の X.509 DER のリスト(no_std / ヒープレス)。PAI の
+    /// issuer と DER バイト一致する subject を持つ PAA を探し、その公開鍵で PAI 署名を
+    /// 検証する。CD は presence チェックのみ(CMS 署名検証はスコープ外、§1)。
+    Verify {
+        /// 信頼する PAA の X.509 DER 群。
+        paa_store: &'a [&'a [u8]],
+    },
+}
+
+/// device attestation 検証の失敗理由(`docs/design/attestation.md` §1)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttestationError {
+    /// DAC(X.509 DER)のパースに失敗した。
+    DacParse,
+    /// PAI(X.509 DER)のパースに失敗した。
+    PaiParse,
+    /// DAC が PAI で署名されていない(チェーン不成立)。
+    DacChain,
+    /// PAI の issuer と一致し、かつ PAI 署名を検証できる PAA が信頼ストアに無い。
+    PaaNotFound,
+    /// attestation 署名(elements ‖ challenge)が DAC 公開鍵で検証できない。
+    Signature,
+    /// elements 内の nonce が送信した nonce と一致しない。
+    Nonce,
+    /// elements 内の CD(cx1)が空、または elements の構造が不正。
+    Cd,
+    /// PASE セッションから attestation challenge を取得できない。
+    Challenge,
+    /// 暗号バックエンドが検証中にエラーを返した。
+    Crypto,
 }
 
 /// コミッショニング失敗の理由(§6.1)。
@@ -78,6 +118,8 @@ pub enum CommissionError {
     Ca,
     /// CSR 解析・公開鍵抽出・署名検証に失敗した。
     Csr,
+    /// device attestation の検証に失敗した(`AttestationPolicy::Verify`)。
+    Attestation(AttestationError),
     /// 統合層(`start_*`)がエラーを返した(exchange/session 枯渇等)。
     Stack(Error),
     /// 予期しないイベント順序・内部状態違反。
@@ -169,7 +211,7 @@ pub struct DriveOutcome {
 pub struct Commissioner<'a, C: Crypto> {
     ca: &'a Ca<C>,
     crypto: &'a C,
-    policy: AttestationPolicy,
+    policy: AttestationPolicy<'a>,
     phase: Phase,
     /// `true` = イベント待ち、`false` = 次の開始を発行する。
     awaiting: bool,
@@ -191,7 +233,28 @@ pub struct Commissioner<'a, C: Crypto> {
     /// [`set_wifi_credentials`](Self::set_wifi_credentials) で設定した Wi-Fi 資格情報。
     /// `Some` なら AddNOC 後に AddOrUpdateWiFiNetwork → ConnectNetwork を挿入する。
     wifi: Option<WifiCreds>,
+    /// `Phase::Attestation`(`Verify`)のサブステップ: 0=DAC 要求, 1=PAI 要求,
+    /// 2=AttestationRequest, 3=検証完了(§3)。`Skip` では未使用。
+    att_step: u8,
+    /// CertificateChainRequest(DAC)で捕捉した X.509 DER。
+    dac_der: [u8; ATT_CERT_BUF],
+    dac_len: usize,
+    /// CertificateChainRequest(PAI)で捕捉した X.509 DER。
+    pai_der: [u8; ATT_CERT_BUF],
+    pai_len: usize,
+    /// AttestationResponse の attestation_elements(TLV)。
+    att_elements: [u8; ATT_ELEMENTS_BUF],
+    att_elements_len: usize,
+    /// AttestationResponse の signature(生 r‖s、64B)。
+    att_sig: [u8; 64],
+    /// AttestationRequest で送出した 32B nonce(エコー照合用)。
+    att_nonce: [u8; 32],
 }
+
+/// 捕捉する DAC / PAI の X.509 DER 上限(chip 開発 DAC=491B / PAI=463B に余裕)。
+const ATT_CERT_BUF: usize = 700;
+/// 捕捉する attestation_elements の上限(CD 541B + nonce + timestamp、デバイス側と同値)。
+const ATT_ELEMENTS_BUF: usize = 704;
 
 /// AddOrUpdateWiFiNetwork / ConnectNetwork へ渡す Wi-Fi 資格情報(固定長バッファ)。
 struct WifiCreds {
@@ -212,7 +275,7 @@ impl WifiCreds {
 
 impl<'a, C: Crypto> Commissioner<'a, C> {
     /// CA・crypto・attestation ポリシからコミッショナを作る(初期フェーズ = Idle)。
-    pub fn new(ca: &'a Ca<C>, crypto: &'a C, policy: AttestationPolicy) -> Self {
+    pub fn new(ca: &'a Ca<C>, crypto: &'a C, policy: AttestationPolicy<'a>) -> Self {
         Self {
             ca,
             crypto,
@@ -231,6 +294,15 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
             scratch: [0u8; MAX_CERT_TLV_LEN],
             suspend_before_case: false,
             wifi: None,
+            att_step: 0,
+            dac_der: [0u8; ATT_CERT_BUF],
+            dac_len: 0,
+            pai_der: [0u8; ATT_CERT_BUF],
+            pai_len: 0,
+            att_elements: [0u8; ATT_ELEMENTS_BUF],
+            att_elements_len: 0,
+            att_sig: [0u8; 64],
+            att_nonce: [0u8; 32],
         }
     }
 
@@ -335,14 +407,13 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
                 send: None,
             };
         }
-        // attestation は `Skip` では即遷移(フェーズ表は常設、§6.4)。
-        if matches!(self.phase, Phase::Attestation) {
-            match self.policy {
-                AttestationPolicy::Skip => {
-                    self.phase = Phase::Csr;
-                    self.awaiting = false;
-                }
-            }
+        // attestation: `Skip` では即遷移(フェーズ表は常設、§6.4)。`Verify` は
+        // 通常の emit/consume サイクルへ落とし、サブステップ(§3)を回す。
+        if matches!(self.phase, Phase::Attestation)
+            && matches!(self.policy, AttestationPolicy::Skip)
+        {
+            self.phase = Phase::Csr;
+            self.awaiting = false;
         }
 
         // 方向 B: AddNOC 完了後、CASE 開始(sigma1)を保留する。呼び出し側が
@@ -411,6 +482,52 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
                         tx_out,
                     )
                     .map_err(CommissionError::Stack)
+            }
+            // attestation(`Verify`)のサブステップ(§3): DAC/PAI 取得 → AttestationRequest。
+            Phase::Attestation => {
+                let session = self.pase_session.ok_or(CommissionError::Protocol)?;
+                match self.att_step {
+                    0 | 1 => {
+                        let cert_type = if self.att_step == 0 {
+                            CERT_TYPE_DAC
+                        } else {
+                            CERT_TYPE_PAI
+                        };
+                        stack
+                            .start_invoke(
+                                session,
+                                cmd_path(CLUSTER_OPERATIONAL_CREDENTIALS, CMD_CERT_CHAIN_REQUEST),
+                                move |w, t| {
+                                    w.start_struct(t)?;
+                                    w.write_u8(&cx(0), cert_type)?; // certificateType
+                                    w.end_container()
+                                },
+                                now_ms,
+                                tx_out,
+                            )
+                            .map_err(CommissionError::Stack)
+                    }
+                    _ => {
+                        // AttestationRequest: 32B nonce を Rng から払い出して送る。
+                        stack
+                            .fill_random(&mut self.att_nonce)
+                            .map_err(CommissionError::Stack)?;
+                        let nonce = self.att_nonce;
+                        stack
+                            .start_invoke(
+                                session,
+                                cmd_path(CLUSTER_OPERATIONAL_CREDENTIALS, CMD_ATTESTATION_REQUEST),
+                                move |w, t| {
+                                    w.start_struct(t)?;
+                                    w.write_bytes(&cx(0), &nonce)?; // attestationNonce
+                                    w.end_container()
+                                },
+                                now_ms,
+                                tx_out,
+                            )
+                            .map_err(CommissionError::Stack)
+                    }
+                }
             }
             Phase::Csr => {
                 let session = self.pase_session.ok_or(CommissionError::Protocol)?;
@@ -623,10 +740,14 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
     {
         match self.phase {
             Phase::ArmFailSafe => match response_status_code(stack.im_result()) {
-                Ok(0) => self.advance(Phase::Attestation),
+                Ok(0) => {
+                    self.att_step = 0;
+                    self.advance(Phase::Attestation);
+                }
                 Ok(code) => self.enter_failed(CommissionError::Status(code)),
                 Err(_) => self.enter_failed(CommissionError::Protocol),
             },
+            Phase::Attestation => self.on_attestation_response(stack),
             Phase::Csr => match extract_csr_pubkey(self.crypto, stack.im_result()) {
                 Ok(pk) => {
                     self.device_pubkey = pk;
@@ -669,6 +790,154 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
             },
             _ => self.enter_failed(CommissionError::Protocol),
         }
+    }
+
+    /// `Phase::Attestation`(`Verify`)の各サブステップ応答を処理する(§3)。
+    fn on_attestation_response<
+        R,
+        F,
+        const SS: usize,
+        const EX: usize,
+        const TX: usize,
+        const RS: usize,
+    >(
+        &mut self,
+        stack: &ControllerStack<'_, C, R, F, SS, EX, TX, RS>,
+    ) where
+        R: Rng,
+        F: FabricStore + NocResolver,
+    {
+        match self.att_step {
+            0 => match extract_cert_chain(stack.im_result()) {
+                Ok(cert) if cert.len() <= ATT_CERT_BUF => {
+                    self.dac_der[..cert.len()].copy_from_slice(cert);
+                    self.dac_len = cert.len();
+                    self.att_step = 1;
+                    self.awaiting = false; // 同フェーズで PAI 要求を再発行する。
+                }
+                _ => self.enter_failed(CommissionError::Attestation(AttestationError::DacParse)),
+            },
+            1 => match extract_cert_chain(stack.im_result()) {
+                Ok(cert) if cert.len() <= ATT_CERT_BUF => {
+                    self.pai_der[..cert.len()].copy_from_slice(cert);
+                    self.pai_len = cert.len();
+                    self.att_step = 2;
+                    self.awaiting = false; // 同フェーズで AttestationRequest を再発行する。
+                }
+                _ => self.enter_failed(CommissionError::Attestation(AttestationError::PaiParse)),
+            },
+            _ => {
+                // AttestationResponse: elements + signature を捕捉して検証する。
+                match extract_attestation(stack.im_result()) {
+                    Ok((elements, sig)) if elements.len() <= ATT_ELEMENTS_BUF => {
+                        self.att_elements[..elements.len()].copy_from_slice(elements);
+                        self.att_elements_len = elements.len();
+                        self.att_sig = sig;
+                    }
+                    _ => {
+                        self.enter_failed(CommissionError::Attestation(
+                            AttestationError::Signature,
+                        ));
+                        return;
+                    }
+                }
+                // attestation challenge を PASE セッションから取得する。
+                let challenge = match self
+                    .pase_session
+                    .and_then(|id| stack.sessions().get(id))
+                    .and_then(|s| s.att_challenge())
+                {
+                    Some(c) => *c,
+                    None => {
+                        self.enter_failed(CommissionError::Attestation(
+                            AttestationError::Challenge,
+                        ));
+                        return;
+                    }
+                };
+                match self.verify_attestation(&challenge) {
+                    Ok(()) => {
+                        self.att_step = 3;
+                        self.advance(Phase::Csr);
+                    }
+                    Err(e) => self.enter_failed(CommissionError::Attestation(e)),
+                }
+            }
+        }
+    }
+
+    /// 捕捉済みの DAC/PAI/elements/signature を検証する(§1)。
+    fn verify_attestation(
+        &self,
+        challenge: &[u8; 16],
+    ) -> core::result::Result<(), AttestationError> {
+        let paa_store = match self.policy {
+            AttestationPolicy::Verify { paa_store } => paa_store,
+            AttestationPolicy::Skip => return Err(AttestationError::PaaNotFound),
+        };
+
+        let dac =
+            parse_x509(&self.dac_der[..self.dac_len]).map_err(|_| AttestationError::DacParse)?;
+        let pai =
+            parse_x509(&self.pai_der[..self.pai_len]).map_err(|_| AttestationError::PaiParse)?;
+
+        // 1. DAC が PAI で署名されていること。
+        if !verify_signed_by(self.crypto, &dac, &pai.spki_pubkey)
+            .map_err(|_| AttestationError::Crypto)?
+        {
+            return Err(AttestationError::DacChain);
+        }
+
+        // 2. PAI の issuer と DER 一致する subject を持つ PAA を信頼ストアから探し、
+        //    その公開鍵で PAI 署名を検証する。
+        let mut chain_ok = false;
+        for paa_der in paa_store {
+            let Ok(paa) = parse_x509(paa_der) else {
+                continue;
+            };
+            if paa.subject != pai.issuer {
+                continue;
+            }
+            if verify_signed_by(self.crypto, &pai, &paa.spki_pubkey)
+                .map_err(|_| AttestationError::Crypto)?
+            {
+                chain_ok = true;
+                break;
+            }
+        }
+        if !chain_ok {
+            return Err(AttestationError::PaaNotFound);
+        }
+
+        // 3. attestation 署名: elements ‖ challenge を DAC 公開鍵で検証(§1)。
+        let elements = &self.att_elements[..self.att_elements_len];
+        let mut tbs = [0u8; ATT_ELEMENTS_BUF + 16];
+        let total = elements.len() + challenge.len();
+        if total > tbs.len() {
+            return Err(AttestationError::Signature);
+        }
+        tbs[..elements.len()].copy_from_slice(elements);
+        tbs[elements.len()..total].copy_from_slice(challenge);
+        let dac_key = self
+            .crypto
+            .p256_public_key_from_bytes(&dac.spki_pubkey)
+            .map_err(|_| AttestationError::Crypto)?;
+        if !dac_key
+            .verify(&tbs[..total], &self.att_sig)
+            .map_err(|_| AttestationError::Crypto)?
+        {
+            return Err(AttestationError::Signature);
+        }
+
+        // 4. CD presence + nonce エコー照合。
+        let (cd, nonce) = parse_att_elements(elements).map_err(|_| AttestationError::Cd)?;
+        if cd.is_empty() {
+            return Err(AttestationError::Cd);
+        }
+        if nonce != self.att_nonce.as_slice() {
+            return Err(AttestationError::Nonce);
+        }
+        Ok(())
     }
 
     fn advance(&mut self, next: Phase) {
@@ -736,6 +1005,37 @@ fn enter_command_fields<'a>(result: &'a [u8]) -> Result<TlvReader<'a>> {
 fn response_status_code(result: &[u8]) -> Result<u64> {
     let mut r = enter_command_fields(result)?;
     find_ctx(&mut r, 0)?.value.as_unsigned()
+}
+
+/// CertificateChainResponse の cx0(証明書 DER bytes)を借用で返す。
+fn extract_cert_chain(result: &[u8]) -> Result<&[u8]> {
+    let mut r = enter_command_fields(result)?;
+    find_ctx(&mut r, 0)?.value.as_bytes()
+}
+
+/// AttestationResponse の cx0(elements bytes)と cx1(signature 64B)を返す。
+fn extract_attestation(result: &[u8]) -> Result<(&[u8], [u8; 64])> {
+    let mut r = enter_command_fields(result)?;
+    let elements = find_ctx(&mut r, 0)?.value.as_bytes()?;
+    let sig_b = find_ctx(&mut r, 1)?.value.as_bytes()?;
+    if sig_b.len() != 64 {
+        return Err(Error::Decode);
+    }
+    let mut sig = [0u8; 64];
+    sig.copy_from_slice(sig_b);
+    Ok((elements, sig))
+}
+
+/// AttestationElements(TLV struct `{ cx1: CD, cx2: nonce, cx3: ts }`)から
+/// (CD, nonce) を借用で返す。
+fn parse_att_elements(elements: &[u8]) -> Result<(&[u8], &[u8])> {
+    let mut r = TlvReader::new(elements);
+    if r.enter_container()? != ContainerType::Structure {
+        return Err(Error::Decode);
+    }
+    let cd = find_ctx(&mut r, 1)?.value.as_bytes()?;
+    let nonce = find_ctx(&mut r, 2)?.value.as_bytes()?;
+    Ok((cd, nonce))
 }
 
 /// CSRResponse の NOCSRElements 内 CSR を取り出し、公開鍵を抽出・署名検証して返す。

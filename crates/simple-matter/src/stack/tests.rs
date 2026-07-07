@@ -1228,8 +1228,10 @@ mod controller_e2e {
 
     use crate::controller::ca::Ca;
     use crate::controller::{
-        AttestationPolicy, Commissioner, ControllerCreds, ControllerStack, Phase,
+        AttestationError, AttestationPolicy, CommissionError, Commissioner, ControllerCreds,
+        ControllerStack, Phase,
     };
+    use crate::dm::clusters::operational_credentials::dev_creds::TEST_PAA_CERT_FFF1;
     use crate::im::client::ImClient;
     use crate::im::wire::ImStatus;
     use crate::im::ImEvent;
@@ -1523,6 +1525,137 @@ mod controller_e2e {
             reported,
             Some(false),
             "report carries the toggled OnOff value"
+        );
+    }
+
+    /// device attestation を **実検証**(`AttestationPolicy::Verify`)してフルコミッショニング
+    /// する。デバイスは `TestDacProvider`(chip 開発 DAC チェーン)、PAA は埋め込みテスト定数。
+    /// コミッショナが DAC/PAI 取得 → AttestationRequest → チェーン+署名+nonce 検証を通過し、
+    /// CASE まで完走することを検証する(`docs/design/attestation.md` §5)。
+    #[test]
+    fn controller_end_to_end_attestation_verify() {
+        let crypto = RustCrypto::new(SeqRng(0xA11E_5701_1234_5678));
+        let fabrics: RefCell<FabricTable<Crb, 5>> = RefCell::new(FabricTable::new());
+
+        let config = PaseConfig::from_passcode(PASSCODE, &SALT, ITERATIONS).unwrap();
+        let dev_creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
+        let sc = SecureChannel::new(&crypto, SeqRng(0x5C00_0AAA), config, dev_creds);
+        let im = InteractionModel::new(build_device(&fabrics));
+        let mut dev: TestStack = MatterStack::new(&crypto, sc, im);
+
+        let ca = Ca::<Crb>::generate(
+            &crypto,
+            &mut SeqRng(0xCA00_0AAA),
+            FABRIC_ID,
+            COMM_NODE,
+            0xFFF1,
+            0,
+        )
+        .expect("Ca::generate");
+        let ctrl_creds = ControllerCreds::new(&ca, &crypto, 0);
+        let sc_init = ScInitiator::new(&crypto, SeqRng(0x1C00_0AAA), ctrl_creds);
+        let mut ctrl: Ctrl = ControllerStack::new(&crypto, sc_init, ImClient::new());
+
+        let paa_store: [&[u8]; 1] = [&TEST_PAA_CERT_FFF1];
+        let mut comm = Commissioner::new(
+            &ca,
+            &crypto,
+            AttestationPolicy::Verify {
+                paa_store: &paa_store,
+            },
+        );
+        comm.commission(peer(), PASSCODE, DEVICE_NODE, NOW).unwrap();
+
+        let mut tx = [0u8; 1700];
+        let mut final_phase = comm.phase();
+        let mut saw_attestation = false;
+        for _ in 0..80 {
+            let out = comm.drive(&mut ctrl, NOW, &mut tx);
+            final_phase = out.phase;
+            if matches!(out.phase, Phase::Attestation) {
+                saw_attestation = true;
+            }
+            if let Some(d) = out.send {
+                deliver_and_settle(&mut ctrl, &mut dev, NOW, &tx, d.len);
+            }
+            match out.phase {
+                Phase::Done { .. } | Phase::Failed { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(saw_attestation, "attestation phase was exercised");
+        match final_phase {
+            Phase::Done { .. } => {}
+            other => panic!("attestation-verified commissioning did not complete: {other:?}"),
+        }
+        assert_eq!(
+            fabrics.borrow().len(),
+            1,
+            "device fabric added after verify"
+        );
+    }
+
+    /// PAA 信頼ストアに正しい PAA が無い場合、attestation 検証が
+    /// `CommissionError::Attestation(PaaNotFound)` でコミッショニングを中断する(§5 失敗系)。
+    #[test]
+    fn controller_end_to_end_attestation_verify_fails_without_paa() {
+        let crypto = RustCrypto::new(SeqRng(0xBAD0_5701_1234_5678));
+        let fabrics: RefCell<FabricTable<Crb, 5>> = RefCell::new(FabricTable::new());
+
+        let config = PaseConfig::from_passcode(PASSCODE, &SALT, ITERATIONS).unwrap();
+        let dev_creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
+        let sc = SecureChannel::new(&crypto, SeqRng(0x5C00_0BBB), config, dev_creds);
+        let im = InteractionModel::new(build_device(&fabrics));
+        let mut dev: TestStack = MatterStack::new(&crypto, sc, im);
+
+        let ca = Ca::<Crb>::generate(
+            &crypto,
+            &mut SeqRng(0xCA00_0BBB),
+            FABRIC_ID,
+            COMM_NODE,
+            0xFFF1,
+            0,
+        )
+        .expect("Ca::generate");
+        let ctrl_creds = ControllerCreds::new(&ca, &crypto, 0);
+        let sc_init = ScInitiator::new(&crypto, SeqRng(0x1C00_0BBB), ctrl_creds);
+        let mut ctrl: Ctrl = ControllerStack::new(&crypto, sc_init, ImClient::new());
+
+        // 空の信頼ストア: DAC/PAI/AttestationRequest は完走するが PAA 照合で失敗する。
+        let paa_store: [&[u8]; 0] = [];
+        let mut comm = Commissioner::new(
+            &ca,
+            &crypto,
+            AttestationPolicy::Verify {
+                paa_store: &paa_store,
+            },
+        );
+        comm.commission(peer(), PASSCODE, DEVICE_NODE, NOW).unwrap();
+
+        let mut tx = [0u8; 1700];
+        let mut final_phase = comm.phase();
+        for _ in 0..80 {
+            let out = comm.drive(&mut ctrl, NOW, &mut tx);
+            final_phase = out.phase;
+            if let Some(d) = out.send {
+                deliver_and_settle(&mut ctrl, &mut dev, NOW, &tx, d.len);
+            }
+            match out.phase {
+                Phase::Done { .. } | Phase::Failed { .. } => break,
+                _ => {}
+            }
+        }
+        match final_phase {
+            Phase::Failed {
+                reason: CommissionError::Attestation(AttestationError::PaaNotFound),
+                ..
+            } => {}
+            other => panic!("expected Attestation(PaaNotFound) failure, got {other:?}"),
+        }
+        assert_eq!(
+            fabrics.borrow().len(),
+            0,
+            "no fabric added on attestation failure"
         );
     }
 

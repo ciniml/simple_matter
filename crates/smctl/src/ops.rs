@@ -186,6 +186,9 @@ pub struct Exec<'a> {
     subs: Vec<SubStat>,
     /// バッチモードか(`subscribe` の非ブロッキング化)。
     batch: bool,
+    /// `--paa-trust-store-path` 由来の PAA 信頼ストア(X.509 DER)。空なら attestation は
+    /// スキップ、非空なら `AttestationPolicy::Verify` で pairing する。
+    paa_store: Vec<Vec<u8>>,
 }
 
 impl<'a> Exec<'a> {
@@ -205,6 +208,10 @@ impl<'a> Exec<'a> {
         let sc_init = simple_matter::sc::initiator::ScInitiator::new(crypto, OsRng, ctrl_creds);
         let stack: Ctrl<'a> =
             simple_matter::controller::ControllerStack::new(crypto, sc_init, ImClient::new());
+        let paa_store = match &g.paa_trust_store_path {
+            Some(dir) => load_paa_store(dir)?,
+            None => Vec::new(),
+        };
         Ok(Self {
             g,
             state,
@@ -218,6 +225,7 @@ impl<'a> Exec<'a> {
             cases: Vec::new(),
             subs: Vec::new(),
             batch,
+            paa_store,
         })
     }
 
@@ -481,7 +489,23 @@ impl<'a> Exec<'a> {
             self.ca.controller_node_id()
         );
 
-        let mut comm = Commissioner::new(self.ca, self.crypto, AttestationPolicy::Skip);
+        // PAA 信頼ストアが空なら Skip、非空なら Verify(§3/§4)。ローカルへ複製してから
+        // slice 群を作る(`comm` が `self` を借用したまま `self.quiesce` へ入るのを避ける)。
+        let paa_owned: Vec<Vec<u8>> = self.paa_store.clone();
+        let paa_slices: Vec<&[u8]> = paa_owned.iter().map(Vec::as_slice).collect();
+        let policy = if paa_slices.is_empty() {
+            info!("[attestation] skipped (no --paa-trust-store-path)");
+            AttestationPolicy::Skip
+        } else {
+            info!(
+                "[attestation] verifying DAC chain against {} PAA cert(s)",
+                paa_slices.len()
+            );
+            AttestationPolicy::Verify {
+                paa_store: &paa_slices,
+            }
+        };
+        let mut comm = Commissioner::new(self.ca, self.crypto, policy);
         let deadline = Instant::now() + self.g.timeout;
         let mut last_phase = Phase::Idle;
 
@@ -1048,6 +1072,33 @@ impl<'a> Exec<'a> {
 const TIMED_INVOKE_TIMEOUT_MS: u16 = 10_000;
 
 /// setup passcode の有効性(§5.1.7: 全 0 / 全同一数字 / 連番等の 12 値と範囲を除外)。
+/// `--paa-trust-store-path <dir>` のディレクトリから PAA 証明書(`*.der`)を全部読む(§4)。
+///
+/// 各ファイルの生バイト列(X.509 DER)を返す。ディレクトリが読めない・`.der` が 1 つも
+/// 無い場合はエラー(誤設定を検証スキップに退化させないため)。
+fn load_paa_store(dir: &std::path::Path) -> Result<Vec<Vec<u8>>, String> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("--paa-trust-store-path {}: {e}", dir.display()))?;
+    let mut store = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|e| format!("reading {}: {e}", dir.display()))?
+            .path();
+        if path.extension().and_then(|s| s.to_str()) != Some("der") {
+            continue;
+        }
+        let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+        store.push(bytes);
+    }
+    if store.is_empty() {
+        return Err(format!(
+            "--paa-trust-store-path {}: no *.der certificates found",
+            dir.display()
+        ));
+    }
+    Ok(store)
+}
+
 fn passcode_is_valid(p: u32) -> bool {
     const INVALID: [u32; 12] = [
         0, 11111111, 22222222, 33333333, 44444444, 55555555, 66666666, 77777777, 88888888,
@@ -1125,7 +1176,7 @@ pub(crate) fn report_phase(phase: Phase) {
         Phase::Idle => "Idle",
         Phase::Pase => "PASE handshake",
         Phase::ArmFailSafe => "ArmFailSafe",
-        Phase::Attestation => "Attestation (skipped)",
+        Phase::Attestation => "Attestation",
         Phase::Csr => "CSRRequest",
         Phase::AddTrustedRoot => "AddTrustedRootCertificate",
         Phase::AddNoc => "AddNOC",

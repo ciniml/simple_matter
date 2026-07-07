@@ -34,6 +34,9 @@ pub struct Globals {
     pub passcode: Option<u32>,
     /// `--timed <ms>`: invoke を timed interaction(TimedRequest → Invoke)で行う。
     pub timed_ms: Option<u16>,
+    /// `--paa-trust-store-path <dir>`: 指定時、pairing で device attestation を検証する
+    /// (ディレクトリ内の `*.der` を PAA 信頼ストアとして読む)。未指定は検証スキップ。
+    pub paa_trust_store_path: Option<PathBuf>,
 }
 
 impl Globals {
@@ -47,6 +50,7 @@ impl Globals {
             json: false,
             passcode: None,
             timed_ms: None,
+            paa_trust_store_path: None,
         }
     }
 }
@@ -61,6 +65,7 @@ impl Clone for Globals {
             json: self.json,
             passcode: self.passcode,
             timed_ms: self.timed_ms,
+            paa_trust_store_path: self.paa_trust_store_path.clone(),
         }
     }
 }
@@ -200,6 +205,12 @@ fn parse_globals(args: &[String], base: &Globals) -> Result<(Globals, Vec<String
                 let v = it.next().ok_or("--timed requires a value (milliseconds)")?;
                 let ms: u16 = v.parse().map_err(|_| format!("invalid --timed: {v:?}"))?;
                 g.timed_ms = Some(ms);
+            }
+            "--paa-trust-store-path" => {
+                let v = it
+                    .next()
+                    .ok_or("--paa-trust-store-path requires a directory")?;
+                g.paa_trust_store_path = Some(PathBuf::from(v));
             }
             "-h" | "--help" => {
                 pos.clear();
@@ -802,7 +813,7 @@ pub(crate) fn print_help() {
     println!(
         "\
 smctl — CLI Matter controller built on simple-matter (development tool;
-device attestation is NOT verified)
+device attestation is verified only with --paa-trust-store-path, otherwise skipped)
 
 USAGE:
   smctl pairing onnetwork       <node-id> <passcode>
@@ -843,6 +854,9 @@ OPTIONS:
   --passcode <n>        passcode for `admincommissioning open-window` (default: random)
   --timed <ms>          send cluster command invokes as timed interactions
                         (TimedRequest -> Invoke); required by some commands
+  --paa-trust-store-path <dir>
+                        verify device attestation during pairing using the PAA
+                        certificates (*.der) in <dir>; omit to skip verification
   --json                machine-readable output: one JSON object per line on
                         stdout (read/write/invoke/subscribe reports/discover);
                         human-readable progress moves to stderr. Works in

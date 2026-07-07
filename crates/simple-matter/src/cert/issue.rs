@@ -152,7 +152,7 @@ pub const NOC_EKU: [u8; 2] = [ext_key_usage::SERVER_AUTH, ext_key_usage::CLIENT_
 /// DER の 1 つの TLV を読み、`(tag, content_start, content_len, next)` を返す。
 ///
 /// 長さは短形式と長形式(1〜2 バイト)のみ対応。範囲外・不正長は [`Error::Decode`]。
-fn der_tlv(buf: &[u8], pos: usize) -> Result<(u8, usize, usize, usize)> {
+pub(crate) fn der_tlv(buf: &[u8], pos: usize) -> Result<(u8, usize, usize, usize)> {
     let tag = *buf.get(pos).ok_or(Error::Decode)?;
     let l0 = *buf.get(pos + 1).ok_or(Error::Decode)?;
     let (content_start, len) = if l0 < 0x80 {
@@ -193,7 +193,7 @@ fn copy_be_fixed(be: &[u8], out: &mut [u8]) -> Result<()> {
 }
 
 /// DER `ECDSA-Sig-Value ::= SEQUENCE { INTEGER r, INTEGER s }` を生 `r || s`(64 バイト)へ。
-fn der_ecdsa_to_raw(der: &[u8]) -> Result<[u8; P256_SIGNATURE_LEN]> {
+pub(crate) fn der_ecdsa_to_raw(der: &[u8]) -> Result<[u8; P256_SIGNATURE_LEN]> {
     let (tag, cs, cl, _) = der_tlv(der, 0)?;
     if tag != 0x30 {
         return Err(Error::Decode);

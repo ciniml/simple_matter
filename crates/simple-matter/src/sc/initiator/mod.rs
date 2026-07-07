@@ -236,6 +236,11 @@ impl<'c, C: Crypto, R: Rng, F> ScInitiator<'c, C, R, F> {
         }
     }
 
+    /// `dest` を Rng で満たす(コミッショナの attestation nonce 払い出し用)。
+    pub fn fill_random(&mut self, dest: &mut [u8]) -> Result<()> {
+        self.rng.fill_bytes(dest)
+    }
+
     /// 新規セキュアセッションの送信メッセージカウンタ初期値(下位 28bit 乱数 + 1)。
     fn initial_tx_ctr(&mut self) -> u32 {
         let mut b = [0u8; 4];

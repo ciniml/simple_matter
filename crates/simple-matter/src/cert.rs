@@ -54,8 +54,15 @@ mod der;
 #[cfg(feature = "controller")]
 pub mod issue;
 
+/// device attestation 用の最小 X.509 リーダとチェーン署名検証。`controller` feature 有効時のみ。
+#[cfg(feature = "controller")]
+pub mod x509;
+
 #[cfg(feature = "controller")]
 pub use issue::{parse_csr, write_matter_cert, DnAttr, MatterCertSpec, NOC_EKU};
+
+#[cfg(feature = "controller")]
+pub use x509::{parse_x509, verify_signed_by, X509Cert};
 
 /// Matter epoch(2000-01-01T00:00:00Z)の Unix タイムスタンプ(秒)。
 ///
