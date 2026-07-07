@@ -290,6 +290,15 @@ struct Subscription<const P: usize> {
     paths: [AttributePath; P],
     /// `paths` の有効長。
     npaths: usize,
+    /// 購読イベントパス列(EventRequests、固定上限、設計 §12)。
+    event_paths: [EventPath; P],
+    /// `event_paths` の有効長。
+    n_event_paths: usize,
+    /// リクエストの EventFilters eventMin(プライミングで既存イベントを絞る、設計 §12)。
+    event_min: Option<u64>,
+    /// 配信済みイベント floor: この番号未満のイベントは配信済み(> はプライミング/レポートで
+    /// 未配信)。プライミング完了時に EventLog の次番号を記録し、レポートのたびに前進する。
+    event_floor: u64,
     /// 最小レポート間隔(秒)。
     min_interval_s: u16,
     /// 最大レポート間隔(秒)。
@@ -298,6 +307,9 @@ struct Subscription<const P: usize> {
     last_report_ms: u64,
     /// 前回レポート以降に交差クラスタが変更されたか。
     dirty: bool,
+    /// 直近の device 発レポートを運んだ exchange(MRP 諦め時の購読破棄の逆引き用、
+    /// 設計 §6.3。単一チャンクレポートは reads に継続 slot を持たないため購読側で覚える)。
+    report_exchange: Option<ExchangeId>,
     /// 状態。
     state: SubState,
 }
@@ -318,13 +330,31 @@ impl<const P: usize> Subscription<P> {
             acc,
             paths: [AttributePath::default(); P],
             npaths: 0,
+            event_paths: [EventPath::default(); P],
+            n_event_paths: 0,
+            event_min: None,
+            event_floor: 0,
             min_interval_s,
             max_interval_s,
             last_report_ms: now_ms,
             dirty: false,
+            report_exchange: None,
             state: SubState::Priming,
         }
     }
+}
+
+/// EventLog に、購読の event_paths に合致する未配信(番号 >= floor)イベントがあるか(設計 §12)。
+fn sub_has_new_event<const P: usize>(sub: &Subscription<P>, log: &EventLog<EVENT_LOG_CAP>) -> bool {
+    if sub.n_event_paths == 0 {
+        return false;
+    }
+    log.iter().any(|rec| {
+        rec.number >= sub.event_floor
+            && sub.event_paths[..sub.n_event_paths]
+                .iter()
+                .any(|p| p.matches(rec.endpoint, rec.cluster, rec.event))
+    })
 }
 
 /// いずれかの購読パスが (endpoint, cluster) を含むか。
@@ -720,14 +750,33 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
             txn.paths[txn.npaths] = p;
             txn.npaths += 1;
         }
+        // EventRequests / EventFilters(設計 §12): 購読とプライミング txn の双方へ載せる。
+        for p in req.event_paths()? {
+            let p = p?;
+            if sub.n_event_paths >= PATHS {
+                break;
+            }
+            sub.event_paths[sub.n_event_paths] = p;
+            sub.n_event_paths += 1;
+            txn.event_paths[txn.n_event_paths] = p;
+            txn.n_event_paths += 1;
+        }
+        sub.event_min = req.event_min()?;
+        // プライミングでは EventFilters の eventMin を尊重して既存イベントを配信する。
+        txn.event_min = sub.event_min;
 
         let outcome;
         let len;
         {
-            let mut builder = ReportChunkBuilder::new(tx, None)?;
+            // プライミングレポートにも SubscriptionId を含める(chip の ReadClient は
+            // SubscriptionId 欠如の priming ReportData を Invalid argument で拒否する。実測)。
+            let mut builder = ReportChunkBuilder::new(tx, Some(id))?;
             outcome = emit_chunk(&self.dm, &mut txn, &mut builder, self.data_version)?;
             len = match outcome {
                 ChunkOutcome::Done => {
+                    // プライミングで既存イベントを相乗り配信し、配信済み floor を記録する。
+                    emit_events(&self.dm, &self.events, &mut txn, &mut builder)?;
+                    sub.event_floor = self.events.next_number();
                     txn.priming_reports_done = true;
                     builder.finish(false, false)?
                 }
@@ -760,12 +809,34 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
     ) -> Result<HandlerAction> {
         let sr = StatusResponse::decode(rx.payload)?;
         let Some(idx) = self.reads.iter().position(|t| t.exchange == rx.exchange) else {
-            // 継続 slot が無い(完了済みトランザクションへの ACK 等)→ 無視。
-            return Ok(HandlerAction::None);
+            // 継続 slot が無い = 完了済みトランザクション(単一チャンクの購読レポート等)への
+            // 終端 StatusResponse。exchange を終端予約して回収させる(回帰修正: None のまま
+            // 放置すると device 発の購読レポートごとに initiator exchange がリークし、
+            // EXCHANGES 本のプールが枯渇して以降の受信が全て silent drop になる)。
+            // 保留中の遅延 InvokeResponse の exchange だけは生存維持する(設計 §E7.2)。
+            if self
+                .deferred
+                .as_ref()
+                .is_some_and(|d| d.exchange == rx.exchange)
+            {
+                return Ok(HandlerAction::None);
+            }
+            // 配達確認: この exchange が購読レポートを運んでいたなら逆引きマップを消す
+            // (以降の無関係な exchange 失敗で購読を誤破棄しないため)。
+            let acked = self
+                .subs
+                .iter()
+                .position(|s| s.report_exchange == Some(rx.exchange));
+            if let Some(i) = acked {
+                self.subs[i].report_exchange = None;
+            }
+            return Ok(HandlerAction::CloseSilent);
         };
         if !sr.status.is_success() {
+            // クライアントがトランザクションを拒否(InvalidSubscription 等)。slot を破棄し、
+            // exchange も終端予約する(リーク防止)。
             self.reads.swap_remove(idx);
-            return Ok(HandlerAction::None);
+            return Ok(HandlerAction::CloseSilent);
         }
 
         // プライミングのレポート送信が完了していれば SubscribeResponse を返す。
@@ -793,14 +864,16 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
             let dm = &self.dm;
             let events = &self.events;
             let txn = &mut self.reads[idx];
+            // 購読レポート/プライミング継続チャンクにも SubscriptionId を含める(chip 互換)。
             let sub_id = match txn.kind {
-                ReadKind::Report(id) => Some(id),
-                _ => None,
+                ReadKind::Report(id) | ReadKind::Priming(id) => Some(id),
+                ReadKind::Read => None,
             };
             let mut builder = ReportChunkBuilder::new(tx, sub_id)?;
             outcome = emit_chunk(dm, txn, &mut builder, dv)?;
-            // 通常 Read の最終チャンクでイベントレポートを付ける(Subscribe のイベントは非対応)。
-            if outcome == ChunkOutcome::Done && matches!(txn.kind, ReadKind::Read) {
+            // 最終チャンクでイベントレポートを付ける(Read / Subscribe プライミング / 購読レポート、
+            // 設計 §12)。txn.event_paths/event_min は各 open 経路で載せてある。
+            if outcome == ChunkOutcome::Done {
                 emit_events(dm, events, txn, &mut builder)?;
             }
             len = match (outcome, txn.kind) {
@@ -819,12 +892,16 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
                 self.reads.swap_remove(idx);
                 Ok(close(ImOpCode::ReportData, true, len))
             }
-            (ChunkOutcome::Done, ReadKind::Priming(_)) => {
-                // 最終プライミングレポートを送った。次の StatusResponse で SubscribeResponse。
+            (ChunkOutcome::Done, ReadKind::Priming(id)) => {
+                // 最終プライミングレポートを送った。既存イベントを配信し切ったので floor を記録。
+                self.set_event_floor(id, self.events.next_number());
+                // 次の StatusResponse で SubscribeResponse。
                 Ok(respond(ImOpCode::ReportData, true, len))
             }
             (ChunkOutcome::Done, ReadKind::Report(id)) => {
                 self.reads.swap_remove(idx);
+                // 配信済みイベント floor を前進させてから last_report / dirty を更新する。
+                self.set_event_floor(id, self.events.next_number());
                 self.mark_reported(id, now_ms);
                 Ok(close(ImOpCode::ReportData, true, len))
             }
@@ -1134,8 +1211,17 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
     /// min_interval を尊重し、dirty でも `last_report + min` 未満なら due にしない。
     pub fn poll_subscriptions(&mut self, now_ms: u64) -> Option<SubDue> {
         self.sweep_dirty();
+        self.sweep_events();
         for s in self.subs.iter() {
             if s.state != SubState::Active {
+                continue;
+            }
+            // 前回レポートが未完了(ack 未着 = `report_exchange` 保持中)の購読は due にしない。
+            // レポートトランザクションは購読ごとに同時 1 本(仕様どおり)で、これにより
+            // (1) MRP 再送中の多重レポート送出、(2) 30 秒再レポートによる `report_exchange`
+            // 上書きで MRP give-up 時の逆引き([`Self::on_report_exchange_failed`])が外れて
+            // 死んだ購読者を破棄し損ねる問題、の両方を防ぐ(設計 §6.3 liveness)。
+            if s.report_exchange.is_some() {
                 continue;
             }
             let max_due = s
@@ -1177,6 +1263,11 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
             let sub = &self.subs[si];
             txn.npaths = sub.npaths;
             txn.paths[..sub.npaths].copy_from_slice(&sub.paths[..sub.npaths]);
+            // イベントパスと「未配信のみ」フィルタ(floor)を載せる(設計 §12)。
+            txn.n_event_paths = sub.n_event_paths;
+            txn.event_paths[..sub.n_event_paths]
+                .copy_from_slice(&sub.event_paths[..sub.n_event_paths]);
+            txn.event_min = Some(sub.event_floor);
         }
 
         let outcome;
@@ -1184,24 +1275,48 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         {
             let mut builder = ReportChunkBuilder::new(tx, Some(subscription))?;
             outcome = emit_chunk(&self.dm, &mut txn, &mut builder, self.data_version)?;
+            if outcome == ChunkOutcome::Done {
+                emit_events(&self.dm, &self.events, &mut txn, &mut builder)?;
+            }
             len = match outcome {
                 ChunkOutcome::Done => builder.finish(false, false)?,
                 ChunkOutcome::More => builder.finish(true, false)?,
             };
         }
 
+        // このレポートを運ぶ exchange を記録する(MRP 諦め時の購読破棄の逆引き、設計 §6.3)。
+        // 組み立て成功後にのみ記録する(エラー時に閉じた exchange を指したまま残すと、
+        // in-flight ガードで購読が永久に due しなくなる)。送信失敗時は統合層が
+        // [`Self::on_report_send_failed`] で解除する。
+        self.subs[si].report_exchange = Some(exchange);
+
         match outcome {
             ChunkOutcome::Done => {
+                // 配信済みイベント floor を前進させてから last_report / dirty を更新する。
+                self.set_event_floor(subscription, self.events.next_number());
                 self.mark_reported(subscription, now_ms);
                 Ok(len)
             }
             ChunkOutcome::More => {
                 if self.reads.push(txn).is_err() {
                     // 継続 slot が無い場合は打ち切り(報告済み扱いにして stall を避ける)。
+                    self.set_event_floor(subscription, self.events.next_number());
                     self.mark_reported(subscription, now_ms);
                 }
                 Ok(len)
             }
+        }
+    }
+
+    /// 組み立て済みレポートの**送出**に失敗した(が購読は維持する)ことを通知する。
+    ///
+    /// 統合層が一時的エラー(tx バッファ枯渇等)で ReportData を送れなかったときに呼ぶ。
+    /// in-flight 記録(`report_exchange`)を解除し、次の poll で再レポートできるようにする
+    /// (解除しないと in-flight ガードにより購読が永久に due しなくなる。設計 §6.3)。
+    pub fn on_report_send_failed(&mut self, subscription: u32) {
+        let idx = self.subs.iter().position(|s| s.id == subscription);
+        if let Some(i) = idx {
+            self.subs[i].report_exchange = None;
         }
     }
 
@@ -1323,6 +1438,28 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         }
     }
 
+    /// MRP が諦めた exchange を購読レポートへ逆引きし、該当購読を破棄する(設計 §6.3)。
+    ///
+    /// 統合層が `PollAction::Failed` のたびに呼ぶ。チャンク継続中は reads の
+    /// [`ReadKind::Report`] slot、単一チャンクは購読の `report_exchange` で照合する。
+    /// 該当が無ければ何もしない(購読レポート以外の exchange 失敗)。ack されない購読を
+    /// 残すと、消えたピアへ max interval ごとにレポートを送り続けて exchange/tx バッファを
+    /// 浪費する(実機回帰の 2 次要因)。
+    pub fn on_report_exchange_failed(&mut self, exchange: ExchangeId) {
+        let from_reads = self.reads.iter().find_map(|t| match t.kind {
+            ReadKind::Report(id) if t.exchange == exchange => Some(id),
+            _ => None,
+        });
+        let from_subs = self
+            .subs
+            .iter()
+            .find(|s| s.report_exchange == Some(exchange))
+            .map(|s| s.id);
+        if let Some(id) = from_reads.or(from_subs) {
+            self.on_report_failed(id);
+        }
+    }
+
     /// セッション切断時に、そのセッションに紐づく購読・継続・Timed を破棄する(設計 §6)。
     pub fn on_session_closed(&mut self, session: SessionId) {
         loop {
@@ -1415,6 +1552,20 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         }
     }
 
+    /// EventLog を掃引し、各 Active 購読の event_paths に合致する未配信イベント(番号 >= floor)
+    /// があれば dirty を立てる(設計 §12、dirty 掃引への相乗り)。
+    fn sweep_events(&mut self) {
+        for i in 0..self.subs.len() {
+            let s = &self.subs[i];
+            if s.state != SubState::Active || s.dirty {
+                continue;
+            }
+            if sub_has_new_event(s, &self.events) {
+                self.subs[i].dirty = true;
+            }
+        }
+    }
+
     /// プライミング完了で購読を Active 化する。
     fn activate_subscription(&mut self, id: u32, now_ms: u64) {
         let idx = self.subs.iter().position(|s| s.id == id);
@@ -1423,6 +1574,14 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
             s.state = SubState::Active;
             s.last_report_ms = now_ms;
             s.dirty = false;
+        }
+    }
+
+    /// 購読 `id` の配信済みイベント floor を設定する(設計 §12)。
+    fn set_event_floor(&mut self, id: u32, floor: u64) {
+        let idx = self.subs.iter().position(|s| s.id == id);
+        if let Some(i) = idx {
+            self.subs[i].event_floor = floor;
         }
     }
 

@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use simple_matter::discovery::MATTER_PORT;
-use simple_matter::dm::meta::{AttributeId, ClusterId, CommandId};
+use simple_matter::dm::meta::{AttributeId, ClusterId, CommandId, EventId};
 
 use crate::clusters::{self, ClusterDef, ValueKind};
 use crate::ops::{parse_literal, parse_typed_literal, parse_u64, Parsed, Target};
@@ -154,6 +154,15 @@ pub enum Cmd {
         ep: u16,
         cluster: ClusterId,
         attr: AttributeId,
+        min_s: u16,
+        max_s: u16,
+    },
+    /// イベント Subscribe(`event = None` はイベントワイルドカード、設計 §12)。
+    SubscribeEvent {
+        node: u64,
+        ep: u16,
+        cluster: ClusterId,
+        event: Option<EventId>,
         min_s: u16,
         max_s: u16,
     },
@@ -752,6 +761,7 @@ fn parse_cluster(def: &'static ClusterDef, args: &[String]) -> Result<Cmd, Strin
             })
         }
         "subscribe" => parse_subscribe(def, &args[1..]),
+        "subscribe-event" => parse_subscribe_event(def, &args[1..]),
         name => {
             let cmd = def.cmd_by_name(name).ok_or_else(|| {
                 format!(
@@ -801,6 +811,45 @@ fn parse_subscribe(def: &'static ClusterDef, args: &[String]) -> Result<Cmd, Str
         ep: parse_ep(&rest[3])?,
         cluster: def.id,
         attr: attr.id,
+        min_s: min,
+        max_s: max,
+    })
+}
+
+/// `subscribe-event [<event>] <min-interval> <max-interval> <node-id> <endpoint>`(設計 §12)
+///
+/// `<event>` 省略時はクラスタの全イベント(イベントワイルドカード)を購読する。イベント名は
+/// クラスタテーブル(無ければ ID)で引く。chip-tool の語順に合わせる。
+fn parse_subscribe_event(def: &'static ClusterDef, args: &[String]) -> Result<Cmd, String> {
+    let usage = format!(
+        "usage: smctl {} subscribe-event [<event>] <min-interval-s> <max-interval-s> \
+         <node-id> <endpoint>",
+        def.name
+    );
+    // 先頭引数が数値なら <event> 省略形(全イベント)とみなす(イベント名は数字で始まらない)。
+    let (event, rest) = match args.first() {
+        Some(e) if e.parse::<u16>().is_err() => {
+            let ev = def
+                .event_by_name(e)
+                .ok_or_else(|| format!("unknown event {e:?} for cluster {}", def.name))?;
+            (Some(ev.id), &args[1..])
+        }
+        _ => (None, args),
+    };
+    if rest.len() != 4 {
+        return Err(usage);
+    }
+    let min: u16 = rest[0]
+        .parse()
+        .map_err(|_| format!("invalid min interval: {:?}", rest[0]))?;
+    let max: u16 = rest[1]
+        .parse()
+        .map_err(|_| format!("invalid max interval: {:?}", rest[1]))?;
+    Ok(Cmd::SubscribeEvent {
+        node: parse_u64(&rest[2])?,
+        ep: parse_ep(&rest[3])?,
+        cluster: def.id,
+        event,
         min_s: min,
         max_s: max,
     })
@@ -869,7 +918,7 @@ fn unknown_attr(def: &ClusterDef, attr: &str) -> String {
 
 fn cluster_usage(def: &ClusterDef) -> String {
     format!(
-        "usage: smctl {} <read|write|subscribe|{}> ... (see `smctl help`)",
+        "usage: smctl {} <read|write|subscribe|subscribe-event|{}> ... (see `smctl help`)",
         def.name,
         def.cmds
             .iter()
@@ -908,6 +957,7 @@ USAGE:
   smctl <cluster> read       <attr> <node-id> <endpoint>
   smctl <cluster> write      <attr> <value> <node-id> <endpoint>
   smctl <cluster> subscribe  [<attr>] <min-s> <max-s> <node-id> <endpoint>
+  smctl <cluster> subscribe-event [<event>] <min-s> <max-s> <node-id> <endpoint>
   smctl <cluster> <command>  [<field-value>...] <node-id> <endpoint>
   smctl any read   <node-id> <endpoint> <cluster-id> <attribute-id|*>
   smctl any write  <node-id> <endpoint> <cluster-id> <attribute-id> <type>:<value>

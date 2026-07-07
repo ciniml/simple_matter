@@ -14,10 +14,12 @@ use std::time::{Duration, Instant};
 
 use simple_matter::controller::ca::Ca;
 use simple_matter::controller::{AttestationPolicy, Commissioner, Phase, CONTROLLER_FABRIC_INDEX};
-use simple_matter::dm::meta::{AttributeId, ClusterId, CommandId, EndpointId};
+use simple_matter::dm::meta::{AttributeId, ClusterId, CommandId, EndpointId, EventId};
 use simple_matter::error::Result as MResult;
 use simple_matter::im::client::ImClient;
-use simple_matter::im::wire::{AttributePath, AttributeReportRef, CommandPath};
+use simple_matter::im::wire::{
+    AttributePath, AttributeReportRef, CommandPath, EventPath, EventReportRef,
+};
 use simple_matter::im::ImEvent;
 use simple_matter::sc::initiator::ScEvent;
 use simple_matter::tlv::{ContainerType, TlvElement, TlvReader, TlvTag, TlvValue, TlvWriter};
@@ -175,6 +177,8 @@ struct SubStat {
     node: u64,
     reports: u64,
     lost: bool,
+    /// イベント購読(`subscribe-event`)なら true。レポート表示をイベント用に切り替える(設計 §12)。
+    events: bool,
 }
 
 /// 実行コンテキスト。
@@ -310,6 +314,14 @@ impl<'a> Exec<'a> {
                 min_s,
                 max_s,
             } => self.subscribe(*node, *ep, *cluster, *attr, *min_s, *max_s),
+            Cmd::SubscribeEvent {
+                node,
+                ep,
+                cluster,
+                event,
+                min_s,
+                max_s,
+            } => self.subscribe_event(*node, *ep, *cluster, *event, *min_s, *max_s),
             Cmd::Wait { secs } => self.wait(*secs),
             // 以下はコンテキスト非依存(バッチ内でも独立に動く)。
             Cmd::PairingList => pairing_list(&self.g),
@@ -386,12 +398,27 @@ impl<'a> Exec<'a> {
         match ev {
             ImEvent::SubscriptionReport { subscription_id } => {
                 let ts = self.start.elapsed().as_secs();
-                print_reports(
-                    self.stack.sub_reports(),
-                    &format!("[report +{ts}s sub={subscription_id}] "),
-                    "report",
-                    Some(subscription_id),
-                );
+                let is_event = self
+                    .subs
+                    .iter()
+                    .find(|s| s.id == subscription_id)
+                    .map(|s| s.events)
+                    .unwrap_or(false);
+                if is_event {
+                    print_event_reports(
+                        self.stack.sub_event_reports(),
+                        &format!("[event +{ts}s sub={subscription_id}] "),
+                        "event-report",
+                        Some(subscription_id),
+                    );
+                } else {
+                    print_reports(
+                        self.stack.sub_reports(),
+                        &format!("[report +{ts}s sub={subscription_id}] "),
+                        "report",
+                        Some(subscription_id),
+                    );
+                }
                 if let Some(s) = self.subs.iter_mut().find(|s| s.id == subscription_id) {
                     s.reports += 1;
                 }
@@ -1360,6 +1387,7 @@ impl<'a> Exec<'a> {
             node: node_id,
             reports: 0,
             lost: false,
+            events: false,
         });
         if json::enabled() {
             Obj::new("subscribe")
@@ -1380,6 +1408,103 @@ impl<'a> Exec<'a> {
         }
 
         // 常駐モード: レポートを受信し続ける(SubscriptionLost で非 0 終了)。
+        loop {
+            self.step_io()?;
+            self.drain_events();
+            if let Some(s) = self.subs.iter().find(|s| s.id == sub_id) {
+                if s.lost {
+                    return Err(format!(
+                        "subscription {sub_id} LOST (no report within max interval + grace)"
+                    ));
+                }
+            }
+        }
+    }
+
+    /// イベント Subscribe(設計 §12)。
+    ///
+    /// `event = None` はイベントワイルドカード(クラスタの全イベント)。属性 Subscribe と同じく
+    /// 単発モードは常駐、バッチモードはプライミング完了で戻る。受信イベントは read-event 相当で表示。
+    fn subscribe_event(
+        &mut self,
+        node_id: u64,
+        ep: u16,
+        cluster: ClusterId,
+        event: Option<EventId>,
+        min_s: u16,
+        max_s: u16,
+    ) -> Result<(), String> {
+        let session = self.case_session(node_id)?;
+        let event_path = match event {
+            Some(ev) => EventPath::concrete(EndpointId(ep), cluster, ev),
+            None => EventPath {
+                endpoint: Some(EndpointId(ep)),
+                cluster: Some(cluster),
+                event: None,
+                is_urgent: None,
+            },
+        };
+        logf!(
+            Level::Debug,
+            "im",
+            "SubscribeRequest(event) node={node_id} ep{ep} cluster={:#06x} event={:?} \
+             min={min_s}s max={max_s}s",
+            cluster.0,
+            event.map(|e| e.0)
+        );
+        let now = self.now_ms();
+        let dir = self
+            .stack
+            .start_subscribe_events(
+                session,
+                &[],
+                &[event_path],
+                None,
+                min_s,
+                max_s,
+                now,
+                &mut self.tx,
+            )
+            .map_err(|e| format!("start_subscribe_events: {e:?}"))?;
+        send_dir(&self.socket, &self.tx, &dir);
+        info!("[subscribe-event] SubscribeRequest sent (min={min_s}s max={max_s}s)");
+
+        let (sub_id, neg_max) = match self.wait_txn_event(Instant::now() + self.g.timeout)? {
+            Some(ImEvent::SubscribeDone {
+                subscription_id,
+                max_interval_s,
+            }) => (subscription_id, max_interval_s),
+            Some(ev) => return Err(format!("subscribe-event failed: {ev:?}")),
+            None => return self.op_timeout(node_id, "subscribe-event"),
+        };
+        self.subs.push(SubStat {
+            id: sub_id,
+            node: node_id,
+            reports: 0,
+            lost: false,
+            events: true,
+        });
+        if json::enabled() {
+            let mut o = Obj::new("subscribe-event")
+                .num("node", node_id)
+                .num("endpoint", ep)
+                .num("cluster", cluster.0);
+            if let Some(ev) = event {
+                o = o.num("event", ev.0);
+            }
+            o.num("subscriptionId", sub_id)
+                .num("maxIntervalS", neg_max)
+                .emit();
+        }
+        info!(
+            "[subscribe-event] ESTABLISHED: subscription_id={sub_id} max_interval={neg_max}s{}",
+            if self.batch { "" } else { " (Ctrl-C to stop)" }
+        );
+        if self.batch {
+            return Ok(()); // 非ブロッキング: レポートは以後のポンプで表示される。
+        }
+
+        // 常駐モード: イベントレポートを受信し続ける(SubscriptionLost で非 0 終了)。
         loop {
             self.step_io()?;
             self.drain_events();
@@ -1934,6 +2059,145 @@ where
     if n == 0 && !json::enabled() {
         println!("{prefix}(no attribute reports)");
     }
+}
+
+/// priority コード(0/1/2)を人間可読名にする。
+fn priority_name(p: u8) -> &'static str {
+    match p {
+        0 => "DEBUG",
+        1 => "INFO",
+        2 => "CRITICAL",
+        _ => "?",
+    }
+}
+
+/// イベントパスを `cluster/event (0xNNNN/0xNN) ep=N` 形式で表示する(名前はテーブルから)。
+fn format_event_path(path: &EventPath) -> String {
+    let ep = path
+        .endpoint
+        .map(|e| e.0.to_string())
+        .unwrap_or_else(|| "*".into());
+    let def = path.cluster.and_then(clusters::by_id);
+    let cname = def.map(|d| d.name.to_string());
+    let ename = path
+        .event
+        .and_then(|ev| def.and_then(|d| d.event_by_id(ev)))
+        .map(|e| e.name.to_string());
+    let cid = match path.cluster {
+        Some(c) => format!("{:#06x}", c.0),
+        None => "*".into(),
+    };
+    let eid = match path.event {
+        Some(e) => format!("{:#04x}", e.0),
+        None => "*".into(),
+    };
+    match (cname, ename) {
+        (Some(c), Some(e)) => format!("ep{ep} {c}/{e} ({cid}/{eid})"),
+        (Some(c), None) => format!("ep{ep} {c}/{eid}"),
+        _ => format!("ep{ep} {cid}/{eid}"),
+    }
+}
+
+/// イベントレポート列を 1 行ずつ表示する(read-event / subscribe-event 共通、設計 §12)。
+///
+/// `--json` では 1 行 1 オブジェクト(`event` = `"event-report"`、購読なら `subscriptionId`)。
+fn print_event_reports<'r, I>(reports: I, prefix: &str, event: &str, sub_id: Option<u32>)
+where
+    I: Iterator<Item = MResult<EventReportRef<'r>>>,
+{
+    let mut n = 0;
+    for report in reports {
+        n += 1;
+        match &report {
+            Ok(EventReportRef::Data(d)) => {
+                logf!(
+                    Level::Debug,
+                    "im",
+                    "EventReport {} num={} priority={}",
+                    format_event_path(&d.path),
+                    d.number,
+                    priority_name(d.priority)
+                );
+            }
+            Ok(EventReportRef::Status(s)) => {
+                logf!(Level::Debug, "im", "EventReport status={:?}", s.status);
+            }
+            Err(_) => {}
+        }
+        if json::enabled() {
+            let mut o = Obj::new(event);
+            if let Some(id) = sub_id {
+                o = o.num("subscriptionId", id);
+            }
+            match report {
+                Ok(EventReportRef::Data(d)) => {
+                    let mut r = d.value();
+                    let value = json_next_value(&mut r).unwrap_or_else(|| "null".into());
+                    o = json_event_path(o, &d.path)
+                        .num("eventNumber", d.number)
+                        .num("priority", d.priority as u64)
+                        .str("priorityName", priority_name(d.priority));
+                    if let Some(ts) = d.system_timestamp_ms {
+                        o = o.num("systemTimestampMs", ts);
+                    }
+                    o.raw("value", &value).emit();
+                }
+                Ok(EventReportRef::Status(s)) => {
+                    o.str("status", &format!("{:?}", s.status))
+                        .num("statusCode", s.status.to_u8())
+                        .emit();
+                }
+                Err(e) => o.str("error", &format!("undecodable event: {e:?}")).emit(),
+            }
+            continue;
+        }
+        match report {
+            Ok(EventReportRef::Data(d)) => {
+                let path = format_event_path(&d.path);
+                let mut r = d.value();
+                let value = fmt_next_value(&mut r).unwrap_or_else(|| "<empty>".into());
+                let ts = d
+                    .system_timestamp_ms
+                    .map(|t| format!(" ts={t}ms"))
+                    .unwrap_or_default();
+                println!(
+                    "{prefix}{path} #{} [{}]{ts} = {value}",
+                    d.number,
+                    priority_name(d.priority)
+                );
+            }
+            Ok(EventReportRef::Status(s)) => {
+                println!("{prefix}event status {:?}", s.status);
+            }
+            Err(e) => println!("{prefix}<undecodable event: {e:?}>"),
+        }
+    }
+    if n == 0 && !json::enabled() {
+        println!("{prefix}(no event reports)");
+    }
+}
+
+/// イベントパスを JSON オブジェクトのフィールド群として追記する。
+fn json_event_path(mut o: Obj, path: &EventPath) -> Obj {
+    if let Some(ep) = path.endpoint {
+        o = o.num("endpoint", ep.0);
+    }
+    if let Some(c) = path.cluster {
+        o = o.num("cluster", c.0);
+        let def = clusters::by_id(c);
+        if let Some(def) = def {
+            o = o.str("clusterName", def.name);
+        }
+        if let Some(ev) = path.event {
+            o = o.num("event", ev.0);
+            if let Some(name) = def.and_then(|d| d.event_by_id(ev)).map(|e| e.name) {
+                o = o.str("eventName", name);
+            }
+        }
+    } else if let Some(ev) = path.event {
+        o = o.num("event", ev.0);
+    }
+    o
 }
 
 /// 属性パスを JSON オブジェクトのフィールド群として追記する。

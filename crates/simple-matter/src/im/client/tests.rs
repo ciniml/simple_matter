@@ -27,7 +27,10 @@ use crate::exchange::{
     SendTiming,
 };
 use crate::im::engine::InteractionModel;
-use crate::im::wire::{AttributeId, AttributePath, AttributeReportRef, CommandId, CommandPath};
+use crate::im::wire::{
+    AttributeId, AttributePath, AttributeReportRef, CommandId, CommandPath, EventId, EventPath,
+    EventReportRef,
+};
 use crate::tlv::{TlvTag, TlvWriter};
 use crate::transport::net::PeerAddr;
 use crate::transport::session::{SessionId, SessionInit, SessionManager, SessionMode};
@@ -896,6 +899,138 @@ fn subscribe_priming_and_device_report() {
 
     // ack 済みなので dirty は消えている(即座に次の due は無い)。
     assert!(dev_mgr.handler_mut().im.poll_subscriptions(NOW).is_none());
+}
+
+// ==========================================================================
+// (g') イベント購読: プライミング + デバイス発イベントレポート(設計 §12)
+// ==========================================================================
+
+#[test]
+fn subscribe_events_priming_and_device_report() {
+    let crypto = crypto();
+    let (mut dev_mgr, mut dev_sessions, mut dev_pool) = device();
+    let (mut cli_mgr, mut cli_sessions, mut cli_pool) = client();
+    let cli_s = establish_case_pair(&mut cli_sessions, &mut dev_sessions);
+
+    // デバイスに既存 StartUp イベントを 1 件積む(number 0)。
+    dev_mgr
+        .handler_mut()
+        .im
+        .post_event(
+            EndpointId(0),
+            ClusterId(0x0028),
+            EventId(0),
+            crate::im::events::PRIORITY_CRITICAL,
+            NOW,
+            |w, tag| {
+                w.start_struct(tag)?;
+                w.write_u32(&TlvTag::ContextSpecific(0), 0xABCD)?;
+                w.end_container()
+            },
+        )
+        .unwrap();
+
+    // イベントのみの購読(属性パス 0 本、StartUp イベントパス)。
+    let ex = cli_mgr.open_initiator(cli_s).unwrap();
+    let event_paths = [EventPath::concrete(
+        EndpointId(0),
+        ClusterId(0x0028),
+        EventId(0),
+    )];
+    let mut out = [0u8; 256];
+    let plen = cli_mgr
+        .handler_mut()
+        .im
+        .start_subscribe_events(ex, &[], &event_paths, None, 0, 60, &mut out, NOW)
+        .unwrap();
+    run(
+        &crypto,
+        &mut cli_mgr,
+        &mut cli_sessions,
+        &mut cli_pool,
+        &mut dev_mgr,
+        &mut dev_sessions,
+        &mut dev_pool,
+        1600,
+        ex,
+        ImOpCode::SubscribeRequest as u8,
+        &out[..plen],
+    );
+    let sub_id = match cli_mgr.handler_mut().im.take_event() {
+        Some(ImEvent::SubscribeDone {
+            subscription_id, ..
+        }) => subscription_id,
+        other => panic!("expected SubscribeDone, got {other:?}"),
+    };
+    assert_eq!(dev_mgr.handler().im.subscription_count(), 1);
+
+    // 新しいイベントを積む(number 1)。
+    dev_mgr
+        .handler_mut()
+        .im
+        .post_event(
+            EndpointId(0),
+            ClusterId(0x0028),
+            EventId(0),
+            crate::im::events::PRIORITY_CRITICAL,
+            NOW,
+            |w, tag| {
+                w.start_struct(tag)?;
+                w.write_u32(&TlvTag::ContextSpecific(0), 0x1234)?;
+                w.end_container()
+            },
+        )
+        .unwrap();
+
+    let (wire, wlen) = stage_device_report(
+        &crypto,
+        &mut dev_mgr,
+        &mut dev_sessions,
+        &mut dev_pool,
+        1600,
+        NOW,
+    )
+    .expect("new event makes the subscription due (min=0)");
+    pump(
+        &crypto,
+        &mut cli_mgr,
+        &mut cli_sessions,
+        &mut cli_pool,
+        &mut dev_mgr,
+        &mut dev_sessions,
+        &mut dev_pool,
+        1600,
+        wire,
+        wlen,
+        false,
+    );
+
+    assert_eq!(
+        cli_mgr.handler_mut().im.take_event(),
+        Some(ImEvent::SubscriptionReport {
+            subscription_id: sub_id
+        })
+    );
+    let im = &cli_mgr.handler().im;
+    // 属性レポートは無く、イベントレポート(新規 number 1)が載る。
+    assert_eq!(im.sub_reports().count(), 0, "no attribute reports");
+    let mut n = 0;
+    let mut last = (0u64, 0u64);
+    for r in im.sub_event_reports() {
+        if let EventReportRef::Data(d) = r.unwrap() {
+            let mut v = d.value();
+            let _struct = v.read_next().unwrap().unwrap();
+            let sw = v.read_next().unwrap().unwrap().value.as_unsigned().unwrap();
+            last = (d.number, sw);
+            n += 1;
+        }
+    }
+    assert_eq!(n, 1, "only the new event is delivered");
+    assert_eq!(
+        last,
+        (1, 0x1234),
+        "new event number 1, softwareVersion 0x1234"
+    );
 }
 
 // ==========================================================================

@@ -1046,9 +1046,9 @@ pub type DefaultStack<N, C> = MatterStack<N, C, 4, 4, 2, 2, 2, 3, 8>;
 
 ## 12. イベント(最小実装)
 
-Matter のイベント(Core Spec §8.4 / §10.6.9 EventDataIB)を最小構成で実装する。範囲は
-「デバイスがイベントをリングに積み、ReadRequest の EventPaths に対して EventReportIB を返す」まで。
-Subscribe のイベント配信は範囲外(下記)。
+Matter のイベント(Core Spec §8.4 / §10.6.9 EventDataIB)を最小構成で実装する。デバイスが
+イベントをリングに積み、ReadRequest / SubscribeRequest の EventPaths に対して EventReportIB を
+返す(Subscribe はプライミングで既存イベント、以降のレポートで新規イベントを配信、§12.6)。
 
 ### 12.1 イベントログ(リングバッファ)
 
@@ -1070,6 +1070,7 @@ priority(u8: DEBUG=0 / INFO=1 / CRITICAL=2)/ SystemTimestamp(起動起点の単�
 - **EventPathIB**(list): `Node`=0, `Endpoint`=1, `Cluster`=2, `Event`=3, `IsUrgent`=4。
 - **EventFilterIB**(struct): `Node`=0, `EventMin`=1。
 - **ReadRequest**: `EventRequests`=1(EventPathIB のリスト), `EventFilters`=2。
+- **SubscribeRequest**: `EventRequests`=4(EventPathIB のリスト), `EventFilters`=5。
 - **ReportData**: `EventReports`=2(AttributeReports=1 の後に書く)。
 
 StartUp イベント(BasicInformation 0x0028 / event 0x00 / CRITICAL)の Data は
@@ -1093,14 +1094,54 @@ cluster / event 省略)対応。`EventFilters` の `eventMin` があれば `even
   切らないイベントはドロップ(§5.4 の属性 chunking 機構はイベントに適用しない)。
 - **per-event ACL 近似**: イベント read の権限は属性 read と同等(View、`(endpoint, cluster)`)で近似
   する(仕様の per-event 権限は割り切り)。
-- **Subscribe のイベント配信は未対応**: 購読へのイベント通知(IsUrgent / 定期配信)は範囲外。
-  `EventLog` と Read 経路のみで、`poll_subscriptions` はイベントを見ない。将来課題(§12.5)。
 
-### 12.5 将来課題
+### 12.5 Subscribe のイベント配信
 
-Subscribe のイベント対応(購読パスの EventRequests、dirty 相当の「新規イベント」通知、IsUrgent に
-よる即時レポート)。属性の dirty 追跡(§6.2)と同様に、購読ごとに「最後に配信した event_number」を
-保持して差分配信する形が素直。永続 event_number(リブート跨ぎの単調性)も同時に検討する。
+`SubscribeRequest` の `EventRequests`(context 4)+ `EventFilters`(context 5)を受理し、購読に
+イベントを配信する。属性の dirty 追跡(§6.2)へ相乗りする形で実装した:
+
+- **Subscription の追加フィールド**: 属性パスと同じ上限 `PATHS` のイベントパス列 + リクエストの
+  `eventMin` + `event_floor`(配信済みイベント floor: この番号未満は配信済み)。
+- **プライミング**: `subscribe_open` は Read と同じ txn 機構(`emit_events`)を使うため、購読の
+  イベントパスをプライミング txn に載せ、既存イベントを相乗り配信する。プライミング完了時点の
+  `EventLog::next_number()` を購読の `event_floor` に記録する(以降これ未満は配信済み扱い)。
+- **新規イベントの配信**: `poll_subscriptions` の dirty 掃引に `sweep_events` を追加し、購読の
+  イベントパスに合致する未配信イベント(番号 >= `event_floor`)があれば `dirty` を立てる(min/max
+  interval 尊重は属性と共通機構)。`build_report`(および継続チャンクの `on_status`)は
+  `event_min = event_floor` を渡して**新規イベントのみ**を EventReportIB として同一 ReportData に
+  載せ、送出後に `event_floor` を `next_number()` へ前進させる。
+- **イベントのみの購読**: 属性パス 0 本でも動く(`emit_chunk` は即 Done、`emit_events` のみ出力)。
+- **controller 側**: `ImClient` は購読レポートの EventReports(context 2)を属性本文とは別バッファ
+  (`sub_event_result`)へ写し、`sub_event_reports()`(`EventReportRef` 列)で走査する。
+  `ImEvent::SubscriptionReport` は属性・イベント双方の到着を表す。
+
+実機 E2E(chip-tool v1.5.1)で確定した相互運用の要点(2026-07-08):
+
+- **プライミングレポートにも SubscriptionId 必須**: chip の `ReadClient::ProcessReportData` は
+  購読の ReportData に SubscriptionId(context 0)が無いと Invalid argument で切断する
+  (ReadClient.cpp の `CHIP_END_OF_TLV → INVALID_ARGUMENT` 分岐)。プライミング/継続チャンク
+  とも `Some(id)` で送る。
+- **空の AttributeReports / EventReports 配列を書かない**: 仕様上両フィールドは optional。
+  `ReportChunkBuilder` は両配列を最初の push で遅延オープンし、空なら省略する(chip は
+  「属性パスの無い購読に AttributeReportIBs がある」形を拒否。keep-alive の空レポートも
+  chip と同形になる)。
+- **配信済みレポート exchange の回収**(回帰修正): 単一チャンクの device 発レポートへの終端
+  StatusResponse は継続 slot を持たないため、`on_status` の no-slot 分岐で `CloseSilent` を
+  返して exchange を終端予約する(放置すると 1 レポートごとに initiator exchange がリークし、
+  EXCHANGES=4 が枯渇して以降の受信が全て silent drop になる。実機ソークで発見)。
+- **dead-subscriber liveness**(§6.3): 購読ごとに in-flight レポートの exchange
+  (`report_exchange`)を記録し、(1) in-flight 中は当該購読を due にしない(多重レポート禁止 +
+  逆引きの上書き防止)、(2) MRP 諦め(`PollAction::Failed`)で `on_report_exchange_failed` が
+  当該購読を破棄、(3) セッション消滅(send `NotFound`)でも破棄、(4) 一時エラー(tx 枯渇等)は
+  `on_report_send_failed` で in-flight 記録だけ解除して再試行。購読者プロセスが応答しないまま
+  死ぬと、MRP give-up(数十秒)までは SUBS / tx バッファを占有するため、その間の新規購読は
+  ResourceExhausted になり得る(自己回復する縮退動作。実測 ~30 秒)。
+
+### 12.6 将来課題
+
+`IsUrgent` による min interval 短絡(即時レポート)、per-event ACL、永続 event_number(リブート
+跨ぎの単調性)、`DataVersionFilter` 相当のイベント差分最適化(現状は属性 dirty と同様、交差購読へ
+新規イベントをまとめて配信)。
 
 ---
 

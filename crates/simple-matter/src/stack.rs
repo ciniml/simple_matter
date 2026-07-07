@@ -401,10 +401,17 @@ impl<
                     }
                     // ACK 構築に失敗した場合は次の poll 対象へ進む。
                 }
-                PollAction::Failed { freed_tx, .. } => {
+                PollAction::Failed {
+                    exchange, freed_tx, ..
+                } => {
                     self.tx_pool.release(freed_tx);
-                    // 会話は除去済み。購読レポートの失敗は次段の poll_subscriptions が検知しない
-                    // ため best-effort(乖離:exchange→subscription 逆引きは未実装)。
+                    // 会話は除去済み。device 発の購読レポートだった場合は購読を破棄する
+                    // (設計 §6.3 liveness。ack しないピアへ max interval ごとにレポートを
+                    // 送り続けて exchange/tx バッファを浪費しないため)。
+                    self.mgr
+                        .handler_mut()
+                        .im
+                        .on_report_exchange_failed(exchange);
                 }
                 PollAction::Idle { .. } => break,
             }
@@ -585,8 +592,21 @@ impl<
             },
         ) {
             Ok(s) => s,
-            Err(_) => {
+            Err(e) => {
                 let _ = self.mgr.close(ex);
+                // セッション消滅(LRU 退避等)でパケットを組めない購読は破棄する(設計 §6.3。
+                // 残すと毎 poll due になり続け、他の購読のレポートも詰まる)。NoSpace
+                // (一時的な tx バッファ枯渇)は次の poll で再試行するため残す。
+                if matches!(e, crate::error::Error::NotFound) {
+                    self.mgr.handler_mut().im.on_report_failed(due.subscription);
+                } else {
+                    // 一時的エラー(tx バッファ枯渇等): in-flight 記録を解除して
+                    // 次の poll で再レポートさせる(設計 §6.3)。
+                    self.mgr
+                        .handler_mut()
+                        .im
+                        .on_report_send_failed(due.subscription);
+                }
                 return None;
             }
         };

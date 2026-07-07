@@ -5,7 +5,7 @@
 //! テーブルは便利層であり、未収載クラスタも将来の `any` サブコマンド(C2)で
 //! ID 直指定できる(機能の欠落にしない)。
 
-use simple_matter::dm::meta::{AttributeId, ClusterId, CommandId};
+use simple_matter::dm::meta::{AttributeId, ClusterId, CommandId, EventId};
 
 pub mod access_control;
 pub mod administrator_commissioning;
@@ -93,6 +93,13 @@ pub struct CmdDef {
     pub fields: &'static [FieldDef],
 }
 
+/// イベントの名前テーブルエントリ(設計 §12)。
+pub struct EventDef {
+    pub id: EventId,
+    /// kebab-case のイベント名。
+    pub name: &'static str,
+}
+
 /// 1 クラスタ分の名前テーブル。
 pub struct ClusterDef {
     pub id: ClusterId,
@@ -100,6 +107,7 @@ pub struct ClusterDef {
     pub name: &'static str,
     pub attrs: &'static [AttrDef],
     pub cmds: &'static [CmdDef],
+    pub events: &'static [EventDef],
 }
 
 impl ClusterDef {
@@ -116,6 +124,16 @@ impl ClusterDef {
     /// コマンドを名前で引く。
     pub fn cmd_by_name(&self, name: &str) -> Option<&'static CmdDef> {
         self.cmds.iter().find(|c| c.name == name)
+    }
+
+    /// イベントを名前で引く。
+    pub fn event_by_name(&self, name: &str) -> Option<&'static EventDef> {
+        self.events.iter().find(|e| e.name == name)
+    }
+
+    /// イベントを ID で引く(結果表示の名前引き)。
+    pub fn event_by_id(&self, id: EventId) -> Option<&'static EventDef> {
+        self.events.iter().find(|e| e.id == id)
     }
 }
 
@@ -165,6 +183,7 @@ macro_rules! cluster_def {
         pub $def:ident = cluster($cid:expr, $cname:literal) {
             attrs { $( $aid:expr => $aname:literal : $akind:ident $($aflag:ident)? ; )* }
             cmds { $( $mid:expr => $mname:literal { $( $ftag:expr => $fname:literal : $fkind:ident $($fflag:ident)? ; )* } )* }
+            $( events { $( $eid:expr => $ename:literal ; )* } )?
         }
     ) => {
         pub static $def: crate::clusters::ClusterDef = crate::clusters::ClusterDef {
@@ -191,6 +210,12 @@ macro_rules! cluster_def {
                         },)*
                     ],
                 },)*
+            ],
+            events: &[
+                $($(crate::clusters::EventDef {
+                    id: simple_matter::dm::meta::EventId($eid),
+                    name: $ename,
+                },)*)?
             ],
         };
     };

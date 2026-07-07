@@ -12,5 +12,9 @@ cluster_def! {
             0x01 => "on" {}
             0x02 => "toggle" {}
         }
+        events {
+            // simple_matter の onoff-light 例が状態変化で post する { 0: newState(bool) }。
+            0x00 => "state-changed";
+        }
     }
 }

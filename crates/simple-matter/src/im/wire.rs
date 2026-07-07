@@ -706,31 +706,40 @@ impl<'a> ReadRequestRef<'a> {
     /// 最小実装は単一フィルタの eventMin のみ解釈する(複数フィルタ・Node フィールドは
     /// 無視、`docs/design/interaction-model.md` §12)。
     pub fn event_min(&self) -> Result<Option<u64>> {
-        let Some(mut r) = field_reader(self.msg, 2)? else {
-            return Ok(None);
-        };
-        if r.enter_container()? != ContainerType::Array {
-            return Err(Error::Decode);
-        }
-        // 先頭 EventFilterIB(struct)のみ見る。
-        match r.read_next()? {
-            Some(e) if matches!(e.value, TlvValue::ContainerStart(ContainerType::Structure)) => {
-                let mut min = None;
-                while let Some(tag) = next_ctx(&mut r)? {
-                    match tag {
-                        1 => min = Some(r.read_next()?.ok_or(Error::Decode)?.value.as_unsigned()?),
-                        _ => skip_field(&mut r)?,
-                    }
-                }
-                Ok(min)
-            }
-            _ => Ok(None),
-        }
+        first_event_filter_min(self.msg, 2)
     }
 
     /// fabric-filtered フラグ(既定 `false`)。
     pub fn fabric_filtered(&self) -> Result<bool> {
         Ok(field_bool(self.msg, 3)?.unwrap_or(false))
+    }
+}
+
+/// EventFilters(context `tag` の配列)の先頭 EventFilterIB の `eventMin`(context 1)を返す。
+///
+/// ReadRequest(tag=2)と SubscribeRequest(tag=5)で共用する。最小実装は単一フィルタの
+/// eventMin のみ解釈する(複数フィルタ・Node フィールドは無視、
+/// `docs/design/interaction-model.md` §12)。
+fn first_event_filter_min(msg: &[u8], tag: u8) -> Result<Option<u64>> {
+    let Some(mut r) = field_reader(msg, tag)? else {
+        return Ok(None);
+    };
+    if r.enter_container()? != ContainerType::Array {
+        return Err(Error::Decode);
+    }
+    // 先頭 EventFilterIB(struct)のみ見る。
+    match r.read_next()? {
+        Some(e) if matches!(e.value, TlvValue::ContainerStart(ContainerType::Structure)) => {
+            let mut min = None;
+            while let Some(t) = next_ctx(&mut r)? {
+                match t {
+                    1 => min = Some(r.read_next()?.ok_or(Error::Decode)?.value.as_unsigned()?),
+                    _ => skip_field(&mut r)?,
+                }
+            }
+            Ok(min)
+        }
+        _ => Ok(None),
     }
 }
 
@@ -822,6 +831,16 @@ impl<'a> SubscribeRequestRef<'a> {
         array_iter(self.msg, 3)
     }
 
+    /// イベントパス列(`EventPathIBs`、context 4)のイテレータを返す(設計 §12)。
+    pub fn event_paths(&self) -> Result<EventPathIter<'a>> {
+        event_path_array_iter(self.msg, 4)
+    }
+
+    /// EventFilters(context 5)の先頭 EventFilterIB の `eventMin`(context 1)を返す(設計 §12)。
+    pub fn event_min(&self) -> Result<Option<u64>> {
+        first_event_filter_min(self.msg, 5)
+    }
+
     /// fabric-filtered フラグ(既定 `false`)。
     pub fn fabric_filtered(&self) -> Result<bool> {
         Ok(field_bool(self.msg, 7)?.unwrap_or(false))
@@ -845,6 +864,44 @@ pub fn encode_subscribe_request(
     w.start_array(&TlvTag::ContextSpecific(3))?;
     paths(&mut AttrPathListWriter { w: &mut w })?;
     w.end_container()?;
+    w.write_bool(&TlvTag::ContextSpecific(7), fabric_filtered)?;
+    end_msg(&mut w)
+}
+
+/// SubscribeRequest を **イベントパス付き**でエンコードする(chip-tool の subscribe-event 相当)。
+///
+/// `attr_paths` は AttributeRequests(context 3)、`event_paths` は EventRequests(context 4)、
+/// `event_min` を `Some` にすると EventFilters(context 5)に単一 EventFilterIB
+/// (`{ eventMin(1) }`)を書く。タグ順(0→1→2→3→4→5→7)を保つ(設計 §12)。
+#[allow(clippy::too_many_arguments)]
+pub fn encode_subscribe_request_events(
+    tx: &mut [u8],
+    keep_existing: bool,
+    min_interval_floor_s: u16,
+    max_interval_ceiling_s: u16,
+    fabric_filtered: bool,
+    attr_paths: impl FnOnce(&mut AttrPathListWriter<'_, '_>) -> Result<()>,
+    event_paths: impl FnOnce(&mut EventPathListWriter<'_, '_>) -> Result<()>,
+    event_min: Option<u64>,
+) -> Result<usize> {
+    let mut w = TlvWriter::new(tx);
+    w.start_struct(&TlvTag::Anonymous)?;
+    w.write_bool(&TlvTag::ContextSpecific(0), keep_existing)?;
+    w.write_u16(&TlvTag::ContextSpecific(1), min_interval_floor_s)?;
+    w.write_u16(&TlvTag::ContextSpecific(2), max_interval_ceiling_s)?;
+    w.start_array(&TlvTag::ContextSpecific(3))?;
+    attr_paths(&mut AttrPathListWriter { w: &mut w })?;
+    w.end_container()?;
+    w.start_array(&TlvTag::ContextSpecific(4))?;
+    event_paths(&mut EventPathListWriter { w: &mut w })?;
+    w.end_container()?;
+    if let Some(min) = event_min {
+        w.start_array(&TlvTag::ContextSpecific(5))?;
+        w.start_struct(&TlvTag::Anonymous)?; // EventFilterIB
+        w.write_u64(&TlvTag::ContextSpecific(1), min)?;
+        w.end_container()?;
+        w.end_container()?;
+    }
     w.write_bool(&TlvTag::ContextSpecific(7), fabric_filtered)?;
     end_msg(&mut w)
 }
@@ -974,13 +1031,20 @@ pub struct ReportChunkBuilder<'b> {
     limit: usize,
     /// これまでに確定した AttributeReportIB 数。
     count: usize,
-    /// EventReports 配列(context 2)を開いたか([`ReportChunkBuilder::begin_events`] 済み)。
+    /// AttributeReports 配列(context 1)を開いたか(最初の属性 push で遅延オープン)。
+    attrs_open: bool,
+    /// EventReports 配列(context 2)を開いたか(最初のイベント push で遅延オープン)。
     /// `true` の間、`finish` は AttributeReports ではなく EventReports 配列を閉じる。
     events_open: bool,
 }
 
 impl<'b> ReportChunkBuilder<'b> {
-    /// ReportData の外枠(構造体 + 任意の SubscriptionId + AttributeReports 配列)を開く。
+    /// ReportData の外枠(構造体 + 任意の SubscriptionId)を開く。
+    ///
+    /// AttributeReports / EventReports 配列は**最初の push で遅延オープン**する。仕様上
+    /// 両フィールドは optional で、chip の ReadClient は「リクエストに属性パスが無いのに
+    /// AttributeReportIBs がある」空配列を Invalid argument で拒否する(イベントのみ購読の
+    /// プライミングで実測)。空配列は書かない。
     ///
     /// `subscription_id` は購読レポートでのみ `Some`(プライミング/通常 Read は `None`)。
     pub fn new(tx: &'b mut [u8], subscription_id: Option<u32>) -> Result<Self> {
@@ -990,13 +1054,23 @@ impl<'b> ReportChunkBuilder<'b> {
         if let Some(id) = subscription_id {
             w.write_u32(&TlvTag::ContextSpecific(0), id)?;
         }
-        w.start_array(&TlvTag::ContextSpecific(1))?;
         Ok(Self {
             w,
             limit: cap.saturating_sub(REPORT_TAIL_MARGIN),
             count: 0,
+            attrs_open: false,
             events_open: false,
         })
+    }
+
+    /// AttributeReports 配列(context 1)を必要なら開く(イベント配列オープン前のみ)。
+    fn ensure_attrs_open(&mut self) -> Result<()> {
+        debug_assert!(!self.events_open, "attribute push after begin_events");
+        if !self.attrs_open {
+            self.w.start_array(&TlvTag::ContextSpecific(1))?;
+            self.attrs_open = true;
+        }
+        Ok(())
     }
 
     /// これまでに確定したレポート数。
@@ -1020,21 +1094,28 @@ impl<'b> ReportChunkBuilder<'b> {
         value: impl FnOnce(&mut TlvWriter<'_>, &TlvTag) -> Result<()>,
     ) -> Result<bool> {
         let cp = self.w.checkpoint();
-        match write_attr_data_ib(&mut self.w, data_version, path, value) {
+        let was_open = self.attrs_open;
+        let r = self
+            .ensure_attrs_open()
+            .and_then(|()| write_attr_data_ib(&mut self.w, data_version, path, value));
+        match r {
             Ok(()) if self.w.len() <= self.limit => {
                 self.count += 1;
                 Ok(true)
             }
             Ok(()) => {
                 self.w.rewind(cp);
+                self.attrs_open = was_open;
                 Ok(false)
             }
             Err(Error::NoSpace) => {
                 self.w.rewind(cp);
+                self.attrs_open = was_open;
                 Ok(false)
             }
             Err(e) => {
                 self.w.rewind(cp);
+                self.attrs_open = was_open;
                 Err(e)
             }
         }
@@ -1043,21 +1124,28 @@ impl<'b> ReportChunkBuilder<'b> {
     /// AttributeStatusIB を試し書きする。収まれば `Ok(true)`、収まらなければ巻き戻して `Ok(false)`。
     pub fn try_push_status(&mut self, path: &AttributePath, status: &StatusIB) -> Result<bool> {
         let cp = self.w.checkpoint();
-        match write_attr_status_ib(&mut self.w, path, status) {
+        let was_open = self.attrs_open;
+        let r = self
+            .ensure_attrs_open()
+            .and_then(|()| write_attr_status_ib(&mut self.w, path, status));
+        match r {
             Ok(()) if self.w.len() <= self.limit => {
                 self.count += 1;
                 Ok(true)
             }
             Ok(()) => {
                 self.w.rewind(cp);
+                self.attrs_open = was_open;
                 Ok(false)
             }
             Err(Error::NoSpace) => {
                 self.w.rewind(cp);
+                self.attrs_open = was_open;
                 Ok(false)
             }
             Err(e) => {
                 self.w.rewind(cp);
+                self.attrs_open = was_open;
                 Err(e)
             }
         }
@@ -1072,9 +1160,11 @@ impl<'b> ReportChunkBuilder<'b> {
         if self.events_open {
             return Ok(());
         }
-        self.w.end_container()?; // AttributeReports 配列を閉じる
-        self.w.start_array(&TlvTag::ContextSpecific(2))?; // EventReports 配列
-        self.events_open = true;
+        if self.attrs_open {
+            self.w.end_container()?; // AttributeReports 配列を閉じる
+            self.attrs_open = false;
+        }
+        // EventReports 配列自体は最初の try_push_event で遅延オープンする(空配列を書かない)。
         Ok(())
     }
 
@@ -1092,38 +1182,53 @@ impl<'b> ReportChunkBuilder<'b> {
         data: &[u8],
     ) -> Result<bool> {
         let cp = self.w.checkpoint();
-        match write_event_data_ib(
-            &mut self.w,
-            path,
-            number,
-            priority,
-            system_timestamp_ms,
-            data,
-        ) {
+        let was_open = self.events_open;
+        let r = (|| {
+            if !self.events_open {
+                self.w.start_array(&TlvTag::ContextSpecific(2))?; // EventReports 配列
+                self.events_open = true;
+            }
+            write_event_data_ib(
+                &mut self.w,
+                path,
+                number,
+                priority,
+                system_timestamp_ms,
+                data,
+            )
+        })();
+        match r {
             Ok(()) if self.w.len() <= self.limit => {
                 self.count += 1;
                 Ok(true)
             }
             Ok(()) => {
                 self.w.rewind(cp);
+                self.events_open = was_open;
                 Ok(false)
             }
             Err(Error::NoSpace) => {
                 self.w.rewind(cp);
+                self.events_open = was_open;
                 Ok(false)
             }
             Err(e) => {
                 self.w.rewind(cp);
+                self.events_open = was_open;
                 Err(e)
             }
         }
     }
 
-    /// 配列と構造体を閉じ、`MoreChunkedMessages`/`SuppressResponse`/InteractionModelRevision を
-    /// 書いて確定バイト長を返す。
+    /// 開いている配列と構造体を閉じ、`MoreChunkedMessages`/`SuppressResponse`/
+    /// InteractionModelRevision を書いて確定バイト長を返す。
+    ///
+    /// 何も push されていなければ AttributeReports / EventReports とも**書かれない**
+    /// (空レポート。chip の keep-alive と同形)。
     pub fn finish(mut self, more_chunks: bool, suppress_response: bool) -> Result<usize> {
-        // 開いている配列(EventReports を開いていればそれ、無ければ AttributeReports)を閉じる。
-        self.w.end_container()?;
+        if self.attrs_open || self.events_open {
+            self.w.end_container()?;
+        }
         if more_chunks {
             self.w.write_bool(&TlvTag::ContextSpecific(3), true)?;
         }
@@ -1595,6 +1700,14 @@ pub enum EventReportRef<'a> {
 }
 
 impl<'a> EventReportRef<'a> {
+    /// 連結された EventReportIB(struct)の 1 要素を読む(struct 開始はまだ消費していない状態から)。
+    ///
+    /// コントローラ側で `sub_result`/`result` に写した EventReports 配列要素を走査するのに使う。
+    pub fn decode(r: &mut TlvReader<'a>) -> Result<Self> {
+        expect_container(r, ContainerType::Structure)?;
+        Self::decode_body(r)
+    }
+
     fn decode_body(r: &mut TlvReader<'a>) -> Result<Self> {
         let mut out = None;
         while let Some(tag) = next_ctx(r)? {

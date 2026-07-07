@@ -37,14 +37,16 @@ use simple_matter::dm::clusters::{
     CommissioningWindow, DescriptorCluster, GeneralCommissioning, NetworkCommissioning,
     OnOffCluster, OpCredsCluster, TestDacProvider, WindowEvent,
 };
-use simple_matter::dm::meta::{ClusterId, DeviceType, EndpointId, EndpointMeta};
+use simple_matter::dm::meta::{ClusterId, DeviceType, EndpointId, EndpointMeta, EventId};
 use simple_matter::dm::{DataModel, ServerCluster};
 use simple_matter::error::{Error, Result as SmResult};
 use simple_matter::fabric::FabricTable;
 use simple_matter::im::engine::InteractionModel;
+use simple_matter::im::events::PRIORITY_INFO;
 use simple_matter::kvs::Kvs;
 use simple_matter::sc::{PaseConfig, SecureChannel};
 use simple_matter::stack::{DefaultStack, MatterStack, SharedFabricCreds};
+use simple_matter::tlv::TlvTag;
 use simple_matter::transport::net::{PeerAddr, MAX_RX_PACKET_SIZE};
 
 const PASSCODE: u32 = 20202021;
@@ -431,6 +433,8 @@ fn main() -> std::io::Result<()> {
     // CASE resumption ストアの世代(変化検知で KVS 保存)。復元後の値を基準に取ることで
     // 復元直後の不要な再保存を避ける(secure-channel.md §7.4)。
     let mut last_resumption_gen = stack.resumption_generation();
+    // OnOff 状態の直近値(変化を検知して OnOff イベントを post するため)。
+    let mut last_on = stack.device().onoff.is_on();
     // 起動時コミッショニング窓(未コミッショニング時の announcement 窓)が開いているか。
     // 復元で fabric>0 のときは閉じた状態で起動する。
     let mut boot_window_open = restored_fabric_count == 0;
@@ -474,6 +478,26 @@ fn main() -> std::io::Result<()> {
             if let Some(addr) = dir.addr.socket_addr() {
                 let _ = socket.send_to(&tx[..dir.len], addr);
             }
+        }
+
+        // 2b) OnOff 状態変化を OnOff クラスタ(0x0006)のイベント(id 0x00、INFO、
+        //     { 0: newState(bool) })として post する。StartUp 同様 EventLog に積まれ、
+        //     購読者へ配信される(docs/design/interaction-model.md §12)。
+        let on_now = stack.device().onoff.is_on();
+        if on_now != last_on {
+            last_on = on_now;
+            let _ = stack.post_event(
+                EndpointId(1),
+                ClusterId(0x0006),
+                EventId(0),
+                PRIORITY_INFO,
+                now,
+                |w, tag| {
+                    w.start_struct(tag)?;
+                    w.write_bool(&TlvTag::ContextSpecific(0), on_now)?;
+                    w.end_container()
+                },
+            );
         }
 
         // 3) fabric が増減したら operational 広告に反映して再 announce。

@@ -36,8 +36,10 @@ use crate::exchange::{
     ExchangeId, ExchangeManager, HandlerAction, Outgoing, PollAction, ProtocolMux, SendTiming,
 };
 use crate::fabric::FabricEntry;
-use crate::im::client::{AttrReports, ImClient, ImEvent};
-use crate::im::wire::{AttributePath, CommandPath, ImOpCode, PROTO_ID_INTERACTION_MODEL};
+use crate::im::client::{AttrReports, EventReports, ImClient, ImEvent};
+use crate::im::wire::{
+    AttributePath, CommandPath, EventPath, ImOpCode, PROTO_ID_INTERACTION_MODEL,
+};
 use crate::sc::case::creds::{FabricStore, NocResolver, PeerIdentity};
 use crate::sc::initiator::{ScEvent, ScInitiator};
 use crate::sc::{OpCode, PROTO_ID_SECURE_CHANNEL};
@@ -251,6 +253,17 @@ impl<
     /// 走査する(§4.5.4)。
     pub fn sub_reports(&self) -> AttrReports<'_> {
         self.mgr.handler().im.sub_reports()
+    }
+
+    /// 直近の購読レポートのイベント本文(EventReportIB 連結の生 TLV、設計 §12)。
+    pub fn im_sub_event_report(&self) -> &[u8] {
+        self.mgr.handler().im.sub_event_report()
+    }
+
+    /// 直近の購読レポートを [`EventReportRef`](crate::im::wire::EventReportRef) 列で走査する
+    /// (設計 §12)。
+    pub fn sub_event_reports(&self) -> EventReports<'_> {
+        self.mgr.handler().im.sub_event_reports()
     }
 
     /// 確立済み購読数(client 側テーブル)。
@@ -695,6 +708,49 @@ impl<
         let len = match self.mgr.handler_mut().im.start_subscribe(
             ex,
             paths,
+            min_interval_floor_s,
+            max_interval_ceiling_s,
+            &mut self.resp,
+            now_ms,
+        ) {
+            Ok(l) => l,
+            Err(e) => {
+                let _ = self.mgr.close(ex);
+                return Err(e);
+            }
+        };
+        self.send_started(
+            ex,
+            PROTO_ID_INTERACTION_MODEL,
+            ImOpCode::SubscribeRequest.to_u8(),
+            len,
+            now_ms,
+            tx_out,
+        )
+    }
+
+    /// 確立済み `session` 上でイベント Subscribe を開始する(EventRequests + EventFilters、設計 §12)。
+    ///
+    /// `attr_paths` を空にすればイベントのみの購読。受信イベントは
+    /// [`sub_event_reports`](Self::sub_event_reports) で走査する。
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_subscribe_events(
+        &mut self,
+        session: SessionId,
+        attr_paths: &[AttributePath],
+        event_paths: &[EventPath],
+        event_min: Option<u64>,
+        min_interval_floor_s: u16,
+        max_interval_ceiling_s: u16,
+        now_ms: u64,
+        tx_out: &mut [u8],
+    ) -> Result<SendDirective> {
+        let ex = self.mgr.open_initiator(session)?;
+        let len = match self.mgr.handler_mut().im.start_subscribe_events(
+            ex,
+            attr_paths,
+            event_paths,
+            event_min,
             min_interval_floor_s,
             max_interval_ceiling_s,
             &mut self.resp,

@@ -17,10 +17,11 @@ use crate::im::engine::{InteractionModel, SubDue};
 use crate::im::events::PRIORITY_CRITICAL;
 use crate::im::wire::{
     encode_invoke_request, encode_read_request, encode_read_request_events,
-    encode_subscribe_request, encode_write_request, AttributeId, AttributePath, AttributeReportRef,
-    ClusterId, CommandId, CommandPath, EventId, EventPath, EventReportRef, ImOpCode, ImStatus,
-    InvokeRequestHeader, InvokeResponseRef, InvokeResponseRefItem, ReportDataRef, StatusResponse,
-    SubscribeResponse, WriteRequestHeader, WriteResponseRef,
+    encode_subscribe_request, encode_subscribe_request_events, encode_write_request, AttributeId,
+    AttributePath, AttributeReportRef, ClusterId, CommandId, CommandPath, EventId, EventPath,
+    EventReportRef, ImOpCode, ImStatus, InvokeRequestHeader, InvokeResponseRef,
+    InvokeResponseRefItem, ReportDataRef, StatusResponse, SubscribeResponse, WriteRequestHeader,
+    WriteResponseRef,
 };
 use crate::tlv::{TlvTag, TlvValue, TlvWriter};
 use crate::transport::header::{ExchFlags, PayloadHeader};
@@ -437,10 +438,12 @@ fn subscribe_prime_then_report_on_dirty() {
     assert!(!is_close);
     let rd = ReportDataRef::new(&tx[..len]).unwrap();
     assert!(!rd.more_chunks().unwrap());
+    // プライミングレポートにも SubscriptionId を含める(chip の ReadClient は欠如を
+    // Invalid argument で拒否する。実測、2026-07-08)。
     assert_eq!(
         rd.subscription_id().unwrap(),
-        None,
-        "priming report has no sub id"
+        Some(1),
+        "priming report carries the subscription id (chip 互換)"
     );
     // OnOff(false) が含まれる。
     assert!(rd
@@ -1996,5 +1999,179 @@ mod events {
         let n = collect_events(&tx[..len], &mut buf);
         assert_eq!(n, 1);
         assert_eq!(buf[0], (0, PRIORITY_CRITICAL, 42));
+    }
+
+    /// StartUp イベントパス(BasicInformation 0x0028 / event 0)。
+    fn startup_event_path() -> EventPath {
+        EventPath::concrete(EndpointId(0), ClusterId(0x0028), EventId(0))
+    }
+
+    /// イベント購読のプライミングを完了させ、購読 ID を返す(属性パスとイベントパスを渡す)。
+    fn prime_event_sub(
+        im: &mut Im,
+        mgr: &mut SessionManager<2>,
+        ex: ExchangeId,
+        attr: &[AttributePath],
+        events: &[EventPath],
+        now_ms: u64,
+    ) -> (u32, usize) {
+        let mut req = [0u8; 192];
+        let slen = encode_subscribe_request_events(
+            &mut req,
+            false,
+            1,
+            10,
+            false,
+            |w| {
+                for p in attr {
+                    w.push(p)?;
+                }
+                Ok(())
+            },
+            |w| {
+                for p in events {
+                    w.push(p)?;
+                }
+                Ok(())
+            },
+            None,
+        )
+        .unwrap();
+        let sh = phdr(ImOpCode::SubscribeRequest.to_u8());
+        let mut tx = [0u8; 2048];
+        let a = im
+            .handle(&rxm(&sh, &req[..slen], ex), &mut tx, mgr, now_ms)
+            .unwrap();
+        let (op, len, _close) = parts(a);
+        assert_eq!(op, ImOpCode::ReportData.to_u8(), "priming report first");
+        // プライミングレポートに載った既存イベント数。
+        let mut buf = [(0u64, 0u8, 0u32); 8];
+        let primed = collect_events(&tx[..len], &mut buf);
+
+        // StatusResponse(SUCCESS) → SubscribeResponse。
+        let stath = phdr(ImOpCode::StatusResponse.to_u8());
+        let mut stat = [0u8; 16];
+        let stlen = StatusResponse::new(ImStatus::Success)
+            .encode(&mut stat)
+            .unwrap();
+        let mut tx2 = [0u8; 64];
+        let a = im
+            .handle(&rxm(&stath, &stat[..stlen], ex), &mut tx2, mgr, now_ms)
+            .unwrap();
+        let (op, len, _close) = parts(a);
+        assert_eq!(op, ImOpCode::SubscribeResponse.to_u8());
+        let sub_id = SubscribeResponse::decode(&tx2[..len])
+            .unwrap()
+            .subscription_id;
+        (sub_id, primed)
+    }
+
+    // (a) EventRequests 付き subscribe → プライミングで既存イベント配信 + floor 記録。
+    #[test]
+    fn subscribe_event_priming_delivers_existing() {
+        let (mut im, mut mgr, ex) = setup();
+        post_startup(&mut im, 0xABCD, 5); // number 0
+
+        let (sub_id, primed) =
+            prime_event_sub(&mut im, &mut mgr, ex, &[], &[startup_event_path()], 0);
+        assert_eq!(primed, 1, "既存 StartUp がプライミングで配信される");
+        assert_eq!(im.subscription_count(), 1);
+
+        // floor が記録され、新規イベントが無いので due にならない(max interval まで)。
+        assert!(im.poll_subscriptions(2_000).is_none());
+        let _ = sub_id;
+    }
+
+    // (b) post_event 後の poll_subscriptions で新イベントのみ配信、floor 前進。
+    #[test]
+    fn subscribe_event_new_event_reported_once() {
+        let (mut im, mut mgr, ex) = setup();
+        post_startup(&mut im, 1, 5); // number 0(プライミングで配信済み)
+
+        let ex_sub = ExchangeId::from_parts(ex.session(), 0x55);
+        let (sub_id, primed) =
+            prime_event_sub(&mut im, &mut mgr, ex_sub, &[], &[startup_event_path()], 0);
+        assert_eq!(primed, 1);
+
+        // プライミング直後は新規イベント無し → due にならない。
+        assert!(im.poll_subscriptions(2_000).is_none());
+
+        // 新しいイベントを積む(number 1)。
+        post_startup(&mut im, 2, 100);
+
+        // min interval(1s)経過後、dirty → due。
+        let due = im.poll_subscriptions(2_000);
+        assert_eq!(
+            due,
+            Some(SubDue {
+                subscription: sub_id,
+                session: ex.session()
+            })
+        );
+
+        // レポート生成: 新規イベント(number 1)のみが載る。
+        let ex_rep = ExchangeId::from_parts(ex.session(), 0x66);
+        let mut rtx = [0u8; 512];
+        let rlen = im.build_report(sub_id, ex_rep, &mut rtx, 2_000).unwrap();
+        let mut buf = [(0u64, 0u8, 0u32); 8];
+        let n = collect_events(&rtx[..rlen], &mut buf);
+        assert_eq!(n, 1, "新規イベントのみ(プライミング済みは再送しない)");
+        assert_eq!(buf[0].0, 1, "number 1");
+        assert_eq!(buf[0].2, 2, "softwareVersion=2");
+
+        // 配信済み floor 前進 → 再 poll では due にならない。
+        assert!(im.poll_subscriptions(2_000).is_none());
+    }
+
+    // (c) イベントのみ購読(属性パス 0 本)。
+    #[test]
+    fn subscribe_event_only_no_attributes() {
+        let (mut im, mut mgr, ex) = setup();
+        let (sub_id, primed) =
+            prime_event_sub(&mut im, &mut mgr, ex, &[], &[startup_event_path()], 0);
+        assert_eq!(primed, 0, "イベント未 post なのでプライミングは空");
+
+        post_startup(&mut im, 9, 50); // number 0
+        let due = im.poll_subscriptions(2_000);
+        assert_eq!(due.map(|d| d.subscription), Some(sub_id));
+
+        let ex_rep = ExchangeId::from_parts(ex.session(), 0x77);
+        let mut rtx = [0u8; 512];
+        let rlen = im.build_report(sub_id, ex_rep, &mut rtx, 2_000).unwrap();
+        // 属性レポート 0 件、イベント 1 件。
+        assert_eq!(count_reports(&rtx[..rlen]), 0);
+        let mut buf = [(0u64, 0u8, 0u32); 8];
+        assert_eq!(collect_events(&rtx[..rlen], &mut buf), 1);
+        assert_eq!(buf[0].2, 9);
+    }
+
+    // (d) 属性 + イベント混在購読で両方届く。
+    #[test]
+    fn subscribe_event_and_attribute_both_reported() {
+        let (mut im, mut mgr, ex) = setup();
+        let (sub_id, _primed) = prime_event_sub(
+            &mut im,
+            &mut mgr,
+            ex,
+            &[onoff_cluster_path()],
+            &[startup_event_path()],
+            0,
+        );
+
+        // 属性変化 + 新イベントの両方を起こす。
+        im.data_model_mut().on_off.set(true);
+        post_startup(&mut im, 3, 100); // number 0
+
+        let due = im.poll_subscriptions(2_000);
+        assert_eq!(due.map(|d| d.subscription), Some(sub_id));
+
+        let ex_rep = ExchangeId::from_parts(ex.session(), 0x88);
+        let mut rtx = [0u8; 1024];
+        let rlen = im.build_report(sub_id, ex_rep, &mut rtx, 2_000).unwrap();
+        // 属性(On/Off 固有 + global)とイベント 1 件が同一 ReportData に載る。
+        assert!(count_reports(&rtx[..rlen]) > 0, "属性レポートあり");
+        let mut buf = [(0u64, 0u8, 0u32); 8];
+        assert_eq!(collect_events(&rtx[..rlen], &mut buf), 1, "イベントも載る");
+        assert_eq!(buf[0].2, 3);
     }
 }

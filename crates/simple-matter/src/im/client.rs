@@ -46,8 +46,9 @@
 use crate::error::{Error, Result};
 use crate::exchange::{ExchangeId, HandlerAction, ProtocolHandler, Role, RxMessage};
 use crate::im::wire::{
-    encode_invoke_request, encode_read_request, encode_subscribe_request, encode_write_request,
-    AttributeDataRef, AttributePath, AttributeReportRef, AttributeStatusRef, CommandPath, ImOpCode,
+    encode_invoke_request, encode_read_request, encode_subscribe_request,
+    encode_subscribe_request_events, encode_write_request, AttributeDataRef, AttributePath,
+    AttributeReportRef, AttributeStatusRef, CommandPath, EventPath, EventReportRef, ImOpCode,
     ImStatus, InvokeRequestHeader, InvokeResponseRef, InvokeResponseRefItem, ReportDataRef,
     StatusIB, StatusResponse, SubscribeResponse, TimedRequest, WriteRequestHeader,
     WriteResponseRef, PROTO_ID_INTERACTION_MODEL,
@@ -203,6 +204,10 @@ pub struct ImClient<const RESULT: usize = DEFAULT_RESULT_LEN> {
     sub_result: [u8; RESULT],
     /// `sub_result` の有効長。
     sub_result_len: usize,
+    /// 直近の購読レポートのイベント本文(EventReportIB 連結、設計 §12)。属性本文と分離。
+    sub_event_result: [u8; RESULT],
+    /// `sub_event_result` の有効長。
+    sub_event_result_len: usize,
     /// 直近レポートが溢れて打ち切られたか。
     sub_truncated: bool,
     /// 購読系イベントの 1 深度 slot(txn イベントと分離。取り出し前の上書きは最新優先)。
@@ -235,6 +240,8 @@ impl<const RESULT: usize> ImClient<RESULT> {
             report_rx: None,
             sub_result: [0u8; RESULT],
             sub_result_len: 0,
+            sub_event_result: [0u8; RESULT],
+            sub_event_result_len: 0,
             sub_truncated: false,
             sub_event: None,
             pending_invoke_len: None,
@@ -292,6 +299,19 @@ impl<const RESULT: usize> ImClient<RESULT> {
     pub fn sub_reports(&self) -> AttrReports<'_> {
         AttrReports {
             r: TlvReader::new(self.sub_report()),
+            done: false,
+        }
+    }
+
+    /// 直近の購読レポートのイベント本文(EventReportIB 連結の生 TLV、設計 §12)。
+    pub fn sub_event_report(&self) -> &[u8] {
+        &self.sub_event_result[..self.sub_event_result_len]
+    }
+
+    /// 直近の購読レポートを [`EventReportRef`] 列として走査する(設計 §12)。
+    pub fn sub_event_reports(&self) -> EventReports<'_> {
+        EventReports {
+            r: TlvReader::new(self.sub_event_report()),
             done: false,
         }
     }
@@ -516,6 +536,47 @@ impl<const RESULT: usize> ImClient<RESULT> {
                 }
                 Ok(())
             },
+        );
+        self.finish_start(len)
+    }
+
+    /// イベントパス付き Subscribe を開始する(EventRequests + 任意の EventFilters eventMin、設計 §12)。
+    ///
+    /// 属性パス `attr_paths` とイベントパス `event_paths` を同一 SubscribeRequest に載せる
+    /// (イベントのみの購読は `attr_paths` を空にする)。プライミングで既存イベントが配信され、
+    /// 以降デバイス発レポートで新規イベントが届く([`Self::sub_event_reports`] で走査)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_subscribe_events(
+        &mut self,
+        exchange: ExchangeId,
+        attr_paths: &[AttributePath],
+        event_paths: &[EventPath],
+        event_min: Option<u64>,
+        min_interval_floor_s: u16,
+        max_interval_ceiling_s: u16,
+        out: &mut [u8],
+        now_ms: u64,
+    ) -> Result<usize> {
+        self.begin(exchange, TxnKind::Subscribe, now_ms)?;
+        let len = encode_subscribe_request_events(
+            out,
+            false,
+            min_interval_floor_s,
+            max_interval_ceiling_s,
+            false,
+            |w| {
+                for p in attr_paths {
+                    w.push(p)?;
+                }
+                Ok(())
+            },
+            |w| {
+                for p in event_paths {
+                    w.push(p)?;
+                }
+                Ok(())
+            },
+            event_min,
         );
         self.finish_start(len)
     }
@@ -754,6 +815,7 @@ impl<const RESULT: usize> ImClient<RESULT> {
         if !continuing {
             // 新しいレポートの先頭チャンク: 直近レポートを破棄して上書き開始。
             self.sub_result_len = 0;
+            self.sub_event_result_len = 0;
             self.sub_truncated = false;
         }
         if append_ctx_array_into(
@@ -766,6 +828,17 @@ impl<const RESULT: usize> ImClient<RESULT> {
         {
             // 溢れ(または不正 TLV)は打ち切りマークだけ立て、レポート自体は ack する
             // (購読の生存を優先。本文は truncated として通知)。
+            self.sub_truncated = true;
+        }
+        // EventReports(context 2)も別バッファへ写す(設計 §12)。
+        if append_ctx_array_into(
+            rx.payload,
+            2,
+            &mut self.sub_event_result,
+            &mut self.sub_event_result_len,
+        )
+        .unwrap_or(true)
+        {
             self.sub_truncated = true;
         }
         self.subs[si].last_report_ms = now_ms;
@@ -937,6 +1010,44 @@ impl<'a> Iterator for AttrReports<'a> {
                 None
             }
             Ok(Some(_)) => match decode_report(&mut self.r) {
+                Ok(v) => Some(Ok(v)),
+                Err(e) => {
+                    self.done = true;
+                    Some(Err(e))
+                }
+            },
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+        }
+    }
+}
+
+/// [`ImClient::sub_event_report`] 内の連結 `EventReportIB` を走査するイテレータ(設計 §12)。
+#[derive(Debug, Clone)]
+pub struct EventReports<'a> {
+    r: TlvReader<'a>,
+    done: bool,
+}
+
+impl<'a> Iterator for EventReports<'a> {
+    type Item = Result<EventReportRef<'a>>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let mut probe = self.r.clone();
+        match probe.read_next() {
+            Ok(None) => {
+                self.done = true;
+                None
+            }
+            Ok(Some(e)) if matches!(e.value, TlvValue::ContainerEnd) => {
+                self.done = true;
+                None
+            }
+            Ok(Some(_)) => match EventReportRef::decode(&mut self.r) {
                 Ok(v) => Some(Ok(v)),
                 Err(e) => {
                     self.done = true;

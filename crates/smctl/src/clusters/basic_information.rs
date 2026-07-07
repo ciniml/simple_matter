@@ -18,5 +18,10 @@ cluster_def! {
         }
         cmds {
         }
+        events {
+            0x00 => "start-up";
+            0x01 => "shut-down";
+            0x02 => "leave";
+        }
     }
 }

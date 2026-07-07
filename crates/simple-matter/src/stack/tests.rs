@@ -1543,6 +1543,328 @@ mod controller_e2e {
         );
     }
 
+    /// イベント購読の回帰再現(実機 E2E: subscribe-event 確立後の同一セッション invoke が
+    /// ドロップされた)。smctl の `onoff subscribe-event state-changed 0 30 1 1` →
+    /// `onoff toggle 1 1` の流れを stack ループバックで再現する:
+    /// (1) StartUp イベントを積んだデバイスへイベントのみ購読(min=0)を確立、
+    /// (2) 同一 CASE セッションで Toggle が応答を返す(回帰点)、
+    /// (3) OnOff イベント post → デバイス発レポートでイベントが届く。
+    #[test]
+    fn subscribe_events_then_invoke_end_to_end() {
+        use crate::dm::meta::EventId;
+        use crate::im::events::PRIORITY_INFO;
+        use crate::im::wire::{EventPath, EventReportRef};
+
+        let crypto = RustCrypto::new(SeqRng(0xE0E0_0001_1234_5678));
+        let fabrics: RefCell<FabricTable<Crb, 5>> = RefCell::new(FabricTable::new());
+
+        let config = PaseConfig::from_passcode(PASSCODE, &SALT, ITERATIONS).unwrap();
+        let dev_creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
+        let sc = SecureChannel::new(&crypto, SeqRng(0x5C00_0EE0), config, dev_creds);
+        let im = InteractionModel::new(build_device(&fabrics));
+        let mut dev: TestStack = MatterStack::new(&crypto, sc, im);
+        // 実デバイス(examples/onoff-light)同様、起動直後に StartUp イベントを積む。
+        let _ = dev.post_startup_event(CFG.software_version, 0);
+
+        let ca = Ca::<Crb>::generate(
+            &crypto,
+            &mut SeqRng(0xCA00_0EE0),
+            FABRIC_ID,
+            COMM_NODE,
+            0xFFF1,
+            0,
+        )
+        .expect("Ca::generate");
+        let ctrl_creds = ControllerCreds::new(&ca, &crypto, 0);
+        let sc_init = ScInitiator::new(&crypto, SeqRng(0x1C00_0EE0), ctrl_creds);
+        let mut ctrl: Ctrl = ControllerStack::new(&crypto, sc_init, ImClient::new());
+
+        let mut comm = Commissioner::new(&ca, &crypto, AttestationPolicy::Skip);
+        comm.commission(peer(), PASSCODE, DEVICE_NODE, NOW).unwrap();
+        let mut tx = [0u8; 1700];
+        let mut final_phase = comm.phase();
+        for _ in 0..60 {
+            let out = comm.drive(&mut ctrl, NOW, &mut tx);
+            final_phase = out.phase;
+            if let Some(d) = out.send {
+                deliver_and_settle(&mut ctrl, &mut dev, NOW, &tx, d.len);
+            }
+            match out.phase {
+                Phase::Done { .. } | Phase::Failed { .. } => break,
+                _ => {}
+            }
+        }
+        let case_session = match final_phase {
+            Phase::Done { session } => session,
+            other => panic!("commissioning did not complete: {other:?}"),
+        };
+
+        // --- (1) イベントのみ購読(smctl subscribe-event 相当、min=0 max=30)---
+        let dir = ctrl
+            .start_subscribe_events(
+                case_session,
+                &[],
+                &[EventPath::concrete(
+                    EndpointId(1),
+                    ClusterId(0x0006),
+                    EventId(0),
+                )],
+                None,
+                0,
+                30,
+                NOW,
+                &mut tx,
+            )
+            .expect("start subscribe-event");
+        deliver_and_settle(&mut ctrl, &mut dev, NOW, &tx, dir.len);
+        let sub_id = match ctrl.im_take_event() {
+            Some(ImEvent::SubscribeDone {
+                subscription_id, ..
+            }) => subscription_id,
+            other => panic!("expected SubscribeDone, got {other:?}"),
+        };
+        assert_eq!(dev.im().subscription_count(), 1, "device subscription slot");
+
+        // --- (2) 同一 CASE セッションで Toggle(回帰点: 応答が返ること)---
+        let t1 = NOW + 1000;
+        let dir = ctrl
+            .start_invoke(
+                case_session,
+                CommandPath::new(EndpointId(1), ClusterId(0x0006), CommandId(0x02)),
+                |w, t| {
+                    w.start_struct(t)?;
+                    w.end_container()
+                },
+                t1,
+                &mut tx,
+            )
+            .expect("start Toggle after subscribe-event");
+        deliver_and_settle(&mut ctrl, &mut dev, t1, &tx, dir.len);
+        let mut invoke_done = false;
+        while let Some(ev) = ctrl.im_take_event() {
+            match ev {
+                ImEvent::InvokeDone { status } => {
+                    assert_eq!(status, ImStatus::Success);
+                    invoke_done = true;
+                }
+                // 途中でレポートが混ざっても許容(この段階ではイベント未 post)。
+                ImEvent::SubscriptionReport { .. } => {}
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert!(
+            invoke_done,
+            "Toggle must be answered while an event subscription is active"
+        );
+        assert!(dev.device().onoff.is_on(), "toggled false → true");
+
+        // --- (3) OnOff イベント post(examples/onoff-light の 2b 相当)→ レポート配信 ---
+        let t2 = t1 + 100;
+        let _ = dev.post_event(
+            EndpointId(1),
+            ClusterId(0x0006),
+            EventId(0),
+            PRIORITY_INFO,
+            t2,
+            |w, tag| {
+                w.start_struct(tag)?;
+                w.write_bool(&TlvTag::ContextSpecific(0), true)?;
+                w.end_container()
+            },
+        );
+        flush(&mut ctrl, &mut dev, t2);
+        let mut report_sub = None;
+        while let Some(ev) = ctrl.im_take_event() {
+            if let ImEvent::SubscriptionReport { subscription_id } = ev {
+                report_sub = Some(subscription_id);
+            }
+        }
+        assert_eq!(report_sub, Some(sub_id), "event report delivered");
+        let mut got = None;
+        for r in ctrl.sub_event_reports() {
+            if let Ok(EventReportRef::Data(d)) = r {
+                let mut v = d.value();
+                let _ = v.read_next(); // struct 開始
+                if let Ok(Some(e)) = v.read_next() {
+                    if let TlvValue::Boolean(b) = e.value {
+                        got = Some((d.number, b));
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            got,
+            Some((1, true)),
+            "new OnOff event (number 1, newState=true) delivered"
+        );
+
+        // --- (4) toggle + イベント post + レポート配信を繰り返しても後続 invoke が通ること
+        //     (実機回帰: 配信完了した device 発レポートの exchange が回収されず、数レポートで
+        //      exchange プール(EXCHANGES=4)が枯渇 → 以降の受信が全て silent drop になった)---
+        let mut now = t2;
+        for cycle in 0..6u32 {
+            now += 1000;
+            let dir = ctrl
+                .start_invoke(
+                    case_session,
+                    CommandPath::new(EndpointId(1), ClusterId(0x0006), CommandId(0x02)),
+                    |w, t| {
+                        w.start_struct(t)?;
+                        w.end_container()
+                    },
+                    now,
+                    &mut tx,
+                )
+                .expect("start Toggle in soak cycle");
+            deliver_and_settle(&mut ctrl, &mut dev, now, &tx, dir.len);
+            let mut invoke_done = false;
+            while let Some(ev) = ctrl.im_take_event() {
+                match ev {
+                    ImEvent::InvokeDone { status } => {
+                        assert_eq!(status, ImStatus::Success);
+                        invoke_done = true;
+                    }
+                    ImEvent::SubscriptionReport { .. } => {}
+                    other => panic!("unexpected event {other:?}"),
+                }
+            }
+            assert!(invoke_done, "Toggle answered in soak cycle {cycle}");
+
+            // 実デバイス同様、状態変化イベントを post → レポート配信(flush 内)。
+            now += 100;
+            let on_now = dev.device().onoff.is_on();
+            let _ = dev.post_event(
+                EndpointId(1),
+                ClusterId(0x0006),
+                EventId(0),
+                PRIORITY_INFO,
+                now,
+                |w, tag| {
+                    w.start_struct(tag)?;
+                    w.write_bool(&TlvTag::ContextSpecific(0), on_now)?;
+                    w.end_container()
+                },
+            );
+            flush(&mut ctrl, &mut dev, now);
+            let mut report_seen = false;
+            while let Some(ev) = ctrl.im_take_event() {
+                if matches!(ev, ImEvent::SubscriptionReport { .. }) {
+                    report_seen = true;
+                }
+            }
+            assert!(report_seen, "event report delivered in soak cycle {cycle}");
+            now += 4000; // flush が進めた時間(16*400ms)を跨いで単調に進める。
+        }
+    }
+
+    /// 購読レポートが MRP で ack されない(購読者が消えた)場合に、購読が破棄され
+    /// (`on_report_failed`、設計 §6.3)、exchange/tx バッファが解放されることを検証する。
+    /// 実機回帰の 2 次要因(前回実行の残骸購読が 30 秒ごとに死んだピアへレポートを送り、
+    /// スロットを浪費し続ける)の再発防止。
+    #[test]
+    fn subscription_dropped_when_report_unacked() {
+        use crate::dm::meta::EventId;
+        use crate::im::events::PRIORITY_INFO;
+        use crate::im::wire::EventPath;
+
+        let crypto = RustCrypto::new(SeqRng(0xDEAD_0001_1234_5678));
+        let fabrics: RefCell<FabricTable<Crb, 5>> = RefCell::new(FabricTable::new());
+
+        let config = PaseConfig::from_passcode(PASSCODE, &SALT, ITERATIONS).unwrap();
+        let dev_creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
+        let sc = SecureChannel::new(&crypto, SeqRng(0x5C00_0DED), config, dev_creds);
+        let im = InteractionModel::new(build_device(&fabrics));
+        let mut dev: TestStack = MatterStack::new(&crypto, sc, im);
+
+        let ca = Ca::<Crb>::generate(
+            &crypto,
+            &mut SeqRng(0xCA00_0DED),
+            FABRIC_ID,
+            COMM_NODE,
+            0xFFF1,
+            0,
+        )
+        .expect("Ca::generate");
+        let ctrl_creds = ControllerCreds::new(&ca, &crypto, 0);
+        let sc_init = ScInitiator::new(&crypto, SeqRng(0x1C00_0DED), ctrl_creds);
+        let mut ctrl: Ctrl = ControllerStack::new(&crypto, sc_init, ImClient::new());
+
+        let mut comm = Commissioner::new(&ca, &crypto, AttestationPolicy::Skip);
+        comm.commission(peer(), PASSCODE, DEVICE_NODE, NOW).unwrap();
+        let mut tx = [0u8; 1700];
+        let mut final_phase = comm.phase();
+        for _ in 0..60 {
+            let out = comm.drive(&mut ctrl, NOW, &mut tx);
+            final_phase = out.phase;
+            if let Some(d) = out.send {
+                deliver_and_settle(&mut ctrl, &mut dev, NOW, &tx, d.len);
+            }
+            match out.phase {
+                Phase::Done { .. } | Phase::Failed { .. } => break,
+                _ => {}
+            }
+        }
+        let case_session = match final_phase {
+            Phase::Done { session } => session,
+            other => panic!("commissioning did not complete: {other:?}"),
+        };
+
+        // イベント購読を確立する。
+        let dir = ctrl
+            .start_subscribe_events(
+                case_session,
+                &[],
+                &[EventPath::concrete(
+                    EndpointId(1),
+                    ClusterId(0x0006),
+                    EventId(0),
+                )],
+                None,
+                0,
+                30,
+                NOW,
+                &mut tx,
+            )
+            .expect("start subscribe-event");
+        deliver_and_settle(&mut ctrl, &mut dev, NOW, &tx, dir.len);
+        assert!(matches!(
+            ctrl.im_take_event(),
+            Some(ImEvent::SubscribeDone { .. })
+        ));
+        assert_eq!(dev.im().subscription_count(), 1);
+
+        // 新イベントを post → レポートが staged される(が、購読者へは届けない = 死んだピア)。
+        let _ = dev.post_event(
+            EndpointId(1),
+            ClusterId(0x0006),
+            EventId(0),
+            PRIORITY_INFO,
+            NOW + 100,
+            |w, tag| {
+                w.start_struct(tag)?;
+                w.write_bool(&TlvTag::ContextSpecific(0), true)?;
+                w.end_container()
+            },
+        );
+        let staged = dev.poll(NOW + 200, &mut tx);
+        assert!(staged.is_some(), "report staged toward the (dead) peer");
+
+        // 届けずに時間だけ進める → MRP 再送 → 諦め(Failed)→ 購読破棄。
+        let mut now = NOW + 200;
+        for _ in 0..64 {
+            now += 2000;
+            while dev.poll(now, &mut tx).is_some() {}
+            if dev.im().subscription_count() == 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            dev.im().subscription_count(),
+            0,
+            "unacked report drops the subscription (design §6.3 liveness)"
+        );
+    }
+
     /// device attestation を **実検証**(`AttestationPolicy::Verify`)してフルコミッショニング
     /// する。デバイスは `TestDacProvider`(chip 開発 DAC チェーン)、PAA は埋め込みテスト定数。
     /// コミッショナが DAC/PAI 取得 → AttestationRequest → チェーン+署名+nonce 検証を通過し、
