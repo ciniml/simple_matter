@@ -1305,3 +1305,298 @@ fn timed_required_command_enforced() {
         (ImStatus::Failure, Some(status_code::BUSY))
     );
 }
+
+// ==========================================================================
+// 遅延 InvokeResponse(設計 port-esp32-device.md §E7.4)
+// ==========================================================================
+
+mod deferred_invoke {
+    use super::*;
+    use crate::dm::codec::{AttrEncoder, CmdResponder};
+    use crate::dm::meta::{AccessContext, ClusterMeta, CommandMeta, EndpointMeta, Privilege};
+    use crate::dm::{DataModel, DeferredPoll, ServerCluster};
+    use crate::tlv::TlvReader;
+
+    /// 応答を保留し、`ready`/`fail` で `poll_deferred` の分岐を制御するテストクラスタ(0x1234)。
+    struct DeferCluster {
+        /// `poll_deferred` が Ready を返すか(false なら Pending)。
+        ready: bool,
+        /// Ready 時にエラー status を返すか(true=Err(Failure)、false=生成レスポンス 0x02)。
+        fail: bool,
+    }
+
+    static DEFER_CMDS: &[CommandMeta] =
+        &[CommandMeta::new(CommandId(0x01), false, Privilege::Operate)];
+    static DEFER_META: ClusterMeta =
+        ClusterMeta::new(ClusterId(0x1234), 1, 0, &[], DEFER_CMDS, &[CommandId(0x02)]);
+
+    impl ServerCluster for DeferCluster {
+        fn meta(&self) -> &'static ClusterMeta {
+            &DEFER_META
+        }
+        fn read_attribute(
+            &self,
+            _attr: AttributeId,
+            _enc: &mut AttrEncoder<'_, '_>,
+            _acc: &AccessContext,
+        ) -> Result<(), ImStatus> {
+            Err(ImStatus::UnsupportedAttribute)
+        }
+        fn invoke_command(
+            &mut self,
+            cmd: CommandId,
+            _fields: &mut TlvReader<'_>,
+            resp: &mut CmdResponder<'_, '_>,
+            _acc: &AccessContext,
+        ) -> Result<(), ImStatus> {
+            match cmd.0 {
+                0x01 => {
+                    // 応答を保留する(join 開始に相当)。
+                    resp.set_deferred();
+                    Ok(())
+                }
+                _ => Err(ImStatus::UnsupportedCommand),
+            }
+        }
+        fn poll_deferred(
+            &mut self,
+            _cmd: CommandId,
+            resp: &mut CmdResponder<'_, '_>,
+        ) -> DeferredPoll {
+            if !self.ready {
+                return DeferredPoll::Pending;
+            }
+            if self.fail {
+                return DeferredPoll::Ready(Err(ImStatus::Failure));
+            }
+            // 生成レスポンス 0x02(空の匿名構造体フィールド)。
+            resp.set_response(CommandId(0x02));
+            let w = resp.writer();
+            w.start_struct(&TlvTag::Anonymous).unwrap();
+            w.end_container().unwrap();
+            DeferredPoll::Ready(Ok(()))
+        }
+    }
+
+    /// EP0 に DeferCluster(0x1234)を 1 個載せた手書き DataModel。
+    struct DeferDev {
+        dc: DeferCluster,
+    }
+
+    static DEFER_EP0: &[ClusterId] = &[ClusterId(0x1234)];
+
+    impl DataModel for DeferDev {
+        fn endpoints(&self) -> &[EndpointMeta] {
+            static EPS: &[EndpointMeta] = &[EndpointMeta::new(EndpointId(0), &[], DEFER_EP0)];
+            EPS
+        }
+        fn clusters_on(&self, ep: EndpointId) -> &[ClusterId] {
+            match ep.0 {
+                0 => DEFER_EP0,
+                _ => &[],
+            }
+        }
+        fn cluster(&self, ep: EndpointId, cl: ClusterId) -> Option<&dyn ServerCluster> {
+            match (ep.0, cl.0) {
+                (0, 0x1234) => Some(&self.dc),
+                _ => None,
+            }
+        }
+        fn cluster_mut(&mut self, ep: EndpointId, cl: ClusterId) -> Option<&mut dyn ServerCluster> {
+            match (ep.0, cl.0) {
+                (0, 0x1234) => Some(&mut self.dc),
+                _ => None,
+            }
+        }
+    }
+
+    type DeferIm = InteractionModel<DeferDev, 2, 2, 8>;
+
+    fn setup_defer() -> (DeferIm, SessionManager<2>, ExchangeId) {
+        let mut mgr: SessionManager<2> = SessionManager::new();
+        let init = SessionInit {
+            peer_addr: addr(),
+            local_node_id: 1,
+            peer_node_id: Some(0x1234),
+            peer_session_id: 1,
+            tx_ctr_start: 1,
+            rx_ctr_start: 0,
+            mode: SessionMode::Case {
+                fabric_idx: NonZeroU8::new(1).unwrap(),
+            },
+            enc_key: [0u8; 16],
+            dec_key: [0u8; 16],
+            att_challenge: [0u8; 16],
+        };
+        let sid = mgr.insert(init, 0).unwrap();
+        let ex = ExchangeId::from_parts(sid, EXCH_ID);
+        let im = DeferIm::new(DeferDev {
+            dc: DeferCluster {
+                ready: false,
+                fail: false,
+            },
+        });
+        (im, mgr, ex)
+    }
+
+    /// DeferCluster のコマンド 0x01 を invoke する InvokeRequest を作る。
+    fn defer_request(buf: &mut [u8]) -> usize {
+        encode_invoke_request(buf, InvokeRequestHeader::default(), |cw| {
+            cw.push(
+                &CommandPath::new(EndpointId(0), ClusterId(0x1234), CommandId(0x01)),
+                None,
+                None::<fn(&mut TlvWriter, &TlvTag) -> crate::error::Result<()>>,
+            )
+        })
+        .unwrap()
+    }
+
+    /// InvokeResponse の先頭 item を (is_command, status) で返す(status は Command なら Success)。
+    fn first_item(msg: &[u8]) -> (bool, ImStatus, Option<CommandId>) {
+        let ir = InvokeResponseRef::new(msg).unwrap();
+        let item = ir.invoke_responses().unwrap().next().unwrap().unwrap();
+        match item {
+            InvokeResponseRefItem::Command(c) => (true, ImStatus::Success, Some(c.path.command)),
+            InvokeResponseRefItem::Status(s) => (false, s.status.status, Some(s.path.command)),
+        }
+    }
+
+    #[test]
+    fn deferral_returns_none_and_records_slot() {
+        let (mut im, mut mgr, ex) = setup_defer();
+        let mut req = [0u8; 64];
+        let ilen = defer_request(&mut req);
+        let ih = phdr(ImOpCode::InvokeRequest.to_u8());
+        let mut tx = [0u8; 128];
+        // 保留成立: 応答アクション無し。
+        let a = im
+            .handle(&rxm(&ih, &req[..ilen], ex), &mut tx, &mut mgr, 1_000)
+            .unwrap();
+        assert!(matches!(a, HandlerAction::None));
+        assert_eq!(im.poll_deferred_invoke(1_000), Some(ex));
+    }
+
+    #[test]
+    fn deferred_success_builds_generated_response() {
+        let (mut im, mut mgr, ex) = setup_defer();
+        let mut req = [0u8; 64];
+        let ilen = defer_request(&mut req);
+        let ih = phdr(ImOpCode::InvokeRequest.to_u8());
+        let mut tx = [0u8; 128];
+        im.handle(&rxm(&ih, &req[..ilen], ex), &mut tx, &mut mgr, 1_000)
+            .unwrap();
+
+        // driver 完了相当。build → 生成レスポンス 0x02。
+        im.data_model_mut().dc.ready = true;
+        let mut rtx = [0u8; 1280];
+        let len = im
+            .build_deferred_invoke_response(ex, &mut rtx, 1_500)
+            .unwrap()
+            .expect("ready → response built");
+        let (is_cmd, _st, cmd) = first_item(&rtx[..len]);
+        assert!(is_cmd, "generated ConnectNetworkResponse-like command");
+        assert_eq!(cmd, Some(CommandId(0x02)));
+        // スロットはまだ残る(統合層が送信成功後に drop する)。
+        assert_eq!(im.poll_deferred_invoke(1_500), Some(ex));
+        im.drop_deferred();
+        assert_eq!(im.poll_deferred_invoke(1_500), None);
+    }
+
+    #[test]
+    fn deferred_failure_builds_status() {
+        let (mut im, mut mgr, ex) = setup_defer();
+        let mut req = [0u8; 64];
+        let ilen = defer_request(&mut req);
+        let ih = phdr(ImOpCode::InvokeRequest.to_u8());
+        let mut tx = [0u8; 128];
+        im.handle(&rxm(&ih, &req[..ilen], ex), &mut tx, &mut mgr, 1_000)
+            .unwrap();
+
+        im.data_model_mut().dc.ready = true;
+        im.data_model_mut().dc.fail = true;
+        let mut rtx = [0u8; 1280];
+        let len = im
+            .build_deferred_invoke_response(ex, &mut rtx, 1_500)
+            .unwrap()
+            .expect("ready → status built");
+        let (is_cmd, st, _cmd) = first_item(&rtx[..len]);
+        assert!(!is_cmd);
+        assert_eq!(st, ImStatus::Failure);
+    }
+
+    #[test]
+    fn deferred_pending_then_deadline_timeout() {
+        let (mut im, mut mgr, ex) = setup_defer();
+        let mut req = [0u8; 64];
+        let ilen = defer_request(&mut req);
+        let ih = phdr(ImOpCode::InvokeRequest.to_u8());
+        let mut tx = [0u8; 128];
+        // now=1000 → deadline=21000。cluster は ready=false(Connecting 相当)。
+        im.handle(&rxm(&ih, &req[..ilen], ex), &mut tx, &mut mgr, 1_000)
+            .unwrap();
+
+        let mut rtx = [0u8; 1280];
+        // 締切内は None(まだ返さない)。
+        assert!(im
+            .build_deferred_invoke_response(ex, &mut rtx, 5_000)
+            .unwrap()
+            .is_none());
+        // 締切超過で Timeout status を返す。
+        let len = im
+            .build_deferred_invoke_response(ex, &mut rtx, 21_001)
+            .unwrap()
+            .expect("deadline → timeout response");
+        let (is_cmd, st, _cmd) = first_item(&rtx[..len]);
+        assert!(!is_cmd);
+        assert_eq!(st, ImStatus::Timeout);
+    }
+
+    #[test]
+    fn second_deferral_is_busy() {
+        let (mut im, mut mgr, ex) = setup_defer();
+        let mut req = [0u8; 64];
+        let ilen = defer_request(&mut req);
+        let ih = phdr(ImOpCode::InvokeRequest.to_u8());
+        let mut tx = [0u8; 128];
+        // 1 本目: 保留成立。
+        let a = im
+            .handle(&rxm(&ih, &req[..ilen], ex), &mut tx, &mut mgr, 1_000)
+            .unwrap();
+        assert!(matches!(a, HandlerAction::None));
+
+        // 2 本目(別 exchange): Busy status で即応答。
+        let ex2 = ExchangeId::from_parts(ex.session(), 0x2222);
+        let mut tx2 = [0u8; 128];
+        let a = im
+            .handle(&rxm(&ih, &req[..ilen], ex2), &mut tx2, &mut mgr, 1_100)
+            .unwrap();
+        let (_op, len, is_close) = parts(a);
+        assert!(is_close);
+        let (is_cmd, st, _cmd) = first_item(&tx2[..len]);
+        assert!(!is_cmd);
+        assert_eq!(st, ImStatus::Busy);
+        // 1 本目のスロットは維持されている。
+        assert_eq!(im.poll_deferred_invoke(1_100), Some(ex));
+    }
+
+    #[test]
+    fn deferred_dropped_when_session_closes() {
+        let (mut im, mut mgr, ex) = setup_defer();
+        let mut req = [0u8; 64];
+        let ilen = defer_request(&mut req);
+        let ih = phdr(ImOpCode::InvokeRequest.to_u8());
+        let mut tx = [0u8; 128];
+        im.handle(&rxm(&ih, &req[..ilen], ex), &mut tx, &mut mgr, 1_000)
+            .unwrap();
+        assert_eq!(im.poll_deferred_invoke(1_000), Some(ex));
+
+        // 宛先セッションが閉じたらスロット破棄。
+        im.on_session_closed(ex.session());
+        assert_eq!(im.poll_deferred_invoke(1_000), None);
+        // build も NotFound。
+        let mut rtx = [0u8; 1280];
+        assert!(im
+            .build_deferred_invoke_response(ex, &mut rtx, 1_000)
+            .is_err());
+    }
+}

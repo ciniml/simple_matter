@@ -41,7 +41,7 @@ use crate::dm::codec::{AttrEncoder, CmdResponder};
 use crate::dm::meta::{
     is_global_attribute, AccessContext, ClusterId, EndpointId, Privilege, SessionKind,
 };
-use crate::dm::{read_global_attribute, AttrWrite, DataModel, ListOp};
+use crate::dm::{read_global_attribute, AttrWrite, DataModel, DeferredPoll, ListOp};
 use crate::error::{Error, Result};
 use crate::exchange::{ExchangeId, HandlerAction, ProtocolHandler, RxMessage};
 use crate::im::wire::{
@@ -62,6 +62,20 @@ const READ_TXN_TIMEOUT_MS: u64 = 30_000;
 
 /// dirty 掃引で 1 回に走査する (endpoint, cluster) の上限。
 const MAX_SWEEP: usize = 64;
+
+/// 遅延 InvokeResponse の締切(設計 `port-esp32-device.md` §E7.2)。
+///
+/// ConnectMaxTimeSeconds(30)より短く、クライアント(ImClient/chip-tool)の txn
+/// タイムアウト 30 秒より必ず先に返すため 20 秒とする。cluster がこの時間内に
+/// `poll_deferred` で `Ready` を返さなければ Timeout ステータスで応答して終端する。
+const DEFERRED_TIMEOUT_MS: u64 = 20_000;
+
+/// 遅延 InvokeResponse 保留中の再 poll 間隔(設計 §E7.2)。
+///
+/// driver の状態変化(join 完了/失敗)はイベントではなく poll で観測するため、保留中は
+/// `next_deadline` にこの間隔を合成して統合層に定期的な poll を促す(締切より手前で
+/// 成功応答を返せるようにする)。
+const DEFERRED_POLL_INTERVAL_MS: u64 = 100;
 
 /// Invoke の生成レスポンスフィールドを一時構築するスクラッチバッファ長。
 ///
@@ -325,6 +339,34 @@ struct TimedTxn {
     deadline_ms: u64,
 }
 
+/// 保留中の遅延 InvokeResponse スロット(設計 §E7.2)。
+///
+/// スロットは **エンジンに 1 本のみ**。2 本目の遅延要求は Busy(ImStatus)で即時拒否する。
+#[derive(Debug, Clone, Copy)]
+struct DeferredInvoke {
+    /// 応答を返すべき元の responder exchange。
+    exchange: ExchangeId,
+    /// 具象コマンドパス(endpoint/cluster/command)。`poll_deferred` の再問い合わせに使う。
+    path: CommandPath,
+    /// バッチ Invoke 用の CommandRef(あれば。応答にエコーする)。
+    command_ref: Option<u16>,
+    /// 締切(絶対時刻ミリ秒)。超過したら cluster の完了を待たず Timeout で応答する。
+    deadline_ms: u64,
+}
+
+// 設計 §E7.2 はスロットにアクセス文脈(fabric index 等)も保持するとしているが、
+// `poll_deferred`(§E7.1 のシグネチャ)は `acc` を取らず、完了応答はアクセス判定を伴わない
+//(元の invoke で ACL 通過済み)。不要な状態を持たないため本実装はスロットに `acc` を持たない。
+
+/// `invoke_one` が「このコマンドは応答を保留した」ことをエンジンへ返す情報(設計 §E7.2)。
+#[derive(Debug, Clone, Copy)]
+struct DeferReq {
+    /// 具象コマンドパス。
+    path: CommandPath,
+    /// CommandRef(あれば)。
+    command_ref: Option<u16>,
+}
+
 /// poll で「レポートすべき」と判定された購読(統合層へ返す、設計 §6.3)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubDue {
@@ -448,6 +490,8 @@ pub struct InteractionModel<D: DataModel, const READS: usize, const SUBS: usize,
     /// 変わる」は満たし、無関係な変更でも version が進む分はコントローラ側の
     /// キャッシュ効率が下がるだけで正しさには影響しない。
     data_version: u32,
+    /// 保留中の遅延 InvokeResponse(設計 §E7.2)。同時に 1 本のみ。
+    deferred: Option<DeferredInvoke>,
 }
 
 impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
@@ -462,6 +506,7 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
             timed: FixedVec::new(),
             next_sub_id: 1,
             data_version: 1,
+            deferred: None,
         }
     }
 
@@ -754,12 +799,14 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
 
         if suppress {
             // 応答は送らないが副作用(および AddNOC の fabric 昇格)は適用する。
-            // `tx` をスクラッチとして使い、生成結果は破棄する。
+            // `tx` をスクラッチとして使い、生成結果は破棄する。応答が無いため遅延は行わない
+            //(cluster が set_deferred しても無視。副作用のみ適用)。
             let dm = &mut self.dm;
+            let mut defer = None;
             let _ = encode_invoke_response(tx, header, |cw| {
                 for item in req.invoke_requests()? {
                     let item = item?;
-                    effects.merge(invoke_one(dm, &item, acc, was_timed, cw)?);
+                    effects.merge(invoke_one(dm, &item, acc, was_timed, cw, &mut defer)?);
                 }
                 Ok(())
             });
@@ -767,14 +814,51 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
             return Ok(HandlerAction::None);
         }
 
+        // 遅延 InvokeResponse(設計 §E7.2): スロットは 1 本。既に保留中なら 2 本目は Busy。
+        let already_deferred = self.deferred.is_some();
+        let mut defer_req: Option<DeferReq> = None;
+        let mut ncommands: usize = 0;
         let dm = &mut self.dm;
         let len = encode_invoke_response(tx, header, |cw| {
             for item in req.invoke_requests()? {
                 let item = item?;
-                effects.merge(invoke_one(dm, &item, acc, was_timed, cw)?);
+                ncommands += 1;
+                let mut defer = None;
+                effects.merge(invoke_one(dm, &item, acc, was_timed, cw, &mut defer)?);
+                if let Some(dr) = defer {
+                    defer_req = Some(dr);
+                }
             }
             Ok(())
         })?;
+
+        if let Some(dr) = defer_req {
+            // 遅延はリクエストが単独コマンドのときのみ支持する(chip-tool は 1 コマンド送信)。
+            // 複数コマンドで遅延しようとした場合や、既に別の遅延が保留中(Busy)の場合は
+            // エラー status で即応答する(設計 §E7.2 の制約)。
+            if ncommands == 1 && !already_deferred {
+                self.deferred = Some(DeferredInvoke {
+                    exchange: rx.exchange,
+                    path: dr.path,
+                    command_ref: dr.command_ref,
+                    deadline_ms: now_ms.saturating_add(DEFERRED_TIMEOUT_MS),
+                });
+                self.apply_invoke_effects(effects, session, sessions);
+                // exchange は生存維持(mark_closing しない)。受信 ACK は standalone ACK 機構が返す。
+                return Ok(HandlerAction::None);
+            }
+            let st = if already_deferred {
+                ImStatus::Busy
+            } else {
+                ImStatus::Failure
+            };
+            let len = encode_invoke_response(tx, header, |cw| {
+                cw.push_status(&dr.path, &StatusIB::simple(st), dr.command_ref)
+            })?;
+            self.apply_invoke_effects(effects, session, sessions);
+            return Ok(close(ImOpCode::InvokeResponse, true, len));
+        }
+
         self.apply_invoke_effects(effects, session, sessions);
         Ok(close(ImOpCode::InvokeResponse, true, len))
     }
@@ -864,8 +948,16 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
 
     /// 次に購読レポートを出すべき最も早い絶対時刻(統合層が `ExchangeManager::next_deadline`
     /// と min して 1 タイマにする)。Active 購読が無ければ `None`。
-    pub fn next_deadline(&self, _now_ms: u64) -> Option<u64> {
+    pub fn next_deadline(&self, now_ms: u64) -> Option<u64> {
         let mut earliest: Option<u64> = None;
+        // 遅延 InvokeResponse 保留中は、driver の状態変化を締切より手前で拾うため定期 poll を促す
+        //(設計 §E7.2)。締切は上限。
+        if let Some(d) = &self.deferred {
+            let cand = now_ms
+                .saturating_add(DEFERRED_POLL_INTERVAL_MS)
+                .min(d.deadline_ms);
+            earliest = Some(cand);
+        }
         for s in self.subs.iter() {
             if s.state != SubState::Active {
                 continue;
@@ -967,6 +1059,106 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         }
     }
 
+    // ----------------------------------------------------------------------
+    // 遅延 InvokeResponse 駆動 API(設計 §E7.2)
+    // ----------------------------------------------------------------------
+
+    /// 保留中の遅延 InvokeResponse があれば、その応答先 [`ExchangeId`] を返す。
+    ///
+    /// 統合層([`crate::stack`])はこれで保留の有無を確認し、あれば
+    /// [`build_deferred_invoke_response`](Self::build_deferred_invoke_response) を試みる。
+    pub fn poll_deferred_invoke(&self, _now_ms: u64) -> Option<ExchangeId> {
+        self.deferred.as_ref().map(|d| d.exchange)
+    }
+
+    /// 保留中の遅延応答を破棄する(送信成功後・exchange 消滅時に統合層が呼ぶ)。
+    pub fn drop_deferred(&mut self) {
+        self.deferred = None;
+    }
+
+    /// 保留中の遅延 InvokeResponse を `tx` に組み立てる(設計 §E7.2)。
+    ///
+    /// cluster の [`ServerCluster::poll_deferred`](crate::dm::ServerCluster::poll_deferred) を
+    /// 問い合わせ、`Ready` なら応答を構築して長さを返す(**スロットはまだ消さない**。統合層が
+    /// 送信成功後に [`drop_deferred`](Self::drop_deferred) で消す。送信失敗時は次 poll で再構築
+    /// できるよう保持する)。`Pending` かつ締切内なら `Ok(None)`(まだ返さない)。締切超過時は
+    /// cluster の完了を待たず Timeout ステータスで応答する。`exchange` が保留スロットと一致
+    /// しなければ [`Error::NotFound`]。
+    pub fn build_deferred_invoke_response(
+        &mut self,
+        exchange: ExchangeId,
+        tx: &mut [u8],
+        now_ms: u64,
+    ) -> Result<Option<usize>> {
+        let Some(slot) = self.deferred else {
+            return Err(Error::NotFound);
+        };
+        if slot.exchange != exchange {
+            return Err(Error::NotFound);
+        }
+        let path = slot.path;
+
+        // cluster へ完了問い合わせ(応答フィールドはスクラッチに書かせ、確定後に転写)。
+        //
+        // スクラッチはスタックに置かず **`tx` の末尾を間借り**する。本関数は統合層の
+        // `poll()` 経路(毎イテレーション呼ばれる)にインライン化され得るため、900B の
+        // ローカル配列はターゲット(ESP32 等)のタスクスタック余裕を常時食い潰す
+        // (実機で BLE ヒープ破壊として顕在化した)。deferred の応答は単一コマンドで
+        // 小さく、`tx`(MAX_PACKET_SIZE)の先頭側だけで十分収まる。
+        if tx.len() < INVOKE_SCRATCH + 128 {
+            return Err(Error::NoSpace);
+        }
+        let (tx, scratch) = tx.split_at_mut(tx.len() - INVOKE_SCRATCH);
+        let (ready, result, response_cmd, cluster_status, scratch_len) = {
+            let mut sw = TlvWriter::new(scratch);
+            let mut resp = CmdResponder::new(&mut sw);
+            let poll = match self.dm.cluster_mut(path.endpoint, path.cluster) {
+                Some(c) => c.poll_deferred(path.command, &mut resp),
+                // cluster が消えた等は Failure 相当で確定させる(スロットを stall させない)。
+                None => DeferredPoll::Ready(Err(ImStatus::Failure)),
+            };
+            match poll {
+                DeferredPoll::Pending => {
+                    if now_ms < slot.deadline_ms {
+                        return Ok(None);
+                    }
+                    // 締切超過: cluster の完了を待たず Timeout status(設計 §E7.2 フォールバック)。
+                    (false, Err(ImStatus::Timeout), None, None, 0)
+                }
+                DeferredPoll::Ready(result) => {
+                    let response_cmd = resp.response_command();
+                    let cluster_status = resp.cluster_status();
+                    let scratch_len = sw.len();
+                    (true, result, response_cmd, cluster_status, scratch_len)
+                }
+            }
+        };
+        let _ = ready;
+
+        let header = InvokeResponseHeader {
+            suppress_response: false,
+            more_chunks: false,
+        };
+        let len = encode_invoke_response(tx, header, |cw| match result {
+            Ok(()) => {
+                if let Some(rid) = response_cmd {
+                    let rpath = CommandPath::new(path.endpoint, path.cluster, rid);
+                    cw.push_command(&rpath, slot.command_ref, |w, tag| {
+                        transcribe(&scratch[..scratch_len], w, tag)
+                    })
+                } else {
+                    cw.push_status(
+                        &path,
+                        &StatusIB::simple(ImStatus::Success),
+                        slot.command_ref,
+                    )
+                }
+            }
+            Err(s) => cw.push_status(&path, &StatusIB::new(s, cluster_status), slot.command_ref),
+        })?;
+        Ok(Some(len))
+    }
+
     /// device 発レポートが MRP で ack されなかった購読を破棄する(設計 §6.3、liveness)。
     pub fn on_report_failed(&mut self, subscription: u32) {
         let sidx = self.subs.iter().position(|s| s.id == subscription);
@@ -1012,6 +1204,12 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
                 break;
             };
             self.timed.swap_remove(i);
+        }
+        // 保留中の遅延応答の宛先セッションが閉じたら破棄する(送出先が無い、設計 §E7.2)。
+        if let Some(d) = &self.deferred {
+            if d.exchange.session() == session {
+                self.deferred = None;
+            }
         }
     }
 
@@ -1174,12 +1372,17 @@ impl InvokeEffects {
 /// 生成レスポンスを宣言した場合、そのフィールド(スクラッチ上の匿名構造体)を InvokeResponseIB の
 /// CommandDataIB へ転写する。宣言が無ければ結果ステータスを CommandStatusIB として書く。
 /// 返り値はクラスタが要求した副作用([`InvokeEffects`])。
+///
+/// クラスタが [`CmdResponder::set_deferred`](crate::dm::codec::CmdResponder::set_deferred) を
+/// 立てた場合は `cw` に何も書かず、`defer_out` に [`DeferReq`] を返す(応答保留、設計 §E7.2)。
+/// 呼び出し側([`invoke`](InteractionModel::invoke))が単独コマンドか等を判定してスロット化する。
 fn invoke_one<D: DataModel + ?Sized>(
     dm: &mut D,
     item: &CommandDataRef<'_>,
     acc: &AccessContext,
     was_timed: bool,
     cw: &mut CmdRespWriter<'_, '_>,
+    defer_out: &mut Option<DeferReq>,
 ) -> Result<InvokeEffects> {
     let path = item.path;
     if !dm.endpoints().iter().any(|e| e.id == path.endpoint) {
@@ -1238,9 +1441,9 @@ fn invoke_one<D: DataModel + ?Sized>(
     let mut fr = TlvReader::new(item.fields.unwrap_or(&[]));
     let mut scratch = [0u8; INVOKE_SCRATCH];
     // resp/sw の借用をブロックで閉じ、確定後にスクラッチを読めるようにする。
-    let (result, response_cmd, effects, cluster_status, scratch_len) = {
+    let (result, response_cmd, effects, cluster_status, deferred, scratch_len) = {
         let mut sw = TlvWriter::new(&mut scratch);
-        let (result, response_cmd, effects, cluster_status) = {
+        let (result, response_cmd, effects, cluster_status, deferred) = {
             let mut resp = CmdResponder::new(&mut sw);
             let result = cluster.invoke_command(path.command, &mut fr, &mut resp, acc);
             let effects = InvokeEffects {
@@ -1253,11 +1456,29 @@ fn invoke_one<D: DataModel + ?Sized>(
                 resp.response_command(),
                 effects,
                 resp.cluster_status(),
+                resp.is_deferred(),
             )
         };
         let scratch_len = sw.len();
-        (result, response_cmd, effects, cluster_status, scratch_len)
+        (
+            result,
+            response_cmd,
+            effects,
+            cluster_status,
+            deferred,
+            scratch_len,
+        )
     };
+
+    // 応答保留(設計 §E7.2): cluster が set_deferred + Ok を返したら `cw` に何も書かず、
+    // 呼び出し側へ保留を通知する。エラーを返したなら保留は無視して通常の status を書く。
+    if deferred && result.is_ok() {
+        *defer_out = Some(DeferReq {
+            path,
+            command_ref: item.command_ref,
+        });
+        return Ok(effects);
+    }
 
     match result {
         Ok(()) => {

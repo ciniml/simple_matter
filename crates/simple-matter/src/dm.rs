@@ -172,6 +172,36 @@ pub trait ServerCluster {
     fn take_dirty(&mut self) -> bool {
         false
     }
+
+    /// **遅延 InvokeResponse** の完了を問い合わせる(設計 `port-esp32-device.md` §E7.1)。
+    ///
+    /// 直前の [`invoke_command`](ServerCluster::invoke_command) が
+    /// [`CmdResponder::set_deferred`](crate::dm::codec::CmdResponder::set_deferred) を立てた
+    /// コマンド `command` について、IM エンジンが poll のたびに呼ぶ。まだ完了していなければ
+    /// [`DeferredPoll::Pending`]、完了したら通常の invoke と同じく `resp` に生成レスポンス
+    /// (`set_response`+フィールド)または status を書いて
+    /// [`DeferredPoll::Ready`] を返す。`Ready` に添える `Result` は invoke_command と同じ意味
+    /// (`Ok(())`=生成レスポンス/成功、`Err(status)`=CommandStatusIB)。
+    ///
+    /// 既定は `Ready(Err(Failure))`(応答を保留しない既存クラスタは呼ばれないため無影響)。
+    fn poll_deferred(
+        &mut self,
+        command: CommandId,
+        resp: &mut CmdResponder<'_, '_>,
+    ) -> DeferredPoll {
+        let _ = (command, resp);
+        DeferredPoll::Ready(Err(ImStatus::Failure))
+    }
+}
+
+/// [`ServerCluster::poll_deferred`] の結果(設計 `port-esp32-device.md` §E7.1)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredPoll {
+    /// まだ完了していない。IM エンジンは締切まで再度 poll する。
+    Pending,
+    /// 応答準備完了。`resp` に書いた内容(生成レスポンス or status)で InvokeResponse を組む。
+    /// `Ok(())` は生成レスポンス(または単純 Success)、`Err(status)` は CommandStatusIB。
+    Ready(core::result::Result<(), ImStatus>),
 }
 
 /// エンドポイント/クラスタの registry(設計 §7.1、chip `DataModel::Provider` 相当)。

@@ -13,7 +13,7 @@ use crate::dm::meta::{
     AccessContext, AttributeId, AttributeMeta, ClusterId, ClusterMeta, CommandId, CommandMeta,
     Privilege, Quality,
 };
-use crate::dm::{AttrWrite, ServerCluster};
+use crate::dm::{AttrWrite, DeferredPoll, ServerCluster};
 use crate::im::wire::ImStatus;
 use crate::tlv::{TlvReader, TlvTag};
 use crate::wifi::{NullWifiDriver, WifiDriver, WifiStatus};
@@ -161,7 +161,19 @@ pub struct NetworkCommissioningWifi<W: WifiDriver = NullWifiDriver> {
     last_connect_error: Option<i32>,
     /// プラットフォーム Wi-Fi ドライバ(ConnectNetwork で join を開始する)。
     driver: W,
+    /// 遅延 ConnectNetwork の残りリトライ回数(doc §E7.3)。
+    ///
+    /// 実機では BLE coex 中の最初の join 試行が過渡的に失敗しやすい
+    /// (AuthenticationExpired 等。実測で 2 回目に成功)。`Failed` を 1 回観測しただけで
+    /// 失敗応答を返すと chip-tool `pairing ble-wifi` が誤って失敗するため、
+    /// `Failed` 観測時は残回数がある限り `driver.connect()` を再発行して `Pending` を
+    /// 継続する。誤 SSID 等の恒常的失敗はリトライ消化後に失敗応答となる
+    /// (2 リトライ ≒ 最悪 3 試行。エンジンの締切 20 秒に収まる)。
+    connect_retries_left: u8,
 }
+
+/// 遅延 ConnectNetwork の join リトライ回数(初回試行を除く)。
+const CONNECT_RETRIES: u8 = 2;
 
 impl Default for NetworkCommissioningWifi {
     fn default() -> Self {
@@ -189,6 +201,7 @@ impl<W: WifiDriver> NetworkCommissioningWifi<W> {
             last_status: None,
             last_connect_error: None,
             driver,
+            connect_retries_left: CONNECT_RETRIES,
         }
     }
 
@@ -310,13 +323,24 @@ impl<W: WifiDriver> NetworkCommissioningWifi<W> {
         close_response(w)
     }
 
-    /// ConnectNetworkResponse(0x07): `{ 0: networkingStatus, 2: errorValue(null) }`。
-    fn write_connect_response(resp: &mut CmdResponder<'_, '_>, status: u8) -> Result<(), ImStatus> {
+    /// ConnectNetworkResponse(0x07): `{ 0: networkingStatus, 2: errorValue }`。
+    ///
+    /// `error` が `Some(v)` なら errorValue=v(join 失敗理由)、`None` なら null(成功)。
+    /// errorValue は nullable かつ非 optional。
+    fn write_connect_response(
+        resp: &mut CmdResponder<'_, '_>,
+        status: u8,
+        error: Option<i32>,
+    ) -> Result<(), ImStatus> {
         let w = open_response(resp, 0x07)?;
         w.write_u8(&TlvTag::ContextSpecific(0), status)
             .map_err(map_tlv)?;
-        // errorValue は nullable かつ非 optional。Success では null を返す。
-        w.write_null(&TlvTag::ContextSpecific(2)).map_err(map_tlv)?;
+        match error {
+            Some(v) => w
+                .write_i32(&TlvTag::ContextSpecific(2), v)
+                .map_err(map_tlv)?,
+            None => w.write_null(&TlvTag::ContextSpecific(2)).map_err(map_tlv)?,
+        }
         close_response(w)
     }
 
@@ -390,9 +414,9 @@ impl<W: WifiDriver> NetworkCommissioningWifi<W> {
                     )
                 }
             }
-            // ConnectNetwork(0x06): ドライバの join を開始し、**即 Success** を返す
-            // (バックグラウンド join、doc §E5.2)。join の結果は update_from_driver 経由で
-            // LastNetworkingStatus / LastConnectErrorValue に後から反映される。
+            // ConnectNetwork(0x06): ドライバの join を **開始** し、応答は **保留(遅延)** する
+            // (doc §E7.3)。join 完了/失敗は poll_deferred で観測し、その時点で
+            // ConnectNetworkResponse を返す。既知 SSID でない場合のみ即 NETWORK_ID_NOT_FOUND。
             0x06 => {
                 let known = Self::first_octstr(fields)
                     .map(|id| id == self.network_id() && self.ssid_len > 0)
@@ -400,13 +424,13 @@ impl<W: WifiDriver> NetworkCommissioningWifi<W> {
                 if known {
                     self.driver
                         .connect(&self.ssid[..self.ssid_len], &self.creds[..self.creds_len]);
-                    self.connected = true;
-                    self.last_status = Some(net_status::SUCCESS);
-                    self.last_connect_error = None;
-                    Self::write_connect_response(resp, net_status::SUCCESS)
+                    self.connect_retries_left = CONNECT_RETRIES;
+                    // 応答は join 完了後(poll_deferred)。ここでは connected/last_status を触らない。
+                    resp.set_deferred();
+                    Ok(())
                 } else {
                     self.last_status = Some(net_status::NETWORK_ID_NOT_FOUND);
-                    Self::write_connect_response(resp, net_status::NETWORK_ID_NOT_FOUND)
+                    Self::write_connect_response(resp, net_status::NETWORK_ID_NOT_FOUND, None)
                 }
             }
             // ReorderNetwork(0x08): 単一ネットワークなので常に Success。
@@ -567,6 +591,55 @@ impl<W: WifiDriver> ServerCluster for NetworkCommissioningWifi<W> {
     ) -> Result<(), ImStatus> {
         self.invoke_cmd(cmd, fields, resp, acc)
     }
+
+    /// 遅延した ConnectNetwork の完了を問い合わせる(doc §E7.3)。
+    ///
+    /// driver の [`WifiStatus`] を見て:
+    /// - `Connected` → ConnectNetworkResponse(Success)。`connected`/`last_status` も更新。
+    /// - `Failed { reason }` → ConnectNetworkResponse(OtherConnectionFailure, errorValue=reason)。
+    /// - `Connecting`(および `Idle`)→ [`DeferredPoll::Pending`]。
+    fn poll_deferred(
+        &mut self,
+        command: CommandId,
+        resp: &mut CmdResponder<'_, '_>,
+    ) -> DeferredPoll {
+        // ConnectNetwork(0x06)以外は遅延しないため、防御的に Failure で確定させる。
+        if command.0 != 0x06 {
+            return DeferredPoll::Ready(Err(ImStatus::Failure));
+        }
+        match self.driver.status() {
+            WifiStatus::Connected => {
+                self.connected = true;
+                self.last_status = Some(net_status::SUCCESS);
+                self.last_connect_error = None;
+                match Self::write_connect_response(resp, net_status::SUCCESS, None) {
+                    Ok(()) => DeferredPoll::Ready(Ok(())),
+                    Err(s) => DeferredPoll::Ready(Err(s)),
+                }
+            }
+            WifiStatus::Failed { reason } => {
+                // 過渡的失敗のリトライ(doc §E7.3): 残回数がある限り join を再発行して保留を続ける。
+                if self.connect_retries_left > 0 {
+                    self.connect_retries_left -= 1;
+                    self.driver
+                        .connect(&self.ssid[..self.ssid_len], &self.creds[..self.creds_len]);
+                    return DeferredPoll::Pending;
+                }
+                self.connected = false;
+                self.last_status = Some(net_status::OTHER_CONNECTION_FAILURE);
+                self.last_connect_error = Some(reason);
+                match Self::write_connect_response(
+                    resp,
+                    net_status::OTHER_CONNECTION_FAILURE,
+                    Some(reason),
+                ) {
+                    Ok(()) => DeferredPoll::Ready(Ok(())),
+                    Err(s) => DeferredPoll::Ready(Err(s)),
+                }
+            }
+            WifiStatus::Idle | WifiStatus::Connecting => DeferredPoll::Pending,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -574,7 +647,7 @@ mod wifi_tests {
     use super::*;
     use crate::dm::codec::CmdResponder;
     use crate::dm::meta::{AttributeId, Privilege, SessionKind};
-    use crate::dm::ServerCluster;
+    use crate::dm::{DeferredPoll, ServerCluster};
     use crate::tlv::{ContainerType, TlvReader, TlvTag, TlvValue, TlvWriter};
 
     fn acc() -> AccessContext {
@@ -630,6 +703,42 @@ mod wifi_tests {
         (rid, out, wlen)
     }
 
+    /// ConnectNetwork(0x06)を起動する。既知 SSID なら応答は **保留(deferred)** される
+    /// (doc §E7.3)。deferred フラグと「即時応答が無い」ことを確認する。
+    fn start_connect<W: WifiDriver>(net: &mut NetworkCommissioningWifi<W>, ssid: &[u8]) {
+        let mut fbuf = [0u8; 96];
+        let flen = write_ssid_fields(&mut fbuf, ssid);
+        let mut fr = TlvReader::new(&fbuf[..flen]);
+        let mut out = [0u8; 64];
+        let mut w = TlvWriter::new(&mut out);
+        let mut resp = CmdResponder::new(&mut w);
+        net.invoke_command(CommandId(0x06), &mut fr, &mut resp, &acc())
+            .unwrap();
+        assert!(resp.is_deferred(), "ConnectNetwork defers its response");
+        assert!(
+            resp.response_command().is_none(),
+            "no immediate generated response"
+        );
+    }
+
+    /// `poll_deferred` を 1 回呼ぶ。`Ready` なら `(rid, out, len)` を返す。
+    fn poll_connect<W: WifiDriver>(
+        net: &mut NetworkCommissioningWifi<W>,
+    ) -> Option<(u32, [u8; 64], usize)> {
+        let mut out = [0u8; 64];
+        let mut w = TlvWriter::new(&mut out);
+        let mut resp = CmdResponder::new(&mut w);
+        match net.poll_deferred(CommandId(0x06), &mut resp) {
+            DeferredPoll::Pending => None,
+            DeferredPoll::Ready(r) => {
+                r.expect("deferred connect resolved with a generated response");
+                let rid = resp.response_command().unwrap().0;
+                let len = w.len();
+                Some((rid, out, len))
+            }
+        }
+    }
+
     #[test]
     fn feature_map_is_wifi() {
         let net = NetworkCommissioningWifi::new();
@@ -679,8 +788,10 @@ mod wifi_tests {
             TlvValue::Boolean(false)
         );
 
-        // ConnectNetwork → ConnectNetworkResponse(0x07), status Success, errorValue null。
-        let (rid, out, len) = invoke(&mut net, 0x06, b"TESTSSID");
+        // ConnectNetwork → 応答保留。NullWifiDriver は即 Connected なので poll_deferred が
+        // 次の poll で ConnectNetworkResponse(0x07), status Success, errorValue null を返す。
+        start_connect(&mut net, b"TESTSSID");
+        let (rid, out, len) = poll_connect(&mut net).expect("NullWifiDriver ready immediately");
         assert_eq!(rid, 0x07);
         assert_eq!(
             resp_field(&out[..len], 0).unwrap().as_unsigned().unwrap(),
@@ -775,16 +886,27 @@ mod wifi_tests {
         // AddOrUpdate では join を開始しない。
         assert_eq!(net.driver().calls, 0);
 
-        // ConnectNetwork → ドライバに ssid/creds が渡り、応答は即 Success。
-        let (rid, out, len) = invoke(&mut net, 0x06, b"iotap");
+        // ConnectNetwork → ドライバに ssid/creds が渡り、応答は保留される。
+        start_connect(&mut net, b"iotap");
+        assert_eq!(net.driver().calls, 1);
+        assert_eq!(net.driver().ssid(), b"iotap");
+        assert_eq!(net.driver().creds(), b"hogeFugapiyo");
+
+        // RecordingDriver は connect で Connecting になるため、最初の poll は Pending。
+        assert!(
+            poll_connect(&mut net).is_none(),
+            "still Connecting → Pending"
+        );
+
+        // driver が Connected を報告したら poll_deferred が Success 応答を返す。
+        net.driver_mut().status = WifiStatus::Connected;
+        let (rid, out, len) = poll_connect(&mut net).expect("Connected → Ready");
         assert_eq!(rid, 0x07);
         assert_eq!(
             resp_field(&out[..len], 0).unwrap().as_unsigned().unwrap(),
             net_status::SUCCESS as u64
         );
-        assert_eq!(net.driver().calls, 1);
-        assert_eq!(net.driver().ssid(), b"iotap");
-        assert_eq!(net.driver().creds(), b"hogeFugapiyo");
+        assert!(matches!(resp_field(&out[..len], 2), Some(TlvValue::Null)));
     }
 
     /// ドライバの Failed を update_from_driver が属性へ反映する。
@@ -792,7 +914,7 @@ mod wifi_tests {
     fn update_from_driver_reflects_failure() {
         let mut net = NetworkCommissioningWifi::with_driver(RecordingDriver::new());
         let (_, _, _) = invoke(&mut net, 0x02, b"iotap");
-        let (_, _, _) = invoke(&mut net, 0x06, b"iotap");
+        start_connect(&mut net, b"iotap");
         net.driver_mut().status = WifiStatus::Failed { reason: -42 };
         net.update_from_driver();
 
@@ -828,12 +950,84 @@ mod wifi_tests {
     #[test]
     fn connect_unknown_network_reports_not_found() {
         let mut net = NetworkCommissioningWifi::new();
-        // 未設定のまま特定 SSID を connect → NetworkIDNotFound。
-        let (rid, out, len) = invoke(&mut net, 0x06, b"NOPE");
-        assert_eq!(rid, 0x07);
+        // 未設定のまま特定 SSID を connect → 即 NetworkIDNotFound(遅延しない)。
+        let mut fbuf = [0u8; 96];
+        let flen = write_ssid_fields(&mut fbuf, b"NOPE");
+        let mut fr = TlvReader::new(&fbuf[..flen]);
+        let mut out = [0u8; 64];
+        let mut w = TlvWriter::new(&mut out);
+        let mut resp = CmdResponder::new(&mut w);
+        net.invoke_command(CommandId(0x06), &mut fr, &mut resp, &acc())
+            .unwrap();
+        assert!(!resp.is_deferred(), "unknown network is not deferred");
+        assert_eq!(resp.response_command().unwrap().0, 0x07);
+        let len = w.len();
         assert_eq!(
             resp_field(&out[..len], 0).unwrap().as_unsigned().unwrap(),
             net_status::NETWORK_ID_NOT_FOUND as u64
         );
+    }
+
+    // E7.4: poll_deferred の 3 分岐(Connecting → Pending、Connected → Success、
+    // Failed → OtherConnectionFailure + errorValue)。
+
+    #[test]
+    fn poll_deferred_connecting_is_pending() {
+        let mut net = NetworkCommissioningWifi::with_driver(RecordingDriver::new());
+        let (_, _, _) = invoke(&mut net, 0x02, b"iotap");
+        start_connect(&mut net, b"iotap");
+        // RecordingDriver::connect → Connecting のまま。poll は Pending。
+        assert!(poll_connect(&mut net).is_none());
+    }
+
+    #[test]
+    fn poll_deferred_connected_returns_success() {
+        let mut net = NetworkCommissioningWifi::with_driver(RecordingDriver::new());
+        let (_, _, _) = invoke(&mut net, 0x02, b"iotap");
+        start_connect(&mut net, b"iotap");
+        net.driver_mut().status = WifiStatus::Connected;
+        let (rid, out, len) = poll_connect(&mut net).expect("Connected → Ready");
+        assert_eq!(rid, 0x07);
+        assert_eq!(
+            resp_field(&out[..len], 0).unwrap().as_unsigned().unwrap(),
+            net_status::SUCCESS as u64
+        );
+        // errorValue は null。
+        assert!(matches!(resp_field(&out[..len], 2), Some(TlvValue::Null)));
+        // connected 属性が立つ。
+        assert!(net.connected);
+    }
+
+    #[test]
+    fn poll_deferred_failed_returns_other_connection_failure() {
+        let mut net = NetworkCommissioningWifi::with_driver(RecordingDriver::new());
+        let (_, _, _) = invoke(&mut net, 0x02, b"iotap");
+        start_connect(&mut net, b"iotap");
+        net.driver_mut().status = WifiStatus::Failed { reason: -7 };
+        // 過渡的失敗のリトライ(doc §E7.3): CONNECT_RETRIES 回は connect を再発行して Pending
+        // (RecordingDriver::connect は status を Connecting に戻すため、毎回 Failed を再注入)。
+        for _ in 0..CONNECT_RETRIES {
+            assert!(
+                poll_connect(&mut net).is_none(),
+                "Failed(リトライ中) → Pending"
+            );
+            net.driver_mut().status = WifiStatus::Failed { reason: -7 };
+        }
+        let (rid, out, len) = poll_connect(&mut net).expect("Failed → Ready");
+        assert_eq!(rid, 0x07);
+        // networkingStatus = OtherConnectionFailure(9)。
+        assert_eq!(
+            resp_field(&out[..len], 0).unwrap().as_unsigned().unwrap(),
+            net_status::OTHER_CONNECTION_FAILURE as u64
+        );
+        // errorValue = reason(-7)。
+        assert!(matches!(
+            resp_field(&out[..len], 2),
+            Some(TlvValue::SignedInteger(-7))
+        ));
+        // 失敗を属性へも反映。
+        assert!(!net.connected);
+        assert_eq!(net.last_status, Some(net_status::OTHER_CONNECTION_FAILURE));
+        assert_eq!(net.last_connect_error, Some(-7));
     }
 }

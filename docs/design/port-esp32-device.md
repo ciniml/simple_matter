@@ -324,9 +324,9 @@ chip-tool は ConnectNetworkResponse を BLE 上で待つ。仕様は「接続�
 - **限界**: join 失敗(パスワード誤り等)を ConnectNetworkResponse で報告できない。
   失敗は `LastNetworkingStatus` / `LastConnectErrorValue` 属性
   (`update_from_driver` で反映)からしか観測できず、chip-tool はディスカバリ
-  タイムアウトで失敗する。**将来課題**: `HandlerAction` の遅延応答型を IM エンジンに
-  追加し、`ConnectMaxTimeSeconds` 以内の完了後応答へ移行する(コア IM の中規模改修。
-  E5 スコープ外)。
+  タイムアウトで失敗する。
+- **→ この限界は E7(遅延 InvokeResponse)で解消済み。** 本節の「即 Success」方式は
+  歴史的経緯として残す。現行実装は E7 の「join 完了/失敗時に応答」。
 
 ### E5.3 `NetworkCommissioningWifi` の一般化(型二重化の解消)
 
@@ -383,6 +383,81 @@ chip-tool は ConnectNetworkResponse を BLE 上で待つ。仕様は「接続�
   `crates/simple-matter-ble/examples/ble-onoff-light.rs` の select ループ構造。
 - ヒープ: Wi-Fi + BLE coex で esp-radio の要求が増える。E4 の 72KiB から増量し、
   SRAM 512KiB(C6)内に収める(実測は E6 の表)。
+
+## E7 設計: 遅延 InvokeResponse(ConnectNetwork の完了後応答)
+
+E5.2 の「即 Success」割り切りを解消する。仕様どおり「join 完了/失敗後に
+ConnectNetworkResponse を返す」ために、IM エンジンへ**遅延 InvokeResponse 機構**を
+追加する。sans-IO・同期 Mealy machine の枠組みは変えず、購読レポート
+(`poll_subscriptions`/`build_report`/`stage_subscription_report`)と同型の
+「poll 駆動の後追い送出」として実装する。
+
+### E7.1 ハンドラ契約(cluster → engine)
+
+- `CmdResponder::set_deferred()` を追加(`set_response` と同格のフラグ)。
+  cluster の `invoke_command` がこれを立てて返すと「応答保留」。
+- `Cluster` trait に `poll_deferred(&mut self, command: CommandId,
+  resp: &mut CmdResponder) -> DeferredPoll`(`Pending` / `Ready`)を追加。
+  デフォルト実装は `Ready`+`Failure`(既存 cluster は無影響)。`Ready` 時は
+  通常の invoke と同じく `set_response`+fields か status で応答内容を組み立てる。
+
+### E7.2 エンジン状態と送出
+
+- 遅延スロットは **1 本**(`Option<DeferredInvoke>`)。保持内容: `ExchangeId`、
+  concrete path、`command_ref`、`suppress_response`、アクセス文脈(fabric index 等)、
+  締切 `deadline_ms`。2 本目の遅延要求は Busy(ImStatus)で即時拒否。
+- 遅延成立時、`invoke()` は `HandlerAction::None` を返す(exchange を
+  `mark_closing` しない=生存維持)。受信 ACK は既存の standalone ACK 機構が返す
+  (MRP 再送は起きない)。
+- `poll_deferred_invoke(now_ms)`(engine)→ due なら
+  `build_deferred_invoke_response(exchange, tx, now)` で InvokeResponse を構築、
+  stack 側の `stage_deferred_invoke_response` が**元の responder exchange** に
+  `send_reliable` して `mark_closing`。`next_deadline` に締切を合成。
+- **締切フォールバック**: `deadline_ms`(既定 = ConnectMaxTimeSeconds より短い
+  20 秒)超過で cluster の完了を待たず失敗応答(cluster 側 `poll_deferred` が
+  `Ready` を返さないままなら Timeout 相当のエラー status/response)。クライアント
+  (ImClient/chip-tool)の txn タイムアウト 30 秒より必ず先に返す。
+- セッション/exchange が先に死んだ場合はスロット破棄(送出先が無いだけで安全)。
+
+### E7.3 NetworkCommissioningWifi の変更
+
+- `ConnectNetwork`: `driver.connect()` 開始 → `set_deferred()`。
+- `poll_deferred`: `driver.status()` を見て `Connected` → Success 応答、
+  `Failed { reason }` → `OTHER_CONNECTION_FAILURE` + errorValue=reason、
+  `Connecting` → `Pending`。応答時に `last_status` / `connected` 属性も更新。
+- `NullWifiDriver` は connect 即 Connected のため、シム経路は「次の poll で
+  Success 応答」となり従来フローと互換(chip-tool ble-wifi 実証パスは不変)。
+- ESP32 `e5-light` は EspWifiDriver が `status()` に失敗を書き戻すこと
+  (auth 失敗/AP 不在で `Failed`)を確認して追従。誤 SSID で chip-tool が
+  ConnectNetworkResponse(status≠0) を受けて即座に失敗終了することを実機ゲートに含む。
+- **過渡的失敗のリトライ**(実機で確定): BLE coex 中の初回 join は過渡的に
+  失敗しやすい(NanoC6 実測: AuthenticationExpired → 2〜3 試行目で成功)。`Failed` を
+  1 回観測しただけで失敗応答を返すと chip-tool `pairing ble-wifi` が誤って失敗する
+  ため、`poll_deferred` は `Failed` 観測時に **2 回まで `driver.connect()` を再発行**
+  して `Pending` を継続する(計 3 試行 ≒ 締切 20 秒内)。誤 SSID 等の恒常的失敗は
+  リトライ消化後に `OTHER_CONNECTION_FAILURE` + errorValue で応答する。
+
+### E7.2b 実装上の注意(実機デバッグで確定した 2 点)
+
+- **送出は `stage_response` に委譲する**: 遅延応答を素の `send_reliable` で送ると
+  BTP セッションで MRP 再送スロットが armed され(BTP は MRP ACK を返さない)、
+  BLE クローズ後に再送が死んだリンクへ飛んで InvalidState になる。即時応答と同じく
+  BTP では reliable→unreliable 格下げが必要。
+- **応答構築のスクラッチをスタックに置かない**: `build_deferred_invoke_response` は
+  統合層 `poll()`(毎イテレーション呼)にインライン化され得るため、900B のローカル
+  配列はタスクスタック余裕を常時消費する。NanoC6 実機ではこれが BLE(esp-radio)
+  ヒープ破壊として顕在化し、attestation/CSR の大型応答中に ATT エラーで切断した
+  (切り分けは staging 呼び出しの無効化ビルドで実施)。スクラッチは `tx` 末尾を
+  間借りする。
+
+### E7.4 検証ゲート
+
+- 単体: エンジンの遅延応答(成功/失敗/締切タイムアウト/2 本目 Busy/exchange 消滅)、
+  wifi cluster の `poll_deferred` 3 分岐。
+- ループバック: `controller_end_to_end_wifi_provisioning` を「遅延応答で完走」に更新
+  +誤 credentials で InvokeResponse が失敗 status になるケースを追加。
+- 実機: chip-tool `pairing ble-wifi`(NanoC6、実 AP)成功パス + **誤 SSID で
+  ConnectNetworkResponse による失敗報告**を確認。
 
 ## 9. 参考(調査ソース)
 

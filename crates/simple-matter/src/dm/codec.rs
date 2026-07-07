@@ -298,6 +298,7 @@ pub struct CmdResponder<'w, 'b> {
     case_admin_acl: Option<(core::num::NonZeroU8, u64)>,
     removed_fabric: Option<core::num::NonZeroU8>,
     cluster_status: Option<u8>,
+    deferred: bool,
 }
 
 impl<'w, 'b> CmdResponder<'w, 'b> {
@@ -310,6 +311,7 @@ impl<'w, 'b> CmdResponder<'w, 'b> {
             case_admin_acl: None,
             removed_fabric: None,
             cluster_status: None,
+            deferred: false,
         }
     }
 
@@ -374,6 +376,21 @@ impl<'w, 'b> CmdResponder<'w, 'b> {
     /// 要求された fabric 連動削除(あれば)。
     pub const fn requested_fabric_removed(&self) -> Option<core::num::NonZeroU8> {
         self.removed_fabric
+    }
+
+    /// このコマンドの応答を **保留(遅延)** するよう宣言する(設計 `port-esp32-device.md` §E7.1)。
+    ///
+    /// `invoke_command` がこれを立てて `Ok(())` を返すと、IM エンジンは即時の
+    /// InvokeResponse を出さず、以降 [`ServerCluster::poll_deferred`](crate::dm::ServerCluster::poll_deferred)
+    /// が `Ready` を返した時点(または締切超過)で応答を送る。ConnectNetwork の
+    /// 「join 完了後応答」に使う。
+    pub fn set_deferred(&mut self) {
+        self.deferred = true;
+    }
+
+    /// 応答保留が宣言されたか([`CmdResponder::set_deferred`])。
+    pub const fn is_deferred(&self) -> bool {
+        self.deferred
     }
 
     /// レスポンスフィールドを書くための下位 [`TlvWriter`] を返す。

@@ -1602,6 +1602,102 @@ mod controller_e2e {
         assert_eq!(fabrics.borrow().len(), 1, "device fabric added");
     }
 
+    /// 誤 credentials で join が失敗する場合、遅延 InvokeResponse として返る
+    /// ConnectNetworkResponse(networkingStatus = OtherConnectionFailure)を Commissioner が
+    /// 受けてコミッショニングを失敗終了することを検証する(doc §E7.3/§E7.4)。
+    #[test]
+    fn controller_wifi_provisioning_reports_connect_failure() {
+        use crate::controller::CommissionError;
+        use crate::dm::clusters::NetworkCommissioningWifi;
+        use crate::wifi::{WifiDriver, WifiStatus};
+
+        /// join が常に失敗するテスト用ドライバ(status() が Failed を返す)。
+        #[derive(Default)]
+        struct FailingDriver {
+            calls: usize,
+        }
+        impl WifiDriver for FailingDriver {
+            fn connect(&mut self, _ssid: &[u8], _creds: &[u8]) {
+                self.calls += 1;
+            }
+            fn status(&self) -> WifiStatus {
+                // auth 失敗 / AP 不在相当。reason は LastConnectErrorValue へ反映される。
+                WifiStatus::Failed { reason: 15 }
+            }
+        }
+
+        let crypto = RustCrypto::new(SeqRng(0xC0FF_EE00_DEAD_BEEF));
+        let fabrics: RefCell<FabricTable<Crb, 5>> = RefCell::new(FabricTable::new());
+
+        let config = PaseConfig::from_passcode(PASSCODE, &SALT, ITERATIONS).unwrap();
+        let dev_creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
+        let sc = SecureChannel::new(&crypto, SeqRng(0x5C00_00F2), config, dev_creds);
+        let im = InteractionModel::new(build_device_with(
+            &fabrics,
+            NetworkCommissioningWifi::with_driver(FailingDriver::default()),
+        ));
+        let mut dev: TestStack<'_, NetworkCommissioningWifi<FailingDriver>> =
+            MatterStack::new(&crypto, sc, im);
+
+        let ca = Ca::<Crb>::generate(
+            &crypto,
+            &mut SeqRng(0xCA00_00F3),
+            FABRIC_ID,
+            COMM_NODE,
+            0xFFF1,
+            0,
+        )
+        .expect("Ca::generate");
+        let ctrl_creds = ControllerCreds::new(&ca, &crypto, 0);
+        let sc_init = ScInitiator::new(&crypto, SeqRng(0x1C00_00F4), ctrl_creds);
+        let mut ctrl: Ctrl = ControllerStack::new(&crypto, sc_init, ImClient::new());
+
+        let mut comm = Commissioner::new(&ca, &crypto, AttestationPolicy::Skip);
+        comm.set_wifi_credentials(b"iotap", b"wrongpassword")
+            .expect("set_wifi_credentials");
+        comm.commission(peer(), PASSCODE, DEVICE_NODE, NOW).unwrap();
+
+        let mut tx = [0u8; 1700];
+        let mut final_phase = comm.phase();
+        let mut saw_connect = false;
+        for _ in 0..60 {
+            let out = comm.drive(&mut ctrl, NOW, &mut tx);
+            final_phase = out.phase;
+            if let Phase::ConnectNetwork = out.phase {
+                saw_connect = true;
+            }
+            if let Some(d) = out.send {
+                deliver_and_settle(&mut ctrl, &mut dev, NOW, &tx, d.len);
+            }
+            match out.phase {
+                Phase::Done { .. } | Phase::Failed { .. } => break,
+                _ => {}
+            }
+        }
+
+        assert!(saw_connect, "ConnectNetwork phase was driven");
+        // ドライバに join が渡っている。
+        // 初回 + リトライ 2 回(doc §E7.3 の過渡的失敗リトライ)で計 3 回 join を試みる。
+        assert_eq!(
+            dev.device().net.driver().calls,
+            3,
+            "connect started + retried"
+        );
+        // Commissioner は ConnectNetworkResponse(status=9)を受けて失敗終了する。
+        match final_phase {
+            Phase::Failed {
+                stage,
+                reason: CommissionError::Status(code),
+            } => {
+                assert_eq!(stage, 11, "failed at ConnectNetwork stage");
+                // OtherConnectionFailure(9)。
+                assert_eq!(code, 9, "networkingStatus = OtherConnectionFailure");
+            }
+            other => panic!("expected ConnectNetwork failure, got {other:?}"),
+        }
+        // 失敗したので fabric は生えるが運用ノードには到達しない(コミッショニング未完了)。
+    }
+
     /// `set_wifi_credentials` の境界: SSID 32 / credentials 64 バイトまで受理、超過は拒否。
     #[test]
     fn set_wifi_credentials_validates_lengths() {

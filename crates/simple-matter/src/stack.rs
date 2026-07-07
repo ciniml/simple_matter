@@ -321,7 +321,10 @@ impl<
             }
         }
 
-        self.stage_subscription_report(now_ms, tx_out)
+        if let Some(d) = self.stage_subscription_report(now_ms, tx_out) {
+            return Some(d);
+        }
+        self.stage_deferred_invoke_response(now_ms, tx_out)
     }
 
     /// 未確立の unsecured セッションが必要なら(平文パケット・未登録の peer)先に確保する。
@@ -507,6 +510,62 @@ impl<
             addr: sent.addr,
             len: sent.len,
         })
+    }
+
+    /// 保留中の遅延 InvokeResponse を **元の responder exchange** に送出する(設計 §E7.2)。
+    ///
+    /// cluster が完了(または締切超過)していれば InvokeResponse を組み立てて `send_reliable`
+    /// し、`mark_closing` で終端予約する。まだ完了していなければ何もしない(次 poll で再試行)。
+    /// exchange が消えていればスロットを破棄する。再送保留中(`send_reliable` の InvalidState)は
+    /// ドロップせず後続の poll で再試行する。
+    fn stage_deferred_invoke_response(
+        &mut self,
+        now_ms: u64,
+        tx_out: &mut [u8],
+    ) -> Option<SendDirective> {
+        let ex = self.mgr.handler().im.poll_deferred_invoke(now_ms)?;
+        // 送出先 exchange が消えていたらスロット破棄(セッション/会話が先に死んだ)。
+        if !self.mgr.contains(ex) {
+            self.mgr.handler_mut().im.drop_deferred();
+            return None;
+        }
+        // 元応答の再送が保留中なら send_reliable は InvalidState。次 poll まで待つ
+        //(応答はまだ組み立てない=スロット保持)。
+        if self.mgr.is_retrans_pending(ex) {
+            return None;
+        }
+        // 応答を組み立てる(スロットはここでは消さない。送信成功後に drop する)。
+        let len = match self.mgr.handler_mut().im.build_deferred_invoke_response(
+            ex,
+            &mut self.resp,
+            now_ms,
+        ) {
+            Ok(Some(n)) => n,
+            // まだ完了していない(Pending かつ締切内)。
+            Ok(None) => return None,
+            // スロット不整合等。破棄して stall を避ける。
+            Err(_) => {
+                self.mgr.handler_mut().im.drop_deferred();
+                return None;
+            }
+        };
+        // 送出は即時応答と同じ `stage_response` に委譲する(BTP セッションでの
+        // reliable→unreliable 格下げを含む。BTP に MRP 再送スロットを登録すると
+        // ACK が来ず再送が閉じた BLE リンクへ飛ぶ)。失敗時はスロットを保持して
+        // 次 poll で再試行する。
+        let d = self.stage_response(
+            ex,
+            PROTO_ID_INTERACTION_MODEL,
+            ImOpCode::InvokeResponse.to_u8(),
+            true,
+            len,
+            now_ms,
+            tx_out,
+        )?;
+        // 送信成功。スロットを消し、exchange を終端予約する(ACK 静穏後に回収)。
+        self.mgr.handler_mut().im.drop_deferred();
+        self.mgr.mark_closing(ex);
+        Some(d)
     }
 }
 
