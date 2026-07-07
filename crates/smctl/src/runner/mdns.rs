@@ -5,17 +5,122 @@
 //! `IP_MULTICAST_IF`/join の LAN 向き IF 固定、`SM_MDNS_TRACE`)を `#[cfg]` で吸収する。
 
 use std::io::ErrorKind;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket};
 use std::time::{Duration, Instant};
 
 use simple_matter::controller::ca::Ca;
 use simple_matter::discovery::client::{CommissionableSet, Ingest, MdnsClient};
-use simple_matter::discovery::{MATTER_PORT, MDNS_IPV4, MDNS_PORT};
+use simple_matter::discovery::{MATTER_PORT, MDNS_IPV4, MDNS_IPV6, MDNS_PORT};
 
 use super::Backend;
 
 /// ブラウズ中にクエリを再送する間隔。
 const MDNS_REQUERY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// nonblocking な複数ソケットを空回しするときの待機。
+const MDNS_POLL_SLEEP: Duration = Duration::from_millis(20);
+
+/// v6 リンクローカル(fe80::/10)か。
+fn is_v6_link_local(ip: Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xffc0) == 0xfe80
+}
+
+/// 解決したアドレスを CASE 接続用の [`SocketAddr`] にする。fe80 リンクローカルには
+/// `scope`(v6 mDNS join に使った if_index)を埋める(design §3)。
+fn socket_addr_with_scope(ip: IpAddr, port: u16, scope: Option<u32>) -> SocketAddr {
+    match ip {
+        IpAddr::V6(v6) if is_v6_link_local(v6) => {
+            SocketAddr::V6(SocketAddrV6::new(v6, port, 0, scope.unwrap_or(0)))
+        }
+        _ => SocketAddr::new(ip, port),
+    }
+}
+
+/// 再接続時(nodes.tlv は scope を保存しない)に fe80 アドレスへ scope_id を補完する
+/// (design §3)。scope 0 の v6 リンクローカルのみ対象。非 unix では既定 scope が
+/// 得られず no-op。
+pub fn fill_link_local_scope(addr: SocketAddr) -> SocketAddr {
+    if let SocketAddr::V6(v6) = addr {
+        if is_v6_link_local(*v6.ip()) && v6.scope_id() == 0 {
+            if let Some(scope) = default_v6_scope() {
+                return SocketAddr::V6(SocketAddrV6::new(*v6.ip(), v6.port(), 0, scope));
+            }
+        }
+    }
+    addr
+}
+
+/// v4 と(unix のみ)v6 の mDNS クエリソケットをまとめて扱う。
+///
+/// 各ソケットは (ソケット, QU モードか, マルチキャスト宛先) を持ち、応答は
+/// ファミリ非依存の [`MdnsClient::parse_*`] に集約する(design §3)。
+struct MdnsSockets {
+    socks: Vec<MdnsSock>,
+    /// v6 ソケットの scope_id(fe80 連絡先の補完に使う)。
+    v6_scope: Option<u32>,
+}
+
+struct MdnsSock {
+    sock: UdpSocket,
+    /// unicast-response(QU)モードか(Windows のエフェメラルポート等)。
+    qu: bool,
+    /// QM 応答/クエリの送信先マルチキャストアドレス。
+    mc_dst: SocketAddr,
+}
+
+impl MdnsSockets {
+    /// v4(+ unix は v6)ソケットを開く。1 本も開けなければ `None`。
+    fn open() -> Option<Self> {
+        let mut socks = Vec::new();
+        let mut v6_scope = None;
+        if let Some((sock, qu)) = open_mdns_browse_socket() {
+            socks.push(MdnsSock {
+                sock,
+                qu,
+                mc_dst: SocketAddr::from((MDNS_IPV4, MDNS_PORT)),
+            });
+        }
+        #[cfg(unix)]
+        if let Some((sock, scope)) = open_mdns_browse_socket_v6() {
+            v6_scope = Some(scope);
+            socks.push(MdnsSock {
+                sock,
+                qu: false,
+                mc_dst: SocketAddr::V6(SocketAddrV6::new(MDNS_IPV6, MDNS_PORT, 0, scope)),
+            });
+        }
+        if socks.is_empty() {
+            None
+        } else {
+            Some(Self { socks, v6_scope })
+        }
+    }
+
+    /// 各ソケットへ、その QU モードに合わせて組んだクエリを送る。
+    fn send_query<F>(&self, build: F)
+    where
+        F: Fn(&mut [u8; 128], bool) -> Result<usize, simple_matter::Error>,
+    {
+        for s in &self.socks {
+            let mut buf = [0u8; 128];
+            if let Ok(len) = build(&mut buf, s.qu) {
+                let _ = s.sock.send_to(&buf[..len], s.mc_dst);
+            }
+        }
+    }
+
+    /// いずれかのソケットから 1 パケット受信する(nonblocking、無ければ `None`)。
+    fn recv(&self, buf: &mut [u8]) -> Option<(usize, SocketAddr)> {
+        for s in &self.socks {
+            match s.sock.recv_from(buf) {
+                Ok(x) => return Some(x),
+                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
+                Err(_) => {}
+            }
+        }
+        None
+    }
+}
 
 /// `_matterc._udp.local` を PTR ブラウズし、最初に発見した commissionable ノードの
 /// (アドレス, ポート)を返す。
@@ -28,14 +133,12 @@ pub fn browse_commissionable(
     timeout: Duration,
 ) -> Result<SocketAddr, String> {
     let trace = std::env::var_os("SM_MDNS_TRACE").is_some();
-    let (socket, qu) = open_mdns_browse_socket().ok_or("open mDNS browse socket failed")?;
+    let socks = MdnsSockets::open().ok_or("open mDNS browse socket failed")?;
 
-    let mut query = [0u8; 128];
-    let qlen = match discriminator {
-        Some(d) => MdnsClient::build_browse_discriminator(&mut query, d, qu),
-        None => MdnsClient::build_browse_commissionable(&mut query, qu),
-    }
-    .map_err(|e| format!("build mDNS query: {e:?}"))?;
+    let build = |buf: &mut [u8; 128], qu: bool| match discriminator {
+        Some(d) => MdnsClient::build_browse_discriminator(buf, d, qu),
+        None => MdnsClient::build_browse_commissionable(buf, qu),
+    };
 
     let start = Instant::now();
     // 最初のクエリは即時送出(last_query を過去に置く)。
@@ -43,18 +146,19 @@ pub fn browse_commissionable(
     let mut rx = [0u8; 1500];
     while start.elapsed() < timeout {
         if last_query.elapsed() >= MDNS_REQUERY_INTERVAL {
-            let _ = socket.send_to(&query[..qlen], (MDNS_IPV4, MDNS_PORT));
+            socks.send_query(build);
             last_query = Instant::now();
             if trace {
-                eprintln!("[mdns-trace] browse query sent ({qlen}B, qu={qu})");
+                eprintln!("[mdns-trace] browse query sent");
             }
         }
-        match socket.recv_from(&mut rx) {
-            Ok((n, src)) => {
+        match socks.recv(&mut rx) {
+            Some((n, src)) => {
                 let parsed = MdnsClient::parse_commissionable(&rx[..n]);
                 if trace {
+                    let fam = if src.is_ipv6() { "v6" } else { "v4" };
                     eprintln!(
-                        "[mdns-trace] rx {n}B from {src} parse={}",
+                        "[mdns-trace] rx {n}B from {src} ({fam}) parse={}",
                         if parsed.is_some() {
                             "commissionable"
                         } else {
@@ -86,14 +190,14 @@ pub fn browse_commissionable(
                         .discriminator
                         .map(|d| d.to_string())
                         .unwrap_or_else(|| "?".into());
+                    let addr = socket_addr_with_scope(ip, port, socks.v6_scope);
                     eprintln!(
-                        "[discovery] found commissionable node at {ip}:{port} (discriminator={disc})"
+                        "[discovery] found commissionable node at {addr} (discriminator={disc})"
                     );
-                    return Ok(SocketAddr::new(ip, port));
+                    return Ok(addr);
                 }
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
-            Err(e) => return Err(format!("mDNS recv: {e}")),
+            None => std::thread::sleep(MDNS_POLL_SLEEP),
         }
     }
     Err(format!(
@@ -110,14 +214,12 @@ pub fn browse_commissionable_list(
     timeout: Duration,
 ) -> Result<usize, String> {
     let trace = std::env::var_os("SM_MDNS_TRACE").is_some();
-    let (socket, qu) = open_mdns_browse_socket().ok_or("open mDNS browse socket failed")?;
+    let socks = MdnsSockets::open().ok_or("open mDNS browse socket failed")?;
 
-    let mut query = [0u8; 128];
-    let qlen = match discriminator {
-        Some(d) => MdnsClient::build_browse_discriminator(&mut query, d, qu),
-        None => MdnsClient::build_browse_commissionable(&mut query, qu),
-    }
-    .map_err(|e| format!("build mDNS query: {e:?}"))?;
+    let build = |buf: &mut [u8; 128], qu: bool| match discriminator {
+        Some(d) => MdnsClient::build_browse_discriminator(buf, d, qu),
+        None => MdnsClient::build_browse_commissionable(buf, qu),
+    };
 
     eprintln!(
         "[discover] browsing _matterc._udp.local for {timeout:?} \
@@ -133,17 +235,18 @@ pub fn browse_commissionable_list(
     let mut rx = [0u8; 1500];
     while start.elapsed() < timeout {
         if last_query.elapsed() >= MDNS_REQUERY_INTERVAL {
-            let _ = socket.send_to(&query[..qlen], (MDNS_IPV4, MDNS_PORT));
+            socks.send_query(build);
             last_query = Instant::now();
         }
-        match socket.recv_from(&mut rx) {
-            Ok((n, src)) => {
+        match socks.recv(&mut rx) {
+            Some((n, src)) => {
                 let ingest = match discriminator {
                     Some(d) => set.ingest_filtered(&rx[..n], d),
                     None => set.ingest(&rx[..n]),
                 };
                 if trace {
-                    eprintln!("[mdns-trace] rx {n}B from {src} ingest={ingest:?}");
+                    let fam = if src.is_ipv6() { "v6" } else { "v4" };
+                    eprintln!("[mdns-trace] rx {n}B from {src} ({fam}) ingest={ingest:?}");
                 }
                 if ingest == Ingest::Added {
                     if let Some(node) = set.iter().last() {
@@ -151,8 +254,7 @@ pub fn browse_commissionable_list(
                     }
                 }
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
-            Err(e) => return Err(format!("mDNS recv: {e}")),
+            None => std::thread::sleep(MDNS_POLL_SLEEP),
         }
     }
     Ok(set.len())
@@ -232,12 +334,12 @@ pub fn resolve_operational(
     let trace = std::env::var_os("SM_MDNS_TRACE").is_some();
     let compressed = ca.compressed_fabric_id_bytes();
 
-    let (socket, qu) = open_mdns_browse_socket().ok_or("open mDNS query socket failed")?;
-    let mut query = [0u8; 128];
-    let qlen = MdnsClient::build_resolve_operational(&mut query, &compressed, node_id, qu)
-        .map_err(|e| format!("build_resolve_operational: {e:?}"))?;
+    let socks = MdnsSockets::open().ok_or("open mDNS query socket failed")?;
+    let build = |buf: &mut [u8; 128], qu: bool| {
+        MdnsClient::build_resolve_operational(buf, &compressed, node_id, qu)
+    };
     eprintln!(
-        "[discovery] resolving _matter._tcp for {:016X}-{node_id:016X} (qu={qu})...",
+        "[discovery] resolving _matter._tcp for {:016X}-{node_id:016X}...",
         u64::from_be_bytes(compressed)
     );
 
@@ -246,18 +348,19 @@ pub fn resolve_operational(
     let mut rx = [0u8; 1500];
     while start.elapsed() < timeout {
         if last_query.elapsed() >= MDNS_REQUERY_INTERVAL {
-            let _ = socket.send_to(&query[..qlen], (MDNS_IPV4, MDNS_PORT));
+            socks.send_query(build);
             last_query = Instant::now();
             if trace {
-                eprintln!("[mdns-trace] operational query sent ({qlen}B, qu={qu})");
+                eprintln!("[mdns-trace] operational query sent");
             }
         }
-        match socket.recv_from(&mut rx) {
-            Ok((n, src)) => {
+        match socks.recv(&mut rx) {
+            Some((n, src)) => {
                 let parsed = MdnsClient::parse_operational(&rx[..n], &compressed, node_id);
                 if trace {
+                    let fam = if src.is_ipv6() { "v6" } else { "v4" };
                     eprintln!(
-                        "[mdns-trace] rx {n}B from {src} parse={}",
+                        "[mdns-trace] rx {n}B from {src} ({fam}) parse={}",
                         if parsed.is_some() {
                             "operational"
                         } else {
@@ -266,6 +369,8 @@ pub fn resolve_operational(
                     );
                 }
                 if let Some(node) = parsed {
+                    // IPv4 優先(design §3)、無ければ最初のアドレス。v6 リンクローカルは
+                    // scope(v6 join に使った if_index)を埋めて CASE 接続可能にする。
                     let picked = node
                         .addrs
                         .iter()
@@ -278,12 +383,11 @@ pub fn resolve_operational(
                         } else {
                             MATTER_PORT
                         };
-                        return Ok(SocketAddr::new(ip, port));
+                        return Ok(socket_addr_with_scope(ip, port, socks.v6_scope));
                     }
                 }
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
-            Err(e) => return Err(format!("mDNS recv: {e}")),
+            None => std::thread::sleep(MDNS_POLL_SLEEP),
         }
     }
     Err(format!(
@@ -316,15 +420,95 @@ fn open_mdns_browse_socket() -> Option<(UdpSocket, bool)> {
         socket
             .join_multicast_v4(&MDNS_IPV4, &Ipv4Addr::UNSPECIFIED)
             .ok()?;
-        socket
-            .set_read_timeout(Some(Duration::from_millis(100)))
-            .ok()?;
+        // 複数ソケット(v4 + v6)を 1 スレッドで多重化するため nonblocking にする。
+        socket.set_nonblocking(true).ok()?;
         Some((socket, false))
     }
     #[cfg(not(unix))]
     {
         open_mdns_query_socket()
     }
+}
+
+/// IPv6(ff02::fb)mDNS クエリソケット(unix、5353 共有 bind + join)。戻りは
+/// (ソケット, scope_id)。リンクローカルが取れなければ `None`。
+#[cfg(unix)]
+fn open_mdns_browse_socket_v6() -> Option<(UdpSocket, u32)> {
+    let scope = default_v6_scope()?;
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .ok()?;
+    socket.set_only_v6(true).ok()?;
+    socket.set_reuse_address(true).ok()?;
+    let _ = socket.set_reuse_port(true);
+    socket
+        .bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, MDNS_PORT)).into())
+        .ok()?;
+    let socket: UdpSocket = socket.into();
+    socket.join_multicast_v6(&MDNS_IPV6, scope).ok()?;
+    socket.set_nonblocking(true).ok()?;
+    Some((socket, scope))
+}
+
+/// 既定 v6 リンクローカル scope_id(if_index)を推定する。
+///
+/// `/proc/net/route` の既定経路 iface の fe80 行を優先(仮想 IF が先に並ぶ環境対策、
+/// W3 の教訓)。無ければ最初の非 lo fe80 にフォールバック。非 Linux は `None`
+/// (smctl の v6 は unix のみ、Windows は v4 のまま = 許容乖離)。
+#[cfg(target_os = "linux")]
+pub fn default_v6_scope() -> Option<u32> {
+    let want_if = default_route_ifname_v6scope();
+    let text = std::fs::read_to_string("/proc/net/if_inet6").ok()?;
+    let mut fallback: Option<u32> = None;
+    for line in text.lines() {
+        let mut cols = line.split_whitespace();
+        let _addr = cols.next()?;
+        let if_index_hex = cols.next()?;
+        let _prefix = cols.next()?;
+        let scope_hex = cols.next()?;
+        let _flags = cols.next()?;
+        let ifname = cols.next()?;
+        if ifname == "lo" {
+            continue;
+        }
+        if u32::from_str_radix(scope_hex, 16).ok()? != 0x20 {
+            continue;
+        }
+        let if_index = u32::from_str_radix(if_index_hex, 16).ok()?;
+        match &want_if {
+            Some(name) if name == ifname => return Some(if_index),
+            _ => {
+                if fallback.is_none() {
+                    fallback = Some(if_index);
+                }
+            }
+        }
+    }
+    fallback
+}
+
+/// `/proc/net/route` から IPv4 既定経路(Destination=00000000)の iface 名を得る。
+#[cfg(target_os = "linux")]
+fn default_route_ifname_v6scope() -> Option<String> {
+    let text = std::fs::read_to_string("/proc/net/route").ok()?;
+    for line in text.lines().skip(1) {
+        let mut cols = line.split_whitespace();
+        let ifname = cols.next()?;
+        let dest = cols.next()?;
+        if dest == "00000000" {
+            return Some(ifname.to_string());
+        }
+    }
+    None
+}
+
+/// 非 Linux 向けフォールバック(v6 scope 発見なし)。
+#[cfg(not(target_os = "linux"))]
+pub fn default_v6_scope() -> Option<u32> {
+    None
 }
 
 /// mDNS 解決用ソケット(エフェメラルポート + QU、Windows 用)。戻りの `bool` は

@@ -421,6 +421,12 @@ pub struct BtpHeader { pub flags: HeaderFlags, pub ack: Option<u8>, pub seq: u8,
   `newest - oldest < window` の間だけ送出可。ラップアラウンドは `Wrapping<u8>` 比較。
 - **ACK 方針**: local window ≤ 1 なら即 standalone ack(`ack_deadline_ms = now`)、
   それ以外は piggyback を優先し、遅延 ack は `now + 2500ms`。idle は `now + 30000ms` で更新。
+- **keep-alive ACK(2026-07-07 追加)**: 純粋 standalone ACK の受信でも遅延 2.5s の
+  ACK を武装して返す(window は非消費)。かつては「データを伴うフラグメントのみ
+  ACK 対象」と簡略化していたが、chip の ack-received タイマは standalone ACK が
+  消費した seq の ACK も待つため、**長アイドル(IM 遅延 InvokeResponse の Wi-Fi join
+  待ち等)で chip 側が BTP リンクを切断する**実機不具合となった(NanoC6 実測)。
+  現在は chip と同じ 2.5s 周期の ACK 応酬でリンクを維持する。
 
 ### 4.4 バッファ戦略とヒープレス性(alloc 方針の遵守)
 

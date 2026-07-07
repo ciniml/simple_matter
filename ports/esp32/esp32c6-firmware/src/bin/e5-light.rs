@@ -57,7 +57,9 @@ use simple_matter::btp::gatt::{AdvData, GattPeripheral, PeripheralEvent};
 use simple_matter::btp::{Btp, BtpRole};
 use simple_matter::crypto::rustcrypto::RustCrypto;
 use simple_matter::crypto::Rng;
-use simple_matter::discovery::{MdnsResponder, Operational, MATTER_PORT, MDNS_IPV4, MDNS_PORT};
+use simple_matter::discovery::{
+    MdnsResponder, Operational, MATTER_PORT, MDNS_IPV4, MDNS_IPV6, MDNS_PORT,
+};
 use simple_matter::dm::clusters::{
     BasicInfoConfig, BasicInformationCluster, DescriptorCluster, GeneralCommissioning,
     NetworkCommissioningWifi, OnOffCluster, OpCredsCluster, TestDacProvider,
@@ -78,7 +80,7 @@ use simple_matter::wifi::WifiDriver;
 
 use esp32c6_firmware::ble::{gatt_worker, BtpGattServer, GattChannels, TroubleGattPeripheral};
 use esp32c6_firmware::kvs::EspKvs;
-use esp32c6_firmware::net::{peer_v4, v4_as_mapped, EspUdp};
+use esp32c6_firmware::net::{peer_v4, peer_v6, v4_as_mapped, EspUdp};
 use esp32c6_firmware::wifi::{wifi_task, EspWifiDriver};
 use esp32c6_firmware::EspRng;
 
@@ -245,6 +247,33 @@ fn trace(dir: &str, frag: &[u8]) {
 /// 単調時刻(ms)。BTP / スタックの `now_ms` 注入に使う(embassy-time の Instant 起点)。
 fn now_ms(start: Instant) -> u64 {
     start.elapsed().as_millis()
+}
+
+/// MAC(48bit)から modified EUI-64 のリンクローカル IPv6(fe80::/64)を導出する。
+///
+/// smoltcp に静的設定する fe80 と AAAA 広告に使う同一アドレス
+/// (docs/design/mdns-ipv6.md §4)。u/l ビット(先頭バイト bit1)を反転し、
+/// 中間に 0xFFFE を挿入する(RFC 4291)。
+fn link_local_from_mac(mac: &[u8; 6]) -> core::net::Ipv6Addr {
+    let mut eui = [0u8; 8];
+    eui[0] = mac[0] ^ 0x02;
+    eui[1] = mac[1];
+    eui[2] = mac[2];
+    eui[3] = 0xFF;
+    eui[4] = 0xFE;
+    eui[5] = mac[3];
+    eui[6] = mac[4];
+    eui[7] = mac[5];
+    core::net::Ipv6Addr::new(
+        0xfe80,
+        0,
+        0,
+        0,
+        u16::from_be_bytes([eui[0], eui[1]]),
+        u16::from_be_bytes([eui[2], eui[3]]),
+        u16::from_be_bytes([eui[4], eui[5]]),
+        u16::from_be_bytes([eui[6], eui[7]]),
+    )
 }
 
 /// BTP が吐く下りフラグメントを尽きるまで C2 indication で送出する(PC 版 flush_out)。
@@ -426,7 +455,13 @@ async fn pump(
                                 stack.handle_rx(&mut sdu[..slen], PeerAddr::Ble(c), now, &mut txd);
                             if let Some(d) = dir {
                                 if let Err(e) = route_send(
-                                    gatt, &mut btp, matter_udp, d, &txd[..d.len], mtu, subscribed,
+                                    gatt,
+                                    &mut btp,
+                                    matter_udp,
+                                    d,
+                                    &txd[..d.len],
+                                    mtu,
+                                    subscribed,
                                     now,
                                 )
                                 .await
@@ -454,7 +489,14 @@ async fn pump(
                 let dir = stack.handle_rx(&mut udp_rx[..n], src, now, &mut txd);
                 if let Some(d) = dir {
                     if let Err(e) = route_send(
-                        gatt, &mut btp, matter_udp, d, &txd[..d.len], mtu, subscribed, now,
+                        gatt,
+                        &mut btp,
+                        matter_udp,
+                        d,
+                        &txd[..d.len],
+                        mtu,
+                        subscribed,
+                        now,
                     )
                     .await
                     {
@@ -470,10 +512,14 @@ async fn pump(
                 if let Some(r) = mdns.as_ref() {
                     // QU(unicast-response)クエリには送信元へユニキャストで返す
                     // (5353 を共有できない querier 対策。RFC 6762 §5.4、PC 版と同じ)。
+                    // QM は受信ファミリに合わせて 224.0.0.251 / ff02::fb へマルチキャスト。
                     let qu = r.query_wants_unicast(&mdns_rx[..n]);
+                    let src_is_v6 = src.socket_addr().map(|s| s.is_ipv6()).unwrap_or(false);
                     if let Some(len) = r.handle_query(&mdns_rx[..n], &mut mdns_tx) {
                         let dst = if qu {
                             src
+                        } else if src_is_v6 {
+                            peer_v6(MDNS_IPV6, MDNS_PORT)
                         } else {
                             peer_v4(MDNS_IPV4, MDNS_PORT)
                         };
@@ -509,7 +555,14 @@ async fn pump(
         let now = now_ms(start);
         while let Some(d) = stack.poll(now, &mut txd) {
             if let Err(e) = route_send(
-                gatt, &mut btp, matter_udp, d, &txd[..d.len], mtu, subscribed, now,
+                gatt,
+                &mut btp,
+                matter_udp,
+                d,
+                &txd[..d.len],
+                mtu,
+                subscribed,
+                now,
             )
             .await
             {
@@ -545,9 +598,18 @@ async fn pump(
                 println!("[net] DHCP up: ip={} gw={:?}", cfg.address, cfg.gateway);
                 // 224.0.0.251 の IGMP join(コア trait は IPv6 のみのため mapped 規約)。
                 if let Err(e) = mdns_udp.join(v4_as_mapped(MDNS_IPV4)).await {
-                    println!("[mdns] multicast join error: {:?}", e);
+                    println!("[mdns] v4 multicast join error: {:?}", e);
                 }
-                let host = simple_matter::discovery::Host::from_mac(&mac, None, Some(ip));
+                // ff02::fb の MLD join(v6 リンクローカルは boot 時から up。design §4)。
+                if let Err(e) = mdns_udp.join(MDNS_IPV6).await {
+                    println!("[mdns] v6 multicast join error: {:?}", e);
+                }
+                // AAAA には MAC 由来 fe80 を載せる(smoltcp に設定した静的 v6 と同一)。
+                let host = simple_matter::discovery::Host::from_mac(
+                    &mac,
+                    Some(link_local_from_mac(&mac)),
+                    Some(ip),
+                );
                 let mut r: MdnsResponder<NF> = MdnsResponder::new(host, MATTER_PORT);
                 r.set_operational(
                     fabrics
@@ -557,8 +619,12 @@ async fn pump(
                 );
                 r.notify_change(now_ms(start));
                 println!(
-                    "[mdns] operational advertising on {}:{} (A record: {})",
-                    MDNS_IPV4, MDNS_PORT, ip
+                    "[mdns] operational advertising on {}:{} + [{}%mld] (A={}, AAAA={})",
+                    MDNS_IPV4,
+                    MDNS_PORT,
+                    MDNS_IPV6,
+                    ip,
+                    link_local_from_mac(&mac)
                 );
                 mdns = Some(r);
             }
@@ -583,15 +649,21 @@ async fn pump(
                         .map(|f| Operational::new(f.compressed_fabric_id(), f.node_id())),
                 );
                 r.notify_change(now_ms(start));
-                println!("[mdns] operational records updated ({})", r.operational_len());
+                println!(
+                    "[mdns] operational records updated ({})",
+                    r.operational_len()
+                );
             }
         }
 
-        // --- mDNS の定期 announce(未回答の gratuitous 広告)---
+        // --- mDNS の定期 announce(未回答の gratuitous 広告。v4 + v6 両ファミリ)---
         if let Some(r) = mdns.as_mut() {
             if let Some(len) = r.poll_announce(now_ms(start), &mut mdns_tx) {
                 let _ = mdns_udp
                     .send_to(&mdns_tx[..len], peer_v4(MDNS_IPV4, MDNS_PORT))
+                    .await;
+                let _ = mdns_udp
+                    .send_to(&mdns_tx[..len], peer_v6(MDNS_IPV6, MDNS_PORT))
                     .await;
             }
         }
@@ -613,7 +685,7 @@ async fn main(_spawner: Spawner) {
 
     // Wi-Fi + BLE coex は esp-radio のヒープ要求が増える(E4 の 72KiB から増量)。
     // MatterStack 自体はヒープレス(main のスタック上に置く)。
-    esp_alloc::heap_allocator!(size: 112 * 1024);
+    esp_alloc::heap_allocator!(size: 144 * 1024);
 
     // esp-radio は preemptive スケジューラ(esp-rtos)を要求する。
     // 「スケジューラ開始 → radio 初期化」の順序が必須(esp-radio ドキュメント)。
@@ -655,12 +727,17 @@ async fn main(_spawner: Spawner) {
     let seed = u64::from_le_bytes(seed_bytes);
     // ソケット枠: Matter UDP + mDNS + DHCPv4 + 予備。
     let mut net_resources: StackResources<6> = StackResources::new();
-    let (net_stack, mut net_runner) = embassy_net::new(
-        sta,
-        embassy_net::Config::dhcpv4(Default::default()),
-        &mut net_resources,
-        seed,
-    );
+    // IPv4 は DHCPv4、IPv6 は MAC 由来の fe80 リンクローカルを静的設定する
+    // (SLAAC/グローバル v6 は不要。docs/design/mdns-ipv6.md §4)。
+    let ll_v6 = link_local_from_mac(&mac);
+    println!("[net] IPv6 link-local: {}", ll_v6);
+    let mut net_config = embassy_net::Config::dhcpv4(Default::default());
+    net_config.ipv6 = embassy_net::ConfigV6::Static(embassy_net::StaticConfigV6 {
+        address: embassy_net::Ipv6Cidr::new(ll_v6, 64),
+        gateway: None,
+        dns_servers: Default::default(),
+    });
+    let (net_stack, mut net_runner) = embassy_net::new(sta, net_config, &mut net_resources, seed);
 
     // Matter UDP(5540)。CASE over UDP / IM の運用トラフィックが通る。
     let mut m_rx_meta = [PacketMetadata::EMPTY; 8];
@@ -739,10 +816,9 @@ async fn main(_spawner: Spawner) {
     } = ble_stack.build();
 
     // GATT サーバ(GAP + Matter BTP service)。
-    let server = BtpGattServer::new_with_config(trouble_host::gap::GapConfig::default(
-        "simple-matter",
-    ))
-    .expect("GATT server build");
+    let server =
+        BtpGattServer::new_with_config(trouble_host::gap::GapConfig::default("simple-matter"))
+            .expect("GATT server build");
 
     // GattPeripheral 実装(channel で worker と接続)。
     let channels = GattChannels::new();

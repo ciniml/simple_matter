@@ -186,6 +186,20 @@ impl RecvWindow {
         });
     }
 
+    /// 純粋 standalone ACK(keep-alive)受信時の ACK 武装。
+    ///
+    /// standalone ACK も seq を消費するため相手は当該 seq の ACK 受領を待つ
+    /// (chip は ack-received タイマで未 ACK を検知して切断する)。データと違い
+    /// local window は消費しないため `level` は減らさず、遅延(2500ms)期限のみ張る
+    /// (既に保留があればそのまま)。これにより長アイドル(遅延 InvokeResponse の
+    /// join 待ち等)でも 2.5s 周期の ACK 応酬で BTP リンクが維持される。
+    pub fn arm_keepalive_ack(&mut self, now_ms: u64) {
+        self.pending_ack = true;
+        if self.ack_deadline_ms.is_none() {
+            self.ack_deadline_ms = Some(now_ms.saturating_add(BTP_ACK_SEND_DELAY_MS));
+        }
+    }
+
     /// 保留 ACK があれば取り出し(piggyback / standalone 送出時)、local window を戻す。
     pub fn take_ack(&mut self) -> Option<u8> {
         if self.pending_ack {

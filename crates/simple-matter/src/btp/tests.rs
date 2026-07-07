@@ -509,3 +509,38 @@ fn chip_compatible_initial_seq_and_resp_ack() {
     c.process_incoming(&buf[..n], MTU, 20).unwrap();
     assert_eq!(c.recv().expect("SDU"), b"world");
 }
+
+#[test]
+fn keepalive_ack_exchange_sustains_idle_link() {
+    // 純粋 standalone ACK(keep-alive)を受けた側は、遅延 2.5s で ACK を返す
+    // (chip の ack-received タイマ対策。長アイドルでのリンク維持)。
+    let (mut c, mut p) = establish::<6>(MTU);
+    let mut buf = [0u8; 300];
+
+    // c → p にデータ 1 本。p は遅延 ACK(2500ms)を standalone で返す。
+    c.send(b"z", 0).unwrap();
+    let n = c.process_outgoing(&mut buf, MTU, 0).unwrap();
+    p.process_incoming(&buf[..n], MTU, 0).unwrap();
+    assert_eq!(p.recv().unwrap(), b"z");
+    let n = p.process_outgoing(&mut buf, MTU, 2_500).unwrap();
+    assert!(n > 0, "p sends standalone ACK");
+
+    // c はその standalone ACK(seq 消費)を受けて keep-alive ACK を武装し、
+    // 2.5s 後に standalone ACK を返す(応酬 = keep-alive)。
+    c.process_incoming(&buf[..n], MTU, 2_500).unwrap();
+    assert_eq!(
+        c.process_outgoing(&mut buf, MTU, 2_500).unwrap(),
+        0,
+        "not before the 2.5s delay"
+    );
+    assert_eq!(c.next_deadline(), Some(5_000));
+    let n = c.process_outgoing(&mut buf, MTU, 5_000).unwrap();
+    assert!(n > 0, "c returns keep-alive ACK");
+
+    // 応酬が双方向に続く(p 側も同様に 2.5s 後へ武装)。
+    p.process_incoming(&buf[..n], MTU, 5_000).unwrap();
+    let n = p.process_outgoing(&mut buf, MTU, 7_500).unwrap();
+    assert!(n > 0, "p keeps the exchange going");
+    // リンクはアイドルタイムアウトしない(last_activity が更新され続ける)。
+    assert!(!p.is_timed_out(7_501));
+}

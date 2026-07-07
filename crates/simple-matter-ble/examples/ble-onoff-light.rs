@@ -36,7 +36,7 @@
 
 use std::cell::RefCell;
 use std::io::ErrorKind;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use simple_matter::btp::gatt::{AdvData, GattPeripheral, PeripheralEvent};
@@ -45,7 +45,7 @@ use simple_matter::crypto::rustcrypto::RustCrypto;
 use simple_matter::crypto::Rng;
 use simple_matter::discovery::{
     Commissionable, CommissioningMode, Host, MdnsResponder, Operational, MATTER_PORT, MDNS_IPV4,
-    MDNS_PORT,
+    MDNS_IPV6, MDNS_PORT,
 };
 use simple_matter::dm::clusters::{
     BasicInfoConfig, BasicInformationCluster, DescriptorCluster, GeneralCommissioning,
@@ -267,14 +267,17 @@ async fn main() -> std::result::Result<(), String> {
     let mut stack: DefaultStack<Backend, DemoRng, Light> = MatterStack::new(&crypto, sc, im);
 
     // --- UDP(運用トランスポート)---
-    let udp = UdpSocket::bind(("0.0.0.0", MATTER_PORT)).map_err(|e| format!("udp bind: {e}"))?;
+    // デュアルスタック(v6only=false)で bind。AAAA 解決したコントローラが IPv6 で
+    // CASE を張れるようにする(docs/design/mdns-ipv6.md §1)。
+    let udp = open_matter_udp().map_err(|e| format!("udp bind: {e}"))?;
     udp.set_nonblocking(true)
         .map_err(|e| format!("udp nonblocking: {e}"))?;
 
     // --- mDNS ディスカバリ(commissionable + operational)---
     let local_ipv4 = discover_local_ipv4();
+    let local_ipv6 = discover_local_ipv6();
     let mac = MDNS_INSTANCE_ID.to_be_bytes();
-    let host = Host::from_mac(&mac[2..8], None, Some(local_ipv4));
+    let host = Host::from_mac(&mac[2..8], local_ipv6.map(|(ip, _)| ip), Some(local_ipv4));
     let mut mdns: MdnsResponder<NF> = MdnsResponder::new(host, MATTER_PORT);
     mdns.set_commissionable(Some(Commissionable {
         device_type: Some(0x0100),
@@ -288,6 +291,9 @@ async fn main() -> std::result::Result<(), String> {
         )
     }));
     let mdns_socket = open_mdns_socket();
+    let mdns_socket_v6 = local_ipv6.and_then(|(_, scope)| open_mdns_socket_v6(scope));
+    let mdns_v6_dst: Option<SocketAddr> = local_ipv6
+        .map(|(_, scope)| SocketAddr::V6(SocketAddrV6::new(MDNS_IPV6, MDNS_PORT, 0, scope)));
 
     // --- BLE バックエンド + BTP(peripheral)---
     // SM_BLE_ADAPTER=hci1 等でアダプタを指定できる(2 アダプタ構成用)。未指定は default。
@@ -322,6 +328,12 @@ async fn main() -> std::result::Result<(), String> {
     match &mdns_socket {
         Some(_) => println!("  mDNS advertising on 224.0.0.251:5353 (A record: {local_ipv4})"),
         None => println!("  (mDNS socket unavailable; operational discovery may not work.)"),
+    }
+    match (&mdns_socket_v6, local_ipv6) {
+        (Some(_), Some((ip, scope))) => {
+            println!("  mDNS advertising on [ff02::fb%{scope}]:5353 (AAAA record: {ip})")
+        }
+        _ => println!("  (no IPv6 link-local mDNS; IPv4-only discovery)"),
     }
     println!("  commission with: chip-tool pairing ble-wifi 1 <ssid> <pass> {PASSCODE} {DISCRIMINATOR} --ble-controller 0 --bypass-attestation-verifier true");
 
@@ -468,27 +480,27 @@ async fn main() -> std::result::Result<(), String> {
             mdns.notify_change(now_ms(&start));
         }
 
-        // --- mDNS の受信応答と announce ---
+        // --- mDNS の受信応答と announce(v4 / v6 両ファミリ)---
         if let Some(msock) = &mdns_socket {
-            match msock.recv_from(&mut mdns_rx) {
-                Ok((n, src)) => {
-                    // QU(unicast-response)クエリには送信元へユニキャストで返す
-                    // (5353 を共有できない querier 対策。RFC 6762 §5.4)。
-                    let qu = mdns.query_wants_unicast(&mdns_rx[..n]);
-                    if let Some(len) = mdns.handle_query(&mdns_rx[..n], &mut mdns_tx) {
-                        let dst = if qu {
-                            src
-                        } else {
-                            (MDNS_IPV4, MDNS_PORT).into()
-                        };
-                        let _ = msock.send_to(&mdns_tx[..len], dst);
-                    }
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
-                Err(_) => {}
-            }
-            if let Some(len) = mdns.poll_announce(now_ms(&start), &mut mdns_tx) {
+            serve_mdns_socket(
+                &mut mdns,
+                msock,
+                (MDNS_IPV4, MDNS_PORT).into(),
+                &mut mdns_rx,
+                &mut mdns_tx,
+            );
+        }
+        if let (Some(msock), Some(dst)) = (&mdns_socket_v6, mdns_v6_dst) {
+            serve_mdns_socket(&mut mdns, msock, dst, &mut mdns_rx, &mut mdns_tx);
+        }
+        // 定期 announce は 1 回の poll_announce を両ソケットへ(スケジュールを進めるため
+        // socket ごとに呼ばない)。
+        if let Some(len) = mdns.poll_announce(now_ms(&start), &mut mdns_tx) {
+            if let Some(msock) = &mdns_socket {
                 let _ = msock.send_to(&mdns_tx[..len], (MDNS_IPV4, MDNS_PORT));
+            }
+            if let (Some(msock), Some(dst)) = (&mdns_socket_v6, mdns_v6_dst) {
+                let _ = msock.send_to(&mdns_tx[..len], dst);
             }
         }
     }
@@ -532,6 +544,124 @@ fn discover_local_ipv4() -> Ipv4Addr {
             SocketAddr::V6(_) => None,
         })
         .unwrap_or(Ipv4Addr::LOCALHOST)
+}
+
+/// Matter 運用 UDP(5540)をデュアルスタック(v6only=false)で bind する。
+fn open_matter_udp() -> std::io::Result<UdpSocket> {
+    let s = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    s.set_only_v6(false)?;
+    s.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, MATTER_PORT)).into())?;
+    Ok(s.into())
+}
+
+/// mDNS の受信クエリに応答する(1 ソケット分)。QU はソース宛ユニキャスト、
+/// QM は `mc_dst`(v4=224.0.0.251 / v6=[ff02::fb%scope])宛マルチキャスト。
+fn serve_mdns_socket(
+    mdns: &mut MdnsResponder<NF>,
+    sock: &UdpSocket,
+    mc_dst: SocketAddr,
+    rx: &mut [u8],
+    tx: &mut [u8],
+) {
+    match sock.recv_from(rx) {
+        Ok((n, src)) => {
+            let qu = mdns.query_wants_unicast(&rx[..n]);
+            if let Some(len) = mdns.handle_query(&rx[..n], tx) {
+                let dst = if qu { src } else { mc_dst };
+                let _ = sock.send_to(&tx[..len], dst);
+            }
+        }
+        Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
+        Err(_) => {}
+    }
+}
+
+/// IPv6(ff02::fb)用 mDNS ソケットを開き、`scope`(if_index)で join する。
+fn open_mdns_socket_v6(scope: u32) -> Option<UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .ok()?;
+    socket.set_only_v6(true).ok()?;
+    socket.set_reuse_address(true).ok()?;
+    #[cfg(unix)]
+    let _ = socket.set_reuse_port(true);
+    socket
+        .bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, MDNS_PORT)).into())
+        .ok()?;
+    let socket: UdpSocket = socket.into();
+    socket.join_multicast_v6(&MDNS_IPV6, scope).ok()?;
+    socket.set_nonblocking(true).ok()?;
+    Some(socket)
+}
+
+/// リンクローカル IPv6(fe80::/10)と scope_id(if_index)を推定する
+/// (Linux は既定経路 iface の fe80 を採る。詳細は onoff-light.rs 同名関数)。
+#[cfg(target_os = "linux")]
+fn discover_local_ipv6() -> Option<(Ipv6Addr, u32)> {
+    let want_if = default_route_ifname();
+    let text = std::fs::read_to_string("/proc/net/if_inet6").ok()?;
+    let mut fallback: Option<(Ipv6Addr, u32)> = None;
+    for line in text.lines() {
+        let mut cols = line.split_whitespace();
+        let addr_hex = cols.next()?;
+        let if_index_hex = cols.next()?;
+        let _prefix = cols.next()?;
+        let scope_hex = cols.next()?;
+        let _flags = cols.next()?;
+        let ifname = cols.next()?;
+        if ifname == "lo" {
+            continue;
+        }
+        if u32::from_str_radix(scope_hex, 16).ok()? != 0x20 {
+            continue;
+        }
+        if addr_hex.len() != 32 {
+            continue;
+        }
+        let mut octets = [0u8; 16];
+        for (i, o) in octets.iter_mut().enumerate() {
+            *o = u8::from_str_radix(&addr_hex[i * 2..i * 2 + 2], 16).ok()?;
+        }
+        let if_index = u32::from_str_radix(if_index_hex, 16).ok()?;
+        let entry = (Ipv6Addr::from(octets), if_index);
+        match &want_if {
+            Some(name) if name == ifname => return Some(entry),
+            _ => {
+                if fallback.is_none() {
+                    fallback = Some(entry);
+                }
+            }
+        }
+    }
+    fallback
+}
+
+/// `/proc/net/route` から IPv4 既定経路(Destination=00000000)の iface 名を得る。
+#[cfg(target_os = "linux")]
+fn default_route_ifname() -> Option<String> {
+    let text = std::fs::read_to_string("/proc/net/route").ok()?;
+    for line in text.lines().skip(1) {
+        let mut cols = line.split_whitespace();
+        let ifname = cols.next()?;
+        let dest = cols.next()?;
+        if dest == "00000000" {
+            return Some(ifname.to_string());
+        }
+    }
+    None
+}
+
+/// 非 Linux 向けフォールバック(IPv6 リンクローカル発見なし)。
+#[cfg(not(target_os = "linux"))]
+fn discover_local_ipv6() -> Option<(Ipv6Addr, u32)> {
+    None
 }
 
 /// 再組立済み 1 SDU を `out` にコピーして長さを返す(`Btp::recv` の借用を切るため)。

@@ -465,8 +465,10 @@ impl<'a> Exec<'a> {
     fn pair(&mut self, node_id: u64, passcode: u32, target: &Target) -> Result<(), String> {
         let peer_addr = match target {
             Target::Addr(a) => {
+                // fe80 リテラルは scope_id 補完(mdns-ipv6.md §3 の規則)。
+                let a = mdns::fill_link_local_scope(*a);
                 info!("[target] using explicit address {a}");
-                *a
+                a
             }
             Target::Browse(disc) => {
                 info!("[discovery] browsing _matterc._udp.local via mDNS...");
@@ -577,7 +579,9 @@ impl<'a> Exec<'a> {
         }
 
         // 1) キャッシュアドレスへ CASE を試みる(未解決 sentinel はスキップ)。
-        let cached = entry.last_addr;
+        //    nodes.tlv は scope を保存しないため、fe80 には scope_id を補完しておく
+        //    (resolve 経路と宛先比較を揃える。design §3)。
+        let cached = mdns::fill_link_local_scope(entry.last_addr);
         let deadline = Instant::now() + self.g.timeout;
         let mut got: Option<(SessionId, SocketAddr)> = None;
         let mut pending_to: Option<SocketAddr> = None; // 送出済みで未決着の Sigma1 の宛先
@@ -667,6 +671,9 @@ impl<'a> Exec<'a> {
         node_id: u64,
         timeout: Duration,
     ) -> Result<SessionId, CaseAttempt> {
+        // fe80 リンクローカル(nodes.tlv は scope を保存しない・再解決分は解決時に付与済み)
+        // へは scope_id を補完してから接続する(design §3)。
+        let addr = mdns::fill_link_local_scope(addr);
         let now = self.now_ms();
         let dir = self
             .stack

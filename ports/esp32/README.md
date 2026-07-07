@@ -360,14 +360,19 @@ done
   `Signal` に置くだけで、join(`connect_async`)は常駐 `wifi_task` が実行する。
   BLE とは esp-radio の `coex` feature で同時動作。切断時は自動再接続。
 - **UDP**: コアの `UdpSend`/`UdpReceive`/`UdpMulticast` trait を embassy-net 0.9 の
-  `UdpSocket` で実装(`src/net.rs`、**trait 実利用第 1 号**)。DHCPv4。
-  Matter UDP は 5540。IPv4 のみ(IPv6 は将来スコープ)。
-- **mDNS**: DHCP で IPv4 取得後に 5353 + 224.0.0.251(IGMP join)で
-  コアの sans-IO `MdnsResponder` を駆動。operational レコードのみ広告
-  (commissionable は BLE 広告が担う)。QU クエリにはユニキャスト応答。
+  `UdpSocket` で実装(`src/net.rs`、**trait 実利用第 1 号**)。DHCPv4 +
+  IPv6 リンクローカル(fe80、MAC 由来の modified EUI-64 を `StaticConfigV6` で静的設定)。
+  Matter UDP は 5540(v4/v6 両受け)。
+- **mDNS**: DHCP で IPv4 取得後に 5353 + 224.0.0.251(IGMP join)**および ff02::fb
+  (MLD join)**で、コアの sans-IO `MdnsResponder` を駆動。A に DHCP v4、AAAA に fe80 を
+  載せる(`docs/design/mdns-ipv6.md` §4)。operational レコードのみ広告
+  (commissionable は BLE 広告が担う)。QU クエリにはユニキャスト応答、QM は受信
+  ファミリ側のマルチキャストへ返す。
 - ConnectNetworkResponse は**即 Success + バックグラウンド join**
   (シムで chip-tool 相互運用実証済みのフロー。遅延応答は将来課題、doc §E5.2)。
-- ヒープは 112KiB(E4 の 72KiB から増量。Wi-Fi+BLE coex の esp-radio 要求)。
+- ヒープは 144KiB(E4 の 72KiB → E5 の 112KiB から再増量)。IPv6(proto-ipv6)追加後、
+  BLE+Wi-Fi coex 中の大型応答(attestation/CSR)で ATT エラー切断が再発し、ヒープ圧が
+  原因だった(112KiB では枯渇)。144KiB で安定(.stack は 162K→130K に減るが十分)。
 
 ```sh
 cd ports/esp32
@@ -393,12 +398,17 @@ chip-tool onoff toggle 1 1   # → [onoff] light is now ON / GPIO7 の青 LED �
 | `e2-ble`(E2 BLE スモーク) | 369,814 | 45,784 | 30,288 | 7,068 | 90,900 | 453K | 128K |
 | `e3-ble-light`(E3 コミッショニング) | 502,174 | 56,568 | 29,832 | 7,812 | 110,908 | 596K | 149K |
 | `e4-ble-light`(E4 + 永続化) | 525,060 | 58,456 | 30,200 | 7,892 | 112,448 | 622K | 151K |
-| `e5-light`(E5 + Wi-Fi/UDP/mDNS) | 856,426 | 122,936 | 80,772 | 13,428 | 188,200 | 1,074K | 282K |
+| `e5-light`(E5 + Wi-Fi/UDP/mDNS/IPv6) | 901,924 | 127,720 | 80,772 | 13,652 | 190,176 | 1,124K | 285K |
 
 † flash 概算 = .text + .rodata(+wifi) + .rwtext(+wifi) + .data(+wifi)(ロードイメージ)。
 ‡ RAM 常駐 = .rwtext(+wifi) + .data(+wifi) + .bss(スタック除く)。
 E2〜E4 の .bss はヒープ 72KiB を、E5 は 112KiB を含む(esp-alloc の
-`heap_allocator!` は .bss に確保)。E5 の RAM 常駐 282KiB は C6 の SRAM 512KiB に
-収まる(残り ~230KiB がタスクスタック等)。E5 の増分(flash +452K / RAM +131K)は
+`heap_allocator!` は .bss に確保)。E5 の RAM 常駐 285KiB は C6 の SRAM 512KiB に
+収まる(残り ~227KiB がタスクスタック等)。E5 の増分(flash +474K / RAM +134K)は
 ほぼ esp-radio の Wi-Fi ドライバ + smoltcp/embassy-net によるもの。
 bloat-check crate の C6 対応拡張はスコープ外(doc §8 E6 行のとおり記録のみ)。
+
+IPv6(運用 mDNS を ff02::fb でも提供、`docs/design/mdns-ipv6.md` §4)の追加コストは
+smoltcp `proto-ipv6` + MLD 分で **flash +~50K(.text +45K / .rodata +5K)/ RAM(.bss)
++~2K**(v6 なし版の e5-light 比、`size -A`)。リンクローカル fe80 は MAC 由来の
+modified EUI-64 を `StaticConfigV6` で静的設定(SLAAC 不要)。

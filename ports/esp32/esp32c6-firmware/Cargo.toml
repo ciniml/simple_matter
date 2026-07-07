@@ -104,11 +104,14 @@ embedded-storage-async = "0.4"
 # --- E5: Wi-Fi 実 join + UDP/mDNS(doc §E5.4 / §E5.5)---
 #
 # embassy-net: esp-radio の `Interface` が embassy-net-driver 0.2 の `Driver` を
-# 実装するため、その系列に合う版を使う。IPv4 のみ(proto-ipv4 + dhcpv4 + igmp 用
-# multicast)。コアの UdpSend/UdpReceive/UdpMulticast は src/net.rs で実装する。
+# 実装するため、その系列に合う版を使う。IPv4(DHCPv4)+ IPv6 リンクローカル静的設定
+# (proto-ipv6、mDNS の ff02::fb 用に MLD = multicast)。コアの
+# UdpSend/UdpReceive/UdpMulticast は src/net.rs で実装する
+# (docs/design/mdns-ipv6.md §4)。
 embassy-net = { version = "0.9", default-features = false, features = [
     "medium-ethernet",
     "proto-ipv4",
+    "proto-ipv6",
     "udp",
     "dhcpv4",
     "multicast",

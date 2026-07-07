@@ -19,10 +19,11 @@
 //!
 //! # 簡略化(参照実装との乖離、理由付き)
 //!
-//! - 純粋な standalone ACK フラグメント(payload なし)の受信では返信 ACK を武装しない。
-//!   chip は受信 seq ごとに ACK 義務を負い 2.5s 間隔で ACK を往復させる keep-alive を持つが、
-//!   本コアは「データを伴うフラグメントのみ ACK 対象」とし、seq 同期は保ちつつ ACK の
-//!   無限応酬を避ける(決定的テストのため)。データ経路の信頼性・window 制御には影響しない。
+//! - (2026-07-07 撤回)かつては「純粋 standalone ACK の受信では返信 ACK を武装しない」
+//!   簡略化を置いていたが、chip の ack-received タイマは standalone ACK が消費した seq の
+//!   ACK も待つため、長アイドル(遅延 InvokeResponse の Wi-Fi join 待ち等)で chip 側が
+//!   リンクを切断する実機不具合となった。現在は keep-alive ACK(遅延 2.5s、window 非消費)
+//!   を返し、chip と同じ 2.5s 周期の ACK 応酬でリンクを維持する。
 
 pub mod framing;
 pub mod gatt;
@@ -193,6 +194,12 @@ impl<const WINDOW: usize> Btp<WINDOW> {
         } else if !payload.is_empty() {
             // 純粋 ACK は payload を持たない。
             return Err(Error::Decode);
+        } else {
+            // 純粋 standalone ACK(keep-alive)。これも seq を消費しているため、
+            // 遅延 ACK を武装して返す(chip の ack-received タイマ対策。2.5s 周期の
+            // ACK 応酬で長アイドル中も BTP リンクが維持される。遅延 InvokeResponse の
+            // join 待ちで実機切断として顕在化した)。window は消費しない。
+            self.recv.arm_keepalive_ack(now_ms);
         }
 
         self.last_activity_ms = now_ms;

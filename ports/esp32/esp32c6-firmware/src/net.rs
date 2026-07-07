@@ -5,39 +5,29 @@
 //! `std::net::UdpSocket` 直書き)。本モジュールが実利用第 1 号で、esp-radio の
 //! Wi-Fi `Interface`(embassy-net-driver)上の [`embassy_net::udp::UdpSocket`] を包む。
 //!
-//! # IPv4 のみ(doc §E5.5)
+//! # IPv4 + IPv6 リンクローカル(doc §E5.5 / docs/design/mdns-ipv6.md §4)
 //!
-//! smoltcp は `proto-ipv4` のみ有効(IPv6 は将来スコープ)。宛先が IPv6 の
-//! [`PeerAddr`] は、IPv4-mapped IPv6(`::ffff:a.b.c.d`)であれば unmap して送り、
-//! それ以外はエラーにする。[`UdpMulticast::join`] も同じ mapped 規約で IPv4
-//! グループ(例: `::ffff:224.0.0.251`)を受け、smoltcp の IGMP join に渡す
-//! (コア trait のシグネチャは IPv6 のみのため。`canonical_socket_addr` と同じ規約)。
+//! smoltcp は `proto-ipv4` + `proto-ipv6`(link-local 静的設定)を有効化する。宛先は
+//! `canonical_socket_addr` で正規化してから smoltcp の [`IpEndpoint`] に渡す。v4 ピアは
+//! IPv4-mapped IPv6(`::ffff:a.b.c.d`)が正規化で v4 に戻り、fe80 リンクローカルは実 v6
+//! endpoint として送る(単一インターフェースのため scope_id 不要)。
+//! [`UdpMulticast::join`] は mapped v4 グループ(`::ffff:224.0.0.251` → IGMP)と実 v6
+//! グループ(`ff02::fb` → MLD)の双方を受ける。
 
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 
 use embassy_net::udp::UdpSocket;
-use embassy_net::Stack;
-use smoltcp_helpers::endpoint_v4;
+use embassy_net::{IpAddress, IpEndpoint, Stack};
 
 use simple_matter::error::{Error, Result};
 use simple_matter::transport::net::{
     canonical_socket_addr, PeerAddr, UdpMulticast, UdpReceive, UdpSend,
 };
 
-/// smoltcp 型変換の小さなヘルパ(embassy-net 経由で smoltcp の wire 型を使う)。
-mod smoltcp_helpers {
-    use super::*;
-    use embassy_net::IpEndpoint;
-
-    /// `SocketAddr` を IPv4 の [`IpEndpoint`] へ変換する(IPv4-mapped IPv6 は unmap)。
-    ///
-    /// IPv4 で表せないアドレスは `None`(proto-ipv4 のみのビルドでは送れない)。
-    pub fn endpoint_v4(addr: SocketAddr) -> Option<IpEndpoint> {
-        match canonical_socket_addr(addr) {
-            SocketAddr::V4(v4) => Some(IpEndpoint::from(v4)),
-            SocketAddr::V6(_) => None,
-        }
-    }
+/// `SocketAddr` を smoltcp の [`IpEndpoint`] へ変換する(mapped v4 は正規化で unmap、
+/// 実 v6 リンクローカルはそのまま)。proto-ipv4 + proto-ipv6 の双方を扱える。
+fn endpoint(addr: SocketAddr) -> IpEndpoint {
+    IpEndpoint::from(canonical_socket_addr(addr))
 }
 
 /// [`embassy_net::udp::UdpSocket`] をコアの UDP trait 群へ橋渡しするアダプタ。
@@ -59,14 +49,21 @@ impl<'a> EspUdp<'a> {
 impl UdpSend for EspUdp<'_> {
     async fn send_to(&mut self, data: &[u8], addr: PeerAddr) -> Result<()> {
         let sa = addr.socket_addr().ok_or(Error::InvalidState)?;
-        let ep = endpoint_v4(sa).ok_or(Error::InvalidState)?;
-        self.socket.send_to(data, ep).await.map_err(|_| Error::NoSpace)
+        let ep = endpoint(sa);
+        self.socket
+            .send_to(data, ep)
+            .await
+            .map_err(|_| Error::NoSpace)
     }
 }
 
 impl UdpReceive for EspUdp<'_> {
     async fn recv_from(&mut self, buf: &mut [u8]) -> Result<(usize, PeerAddr)> {
-        let (n, meta) = self.socket.recv_from(buf).await.map_err(|_| Error::Decode)?;
+        let (n, meta) = self
+            .socket
+            .recv_from(buf)
+            .await
+            .map_err(|_| Error::Decode)?;
         let sa: SocketAddr = meta.endpoint.into();
         Ok((n, PeerAddr::Udp(sa)))
     }
@@ -74,17 +71,25 @@ impl UdpReceive for EspUdp<'_> {
 
 impl UdpMulticast for EspUdp<'_> {
     async fn join(&mut self, group: Ipv6Addr) -> Result<()> {
-        let v4 = mapped_v4(group).ok_or(Error::InvalidState)?;
         self.stack
-            .join_multicast_group(v4)
+            .join_multicast_group(multicast_group(group))
             .map_err(|_| Error::NoSpace)
     }
 
     async fn leave(&mut self, group: Ipv6Addr) -> Result<()> {
-        let v4 = mapped_v4(group).ok_or(Error::InvalidState)?;
         self.stack
-            .leave_multicast_group(v4)
+            .leave_multicast_group(multicast_group(group))
             .map_err(|_| Error::NotFound)
+    }
+}
+
+/// コア trait の `Ipv6Addr` グループを smoltcp の [`IpAddress`] へ写像する。
+/// IPv4-mapped(`::ffff:224.0.0.251`)は v4 グループ(IGMP)、実 v6(`ff02::fb`)は
+/// v6 グループ(MLD)として join する。
+fn multicast_group(group: Ipv6Addr) -> IpAddress {
+    match mapped_v4(group) {
+        Some(v4) => IpAddress::from(v4),
+        None => IpAddress::from(group),
     }
 }
 
@@ -101,6 +106,14 @@ pub fn v4_as_mapped(addr: Ipv4Addr) -> Ipv6Addr {
 /// IPv4 の `(addr, port)` を [`PeerAddr::Udp`] にする送信宛先ヘルパ。
 pub fn peer_v4(addr: Ipv4Addr, port: u16) -> PeerAddr {
     PeerAddr::Udp(SocketAddr::V4(SocketAddrV4::new(addr, port)))
+}
+
+/// IPv6 の `(addr, port)` を [`PeerAddr::Udp`] にする送信宛先ヘルパ(scope_id=0。
+/// 単一インターフェースのため scope 不要)。
+pub fn peer_v6(addr: Ipv6Addr, port: u16) -> PeerAddr {
+    PeerAddr::Udp(SocketAddr::V6(core::net::SocketAddrV6::new(
+        addr, port, 0, 0,
+    )))
 }
 
 /// `IpAddr` が IPv4(または IPv4-mapped)であれば `Ipv4Addr` を返す。
