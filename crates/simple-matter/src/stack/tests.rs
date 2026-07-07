@@ -203,6 +203,22 @@ fn build_device(fabrics: &RefCell<FabricTable<Crb, 5>>) -> Dev<'_> {
     build_device_with(fabrics, NetworkCommissioning::new(b"eth0"))
 }
 
+/// CD を 1 バイト改竄した DAC provider を持つデバイス(CD CMS 検証の失敗系 E2E 用)。
+fn build_device_tampered_cd(fabrics: &RefCell<FabricTable<Crb, 5>>) -> Dev<'_> {
+    let dac_crypto = RustCrypto::new(SeqRng(0xDAC0_0001));
+    let dac = TestDacProvider::new_with_tampered_cd(&dac_crypto).unwrap();
+    Dev {
+        basic: BasicInformationCluster::new(&CFG),
+        gc: GeneralCommissioning::default_config(),
+        net: NetworkCommissioning::new(b"eth0"),
+        opcreds: OpCredsCluster::new_shared(fabrics, RustCrypto::new(SeqRng(0x00C0_0001)), dac),
+        desc0: DescriptorCluster::new(EndpointId(0), EP0_DT, EP0_SERVERS, &[], EP0_PARTS),
+        onoff: OnOffCluster::new(),
+        desc1: DescriptorCluster::new(EndpointId(1), EP1_DT, EP1_SERVERS, &[], EP1_PARTS),
+        removed_fabric: None,
+    }
+}
+
 /// NetworkCommissioning クラスタ差し替え版(Wi-Fi コミッショニングのテスト用)。
 fn build_device_with<N: ServerCluster>(
     fabrics: &RefCell<FabricTable<Crb, 5>>,
@@ -1994,6 +2010,66 @@ mod controller_e2e {
             0,
             "no fabric added on attestation failure"
         );
+    }
+
+    /// CD(CMS)を 1 バイト改竄したデバイスは、DAC チェーン/attestation 署名は正しくても
+    /// CD の CMS 署名検証([`AttestationError::CdSignature`])でコミッショニングが失敗する
+    /// (attestation.md §7 の失敗系)。
+    #[test]
+    fn controller_end_to_end_attestation_rejects_tampered_cd() {
+        let crypto = RustCrypto::new(SeqRng(0xBAD0_CD01_1234_5678));
+        let fabrics: RefCell<FabricTable<Crb, 5>> = RefCell::new(FabricTable::new());
+
+        let config = PaseConfig::from_passcode(PASSCODE, &SALT, ITERATIONS).unwrap();
+        let dev_creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
+        let sc = SecureChannel::new(&crypto, SeqRng(0x5C00_0CDD), config, dev_creds);
+        let im = InteractionModel::new(build_device_tampered_cd(&fabrics));
+        let mut dev: TestStack = MatterStack::new(&crypto, sc, im);
+
+        let ca = Ca::<Crb>::generate(
+            &crypto,
+            &mut SeqRng(0xCA00_0CDD),
+            FABRIC_ID,
+            COMM_NODE,
+            0xFFF1,
+            0,
+        )
+        .expect("Ca::generate");
+        let ctrl_creds = ControllerCreds::new(&ca, &crypto, 0);
+        let sc_init = ScInitiator::new(&crypto, SeqRng(0x1C00_0CDD), ctrl_creds);
+        let mut ctrl: Ctrl = ControllerStack::new(&crypto, sc_init, ImClient::new());
+
+        let paa_store: [&[u8]; 1] = [&TEST_PAA_CERT_FFF1];
+        let mut comm = Commissioner::new(
+            &ca,
+            &crypto,
+            AttestationPolicy::Verify {
+                paa_store: &paa_store,
+            },
+        );
+        comm.commission(peer(), PASSCODE, DEVICE_NODE, NOW).unwrap();
+
+        let mut tx = [0u8; 1700];
+        let mut final_phase = comm.phase();
+        for _ in 0..80 {
+            let out = comm.drive(&mut ctrl, NOW, &mut tx);
+            final_phase = out.phase;
+            if let Some(d) = out.send {
+                deliver_and_settle(&mut ctrl, &mut dev, NOW, &tx, d.len);
+            }
+            match out.phase {
+                Phase::Done { .. } | Phase::Failed { .. } => break,
+                _ => {}
+            }
+        }
+        match final_phase {
+            Phase::Failed {
+                reason: CommissionError::Attestation(AttestationError::CdSignature),
+                ..
+            } => {}
+            other => panic!("expected Attestation(CdSignature) failure, got {other:?}"),
+        }
+        assert_eq!(fabrics.borrow().len(), 0, "no fabric added on tampered CD");
     }
 
     /// Wi-Fi コミッショニング(`pairing ble-wifi` のコアフロー): `set_wifi_credentials`

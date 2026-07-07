@@ -58,6 +58,11 @@ pub mod issue;
 #[cfg(feature = "controller")]
 pub mod x509;
 
+/// CD(Certification Declaration)検証用の CMS SignedData 最小リーダ(attestation.md §7)。
+/// `controller` feature 有効時のみ。
+#[cfg(feature = "controller")]
+pub mod cms;
+
 #[cfg(feature = "controller")]
 pub use issue::{parse_csr, write_matter_cert, DnAttr, MatterCertSpec, NOC_EKU};
 

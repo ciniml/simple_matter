@@ -99,6 +99,14 @@ pub enum AttestationError {
     Nonce,
     /// elements 内の CD(cx1)が空、または elements の構造が不正。
     Cd,
+    /// CD の CMS SignedData がパースできない(または非対応形状)。
+    CdParse,
+    /// CD の署名者(subjectKeyIdentifier)が既知の CD 署名鍵と一致しない。
+    CdSignerUnknown,
+    /// CD の CMS 署名が検証できない(改竄等)。
+    CdSignature,
+    /// CD の vendor_id / product_id_array が DAC の VID/PID と一致しない。
+    CdVidPidMismatch,
     /// PASE セッションから attestation challenge を取得できない。
     Challenge,
     /// 暗号バックエンドが検証中にエラーを返した。
@@ -936,6 +944,31 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
         }
         if nonce != self.att_nonce.as_slice() {
             return Err(AttestationError::Nonce);
+        }
+
+        // 5. CD の CMS SignedData 検証 + VID/PID クロスチェック(attestation.md §7)。
+        //    既知署名者は chip テスト CD 署名鍵のみ(CSA 本物の CD 署名 CA は割り切り)。
+        let cms =
+            crate::cert::cms::parse_cms_signed_data(cd).map_err(|_| AttestationError::CdParse)?;
+        let signer_pubkey = crate::cert::cms::KNOWN_CD_SIGNERS
+            .iter()
+            .find(|(kid, _)| kid.as_slice() == cms.signer_kid)
+            .map(|(_, pk)| *pk)
+            .ok_or(AttestationError::CdSignerUnknown)?;
+        if !crate::cert::cms::verify_cms_signature(self.crypto, &cms, signer_pubkey)
+            .map_err(|_| AttestationError::Crypto)?
+        {
+            return Err(AttestationError::CdSignature);
+        }
+        // DAC subject の Matter VID/PID DN 属性と CD の vendor_id / product_id_array を照合。
+        let (dac_vid, dac_pid) = crate::cert::x509::matter_vid_pid(dac.subject);
+        let (Some(vid), Some(pid)) = (dac_vid, dac_pid) else {
+            return Err(AttestationError::CdVidPidMismatch);
+        };
+        if !crate::cert::cms::cd_matches_vid_pid(cms.econtent, vid, pid)
+            .map_err(|_| AttestationError::CdParse)?
+        {
+            return Err(AttestationError::CdVidPidMismatch);
         }
         Ok(())
     }

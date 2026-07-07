@@ -146,6 +146,80 @@ pub fn verify_signed_by<C: Crypto>(
     key.verify(child.tbs, &child.sig)
 }
 
+/// Matter DN 属性 OID: 1.3.6.1.4.1.37244.2.1(matter-device-vendor-id)。
+const OID_MATTER_VID: &[u8] = &[0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0xa2, 0x7c, 0x02, 0x01];
+/// Matter DN 属性 OID: 1.3.6.1.4.1.37244.2.2(matter-device-product-id)。
+const OID_MATTER_PID: &[u8] = &[0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0xa2, 0x7c, 0x02, 0x02];
+
+/// subject / issuer Name(DER)から Matter VID / PID DN 属性を読む(CD クロスチェック用、§7)。
+///
+/// Name ::= SEQUENCE OF RDN(SET OF AttributeTypeAndValue)。値は仕様どおり
+/// 大文字 16 進 4 桁の UTF8String / PrintableString として解釈する。
+/// 属性が無ければ `None`(CN 埋め込みの fallback 表現 `Mvid:`/`Mpid:` は非対応、割り切り)。
+pub fn matter_vid_pid(name_der: &[u8]) -> (Option<u16>, Option<u16>) {
+    fn hex4(v: &[u8]) -> Option<u16> {
+        if v.len() != 4 {
+            return None;
+        }
+        let mut out: u16 = 0;
+        for &b in v {
+            let d = match b {
+                b'0'..=b'9' => b - b'0',
+                b'A'..=b'F' => b - b'A' + 10,
+                b'a'..=b'f' => b - b'a' + 10,
+                _ => return None,
+            };
+            out = (out << 4) | u16::from(d);
+        }
+        Some(out)
+    }
+    fn walk(name_der: &[u8]) -> Result<(Option<u16>, Option<u16>)> {
+        let mut vid = None;
+        let mut pid = None;
+        let (t, s, l, _) = der_tlv(name_der, 0)?;
+        if t != 0x30 {
+            return Err(Error::Decode);
+        }
+        let seq = &name_der[s..s + l];
+        let mut pos = 0usize;
+        while pos < seq.len() {
+            let (t, s, l, next) = der_tlv(seq, pos)?; // RDN(SET)
+            pos = next;
+            if t != 0x31 {
+                continue;
+            }
+            let rdn = &seq[s..s + l];
+            let mut rpos = 0usize;
+            while rpos < rdn.len() {
+                let (t, s2, l2, rnext) = der_tlv(rdn, rpos)?; // ATV(SEQUENCE)
+                rpos = rnext;
+                if t != 0x30 {
+                    continue;
+                }
+                let atv = &rdn[s2..s2 + l2];
+                let (t, os, ol, vpos) = der_tlv(atv, 0)?;
+                if t != 0x06 {
+                    continue;
+                }
+                let oid = &atv[os..os + ol];
+                let (vt, vs, vl, _) = der_tlv(atv, vpos)?;
+                // UTF8String(0x0C)/ PrintableString(0x13)のみ。
+                if vt != 0x0c && vt != 0x13 {
+                    continue;
+                }
+                let value = &atv[vs..vs + vl];
+                if oid == OID_MATTER_VID {
+                    vid = hex4(value);
+                } else if oid == OID_MATTER_PID {
+                    pid = hex4(value);
+                }
+            }
+        }
+        Ok((vid, pid))
+    }
+    walk(name_der).unwrap_or((None, None))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

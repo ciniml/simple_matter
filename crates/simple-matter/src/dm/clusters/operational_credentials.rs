@@ -761,6 +761,9 @@ impl<C: Crypto, DAC: DacProvider, const N: usize, FT: FabricAccess<C, N>> Server
 /// 開発・テスト専用であり、製品では固有の DAC を持つ [`DacProvider`] 実装に差し替えること。
 pub struct TestDacProvider<C: Crypto> {
     dac_keypair: C::Keypair,
+    /// 返す CD(既定は [`dev_creds::DEV_CD_FOR_ALL_EXAMPLES`] のコピー。
+    /// [`Self::new_with_tampered_cd`] は 1 バイト改竄した CD を保持する)。
+    cd: [u8; dev_creds::DEV_CD_FOR_ALL_EXAMPLES.len()],
 }
 
 pub mod dev_creds;
@@ -772,7 +775,19 @@ impl<C: Crypto> TestDacProvider<C> {
     /// crypto backend から chip 開発用 DAC 秘密鍵を復元して provider を作る。
     pub fn new(crypto: &C) -> crate::error::Result<Self> {
         let dac_keypair = crypto.p256_keypair_from_bytes(&DEV_DAC_PRIVKEY_FFF1_8001)?;
-        Ok(Self { dac_keypair })
+        Ok(Self {
+            dac_keypair,
+            cd: DEV_CD_FOR_ALL_EXAMPLES,
+        })
+    }
+
+    /// CD 本文を 1 バイト改竄した provider を作る(CD の CMS 検証**失敗系**の
+    /// テスト/E2E 用。attestation.md §7)。
+    pub fn new_with_tampered_cd(crypto: &C) -> crate::error::Result<Self> {
+        let mut p = Self::new(crypto)?;
+        // eContent(CD TLV 本文)内のバイトを反転する(署名は元のまま)。
+        p.cd[80] ^= 0x01;
+        Ok(p)
     }
 
     /// DAC 公開鍵(SEC1 非圧縮 65 バイト。テストでの署名検証用)。
@@ -789,7 +804,7 @@ impl<C: Crypto> DacProvider for TestDacProvider<C> {
         &DEV_PAI_CERT_FFF1
     }
     fn certification_declaration(&self) -> &[u8] {
-        &DEV_CD_FOR_ALL_EXAMPLES
+        &self.cd
     }
     fn sign_with_dac(
         &self,

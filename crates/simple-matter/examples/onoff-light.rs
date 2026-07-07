@@ -263,7 +263,14 @@ fn build_light<'s>(
     window: &'s RefCell<CommissioningWindow>,
 ) -> Light<'s> {
     let dac_crypto = RustCrypto::new(DemoRng::from_time());
-    let dac = TestDacProvider::new(&dac_crypto).expect("test DAC");
+    // SM_TAMPER_CD=1: CD を 1 バイト改竄した DAC provider(コミッショナ側 CD CMS 検証の
+    // 失敗系 E2E 用。attestation.md §7)。
+    let dac = if std::env::var_os("SM_TAMPER_CD").is_some() {
+        eprintln!("[dac] SM_TAMPER_CD set: serving a tampered Certification Declaration");
+        TestDacProvider::new_with_tampered_cd(&dac_crypto).expect("test DAC")
+    } else {
+        TestDacProvider::new(&dac_crypto).expect("test DAC")
+    };
     Light {
         acl,
         access_control: AccessControlCluster::new(acl),

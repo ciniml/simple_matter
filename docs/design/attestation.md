@@ -106,3 +106,60 @@ pub enum AttestationPolicy<'a> {
     ステージ 3 中断(fail-safe はデバイス側期限切れで解除)。
 - x509 検証は controller feature 配下(issue.rs の DER 補助を再利用するため。
   設計 §2 の「コア」からの軽微な乖離)。
+
+## 7. CD の CMS 検証(§1 の割り切り解消、2026-07-08)
+
+§1 で「presence チェックのみ」としていた CD(Certification Declaration)の
+CMS SignedData(PKCS#7、RFC 5652)検証と VID/PID クロスチェックを実装した。
+
+### 7.1 CMS 最小リーダ(`cert/cms.rs`、controller feature 配下)
+
+chip の CD 形状に必要な範囲だけを読む(それ以外は `Error::Decode`):
+
+- 署名者 1 名、`sid` = `[0] IMPLICIT subjectKeyIdentifier`(SignerInfo version 3)
+- digest = SHA-256、signature = ecdsa-with-SHA256(P-256)
+- **signedAttrs 無し**(署名対象は eContent = CD の Matter TLV そのもの)
+- `[0] certificates` / `[1] crls` はあればスキップ(chip の CD には無い)
+
+`parse_cms_signed_data()` → `CmsSignedData { econtent, signer_kid, sig }`(借用
+ビュー、ヒープレス)。`verify_cms_signature()` は eContent を署名者公開鍵で
+ECDSA-P256-SHA256 検証する。
+
+### 7.2 既知 CD 署名者(テーブル `KNOWN_CD_SIGNERS`)
+
+chip `DefaultDeviceAttestationVerifier.cpp` の `gCdSigningKeys`(6 本)の
+サブセットを KID → 公開鍵の静的テーブルで埋め込む:
+
+1. **chip テスト CD 署名鍵**("Matter Test CD Signing Authority"、
+   `gTestCdPubkeyBytes`。credentials/test の Chip-Test-CD-*.der 用)
+2. **CSA 公式 "Signing Key 001"**(`gCdSigningKey001*`)。**chip の
+   `DeviceAttestationCredsExample` 埋め込み CD(= 本実装の
+   `DEV_CD_FOR_ALL_EXAMPLES`)はテスト鍵ではなくこの公式鍵で署名されている**
+   (実測。KID `FE 34 3F 95 ...`)ため必須。
+
+割り切り: 公式鍵 002-005 は未収載(必要時にテーブルへ追加)。CD 署名 CA
+(Matter Certification and Testing CA)チェーンの動的検証・失効確認はしない。
+署名者の同定は KID 完全一致のみ。
+
+### 7.3 検証手順(Commissioner `verify_attestation` ステップ 5)
+
+1. elements cx1 の CD を CMS としてパース(失敗 = `AttestationError::CdParse`)
+2. `signer_kid` を既知署名者テーブルと照合(不一致 = `CdSignerUnknown`)
+3. CMS 署名検証(失敗 = `CdSignature`)
+4. **VID/PID クロスチェック**: DAC subject の Matter DN 属性
+   (OID 1.3.6.1.4.1.37244.2.1 / 2.2、16 進 4 桁文字列)から VID/PID を読み
+   (`cert::x509::matter_vid_pid`。CN 埋め込み fallback `Mvid:`/`Mpid:` は
+   非対応の割り切り)、CD の `vendor_id`(cx1)一致 + `product_id_array`
+   (cx2)に PID が含まれること(不一致 = `CdVidPidMismatch`)
+
+### 7.4 検証ゲート実測(2026-07-08)
+
+- 単体: 埋め込み CD の parse+署名検証(Signing Key 001)、eContent 改竄 →
+  署名検証失敗、署名バイト改竄 → 失敗、VID/PID クロスチェック正負
+  (FFF1/8001 ∈、FFF2 ∉、PID 0x9000 ∉)、DAC subject の VID/PID DN 抽出。
+- ループバック: `controller_end_to_end_attestation_verify`(CD 検証込みで完走)、
+  `controller_end_to_end_attestation_rejects_tampered_cd`(CD 1 バイト改竄
+  デバイス → `Attestation(CdSignature)` で中断、fabric 残留なし)。
+- 実機 E2E: chip-tool `--paa-trust-store-path`(--bypass 無し)完走 + toggle、
+  smctl `--paa-trust-store-path` 完走(CD 検証込み)、`SM_TAMPER_CD=1` の
+  onoff-light 相手に smctl が `Attestation(CdSignature)` で中断。
