@@ -454,7 +454,10 @@ impl CommandPath {
     }
 }
 
-/// EventPathIB(型のみ。codec は初期スコープ外、設計 §2.1)。
+/// EventPathIB(ワイヤ上の生表現、ワイルドカード可)。
+///
+/// TLV では `list`(chip `EventPathIB::Tag`: Node=0, Endpoint=1, Cluster=2, Event=3,
+/// IsUrgent=4)。省略フィールドはワイルドカード。Node は device 側では扱わない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EventPath {
     /// エンドポイント。`None` はワイルドカード。
@@ -465,6 +468,66 @@ pub struct EventPath {
     pub event: Option<EventId>,
     /// 緊急フラグ(Subscribe のイベント用)。
     pub is_urgent: Option<bool>,
+}
+
+impl EventPath {
+    /// 具象イベントパス(endpoint/cluster/event 指定)を作る。
+    pub const fn concrete(endpoint: EndpointId, cluster: ClusterId, event: EventId) -> Self {
+        Self {
+            endpoint: Some(endpoint),
+            cluster: Some(cluster),
+            event: Some(event),
+            is_urgent: None,
+        }
+    }
+
+    /// 具象イベント `(ep, cl, ev)` がこのパス(ワイルドカード可)にマッチするか。
+    pub fn matches(&self, ep: EndpointId, cl: ClusterId, ev: EventId) -> bool {
+        let ep_ok = self.endpoint.map(|e| e == ep).unwrap_or(true);
+        let cl_ok = self.cluster.map(|c| c == cl).unwrap_or(true);
+        let ev_ok = self.event.map(|e| e == ev).unwrap_or(true);
+        ep_ok && cl_ok && ev_ok
+    }
+
+    /// EventPathIB を `tag` 付きの list として書く。
+    pub fn encode(&self, w: &mut TlvWriter<'_>, tag: &TlvTag) -> Result<()> {
+        w.start_list(tag)?;
+        if let Some(e) = self.endpoint {
+            w.write_u16(&TlvTag::ContextSpecific(1), e.0)?;
+        }
+        if let Some(c) = self.cluster {
+            w.write_u32(&TlvTag::ContextSpecific(2), c.0)?;
+        }
+        if let Some(ev) = self.event {
+            w.write_u32(&TlvTag::ContextSpecific(3), ev.0)?;
+        }
+        if let Some(u) = self.is_urgent {
+            w.write_bool(&TlvTag::ContextSpecific(4), u)?;
+        }
+        w.end_container()
+    }
+
+    /// EventPathIB(list)を読む(list 開始はまだ読んでいない状態から)。
+    pub fn decode(r: &mut TlvReader<'_>) -> Result<Self> {
+        expect_container(r, ContainerType::List)?;
+        Self::decode_body(r)
+    }
+
+    /// EventPathIB(list)の本体を読む(list 開始を消費済みの状態から)。
+    fn decode_body(r: &mut TlvReader<'_>) -> Result<Self> {
+        let mut path = Self::default();
+        while let Some(tag) = next_ctx(r)? {
+            match tag {
+                0 => skip_field(r)?, // Node: device 側では扱わない
+                1 => path.endpoint = Some(EndpointId(read_u16(r)?)),
+                2 => path.cluster = Some(ClusterId(read_u32(r)?)),
+                3 => path.event = Some(EventId(read_u32(r)?)),
+                4 => path.is_urgent = Some(read_bool(r)?),
+                _ => skip_field(r)?,
+            }
+        }
+        Ok(path)
+    }
 }
 
 /// 完全解決済みの属性パス(エンジン内部で扱う具象表現)。
@@ -633,6 +696,38 @@ impl<'a> ReadRequestRef<'a> {
         array_iter(self.msg, 0)
     }
 
+    /// イベントパス列(`EventPathIBs`、context 1)のイテレータを返す。
+    pub fn event_paths(&self) -> Result<EventPathIter<'a>> {
+        event_path_array_iter(self.msg, 1)
+    }
+
+    /// EventFilters(context 2)の先頭 EventFilterIB の `eventMin`(context 1)を返す。
+    ///
+    /// 最小実装は単一フィルタの eventMin のみ解釈する(複数フィルタ・Node フィールドは
+    /// 無視、`docs/design/interaction-model.md` §12)。
+    pub fn event_min(&self) -> Result<Option<u64>> {
+        let Some(mut r) = field_reader(self.msg, 2)? else {
+            return Ok(None);
+        };
+        if r.enter_container()? != ContainerType::Array {
+            return Err(Error::Decode);
+        }
+        // 先頭 EventFilterIB(struct)のみ見る。
+        match r.read_next()? {
+            Some(e) if matches!(e.value, TlvValue::ContainerStart(ContainerType::Structure)) => {
+                let mut min = None;
+                while let Some(tag) = next_ctx(&mut r)? {
+                    match tag {
+                        1 => min = Some(r.read_next()?.ok_or(Error::Decode)?.value.as_unsigned()?),
+                        _ => skip_field(&mut r)?,
+                    }
+                }
+                Ok(min)
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// fabric-filtered フラグ(既定 `false`)。
     pub fn fabric_filtered(&self) -> Result<bool> {
         Ok(field_bool(self.msg, 3)?.unwrap_or(false))
@@ -652,6 +747,37 @@ pub fn encode_read_request(
     w.start_array(&TlvTag::ContextSpecific(0))?;
     paths(&mut AttrPathListWriter { w: &mut w })?;
     w.end_container()?;
+    w.write_bool(&TlvTag::ContextSpecific(3), fabric_filtered)?;
+    end_msg(&mut w)
+}
+
+/// ReadRequest を **イベントパス付き**でエンコードする(chip-tool の event read 相当)。
+///
+/// `attr_paths` は AttributeRequests(context 0)、`event_paths` は EventRequests(context 1)。
+/// `event_min` を `Some` にすると EventFilters(context 2)に単一 EventFilterIB
+/// (`{ eventMin(1) }`)を書く。タグ順(0→1→2→3)を保つ。
+pub fn encode_read_request_events(
+    tx: &mut [u8],
+    fabric_filtered: bool,
+    attr_paths: impl FnOnce(&mut AttrPathListWriter<'_, '_>) -> Result<()>,
+    event_paths: impl FnOnce(&mut EventPathListWriter<'_, '_>) -> Result<()>,
+    event_min: Option<u64>,
+) -> Result<usize> {
+    let mut w = TlvWriter::new(tx);
+    w.start_struct(&TlvTag::Anonymous)?;
+    w.start_array(&TlvTag::ContextSpecific(0))?;
+    attr_paths(&mut AttrPathListWriter { w: &mut w })?;
+    w.end_container()?;
+    w.start_array(&TlvTag::ContextSpecific(1))?;
+    event_paths(&mut EventPathListWriter { w: &mut w })?;
+    w.end_container()?;
+    if let Some(min) = event_min {
+        w.start_array(&TlvTag::ContextSpecific(2))?;
+        w.start_struct(&TlvTag::Anonymous)?; // EventFilterIB
+        w.write_u64(&TlvTag::ContextSpecific(1), min)?;
+        w.end_container()?;
+        w.end_container()?;
+    }
     w.write_bool(&TlvTag::ContextSpecific(3), fabric_filtered)?;
     end_msg(&mut w)
 }
@@ -808,6 +934,19 @@ impl<'a> ReportDataRef<'a> {
             }
         }
     }
+
+    /// `EventReportIB` 列(context 2)のイテレータを返す。
+    pub fn event_reports(&self) -> Result<EventReportIter<'a>> {
+        match field_reader(self.msg, 2)? {
+            None => Ok(EventReportIter::empty()),
+            Some(mut r) => {
+                if r.enter_container()? != ContainerType::Array {
+                    return Err(Error::Decode);
+                }
+                Ok(EventReportIter { r, done: false })
+            }
+        }
+    }
 }
 
 // ==========================================================================
@@ -835,6 +974,9 @@ pub struct ReportChunkBuilder<'b> {
     limit: usize,
     /// これまでに確定した AttributeReportIB 数。
     count: usize,
+    /// EventReports 配列(context 2)を開いたか([`ReportChunkBuilder::begin_events`] 済み)。
+    /// `true` の間、`finish` は AttributeReports ではなく EventReports 配列を閉じる。
+    events_open: bool,
 }
 
 impl<'b> ReportChunkBuilder<'b> {
@@ -853,6 +995,7 @@ impl<'b> ReportChunkBuilder<'b> {
             w,
             limit: cap.saturating_sub(REPORT_TAIL_MARGIN),
             count: 0,
+            events_open: false,
         })
     }
 
@@ -920,10 +1063,67 @@ impl<'b> ReportChunkBuilder<'b> {
         }
     }
 
+    /// AttributeReports 配列を閉じ、EventReports 配列(context 2)を開く(1 回のみ)。
+    ///
+    /// 属性の書き込みが全て終わった後、イベントを積む前に呼ぶ。以降 [`try_push_event`]
+    /// (Self::try_push_event)でイベントを積み、[`finish`](Self::finish)が EventReports 配列を
+    /// 閉じる。すでに開いていれば何もしない。
+    pub fn begin_events(&mut self) -> Result<()> {
+        if self.events_open {
+            return Ok(());
+        }
+        self.w.end_container()?; // AttributeReports 配列を閉じる
+        self.w.start_array(&TlvTag::ContextSpecific(2))?; // EventReports 配列
+        self.events_open = true;
+        Ok(())
+    }
+
+    /// EventReportIB(EventDataIB)を試し書きする。収まれば `Ok(true)`、収まらなければ
+    /// 巻き戻して `Ok(false)`。[`begin_events`](Self::begin_events)後にのみ呼ぶこと。
+    ///
+    /// `data` は EventDataIB.Data(タグ 7)の値要素の生 TLV(anonymous タグ付き。
+    /// [`transcribe`] で context 7 へ移し替える)。
+    pub fn try_push_event(
+        &mut self,
+        path: &EventPath,
+        number: u64,
+        priority: u8,
+        system_timestamp_ms: u64,
+        data: &[u8],
+    ) -> Result<bool> {
+        let cp = self.w.checkpoint();
+        match write_event_data_ib(
+            &mut self.w,
+            path,
+            number,
+            priority,
+            system_timestamp_ms,
+            data,
+        ) {
+            Ok(()) if self.w.len() <= self.limit => {
+                self.count += 1;
+                Ok(true)
+            }
+            Ok(()) => {
+                self.w.rewind(cp);
+                Ok(false)
+            }
+            Err(Error::NoSpace) => {
+                self.w.rewind(cp);
+                Ok(false)
+            }
+            Err(e) => {
+                self.w.rewind(cp);
+                Err(e)
+            }
+        }
+    }
+
     /// 配列と構造体を閉じ、`MoreChunkedMessages`/`SuppressResponse`/InteractionModelRevision を
     /// 書いて確定バイト長を返す。
     pub fn finish(mut self, more_chunks: bool, suppress_response: bool) -> Result<usize> {
-        self.w.end_container()?; // AttributeReports 配列
+        // 開いている配列(EventReports を開いていればそれ、無ければ AttributeReports)を閉じる。
+        self.w.end_container()?;
         if more_chunks {
             self.w.write_bool(&TlvTag::ContextSpecific(3), true)?;
         }
@@ -948,6 +1148,30 @@ fn write_attr_data_ib(
     }
     path.encode(w, &TlvTag::ContextSpecific(1))?;
     value(w, &TlvTag::ContextSpecific(2))?;
+    w.end_container()?;
+    w.end_container()
+}
+
+/// EventReportIB(データ)を書く。
+///
+/// `{ 1: EventDataIB { 0: path, 1: eventNumber, 2: priority, 4: systemTimestamp, 7: data } }`
+/// (EventReportIB.EventData = context 1、EventDataIB のタグは chip `EventDataIB::Tag`)。
+/// 壁時計を持たないため EpochTimestamp(3)は載せず SystemTimestamp(4)を使う。
+fn write_event_data_ib(
+    w: &mut TlvWriter<'_>,
+    path: &EventPath,
+    number: u64,
+    priority: u8,
+    system_timestamp_ms: u64,
+    data: &[u8],
+) -> Result<()> {
+    w.start_struct(&TlvTag::Anonymous)?; // EventReportIB
+    w.start_struct(&TlvTag::ContextSpecific(1))?; // EventData = EventDataIB
+    path.encode(w, &TlvTag::ContextSpecific(0))?; // Path(EventPathIB)
+    w.write_u64(&TlvTag::ContextSpecific(1), number)?; // EventNumber
+    w.write_u8(&TlvTag::ContextSpecific(2), priority)?; // PriorityLevel
+    w.write_u64(&TlvTag::ContextSpecific(4), system_timestamp_ms)?; // SystemTimestamp
+    transcribe(data, w, &TlvTag::ContextSpecific(7))?; // Data
     w.end_container()?;
     w.end_container()
 }
@@ -1306,6 +1530,98 @@ impl<'a> AttributeReportRef<'a> {
     }
 }
 
+/// EventDataIB の借用デコードビュー。
+///
+/// `{ path(0), eventNumber(1), priority(2), epochTimestamp(3)?, systemTimestamp(4)?, data(7) }`。
+/// 本実装は SystemTimestamp を書くが、デコードは EpochTimestamp/SystemTimestamp の双方を受ける。
+#[derive(Debug, Clone, Copy)]
+pub struct EventDataRef<'a> {
+    /// イベントパス。
+    pub path: EventPath,
+    /// EventNumber。
+    pub number: u64,
+    /// priority(DEBUG=0 / INFO=1 / CRITICAL=2)。
+    pub priority: u8,
+    /// EpochTimestamp(あれば)。
+    pub epoch_timestamp_ms: Option<u64>,
+    /// SystemTimestamp(あれば)。
+    pub system_timestamp_ms: Option<u64>,
+    /// Data 値要素の生 TLV(元の context タグ 7 を含む)。
+    pub data: &'a [u8],
+}
+
+impl<'a> EventDataRef<'a> {
+    /// Data を読む [`TlvReader`](先頭要素のタグは context 7)。
+    pub fn value(&self) -> TlvReader<'a> {
+        TlvReader::new(self.data)
+    }
+
+    fn decode_body(r: &mut TlvReader<'a>) -> Result<Self> {
+        let mut path = None;
+        let mut number = None;
+        let mut priority = None;
+        let mut epoch = None;
+        let mut system = None;
+        let mut data = None;
+        while let Some(tag) = next_ctx(r)? {
+            match tag {
+                0 => path = Some(EventPath::decode(r)?),
+                1 => number = Some(r.read_next()?.ok_or(Error::Decode)?.value.as_unsigned()?),
+                2 => priority = Some(read_u8(r)?),
+                3 => epoch = Some(r.read_next()?.ok_or(Error::Decode)?.value.as_unsigned()?),
+                4 => system = Some(r.read_next()?.ok_or(Error::Decode)?.value.as_unsigned()?),
+                7 => data = Some(r.take_element_raw()?),
+                _ => skip_field(r)?,
+            }
+        }
+        Ok(Self {
+            path: path.ok_or(Error::Decode)?,
+            number: number.ok_or(Error::Decode)?,
+            priority: priority.ok_or(Error::Decode)?,
+            epoch_timestamp_ms: epoch,
+            system_timestamp_ms: system,
+            data: data.ok_or(Error::Decode)?,
+        })
+    }
+}
+
+/// EventReportIB の借用デコードビュー(`{ eventStatus(0) | eventData(1) }`)。
+#[derive(Debug, Clone, Copy)]
+pub enum EventReportRef<'a> {
+    /// イベントデータ(`EventDataIB`)。
+    Data(EventDataRef<'a>),
+    /// ステータス(`EventStatusIB`、`{ path(0), status(1) }`)。
+    Status(StatusIB),
+}
+
+impl<'a> EventReportRef<'a> {
+    fn decode_body(r: &mut TlvReader<'a>) -> Result<Self> {
+        let mut out = None;
+        while let Some(tag) = next_ctx(r)? {
+            match tag {
+                0 => {
+                    // EventStatusIB { path(0), status(1) } — path は読み飛ばし status のみ。
+                    expect_container(r, ContainerType::Structure)?;
+                    let mut status = None;
+                    while let Some(t) = next_ctx(r)? {
+                        match t {
+                            1 => status = Some(StatusIB::decode(r)?),
+                            _ => skip_field(r)?,
+                        }
+                    }
+                    out = Some(Self::Status(status.ok_or(Error::Decode)?));
+                }
+                1 => {
+                    expect_container(r, ContainerType::Structure)?;
+                    out = Some(Self::Data(EventDataRef::decode_body(r)?));
+                }
+                _ => skip_field(r)?,
+            }
+        }
+        out.ok_or(Error::Decode)
+    }
+}
+
 /// CommandDataIB の借用デコードビュー(`{ path(0), fields(1)?, commandRef(2)? }`)。
 #[derive(Debug, Clone, Copy)]
 pub struct CommandDataRef<'a> {
@@ -1412,6 +1728,19 @@ pub struct AttrPathListWriter<'w, 'b> {
 impl AttrPathListWriter<'_, '_> {
     /// 1 つの [`AttributePath`] を配列要素として書く。
     pub fn push(&mut self, path: &AttributePath) -> Result<()> {
+        path.encode(self.w, &TlvTag::Anonymous)
+    }
+}
+
+/// `EventPathIBs` 配列にパスを積むライタ。
+#[derive(Debug)]
+pub struct EventPathListWriter<'w, 'b> {
+    w: &'w mut TlvWriter<'b>,
+}
+
+impl EventPathListWriter<'_, '_> {
+    /// 1 つの [`EventPath`] を配列要素として書く。
+    pub fn push(&mut self, path: &EventPath) -> Result<()> {
         path.encode(self.w, &TlvTag::Anonymous)
     }
 }
@@ -1592,6 +1921,52 @@ impl Iterator for AttrPathIter<'_> {
     type Item = Result<AttributePath>;
     fn next(&mut self) -> Option<Self::Item> {
         iter_list_element(&mut self.r, &mut self.done, AttributePath::decode_body)
+    }
+}
+
+/// [`EventPath`] の配列イテレータ。
+#[derive(Debug, Clone)]
+pub struct EventPathIter<'a> {
+    r: TlvReader<'a>,
+    done: bool,
+}
+
+impl EventPathIter<'_> {
+    fn empty() -> Self {
+        Self {
+            r: TlvReader::new(&[]),
+            done: true,
+        }
+    }
+}
+
+impl Iterator for EventPathIter<'_> {
+    type Item = Result<EventPath>;
+    fn next(&mut self) -> Option<Self::Item> {
+        iter_list_element(&mut self.r, &mut self.done, EventPath::decode_body)
+    }
+}
+
+/// [`EventReportRef`] の配列イテレータ(ReportData の EventReports 用)。
+#[derive(Debug, Clone)]
+pub struct EventReportIter<'a> {
+    r: TlvReader<'a>,
+    done: bool,
+}
+
+impl EventReportIter<'_> {
+    fn empty() -> Self {
+        Self {
+            r: TlvReader::new(&[]),
+            done: true,
+        }
+    }
+}
+
+impl<'a> Iterator for EventReportIter<'a> {
+    type Item = Result<EventReportRef<'a>>;
+    fn next(&mut self) -> Option<Self::Item> {
+        iter_struct_element(&mut self.r, &mut self.done, EventReportRef::decode_body)
     }
 }
 
@@ -1848,6 +2223,19 @@ fn array_iter(msg: &[u8], tag: u8) -> Result<AttrPathIter<'_>> {
                 return Err(Error::Decode);
             }
             Ok(AttrPathIter { r, done: false })
+        }
+    }
+}
+
+/// 構造体内の配列フィールド `tag` の [`EventPathIter`] を返す。無ければ空。
+fn event_path_array_iter(msg: &[u8], tag: u8) -> Result<EventPathIter<'_>> {
+    match field_reader(msg, tag)? {
+        None => Ok(EventPathIter::empty()),
+        Some(mut r) => {
+            if r.enter_container()? != ContainerType::Array {
+                return Err(Error::Decode);
+            }
+            Ok(EventPathIter { r, done: false })
         }
     }
 }

@@ -33,7 +33,7 @@ use simple_matter::wifi::{WifiDriver, WifiStatus};
 extern crate alloc;
 
 /// join 要求(ConnectNetwork で受けた実 SSID / パスフレーズ)。
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WifiRequest {
     ssid: [u8; 32],
     ssid_len: usize,
@@ -91,6 +91,10 @@ static WIFI_PENDING_SAVE: Mutex<CriticalSectionRawMutex, RefCell<Option<WifiRequ
 pub fn take_pending_credentials() -> Option<WifiRequest> {
     WIFI_PENDING_SAVE.lock(|cell| cell.borrow_mut().take())
 }
+/// 現在 join 済み(または join 試行中)の要求。同一資格情報での再 join 要求を
+/// no-op にする判定に使う([`EspWifiDriver::connect`] 参照)。
+static WIFI_ACTIVE: Mutex<CriticalSectionRawMutex, RefCell<Option<WifiRequest>>> =
+    Mutex::new(RefCell::new(None));
 /// 現在の接続状態([`STATE_IDLE`] など)。
 static WIFI_STATE: AtomicU8 = AtomicU8::new(STATE_IDLE);
 /// 直近の失敗理由(esp-radio の DisconnectReason 由来のコード)。
@@ -108,6 +112,17 @@ impl WifiDriver for EspWifiDriver {
         let req = WifiRequest::new(ssid, creds);
         // 統合層の永続化用コピー(take_pending_credentials で取り出す)。
         WIFI_PENDING_SAVE.lock(|cell| *cell.borrow_mut() = Some(req.clone()));
+        // 同一資格情報で既に join 済み(または試行中)なら no-op。auto-join(KVS 復元)後の
+        // 再コミッショニングで ConnectNetwork が同じ AP を指すケースで、接続済みリンクを
+        // 落とさない(実測: BLE coex 中の re-join は失敗を繰り返し、ハングに至ることがある)。
+        // status は Connected のままなので、遅延 ConnectNetworkResponse は即 Success になる。
+        let state = WIFI_STATE.load(Ordering::Acquire);
+        let same_active = WIFI_ACTIVE.lock(|cell| cell.borrow().as_ref() == Some(&req));
+        if same_active && (state == STATE_CONNECTED || state == STATE_CONNECTING) {
+            println!("[wifi] connect: same credentials already active; skipping re-join");
+            return;
+        }
+        WIFI_ACTIVE.lock(|cell| *cell.borrow_mut() = Some(req.clone()));
         WIFI_STATE.store(STATE_CONNECTING, Ordering::Release);
         WIFI_REQUEST.signal(req);
     }

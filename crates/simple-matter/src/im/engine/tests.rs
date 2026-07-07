@@ -14,11 +14,13 @@ use crate::dm::clusters::{
 use crate::dm::meta::EndpointId;
 use crate::exchange::{ExchangeId, HandlerAction, ProtocolHandler, Role, RxMessage};
 use crate::im::engine::{InteractionModel, SubDue};
+use crate::im::events::PRIORITY_CRITICAL;
 use crate::im::wire::{
-    encode_invoke_request, encode_read_request, encode_subscribe_request, encode_write_request,
-    AttributeId, AttributePath, AttributeReportRef, ClusterId, CommandId, CommandPath, ImOpCode,
-    ImStatus, InvokeRequestHeader, InvokeResponseRef, InvokeResponseRefItem, ReportDataRef,
-    StatusResponse, SubscribeResponse, WriteRequestHeader, WriteResponseRef,
+    encode_invoke_request, encode_read_request, encode_read_request_events,
+    encode_subscribe_request, encode_write_request, AttributeId, AttributePath, AttributeReportRef,
+    ClusterId, CommandId, CommandPath, EventId, EventPath, EventReportRef, ImOpCode, ImStatus,
+    InvokeRequestHeader, InvokeResponseRef, InvokeResponseRefItem, ReportDataRef, StatusResponse,
+    SubscribeResponse, WriteRequestHeader, WriteResponseRef,
 };
 use crate::tlv::{TlvTag, TlvValue, TlvWriter};
 use crate::transport::header::{ExchFlags, PayloadHeader};
@@ -686,6 +688,205 @@ fn timed_write_paths() {
             StatusResponse::decode(&tx[..len]).unwrap().status,
             ImStatus::TimedRequestMismatch
         );
+    }
+}
+
+// ==========================================================================
+// 7b. timed 必須属性の強制(@timed 注釈付き属性 → NeedsTimedInteraction)
+// ==========================================================================
+
+/// timed write 必須の書き込み可能属性を 1 つ持つテスト用クラスタ(id 0xFC00)。
+struct TimedAttrCluster {
+    value: u8,
+}
+
+impl TimedAttrCluster {
+    const fn new() -> Self {
+        Self { value: 0 }
+    }
+
+    fn write_value(
+        &mut self,
+        data: crate::dm::AttrWrite<'_>,
+        _acc: &crate::dm::meta::AccessContext,
+    ) -> Result<(), ImStatus> {
+        self.value = data.as_unsigned()? as u8;
+        Ok(())
+    }
+}
+
+crate::cluster! {
+    TimedAttrCluster {
+        id: 0xFC00,
+        revision: 1,
+        feature_map: 0,
+        dirty: _,
+        invoke: _,
+        attributes: [
+            0x0000 Value {
+                access: View,
+                quality: [],
+                subscribe: false,
+                read: (|c: &TimedAttrCluster, e: &mut crate::dm::codec::AttrEncoder<'_, '_>| e.write_u8(c.value)),
+                write: (Operate, |c: &mut TimedAttrCluster, data, acc| c.write_value(data, acc))
+            } @timed,
+        ],
+        accepted: [],
+        generated: [],
+    }
+}
+
+struct TimedDev {
+    tc: TimedAttrCluster,
+    desc0: DescriptorCluster,
+}
+
+crate::device! {
+    TimedDev {
+        endpoint 0 {
+            device_types: [ (0x0016, 1) ],
+            parts: [],
+            clusters: [ (0xFC00, tc), (0x001D, desc0) ],
+        }
+    }
+}
+
+impl TimedDev {
+    fn build() -> Self {
+        TimedDev {
+            tc: TimedAttrCluster::new(),
+            desc0: DescriptorCluster::new(
+                EndpointId(0),
+                TimedDev::device_types(EndpointId(0)),
+                TimedDev::server_list(EndpointId(0)),
+                &[],
+                TimedDev::parts(EndpointId(0)),
+            ),
+        }
+    }
+}
+
+type TimedIm = InteractionModel<TimedDev, 2, 2, 8>;
+
+fn setup_timed() -> (TimedIm, SessionManager<2>, ExchangeId) {
+    let mut mgr: SessionManager<2> = SessionManager::new();
+    let init = SessionInit {
+        peer_addr: addr(),
+        local_node_id: 1,
+        peer_node_id: Some(0x1234),
+        peer_session_id: 1,
+        tx_ctr_start: 1,
+        rx_ctr_start: 0,
+        mode: SessionMode::Case {
+            fabric_idx: NonZeroU8::new(1).unwrap(),
+        },
+        enc_key: [0u8; 16],
+        dec_key: [0u8; 16],
+        att_challenge: [0u8; 16],
+    };
+    let sid = mgr.insert(init, 0).unwrap();
+    let ex = ExchangeId::from_parts(sid, EXCH_ID);
+    (TimedIm::new(TimedDev::build()), mgr, ex)
+}
+
+/// 属性 0xFC00/0x0000 への WriteRequest を組む(timed フラグは引数)。
+fn timed_attr_write(req: &mut [u8], value: u8, timed: bool) -> usize {
+    encode_write_request(
+        req,
+        WriteRequestHeader {
+            suppress_response: false,
+            timed_request: timed,
+        },
+        |dw| {
+            dw.push(
+                None,
+                &AttributePath::concrete(EndpointId(0), ClusterId(0xFC00), AttributeId(0x0000)),
+                |vw, t| vw.write_u8(t, value),
+            )
+        },
+    )
+    .unwrap()
+}
+
+fn write_status(msg: &[u8]) -> ImStatus {
+    let wr = WriteResponseRef::new(msg).unwrap();
+    wr.write_responses()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .status
+        .status
+}
+
+#[test]
+fn timed_required_attribute_enforced() {
+    use crate::im::wire::TimedRequest;
+
+    // (a) TimedRequest 無しの直 write → NeedsTimedInteraction、値は不変。
+    {
+        let (mut im, mut mgr, ex) = setup_timed();
+        let mut wreq = [0u8; 64];
+        let wlen = timed_attr_write(&mut wreq, 42, false);
+        let wh = phdr(ImOpCode::WriteRequest.to_u8());
+        let mut tx = [0u8; 128];
+        let a = im
+            .handle(&rxm(&wh, &wreq[..wlen], ex), &mut tx, &mut mgr, 0)
+            .unwrap();
+        let (op, len, _) = parts(a);
+        assert_eq!(op, ImOpCode::WriteResponse.to_u8());
+        assert_eq!(write_status(&tx[..len]), ImStatus::NeedsTimedInteraction);
+        assert_eq!(im.data_model().tc.value, 0, "non-timed write rejected");
+    }
+
+    // (b) TimedRequest → 窓内 timed write は成功。
+    {
+        let (mut im, mut mgr, ex) = setup_timed();
+        let mut treq = [0u8; 16];
+        let tlen = TimedRequest::new(1_000).encode(&mut treq).unwrap();
+        let th = phdr(ImOpCode::TimedRequest.to_u8());
+        let mut tx = [0u8; 32];
+        im.handle(&rxm(&th, &treq[..tlen], ex), &mut tx, &mut mgr, 0)
+            .unwrap();
+
+        let mut wreq = [0u8; 64];
+        let wlen = timed_attr_write(&mut wreq, 42, true);
+        let wh = phdr(ImOpCode::WriteRequest.to_u8());
+        let mut tx2 = [0u8; 128];
+        let a = im
+            .handle(&rxm(&wh, &wreq[..wlen], ex), &mut tx2, &mut mgr, 500)
+            .unwrap();
+        let (op, len, _) = parts(a);
+        assert_eq!(op, ImOpCode::WriteResponse.to_u8());
+        assert_eq!(write_status(&tx2[..len]), ImStatus::Success);
+        assert_eq!(im.data_model().tc.value, 42);
+    }
+
+    // (c) 窓 expire 後の timed write は Timeout、値は不変。
+    {
+        let (mut im, mut mgr, ex) = setup_timed();
+        let mut treq = [0u8; 16];
+        let tlen = TimedRequest::new(100).encode(&mut treq).unwrap();
+        let th = phdr(ImOpCode::TimedRequest.to_u8());
+        let mut tx = [0u8; 32];
+        im.handle(&rxm(&th, &treq[..tlen], ex), &mut tx, &mut mgr, 0)
+            .unwrap();
+
+        let mut wreq = [0u8; 64];
+        let wlen = timed_attr_write(&mut wreq, 7, true);
+        let wh = phdr(ImOpCode::WriteRequest.to_u8());
+        let mut tx2 = [0u8; 64];
+        // now(5_000) > deadline(0+100)。
+        let a = im
+            .handle(&rxm(&wh, &wreq[..wlen], ex), &mut tx2, &mut mgr, 5_000)
+            .unwrap();
+        let (op, len, _) = parts(a);
+        assert_eq!(op, ImOpCode::StatusResponse.to_u8());
+        assert_eq!(
+            StatusResponse::decode(&tx2[..len]).unwrap().status,
+            ImStatus::Timeout
+        );
+        assert_eq!(im.data_model().tc.value, 0, "expired timed write rejected");
     }
 }
 
@@ -1598,5 +1799,202 @@ mod deferred_invoke {
         assert!(im
             .build_deferred_invoke_response(ex, &mut rtx, 1_000)
             .is_err());
+    }
+}
+
+// ==========================================================================
+// イベント(StartUp / EventPaths read / eventMin フィルタ、設計 §12)
+// ==========================================================================
+
+mod events {
+    use super::*;
+
+    /// StartUp イベントを積む(BasicInformation 0x0028 / event 0 / CRITICAL / { 0: sw })。
+    fn post_startup(im: &mut Im, sw: u32, now_ms: u64) -> u64 {
+        im.post_event(
+            EndpointId(0),
+            ClusterId(0x0028),
+            EventId(0),
+            PRIORITY_CRITICAL,
+            now_ms,
+            |w, tag| {
+                w.start_struct(tag)?;
+                w.write_u32(&TlvTag::ContextSpecific(0), sw)?;
+                w.end_container()
+            },
+        )
+        .unwrap()
+    }
+
+    /// EventReports を固定バッファに集めて (number, priority, softwareVersion) の件数を返す。
+    fn collect_events(msg: &[u8], out: &mut [(u64, u8, u32)]) -> usize {
+        let rd = ReportDataRef::new(msg).unwrap();
+        let mut n = 0;
+        for r in rd.event_reports().unwrap() {
+            match r.unwrap() {
+                EventReportRef::Data(d) => {
+                    // Data(context 7)= struct { 0: softwareVersion }。
+                    let mut v = d.value();
+                    // 先頭は struct 開始(context 7)。
+                    let e = v.read_next().unwrap().unwrap();
+                    assert!(matches!(
+                        e.value,
+                        TlvValue::ContainerStart(crate::tlv::ContainerType::Structure)
+                    ));
+                    let sw = v.read_next().unwrap().unwrap().value.as_unsigned().unwrap() as u32;
+                    out[n] = (d.number, d.priority, sw);
+                    n += 1;
+                }
+                EventReportRef::Status(_) => panic!("unexpected event status"),
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn startup_event_read_returns_report() {
+        let (mut im, mut mgr, ex) = setup();
+        let num = post_startup(&mut im, 0x0001_0000, 100);
+        assert_eq!(num, 0);
+        assert_eq!(im.events().len(), 1);
+
+        // BasicInformation StartUp を具象パスで read(属性パスなし)。
+        let mut req = [0u8; 96];
+        let rlen = encode_read_request_events(
+            &mut req,
+            false,
+            |_a| Ok(()),
+            |e| {
+                e.push(&EventPath::concrete(
+                    EndpointId(0),
+                    ClusterId(0x0028),
+                    EventId(0),
+                ))
+            },
+            None,
+        )
+        .unwrap();
+        let h = phdr(ImOpCode::ReadRequest.to_u8());
+
+        let mut tx = [0u8; 1024];
+        let a = im
+            .handle(&rxm(&h, &req[..rlen], ex), &mut tx, &mut mgr, 200)
+            .unwrap();
+        let (op, len, is_close) = parts(a);
+        assert_eq!(op, ImOpCode::ReportData.to_u8());
+        assert!(is_close);
+
+        // 属性レポートは 0 件、イベントレポートは 1 件。
+        assert_eq!(count_reports(&tx[..len]), 0);
+        let mut buf = [(0u64, 0u8, 0u32); 8];
+        let n = collect_events(&tx[..len], &mut buf);
+        assert_eq!(n, 1);
+        assert_eq!(buf[0], (0, PRIORITY_CRITICAL, 0x0001_0000));
+
+        // イベントパスとタイムスタンプの検証。
+        let rd = ReportDataRef::new(&tx[..len]).unwrap();
+        let d = match rd.event_reports().unwrap().next().unwrap().unwrap() {
+            EventReportRef::Data(d) => d,
+            _ => panic!(),
+        };
+        assert_eq!(d.path.endpoint, Some(EndpointId(0)));
+        assert_eq!(d.path.cluster, Some(ClusterId(0x0028)));
+        assert_eq!(d.path.event, Some(EventId(0)));
+        assert_eq!(d.system_timestamp_ms, Some(100));
+        assert_eq!(d.epoch_timestamp_ms, None);
+    }
+
+    #[test]
+    fn wildcard_event_path_matches() {
+        let (mut im, mut mgr, ex) = setup();
+        post_startup(&mut im, 7, 10);
+
+        // 完全ワイルドカードのイベントパス(全 endpoint/cluster/event)。
+        let mut req = [0u8; 64];
+        let rlen = encode_read_request_events(
+            &mut req,
+            false,
+            |_a| Ok(()),
+            |e| e.push(&EventPath::default()),
+            None,
+        )
+        .unwrap();
+        let h = phdr(ImOpCode::ReadRequest.to_u8());
+        let mut tx = [0u8; 1024];
+        let a = im
+            .handle(&rxm(&h, &req[..rlen], ex), &mut tx, &mut mgr, 20)
+            .unwrap();
+        let (_op, len, _close) = parts(a);
+        let mut buf = [(0u64, 0u8, 0u32); 8];
+        let n = collect_events(&tx[..len], &mut buf);
+        assert_eq!(n, 1);
+        assert_eq!(buf[0].2, 7);
+    }
+
+    #[test]
+    fn event_min_filter() {
+        let (mut im, mut mgr, ex) = setup();
+        // 3 件積む(number 0,1,2)。
+        for i in 0..3u32 {
+            post_startup(&mut im, i, (i as u64) * 10);
+        }
+
+        // eventMin = 1 → number 1,2 のみ。
+        let mut req = [0u8; 64];
+        let rlen = encode_read_request_events(
+            &mut req,
+            false,
+            |_a| Ok(()),
+            |e| e.push(&EventPath::default()),
+            Some(1),
+        )
+        .unwrap();
+        let h = phdr(ImOpCode::ReadRequest.to_u8());
+        let mut tx = [0u8; 1024];
+        let a = im
+            .handle(&rxm(&h, &req[..rlen], ex), &mut tx, &mut mgr, 100)
+            .unwrap();
+        let (_op, len, _close) = parts(a);
+        let mut buf = [(0u64, 0u8, 0u32); 8];
+        let n = collect_events(&tx[..len], &mut buf);
+        assert_eq!(n, 2);
+        assert_eq!(buf[0].0, 1);
+        assert_eq!(buf[1].0, 2);
+    }
+
+    #[test]
+    fn combined_attr_and_event_read() {
+        let (mut im, mut mgr, ex) = setup();
+        post_startup(&mut im, 42, 5);
+
+        // On/Off クラスタ全属性 + StartUp イベント。
+        let mut req = [0u8; 128];
+        let rlen = encode_read_request_events(
+            &mut req,
+            false,
+            |a| a.push(&onoff_cluster_path()),
+            |e| {
+                e.push(&EventPath::concrete(
+                    EndpointId(0),
+                    ClusterId(0x0028),
+                    EventId(0),
+                ))
+            },
+            None,
+        )
+        .unwrap();
+        let h = phdr(ImOpCode::ReadRequest.to_u8());
+        let mut tx = [0u8; 2048];
+        let a = im
+            .handle(&rxm(&h, &req[..rlen], ex), &mut tx, &mut mgr, 10)
+            .unwrap();
+        let (_op, len, is_close) = parts(a);
+        assert!(is_close);
+        // 属性(On/Off 固有 1 + global 10 = 11)とイベント 1 件が同一 ReportData に載る。
+        assert!(count_reports(&tx[..len]) > 0);
+        let mut buf = [(0u64, 0u8, 0u32); 8];
+        let n = collect_events(&tx[..len], &mut buf);
+        assert_eq!(n, 1);
+        assert_eq!(buf[0], (0, PRIORITY_CRITICAL, 42));
     }
 }

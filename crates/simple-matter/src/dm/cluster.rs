@@ -229,7 +229,7 @@ macro_rules! cluster {
                         subscribe: $asub:literal,
                         read: ( $aread:expr ),
                         write: $awm:tt
-                    }
+                    } $( @ $atimed:ident )?
                 ),* $(,)?
             ],
             accepted: [ $( $cid:literal $cname:ident $( => $cacc:ident )? $( @ $ctimed:ident )? ),* $(,)? ],
@@ -253,6 +253,7 @@ macro_rules! cluster {
                                 $crate::__attr_writable!($awm),
                                 $asub,
                             ).with_write_access($crate::__attr_write_access!($awm))
+                             .with_timed($crate::__cmd_timed!($( $atimed )?))
                         ),* ],
                         &[ $(
                             $crate::dm::meta::CommandMeta::new(

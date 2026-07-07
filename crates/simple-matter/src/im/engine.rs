@@ -39,14 +39,15 @@ use core::num::NonZeroU8;
 
 use crate::dm::codec::{AttrEncoder, CmdResponder};
 use crate::dm::meta::{
-    is_global_attribute, AccessContext, ClusterId, EndpointId, Privilege, SessionKind,
+    is_global_attribute, AccessContext, ClusterId, EndpointId, EventId, Privilege, SessionKind,
 };
 use crate::dm::{read_global_attribute, AttrWrite, DataModel, DeferredPoll, ListOp};
 use crate::error::{Error, Result};
 use crate::exchange::{ExchangeId, HandlerAction, ProtocolHandler, RxMessage};
+use crate::im::events::EventLog;
 use crate::im::wire::{
     encode_invoke_response, encode_write_response, transcribe, AttributeDataRef, AttributePath,
-    CmdRespWriter, CommandDataRef, CommandPath, ConcreteAttrPath, ImOpCode, ImStatus,
+    CmdRespWriter, CommandDataRef, CommandPath, ConcreteAttrPath, EventPath, ImOpCode, ImStatus,
     InvokeRequestRef, InvokeResponseHeader, ReadRequestRef, ReportChunkBuilder, StatusIB,
     StatusResponse, SubscribeRequestRef, SubscribeResponse, TimedRequest, WriteRequestRef,
     PROTO_ID_INTERACTION_MODEL,
@@ -59,6 +60,9 @@ use crate::dm::expand::PathExpandCursor;
 
 /// 放置されたチャンク中 Read トランザクションを掃除するまでの時間(ミリ秒)。
 const READ_TXN_TIMEOUT_MS: u64 = 30_000;
+
+/// イベントログ(リングバッファ)の固定容量(設計 §12)。
+const EVENT_LOG_CAP: usize = 8;
 
 /// dirty 掃引で 1 回に走査する (endpoint, cluster) の上限。
 const MAX_SWEEP: usize = 64;
@@ -226,6 +230,14 @@ struct ReadTxn<const P: usize> {
     paths: [AttributePath; P],
     /// `paths` の有効長。
     npaths: usize,
+    /// リクエストのイベントパス列(EventRequests、設計 §12)。
+    event_paths: [EventPath; P],
+    /// `event_paths` の有効長。
+    n_event_paths: usize,
+    /// EventFilters の eventMin(あれば `event_number >= eventMin` のみ返す)。
+    event_min: Option<u64>,
+    /// イベントレポート(EventReports)の出力を済ませたか(全属性チャンク完了後 1 回)。
+    events_emitted: bool,
     /// ワイルドカード展開の再開カーソル(`Copy`)。
     cursor: PathExpandCursor,
     /// 具象パスの存在チェック(precheck)を済ませたか。
@@ -244,6 +256,10 @@ impl<const P: usize> ReadTxn<P> {
             kind,
             paths: [AttributePath::default(); P],
             npaths: 0,
+            event_paths: [EventPath::default(); P],
+            n_event_paths: 0,
+            event_min: None,
+            events_emitted: false,
             cursor: PathExpandCursor::new(),
             prechecked: false,
             priming_reports_done: false,
@@ -465,6 +481,53 @@ fn emit_chunk<D: DataModel + ?Sized, const P: usize>(
     }
 }
 
+/// `txn` のイベントリクエストに合致するイベントを `builder` に EventReportIB として書く(設計 §12)。
+///
+/// 全属性チャンクの消化後に 1 回だけ呼ぶ(`events_emitted` で単一化)。イベントパスが
+/// 無ければ何もしない。合致判定はパス(ワイルドカード可)+ `event_min`(EventFilters)+
+/// ACL(属性 read と同等の View で近似)。イベント数は少ない前提でチャンク化せず、収まる
+/// 範囲で 1 レポートに載せる(入り切らないイベントはドロップ、割り切り)。
+fn emit_events<D: DataModel + ?Sized, const P: usize>(
+    dm: &D,
+    log: &EventLog<EVENT_LOG_CAP>,
+    txn: &mut ReadTxn<P>,
+    builder: &mut ReportChunkBuilder<'_>,
+) -> Result<()> {
+    if txn.events_emitted || txn.n_event_paths == 0 {
+        txn.events_emitted = true;
+        return Ok(());
+    }
+    builder.begin_events()?;
+    for rec in log.iter() {
+        if let Some(min) = txn.event_min {
+            if rec.number < min {
+                continue;
+            }
+        }
+        let matched = txn.event_paths[..txn.n_event_paths]
+            .iter()
+            .any(|p| p.matches(rec.endpoint, rec.cluster, rec.event));
+        if !matched {
+            continue;
+        }
+        // イベント read の権限は属性 read と同等(View)で近似(設計 §12、per-event 権限は割り切り)。
+        if !allowed(dm, &txn.acc, rec.endpoint, rec.cluster, Privilege::View) {
+            continue;
+        }
+        let path = EventPath::concrete(rec.endpoint, rec.cluster, rec.event);
+        // 収まらなければドロップ(割り切り。イベント数は少ない前提)。
+        let _ = builder.try_push_event(
+            &path,
+            rec.number,
+            rec.priority,
+            rec.system_timestamp_ms,
+            rec.payload(),
+        )?;
+    }
+    txn.events_emitted = true;
+    Ok(())
+}
+
 // ==========================================================================
 // InteractionModel(ProtocolHandler)
 // ==========================================================================
@@ -492,6 +555,8 @@ pub struct InteractionModel<D: DataModel, const READS: usize, const SUBS: usize,
     data_version: u32,
     /// 保留中の遅延 InvokeResponse(設計 §E7.2)。同時に 1 本のみ。
     deferred: Option<DeferredInvoke>,
+    /// イベントログ(リングバッファ、設計 §12)。StartUp 等をここに積む。
+    events: EventLog<EVENT_LOG_CAP>,
 }
 
 impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
@@ -507,12 +572,35 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
             next_sub_id: 1,
             data_version: 1,
             deferred: None,
+            events: EventLog::new(),
         }
     }
 
     /// データモデルへの共有参照(アプリからの属性読み取り等)。
     pub const fn data_model(&self) -> &D {
         &self.dm
+    }
+
+    /// イベントログへの共有参照(診断・テスト用)。
+    pub const fn events(&self) -> &EventLog<EVENT_LOG_CAP> {
+        &self.events
+    }
+
+    /// イベントを 1 件積む(満杯なら最古を追い出す)。採番した EventNumber を返す。
+    ///
+    /// `write_data` は EventDataIB.Data の値要素を `tag`(anonymous)で書く。StartUp なら
+    /// `{ 0: softwareVersion }` の struct(`docs/design/interaction-model.md` §12)。
+    pub fn post_event(
+        &mut self,
+        endpoint: EndpointId,
+        cluster: ClusterId,
+        event: EventId,
+        priority: u8,
+        now_ms: u64,
+        write_data: impl FnOnce(&mut TlvWriter<'_>, &crate::tlv::TlvTag) -> Result<()>,
+    ) -> Result<u64> {
+        self.events
+            .post(endpoint, cluster, event, priority, now_ms, write_data)
     }
 
     /// データモデルへの可変参照(アプリからの状態変更。dirty はクラスタが立てる)。
@@ -562,12 +650,24 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
             txn.paths[txn.npaths] = p;
             txn.npaths += 1;
         }
+        for p in req.event_paths()? {
+            let p = p?;
+            if txn.n_event_paths >= PATHS {
+                return status_response(tx, ImStatus::PathsExhausted);
+            }
+            txn.event_paths[txn.n_event_paths] = p;
+            txn.n_event_paths += 1;
+        }
+        txn.event_min = req.event_min()?;
 
         let outcome;
         let len;
         {
             let mut builder = ReportChunkBuilder::new(tx, None)?;
             outcome = emit_chunk(&self.dm, &mut txn, &mut builder, self.data_version)?;
+            if outcome == ChunkOutcome::Done {
+                emit_events(&self.dm, &self.events, &mut txn, &mut builder)?;
+            }
             len = match outcome {
                 ChunkOutcome::Done => builder.finish(false, true)?,
                 ChunkOutcome::More => builder.finish(true, false)?,
@@ -691,6 +791,7 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         {
             let dv = self.data_version;
             let dm = &self.dm;
+            let events = &self.events;
             let txn = &mut self.reads[idx];
             let sub_id = match txn.kind {
                 ReadKind::Report(id) => Some(id),
@@ -698,6 +799,10 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
             };
             let mut builder = ReportChunkBuilder::new(tx, sub_id)?;
             outcome = emit_chunk(dm, txn, &mut builder, dv)?;
+            // 通常 Read の最終チャンクでイベントレポートを付ける(Subscribe のイベントは非対応)。
+            if outcome == ChunkOutcome::Done && matches!(txn.kind, ReadKind::Read) {
+                emit_events(dm, events, txn, &mut builder)?;
+            }
             len = match (outcome, txn.kind) {
                 (ChunkOutcome::Done, ReadKind::Read) => builder.finish(false, true)?,
                 (ChunkOutcome::Done, ReadKind::Priming(_)) => {
@@ -743,15 +848,16 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         self.data_version = self.data_version.wrapping_add(1);
         let suppress = req.suppress_response()?;
         let timed_flag = req.timed_request()?;
-        if let Err(st) = self.check_timed(rx.exchange, timed_flag, now_ms) {
-            return status_response(tx, st);
-        }
+        let was_timed = match self.check_timed(rx.exchange, timed_flag, now_ms) {
+            Ok(b) => b,
+            Err(st) => return status_response(tx, st),
+        };
 
         if suppress {
             let dm = &mut self.dm;
             for item in req.write_requests()? {
                 let item = item?;
-                let _ = write_one(dm, &item, acc);
+                let _ = write_one(dm, &item, acc, was_timed);
             }
             return Ok(HandlerAction::None);
         }
@@ -760,7 +866,7 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         let len = encode_write_response(tx, |sw| {
             for item in req.write_requests()? {
                 let item = item?;
-                let status = write_one(dm, &item, acc);
+                let status = write_one(dm, &item, acc, was_timed);
                 sw.push(&item.path, &StatusIB::simple(status))?;
             }
             Ok(())
@@ -1300,6 +1406,7 @@ fn write_one<D: DataModel + ?Sized>(
     dm: &mut D,
     item: &AttributeDataRef<'_>,
     acc: &AccessContext,
+    was_timed: bool,
 ) -> ImStatus {
     let p = item.path;
     let (Some(endpoint), Some(cluster_id), Some(attribute)) = (p.endpoint, p.cluster, p.attribute)
@@ -1314,14 +1421,18 @@ fn write_one<D: DataModel + ?Sized>(
     }
     // 必要権限は属性メタの write_access(未知属性は既定 Operate。クラスタが
     // UnsupportedWrite/UnsupportedAttribute を返す)。存在チェック → ACL の順(acl.md §3)。
-    let required = match dm.cluster(endpoint, cluster_id) {
+    let (required, needs_timed) = match dm.cluster(endpoint, cluster_id) {
         Some(c) => c
             .meta()
             .attribute(attribute)
-            .map(|m| m.write_access)
-            .unwrap_or(Privilege::Operate),
+            .map(|m| (m.write_access, m.timed))
+            .unwrap_or((Privilege::Operate, false)),
         None => return ImStatus::UnsupportedCluster,
     };
+    // timed 必須属性の強制(設計 §5.5 / admin-commissioning.md §3)。
+    if needs_timed && !was_timed {
+        return ImStatus::NeedsTimedInteraction;
+    }
     if !allowed(dm, acc, endpoint, cluster_id, required) {
         return ImStatus::UnsupportedAccess;
     }

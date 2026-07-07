@@ -16,6 +16,7 @@
 //! 再エクスポートする(dm 層実装により移設済み)。
 
 pub mod engine;
+pub mod events;
 pub mod wire;
 
 /// IM クライアント(コントローラ側)ハンドラ(`docs/design/controller.md` §4)。

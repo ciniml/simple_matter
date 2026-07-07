@@ -175,6 +175,50 @@ impl<
         self.mgr.handler_mut().im.data_model_mut()
     }
 
+    /// イベントを 1 件積む(IM エンジンのイベントログへ passthrough、設計 §12)。
+    ///
+    /// `write_data` は EventDataIB.Data の値要素を `tag`(anonymous)で書く。採番した
+    /// EventNumber を返す。
+    pub fn post_event(
+        &mut self,
+        endpoint: crate::dm::meta::EndpointId,
+        cluster: crate::dm::meta::ClusterId,
+        event: crate::dm::meta::EventId,
+        priority: u8,
+        now_ms: u64,
+        write_data: impl FnOnce(
+            &mut crate::tlv::TlvWriter<'_>,
+            &crate::tlv::TlvTag,
+        ) -> crate::error::Result<()>,
+    ) -> crate::error::Result<u64> {
+        self.mgr
+            .handler_mut()
+            .im
+            .post_event(endpoint, cluster, event, priority, now_ms, write_data)
+    }
+
+    /// BasicInformation(0x0028)の StartUp イベント(event 0x00、CRITICAL、
+    /// `{ softwareVersion: u32 }`)を積む(設計 §12)。デバイス起動直後に 1 回呼ぶ。
+    pub fn post_startup_event(
+        &mut self,
+        software_version: u32,
+        now_ms: u64,
+    ) -> crate::error::Result<u64> {
+        use crate::tlv::TlvTag;
+        self.post_event(
+            crate::dm::meta::EndpointId(0),
+            crate::dm::meta::ClusterId(0x0028),
+            crate::dm::meta::EventId(0),
+            crate::im::events::PRIORITY_CRITICAL,
+            now_ms,
+            |w, tag| {
+                w.start_struct(tag)?;
+                w.write_u32(&TlvTag::ContextSpecific(0), software_version)?;
+                w.end_container()
+            },
+        )
+    }
+
     /// PASE 設定を差し替える(OpenCommissioningWindow の動的 verifier 注入。
     /// `docs/design/admin-commissioning.md` §4)。
     pub fn set_pase_config(&mut self, config: crate::sc::PaseConfig) {

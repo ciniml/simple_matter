@@ -244,6 +244,8 @@ pub struct AttributeMeta {
     pub writable: bool,
     /// 購読可能か。
     pub subscribable: bool,
+    /// timed write 必須か(TimedRequest 未経由なら NeedsTimedInteraction)。
+    pub timed: bool,
 }
 
 impl AttributeMeta {
@@ -264,12 +266,19 @@ impl AttributeMeta {
             readable,
             writable,
             subscribable,
+            timed: false,
         }
     }
 
     /// write 権限を上書きした複製を返す(`const` チェーン用)。
     pub const fn with_write_access(mut self, write_access: Privilege) -> Self {
         self.write_access = write_access;
+        self
+    }
+
+    /// timed write 必須フラグを設定する(builder)。
+    pub const fn with_timed(mut self, timed: bool) -> Self {
+        self.timed = timed;
         self
     }
 

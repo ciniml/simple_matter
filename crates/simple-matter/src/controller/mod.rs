@@ -634,6 +634,49 @@ impl<
         )
     }
 
+    /// 確立済み `session` 上で timed write(TimedRequest → Write)を開始する
+    /// (`docs/design/admin-commissioning.md` §3)。
+    ///
+    /// まず TimedRequest を送り、デバイスの `StatusResponse(SUCCESS)` 受信時
+    /// ([`Self::handle_rx`] 内)に WriteRequest(`timedRequest=true`)が同 exchange で
+    /// 自動送出される。完了イベントは通常の Write と同じ。
+    pub fn start_write_timed<W>(
+        &mut self,
+        session: SessionId,
+        timeout_ms: u16,
+        path: &AttributePath,
+        value: W,
+        now_ms: u64,
+        tx_out: &mut [u8],
+    ) -> Result<SendDirective>
+    where
+        W: FnOnce(&mut TlvWriter<'_>, &TlvTag) -> Result<()>,
+    {
+        let ex = self.mgr.open_initiator(session)?;
+        let len = match self.mgr.handler_mut().im.start_write_timed(
+            ex,
+            timeout_ms,
+            path,
+            value,
+            &mut self.resp,
+            now_ms,
+        ) {
+            Ok(l) => l,
+            Err(e) => {
+                let _ = self.mgr.close(ex);
+                return Err(e);
+            }
+        };
+        self.send_started(
+            ex,
+            PROTO_ID_INTERACTION_MODEL,
+            ImOpCode::TimedRequest.to_u8(),
+            len,
+            now_ms,
+            tx_out,
+        )
+    }
+
     /// 確立済み `session` 上で Subscribe を開始する(§4.5)。
     ///
     /// プライミング完了で [`ImEvent::SubscribeDone`]、以降デバイス発レポートごとに

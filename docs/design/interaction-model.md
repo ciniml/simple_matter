@@ -1028,7 +1028,67 @@ pub type DefaultStack<N, C> = MatterStack<N, C, 4, 4, 2, 2, 2, 3, 8>;
 
 ---
 
-## 12. オープンな論点
+## 12. イベント(最小実装)
+
+Matter のイベント(Core Spec §8.4 / §10.6.9 EventDataIB)を最小構成で実装する。範囲は
+「デバイスがイベントをリングに積み、ReadRequest の EventPaths に対して EventReportIB を返す」まで。
+Subscribe のイベント配信は範囲外(下記)。
+
+### 12.1 イベントログ(リングバッファ)
+
+`im/events.rs` の `EventLog<const N: usize = 8>`(IM エンジンが所有、容量 `EVENT_LOG_CAP = 8`)。
+1 エントリ(`EventRecord`)は endpoint / cluster / event / `event_number`(u64 グローバル単調増加)/
+priority(u8: DEBUG=0 / INFO=1 / CRITICAL=2)/ SystemTimestamp(起動起点の単調 ms)/ payload
+(EventDataIB.Data の値要素の生 TLV、固定 `EVENT_PAYLOAD_MAX = 32` バイト)を持つ。満杯時は
+最古を追い出す(リング)。`InteractionModel::post_event(...)` / `events()` でアクセスし、`MatterStack`
+は `post_event` と `post_startup_event(software_version, now_ms)` を passthrough する。
+
+### 12.2 ワイヤ形式(chip 互換、E2E の生命線)
+
+タグ番号は chip `src/app/MessageDef/*.h` に一致させた:
+
+- **EventReportIB**: `EventStatus`=0, `EventData`=1(本実装は EventData のみ生成)。
+- **EventDataIB**: `Path`=0, `EventNumber`=1, `Priority`=2, `EpochTimestamp`=3, `SystemTimestamp`=4,
+  `DeltaEpochTimestamp`=5, `DeltaSystemTimestamp`=6, `Data`=7。**壁時計を持たないため
+  SystemTimestamp(4)を使う**(EpochTimestamp は書かない。chip-tool は SystemTimestamp を受理)。
+- **EventPathIB**(list): `Node`=0, `Endpoint`=1, `Cluster`=2, `Event`=3, `IsUrgent`=4。
+- **EventFilterIB**(struct): `Node`=0, `EventMin`=1。
+- **ReadRequest**: `EventRequests`=1(EventPathIB のリスト), `EventFilters`=2。
+- **ReportData**: `EventReports`=2(AttributeReports=1 の後に書く)。
+
+StartUp イベント(BasicInformation 0x0028 / event 0x00 / CRITICAL)の Data は
+`{ softwareVersion: u32 (field 0) }`。デバイス起動直後に `post_startup_event` で 1 回積む
+(examples/onoff-light と ports/esp32 の e3/e4/e5 bin。`BasicInfoConfig::software_version` を渡す)。
+
+### 12.3 Read の EventPaths 対応
+
+`ReadRequest` の `EventRequests`(EventPathIB リスト)を解釈し、合致イベントを EventReportIB として
+同一 ReportData に載せる(AttributeReports の後に EventReports 配列)。ワイルドカード(endpoint /
+cluster / event 省略)対応。`EventFilters` の `eventMin` があれば `event_number >= eventMin` のみ返す
+(先頭フィルタの eventMin のみ解釈)。属性チャンク化(§5.4)の最終チャンク完了後に 1 回だけ
+イベントを出力する(`ReadTxn::events_emitted` で単一化)。
+
+### 12.4 割り切り(意図的な制約)
+
+- **永続化なし**: `event_number` は起動でリセットされる(仕様上は永続カウンタだが、chip-tool の
+  単発 read には実害なし)。
+- **priority 別バッファなし**: 単一リング。満杯時は priority に関わらず最古を追い出す。
+- **イベントのチャンク化なし**: イベント数が少ない前提で 1 ReportData に収まる範囲で載せる。入り
+  切らないイベントはドロップ(§5.4 の属性 chunking 機構はイベントに適用しない)。
+- **per-event ACL 近似**: イベント read の権限は属性 read と同等(View、`(endpoint, cluster)`)で近似
+  する(仕様の per-event 権限は割り切り)。
+- **Subscribe のイベント配信は未対応**: 購読へのイベント通知(IsUrgent / 定期配信)は範囲外。
+  `EventLog` と Read 経路のみで、`poll_subscriptions` はイベントを見ない。将来課題(§12.5)。
+
+### 12.5 将来課題
+
+Subscribe のイベント対応(購読パスの EventRequests、dirty 相当の「新規イベント」通知、IsUrgent に
+よる即時レポート)。属性の dirty 追跡(§6.2)と同様に、購読ごとに「最後に配信した event_number」を
+保持して差分配信する形が素直。永続 event_number(リブート跨ぎの単調性)も同時に検討する。
+
+---
+
+## 13. オープンな論点
 
 1. **Subscribe device 発レポートの統合層契約**(§6.3)。`poll_subscriptions` + `open_initiator` +
    `send_reliable` の配線を統合層(第6段階)がどう回すか。`ExchangeManager::next_deadline` と
@@ -1058,7 +1118,7 @@ pub type DefaultStack<N, C> = MatterStack<N, C, 4, 4, 2, 2, 2, 3, 8>;
 
 ---
 
-## 13. 参照実装との対応表
+## 14. 参照実装との対応表
 
 | 論点 | rs-matter | chip | 本設計 |
 |---|---|---|---|

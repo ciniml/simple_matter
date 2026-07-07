@@ -207,11 +207,12 @@ pub struct ImClient<const RESULT: usize = DEFAULT_RESULT_LEN> {
     sub_truncated: bool,
     /// 購読系イベントの 1 深度 slot(txn イベントと分離。取り出し前の上書きは最新優先)。
     sub_event: Option<ImEvent>,
-    /// timed invoke の 2 相目(InvokeRequest payload)の退避長。
+    /// timed invoke/write の 2 相目(InvokeRequest/WriteRequest payload)の退避長。
     ///
-    /// [`Self::start_invoke_timed`] が InvokeRequest を `result` に先エンコードして退避し、
-    /// TimedRequest への `StatusResponse(SUCCESS)` 受信時に同 exchange の応答として送出する
-    /// (`docs/design/admin-commissioning.md` §3)。
+    /// [`Self::start_invoke_timed`] / [`Self::start_write_timed`] が後続リクエストを `result` に
+    /// 先エンコードして退避し、TimedRequest への `StatusResponse(SUCCESS)` 受信時に同 exchange の
+    /// 応答として送出する(opcode は進行中トランザクション種別で決まる。
+    /// `docs/design/admin-commissioning.md` §3)。
     pending_invoke_len: Option<usize>,
 }
 
@@ -433,6 +434,52 @@ impl<const RESULT: usize> ImClient<RESULT> {
             aw.push(None, path, value)
         });
         self.finish_start(len)
+    }
+
+    /// timed write(TimedRequest → Write)トランザクションを開始する(設計 §5.5)。
+    ///
+    /// `out` には **TimedRequest**(opcode = [`ImOpCode::TimedRequest`])が書かれる。
+    /// WriteRequest(`timedRequest=true`)は内部バッファへ先エンコードして退避し、
+    /// デバイスの `StatusResponse(SUCCESS)` 受信時に同 exchange の応答として自動送出する。
+    /// 完了は通常の Write と同じく [`ImEvent::WriteDone`]。
+    pub fn start_write_timed<F>(
+        &mut self,
+        exchange: ExchangeId,
+        timeout_ms: u16,
+        path: &AttributePath,
+        value: F,
+        out: &mut [u8],
+        now_ms: u64,
+    ) -> Result<usize>
+    where
+        F: FnOnce(&mut TlvWriter<'_>, &TlvTag) -> Result<()>,
+    {
+        self.begin(exchange, TxnKind::Write, now_ms)?;
+        // WriteRequest を result バッファへ先エンコードして退避する(Write の結果書き込みは
+        // WriteResponse 受信時なので競合しない)。
+        let header = WriteRequestHeader {
+            suppress_response: false,
+            timed_request: true,
+        };
+        let write_len =
+            match encode_write_request(&mut self.result, header, |aw| aw.push(None, path, value)) {
+                Ok(l) => l,
+                Err(e) => {
+                    self.txn = None;
+                    return Err(e);
+                }
+            };
+        self.pending_invoke_len = Some(write_len);
+        let len = TimedRequest::new(timeout_ms).encode(out);
+        match len {
+            Ok(l) => Ok(l),
+            Err(e) => {
+                self.txn = None;
+                self.pending_invoke_len = None;
+                self.result_len = 0;
+                Err(e)
+            }
+        }
     }
 
     /// Subscribe トランザクションを開始する。
@@ -744,7 +791,8 @@ impl<const RESULT: usize> ImClient<RESULT> {
         let status = StatusResponse::decode(rx.payload)
             .map(|s| s.status)
             .unwrap_or(ImStatus::InvalidAction);
-        // timed invoke の 2 相目: TimedRequest への SUCCESS で退避済み InvokeRequest を送出する。
+        // timed invoke/write の 2 相目: TimedRequest への SUCCESS で退避済み
+        // InvokeRequest/WriteRequest を送出する(opcode は進行中トランザクション種別で決まる)。
         if let Some(len) = self.pending_invoke_len.take() {
             if status.is_success() {
                 if len > tx.len() {
@@ -752,7 +800,11 @@ impl<const RESULT: usize> ImClient<RESULT> {
                 }
                 tx[..len].copy_from_slice(&self.result[..len]);
                 self.result_len = 0;
-                return Ok(respond(ImOpCode::InvokeRequest, len));
+                let opcode = match self.txn.as_ref().map(|t| t.kind) {
+                    Some(TxnKind::Write) => ImOpCode::WriteRequest,
+                    _ => ImOpCode::InvokeRequest,
+                };
+                return Ok(respond(opcode, len));
             }
             return self.fail(status);
         }

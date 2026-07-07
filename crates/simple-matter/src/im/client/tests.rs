@@ -1188,3 +1188,58 @@ fn timed_invoke_onoff_on() {
         "device OnOff turned on via timed invoke"
     );
 }
+
+// ==========================================================================
+// timed write(TimedRequest → StatusResponse → Write)
+// ==========================================================================
+
+#[test]
+fn timed_write_node_label() {
+    let crypto = crypto();
+    let (mut dev_mgr, mut dev_sessions, mut dev_pool) = device();
+    let (mut cli_mgr, mut cli_sessions, mut cli_pool) = client();
+    let cli_s = establish_case_pair(&mut cli_sessions, &mut dev_sessions);
+
+    let ex = cli_mgr.open_initiator(cli_s).unwrap();
+    let path = AttributePath::concrete(EndpointId(0), ClusterId(0x0028), AttributeId(0x0005));
+    let mut out = [0u8; 128];
+    // TimedRequest が out に書かれ、WriteRequest(timed=true)は client 内部に退避される。
+    let plen = cli_mgr
+        .handler_mut()
+        .im
+        .start_write_timed(
+            ex,
+            10_000,
+            &path,
+            |w, tag| w.write_utf8(tag, "kitchen"),
+            &mut out,
+            NOW,
+        )
+        .unwrap();
+
+    run(
+        &crypto,
+        &mut cli_mgr,
+        &mut cli_sessions,
+        &mut cli_pool,
+        &mut dev_mgr,
+        &mut dev_sessions,
+        &mut dev_pool,
+        1600,
+        ex,
+        ImOpCode::TimedRequest as u8,
+        &out[..plen],
+    );
+
+    assert_eq!(
+        cli_mgr.handler_mut().im.take_event(),
+        Some(ImEvent::WriteDone {
+            status: ImStatus::Success
+        })
+    );
+    assert_eq!(
+        dev_mgr.handler().im.data_model().basic.node_label(),
+        "kitchen",
+        "device NodeLabel written via timed write"
+    );
+}

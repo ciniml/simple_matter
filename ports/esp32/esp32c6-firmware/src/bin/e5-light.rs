@@ -863,6 +863,8 @@ async fn main(_spawner: Spawner) {
     let sc = SecureChannel::new(&crypto, esp_rng(), pase, creds);
     let im = InteractionModel::new(build_light(&fabrics));
     let mut stack: LightStack<'_> = MatterStack::new(&crypto, sc, im);
+    // 起動イベント(BasicInformation StartUp、CRITICAL、{ softwareVersion })を積む。
+    let _ = stack.post_startup_event(CFG.software_version, 0);
     println!(
         "[stack] DefaultStack ready ({} bytes, on main stack)",
         core::mem::size_of::<LightStack<'static>>()

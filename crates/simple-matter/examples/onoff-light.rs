@@ -278,6 +278,10 @@ fn main() -> std::io::Result<()> {
     let im = InteractionModel::new(build_light(&fabrics, &acl, &window));
     let mut stack: DefaultStack<Backend, DemoRng, Light> = MatterStack::new(&crypto, sc, im);
 
+    // 起動イベント(BasicInformation StartUp、CRITICAL、{ softwareVersion })を積む。
+    // SystemTimestamp は起動起点 0ms。chip-tool の `read-event` で観測できる。
+    let _ = stack.post_startup_event(CFG.software_version, 0);
+
     // --- KVS 永続化(環境変数 SM_STATE_DIR 設定時のみ)---
     // 未設定なら None = 完全メモリ内(従来フロー)。設定時は起動直後に
     // fabrics/ACL/resumption を復元し、以降 generation 変化を検知して保存する。

@@ -62,6 +62,22 @@
      (`HandlerAction::Respond`)として返す(契約への追加ゼロ)。
   `ControllerStack::start_invoke_timed` が配線する。
 
+## 3b. Timed write
+
+Matter 仕様では TimedRequest の後続は Invoke でも Write でもよい。同じ window 機構を
+Write に拡張する:
+
+- デバイス側: `AttributeMeta.timed: bool`(`cluster!` の属性ブロック直後に `@timed` 注釈。
+  コマンドの `@timed` と同流儀)。`engine::write` は invoke と同じ `check_timed` で window を
+  検証し(TimedRequest の窓状態スロットは invoke と共用、opcode 分岐のみ追加)、`write_one` が
+  timed 未経由の timed 必須属性への write に `NeedsTimedInteraction(0xC6)` を AttributeStatusIB
+  で返す。窓外/フラグ不整合は invoke と同じく `Timeout`/`TimedRequestMismatch`。
+  (既存クラスタで timed 必須の属性は無い。フラグの利用例はテスト用クラスタのみ。)
+- コントローラ側: `ImClient::start_write_timed`(start_invoke_timed の write 版)。退避バッファ
+  (`pending_invoke_len`)を共用し、StatusResponse(Success) 受信時に退避済み WriteRequest を
+  進行中トランザクション種別(`TxnKind::Write`)に応じた opcode で送出する。
+  `ControllerStack::start_write_timed` が配線する。
+
 ## 4. PASE verifier の動的注入と窓ゲート
 
 - `PaseConfig::from_verifier(w0, L, salt, iterations)` は既存。OCW の
@@ -89,6 +105,7 @@
 smctl admincommissioning open-window <node-id> <timeout-s> <discriminator> [--passcode N]
 smctl admincommissioning revoke <node-id>
 smctl invoke ... [--timed <ms>]      # 汎用 invoke にも timed を開放
+smctl write  ... [--timed <ms>]      # 汎用 write にも timed を開放(TimedRequest → Write)
 ```
 
 - open-window(ECM): passcode 未指定なら乱数生成(1..=99999998、無効値 8 種を除外)。

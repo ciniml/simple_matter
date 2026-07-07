@@ -269,7 +269,15 @@ impl<'a> Exec<'a> {
                 attr,
                 kind,
                 value,
-            } => self.write(*node, *ep, *cluster, *attr, *kind, value.clone()),
+            } => self.write(
+                *node,
+                *ep,
+                *cluster,
+                *attr,
+                *kind,
+                value.clone(),
+                self.g.timed_ms,
+            ),
             Cmd::Invoke {
                 node,
                 ep,
@@ -913,6 +921,10 @@ impl<'a> Exec<'a> {
     }
 
     /// 属性 Write。
+    ///
+    /// `timed_ms` があれば timed interaction(TimedRequest → Write)として送る
+    /// (`docs/design/admin-commissioning.md` §3)。
+    #[allow(clippy::too_many_arguments)]
     fn write(
         &mut self,
         node_id: u64,
@@ -921,26 +933,32 @@ impl<'a> Exec<'a> {
         attr: AttributeId,
         kind: ValueKind,
         value: Parsed,
+        timed_ms: Option<u16>,
     ) -> Result<(), String> {
         let session = self.case_session(node_id)?;
         let path = AttributePath::concrete(EndpointId(ep), cluster, attr);
         logf!(
             Level::Debug,
             "im",
-            "WriteRequest node={node_id} path: {} value={value:?}",
-            annotate_path(ep, cluster, Some(attr), None)
+            "WriteRequest node={node_id} path: {} value={value:?}{}",
+            annotate_path(ep, cluster, Some(attr), None),
+            match timed_ms {
+                Some(ms) => format!(" [timed, {ms}ms window]"),
+                None => String::new(),
+            }
         );
         let now = self.now_ms();
-        let dir = self
-            .stack
-            .start_write(
-                session,
-                &path,
-                move |w, t| write_value(w, t, kind, &value),
-                now,
-                &mut self.tx,
-            )
-            .map_err(|e| format!("start_write: {e:?}"))?;
+        let write_value = move |w: &mut TlvWriter<'_>, t: &TlvTag| write_value(w, t, kind, &value);
+        let dir = match timed_ms {
+            Some(ms) => self
+                .stack
+                .start_write_timed(session, ms, &path, write_value, now, &mut self.tx)
+                .map_err(|e| format!("start_write_timed: {e:?}"))?,
+            None => self
+                .stack
+                .start_write(session, &path, write_value, now, &mut self.tx)
+                .map_err(|e| format!("start_write: {e:?}"))?,
+        };
         send_dir(&self.socket, &self.tx, &dir);
         match self.wait_txn_event(Instant::now() + self.g.timeout)? {
             Some(ImEvent::WriteDone { status }) => {
