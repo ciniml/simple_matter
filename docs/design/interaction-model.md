@@ -938,6 +938,22 @@ impl<C: Crypto, const NF: usize> OpCredsCluster<'_, C, NF> {
 - **failsafe**: AddNOC 前に ArmFailsafe(General Commissioning)が必要。CSRRequest の pending keypair は
   failsafe 中のみ保持し、failsafe expire でロールバック(General Commissioning と OpCreds が failsafe
   context を共有)。初期スコープでは failsafe を簡略実装(タイマ + rollback フック)。
+- **failsafe クリーンアップ(Core Spec §11.10、2026-07 実装)**: `ArmFailSafe(expiry=0)` と failsafe
+  タイマ経過は、pending 破棄だけでなく「未 CommissioningComplete の AddNOC 済み fabric の削除 +
+  その fabric の ACL エントリ削除 + 当該 fabric に紐づくセッション破棄」まで行う。配線:
+  - **OpCreds**: `on_failsafe_expired() -> Option<NonZeroU8>` が pending 破棄に加え、AddNOC で記録した
+    `noc_added` があれば `FabricTable::remove` して削除 index を返す。`on_commissioning_complete()` は
+    `noc_added = None`(以降のクリーンアップで巻き戻さない)。
+  - **General Commissioning**: `ArmFailSafe(0)` で armed なら `CmdResponder::request_failsafe_cleanup()`、
+    CommissioningComplete 成功(armed→disarm)で `request_commissioning_complete()` を出す。
+  - **`DataModel` フック**(アプリが配線): `on_failsafe_cleanup() -> Option<NonZeroU8>`(GC disarm +
+    OpCreds クリーンアップ)、`on_commissioning_complete()`、`take_removed_fabric()`(タイマ経過で
+    `on_tick` が退避した削除 index を統合層が回収)。
+  - **IM エンジン**: invoke の副作用 `apply_invoke_effects` が上記 effect を受け、`on_failsafe_cleanup`/
+    `on_commissioning_complete` を呼び、削除 index について `purge_fabric(idx, keep, sessions)`
+    (ACL `remove_fabric` + 当該 fabric セッション close + `on_session_closed`)を実行する。invoke 経路は
+    応答送出中の現在セッションを `keep` で残す割り切り。タイマ経過経路は `stack::drive_ticks` が
+    `take_removed_fabric` → `purge_fabric(idx, None, ..)` で全セッションを閉じる。
 
 ---
 

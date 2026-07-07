@@ -152,6 +152,18 @@ impl GeneralCommissioning {
         }
     }
 
+    /// fail-safe を明示的に解除する(fail-safe クリーンアップフックの冪等な保険、Core Spec §11.10)。
+    ///
+    /// ArmFailSafe(0) / 期限切れ経路では既に解除済みだが、統合層の
+    /// [`DataModel::on_failsafe_cleanup`](crate::dm::DataModel::on_failsafe_cleanup) が
+    /// GC の解除を担保できるよう公開する(二重解除は冪等)。
+    pub fn disarm(&mut self) {
+        if self.fail_safe.is_armed() {
+            self.fail_safe.disarm();
+            self.dirty.mark();
+        }
+    }
+
     /// Breadcrumb(0x0000)を書き込む。
     fn write_breadcrumb(
         &mut self,
@@ -207,8 +219,15 @@ impl GeneralCommissioning {
                         _ => {}
                     }
                 }
+                let was_armed = self.fail_safe.is_armed();
                 self.fail_safe.arm(expiry_s, breadcrumb, acc.now_ms);
                 self.dirty.mark();
+                // ArmFailSafe(expiry=0) で armed 中の解除は「fail-safe クリーンアップ」と同じ
+                // 巻き戻し(未 CommissioningComplete の fabric / ACL / セッション破棄)を伴う
+                // (Core Spec §11.10)。統合層に掃除を要求する。
+                if expiry_s == 0 && was_armed {
+                    resp.request_failsafe_cleanup();
+                }
                 Self::write_error_response(resp, 0x01, commissioning_error::OK)
             }
             // SetRegulatoryConfig → SetRegulatoryConfigResponse(0x03)。
@@ -242,6 +261,9 @@ impl GeneralCommissioning {
             0x04 => {
                 let error = if self.fail_safe.is_armed() {
                     self.fail_safe.disarm();
+                    // fail-safe 中に追加した fabric を確定する(以降 fail-safe で巻き戻さない、
+                    // Core Spec §11.10)。統合層が OpCreds へ配線する。
+                    resp.request_commissioning_complete();
                     commissioning_error::OK
                 } else {
                     // fail-safe 未アームでも初期実装では成功応答を返す(骨格)。

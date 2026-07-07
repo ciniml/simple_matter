@@ -235,6 +235,10 @@ pub struct OpCredsCluster<
     pending_root_len: usize,
     /// CSRRequest で生成した pending 運用鍵ペア(AddNOC で消費)。
     pending_keypair: Option<C::Keypair>,
+    /// 直近の AddNOC で追加したが、まだ CommissioningComplete していない fabric index
+    /// (fail-safe クリーンアップで巻き戻す対象、Core Spec §11.10)。CommissioningComplete で
+    /// 確定すると `None` に戻る。
+    noc_added: Option<NonZeroU8>,
     dirty: Dirty,
 }
 
@@ -248,6 +252,7 @@ impl<C: Crypto, DAC: DacProvider, const N: usize> OpCredsCluster<C, DAC, N> {
             pending_root: [0u8; MAX_CERT_TLV_LEN],
             pending_root_len: 0,
             pending_keypair: None,
+            noc_added: None,
             dirty: Dirty::new(),
         }
     }
@@ -268,6 +273,7 @@ impl<'f, C: Crypto, DAC: DacProvider, const N: usize>
             pending_root: [0u8; MAX_CERT_TLV_LEN],
             pending_root_len: 0,
             pending_keypair: None,
+            noc_added: None,
             dirty: Dirty::new(),
         }
     }
@@ -281,10 +287,27 @@ impl<C: Crypto, DAC: DacProvider, const N: usize, FT: FabricAccess<C, N>>
         self.fabrics.get()
     }
 
-    /// fail-safe 期限切れで pending(root cert / 運用鍵)を破棄する(設計 §9.4)。
-    pub fn on_failsafe_expired(&mut self) {
+    /// fail-safe 期限切れ / ArmFailSafe(0) の仕様準拠クリーンアップ(Core Spec §11.10)。
+    ///
+    /// pending(root cert / 運用鍵)を破棄し、さらに未 CommissioningComplete の AddNOC で
+    /// 追加した fabric があれば [`FabricTable`] から削除して、その index を返す。統合層は
+    /// 返った index で当該 fabric の ACL エントリとセッションを掃除する(`im`/`stack` 参照)。
+    /// remove が失敗しても `noc_added` はクリアする(pending の一貫性を優先)。
+    pub fn on_failsafe_expired(&mut self) -> Option<NonZeroU8> {
         self.pending_root_len = 0;
         self.pending_keypair = None;
+        let removed = self.noc_added.take();
+        if let Some(idx) = removed {
+            if self.fabrics.get_mut().remove(idx).is_ok() {
+                self.dirty.mark();
+            }
+        }
+        removed
+    }
+
+    /// CommissioningComplete で直近 AddNOC の fabric を確定する(以降 fail-safe で巻き戻さない)。
+    pub fn on_commissioning_complete(&mut self) {
+        self.noc_added = None;
     }
 
     // --- 属性読み取り ---
@@ -568,6 +591,9 @@ impl<C: Crypto, DAC: DacProvider, const N: usize, FT: FabricAccess<C, N>>
         match result {
             Ok(idx) => {
                 self.pending_root_len = 0;
+                // fail-safe が張られたまま(未 CommissioningComplete)の追加として記録する。
+                // ArmFailSafe(0) / fail-safe 期限切れで巻き戻す対象(Core Spec §11.10)。
+                self.noc_added = Some(idx);
                 self.dirty.mark();
                 // PASE セッションを確定 fabric へ昇格する要求(設計 §9.4)。
                 let _ = acc;

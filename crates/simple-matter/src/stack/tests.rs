@@ -131,6 +131,8 @@ struct Dev<'s, N: ServerCluster = NetworkCommissioning> {
     desc0: DescriptorCluster,
     onoff: OnOffCluster,
     desc1: DescriptorCluster,
+    /// fail-safe タイマ経過で削除した fabric index の退避先(stack が take する)。
+    removed_fabric: Option<NonZeroU8>,
 }
 
 // device! マクロはライフタイム付きデバイスに使えないため DataModel を手書きする(乖離)。
@@ -179,9 +181,21 @@ impl<N: ServerCluster> DataModel for Dev<'_, N> {
 
     fn on_tick(&mut self, now_ms: u64) -> Option<u64> {
         if self.gc.on_tick(now_ms) {
-            self.opcreds.on_failsafe_expired();
+            if let Some(idx) = self.opcreds.on_failsafe_expired() {
+                self.removed_fabric = Some(idx);
+            }
         }
         None
+    }
+    fn on_failsafe_cleanup(&mut self) -> Option<NonZeroU8> {
+        self.gc.disarm();
+        self.opcreds.on_failsafe_expired()
+    }
+    fn on_commissioning_complete(&mut self) {
+        self.opcreds.on_commissioning_complete();
+    }
+    fn take_removed_fabric(&mut self) -> Option<NonZeroU8> {
+        self.removed_fabric.take()
     }
 }
 
@@ -204,6 +218,7 @@ fn build_device_with<N: ServerCluster>(
         desc0: DescriptorCluster::new(EndpointId(0), EP0_DT, EP0_SERVERS, &[], EP0_PARTS),
         onoff: OnOffCluster::new(),
         desc1: DescriptorCluster::new(EndpointId(1), EP1_DT, EP1_SERVERS, &[], EP1_PARTS),
+        removed_fabric: None,
     }
 }
 

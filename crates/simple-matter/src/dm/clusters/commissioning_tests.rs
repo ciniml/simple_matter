@@ -7,8 +7,11 @@
 //! 増減することと、AddNOC で PASE セッションが確定 fabric へ昇格することを確認する。
 //! NOC はテスト側(コミッショナ役)が CSR 応答の運用公開鍵から発行する。
 
+use core::cell::RefCell;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+use core::num::NonZeroU8;
 
+use crate::acl::{AclHandle, AclTable};
 use crate::cert::{self, dn_attr, ext_key_usage, key_usage, MatterCert, MAX_TBS_DER_LEN};
 use crate::crypto::rustcrypto::RustCrypto;
 use crate::crypto::{Crypto, P256Keypair, P256PublicKey, Rng};
@@ -16,7 +19,8 @@ use crate::dm::clusters::{
     BasicInfoConfig, BasicInformationCluster, DescriptorCluster, GeneralCommissioning,
     NetworkCommissioning, OpCredsCluster, TestDacProvider,
 };
-use crate::dm::meta::EndpointId;
+use crate::dm::meta::{DeviceType, EndpointId, EndpointMeta};
+use crate::dm::{DataModel, ServerCluster};
 use crate::exchange::{ExchangeId, HandlerAction, ProtocolHandler, Role, RxMessage};
 use crate::im::engine::InteractionModel;
 use crate::im::wire::{
@@ -61,24 +65,86 @@ static CFG: BasicInfoConfig = BasicInfoConfig {
     serial_number: "SN-0001",
 };
 
+/// テスト ACL 容量(5 fabric × per-fabric 上限相当に余裕)。
+const NACL: usize = 8;
+
+static COMM_EP0_DT: &[DeviceType] = &[DeviceType::new(0x0016, 1)];
+static COMM_EP0_SERVERS: &[ClusterId] = &[
+    ClusterId(0x0030),
+    ClusterId(0x0031),
+    ClusterId(0x003E),
+    ClusterId(0x0028),
+    ClusterId(0x001D),
+];
+static COMM_EP0_PARTS: &[EndpointId] = &[];
+
+/// EP0 のみのコミッショニングノード。fail-safe クリーンアップ検証のため ACL を持ち、
+/// `device!` マクロではなく手書き [`DataModel`] で fail-safe フック(Core Spec §11.10)を配線する。
 struct CommNode {
     gc: GeneralCommissioning,
     net: NetworkCommissioning,
     opcreds: Op,
     basic: BasicInformationCluster,
     desc: DescriptorCluster,
+    acl: RefCell<AclTable<NACL>>,
+    removed_fabric: Option<NonZeroU8>,
 }
 
-crate::device! {
-    CommNode {
-        endpoint 0 {
-            device_types: [ (0x0016, 1) ],
-            parts: [],
-            clusters: [
-                (0x0030, gc), (0x0031, net), (0x003E, opcreds),
-                (0x0028, basic), (0x001D, desc)
-            ],
+impl DataModel for CommNode {
+    fn endpoints(&self) -> &[EndpointMeta] {
+        static EPS: &[EndpointMeta] = &[EndpointMeta::new(
+            EndpointId(0),
+            COMM_EP0_DT,
+            COMM_EP0_SERVERS,
+        )];
+        EPS
+    }
+    fn clusters_on(&self, ep: EndpointId) -> &[ClusterId] {
+        match ep.0 {
+            0 => COMM_EP0_SERVERS,
+            _ => &[],
         }
+    }
+    fn cluster(&self, ep: EndpointId, cl: ClusterId) -> Option<&dyn ServerCluster> {
+        match (ep.0, cl.0) {
+            (0, 0x0030) => Some(&self.gc),
+            (0, 0x0031) => Some(&self.net),
+            (0, 0x003E) => Some(&self.opcreds),
+            (0, 0x0028) => Some(&self.basic),
+            (0, 0x001D) => Some(&self.desc),
+            _ => None,
+        }
+    }
+    fn cluster_mut(&mut self, ep: EndpointId, cl: ClusterId) -> Option<&mut dyn ServerCluster> {
+        match (ep.0, cl.0) {
+            (0, 0x0030) => Some(&mut self.gc),
+            (0, 0x0031) => Some(&mut self.net),
+            (0, 0x003E) => Some(&mut self.opcreds),
+            (0, 0x0028) => Some(&mut self.basic),
+            (0, 0x001D) => Some(&mut self.desc),
+            _ => None,
+        }
+    }
+    fn on_tick(&mut self, now_ms: u64) -> Option<u64> {
+        if self.gc.on_tick(now_ms) {
+            if let Some(idx) = self.opcreds.on_failsafe_expired() {
+                self.removed_fabric = Some(idx);
+            }
+        }
+        None
+    }
+    fn on_failsafe_cleanup(&mut self) -> Option<NonZeroU8> {
+        self.gc.disarm();
+        self.opcreds.on_failsafe_expired()
+    }
+    fn on_commissioning_complete(&mut self) {
+        self.opcreds.on_commissioning_complete();
+    }
+    fn take_removed_fabric(&mut self) -> Option<NonZeroU8> {
+        self.removed_fabric.take()
+    }
+    fn acl(&self) -> Option<&dyn AclHandle> {
+        Some(&self.acl)
     }
 }
 
@@ -93,11 +159,13 @@ impl CommNode {
             basic: BasicInformationCluster::new(&CFG),
             desc: DescriptorCluster::new(
                 EndpointId(0),
-                CommNode::device_types(EndpointId(0)),
-                CommNode::server_list(EndpointId(0)),
+                COMM_EP0_DT,
+                COMM_EP0_SERVERS,
                 &[],
-                CommNode::parts(EndpointId(0)),
+                COMM_EP0_PARTS,
             ),
+            acl: RefCell::new(AclTable::new()),
+            removed_fabric: None,
         }
     }
 }
@@ -660,6 +728,324 @@ fn network_commissioning_reads_ethernet_networks() {
         TlvReader::new(&buf).read_next().unwrap().unwrap().value,
         TlvValue::UnsignedInteger(1)
     );
+}
+
+// ==========================================================================
+// fail-safe 仕様準拠クリーンアップ(Core Spec §11.10)
+// ==========================================================================
+
+/// ArmFailSafe(arm_expiry_s) → CSR → AddTrustedRoot → AddNOC を実行し、fabric を 1 つ追加した
+/// 状態にする(クリーンアップ検証の前準備。fail-safe は張られたまま = 未 CommissioningComplete)。
+fn commission_to_addnoc(
+    im: &mut Im,
+    mgr: &mut SessionManager<2>,
+    ex: ExchangeId,
+    crypto: &RustCrypto<DummyRng>,
+    arm_expiry_s: u16,
+) {
+    let mut out = [0u8; 1024];
+    // ArmFailSafe。
+    let len = invoke(
+        im,
+        mgr,
+        ex,
+        0x0030,
+        0x00,
+        0,
+        |w, t| {
+            w.start_struct(t)?;
+            w.write_u16(&cx(0), arm_expiry_s)?;
+            w.write_u64(&cx(1), 1)?;
+            w.end_container()
+        },
+        &mut out,
+    );
+    assert_eq!(resp_command(&out[..len]).0, 0x01, "ArmFailSafeResponse");
+
+    // CSRRequest → 運用公開鍵。
+    let len = invoke(
+        im,
+        mgr,
+        ex,
+        0x003E,
+        0x04,
+        0,
+        |w, t| {
+            w.start_struct(t)?;
+            w.write_bytes(&cx(0), &[0x22u8; 32])?;
+            w.end_container()
+        },
+        &mut out,
+    );
+    let (_, f) = resp_command(&out[..len]);
+    let nocsr = field_bytes(f, 0).unwrap();
+    let csr = field_bytes(nocsr, 1).unwrap();
+    let op_pub = extract_pubkey(csr);
+
+    // RCAC(自己署名)と NOC(op_pub, RCAC 発行)。
+    let root_kp = crypto.p256_keypair_from_bytes(&[0x11; 32]).unwrap();
+    let root_pub = root_kp.public_key().to_bytes();
+    let mut rcac = [0u8; 400];
+    let rcac_len = write_cert(
+        &mut rcac,
+        &[0x01],
+        &[
+            (dn_attr::MATTER_RCAC_ID, RCAC_ID),
+            (dn_attr::MATTER_FABRIC_ID, FABRIC_ID),
+        ],
+        &[
+            (dn_attr::MATTER_RCAC_ID, RCAC_ID),
+            (dn_attr::MATTER_FABRIC_ID, FABRIC_ID),
+        ],
+        &root_pub,
+        true,
+        key_usage::KEY_CERT_SIGN | key_usage::CRL_SIGN,
+        &[],
+        &RCAC_SKID,
+        &RCAC_SKID,
+        &root_kp,
+    );
+    let mut noc = [0u8; 400];
+    let noc_len = write_cert(
+        &mut noc,
+        &[0x02],
+        &[
+            (dn_attr::MATTER_RCAC_ID, RCAC_ID),
+            (dn_attr::MATTER_FABRIC_ID, FABRIC_ID),
+        ],
+        &[
+            (dn_attr::MATTER_NODE_ID, NODE_ID),
+            (dn_attr::MATTER_FABRIC_ID, FABRIC_ID),
+        ],
+        &op_pub,
+        false,
+        key_usage::DIGITAL_SIGNATURE,
+        &[ext_key_usage::SERVER_AUTH, ext_key_usage::CLIENT_AUTH],
+        &NOC_SKID,
+        &RCAC_SKID,
+        &root_kp,
+    );
+
+    // AddTrustedRootCertificate。
+    let len = invoke(
+        im,
+        mgr,
+        ex,
+        0x003E,
+        0x0B,
+        0,
+        |w, t| {
+            w.start_struct(t)?;
+            w.write_bytes(&cx(0), &rcac[..rcac_len])?;
+            w.end_container()
+        },
+        &mut out,
+    );
+    assert_eq!(resp_status(&out[..len]), 0, "AddTrustedRoot success");
+
+    // AddNOC(caseAdminSubject=1 → ACL bootstrap admin エントリが 1 つ入る)。
+    let ipk = [0x44u8; 16];
+    let len = invoke(
+        im,
+        mgr,
+        ex,
+        0x003E,
+        0x06,
+        0,
+        |w, t| {
+            w.start_struct(t)?;
+            w.write_bytes(&cx(0), &noc[..noc_len])?;
+            w.write_bytes(&cx(2), &ipk)?;
+            w.write_u64(&cx(3), 0x0000_0000_0000_0001)?;
+            w.write_u16(&cx(4), 0xFFF1)?;
+            w.end_container()
+        },
+        &mut out,
+    );
+    let (_, f) = resp_command(&out[..len]);
+    assert_eq!(field_uint(f, 0), Some(0), "AddNOC OK");
+    assert_eq!(im.data_model().opcreds.fabrics().len(), 1, "fabric added");
+}
+
+/// (a) AddNOC 後・CommissioningComplete 前に ArmFailSafe(0) → fabric / ACL / pending が巻き戻る。
+#[test]
+fn armfailsafe_zero_rolls_back_uncommitted_commissioning() {
+    let (mut im, mut mgr, ex) = setup();
+    let crypto = RustCrypto::new(DummyRng);
+    commission_to_addnoc(&mut im, &mut mgr, ex, &crypto, 60);
+    // AddNOC の caseAdminSubject で bootstrap admin ACL エントリが 1 つ入っている。
+    assert_eq!(
+        im.data_model().acl.borrow().len(),
+        1,
+        "case_admin ACL entry present after AddNOC"
+    );
+
+    // ArmFailSafe(expiry=0)。
+    let mut out = [0u8; 512];
+    let len = invoke(
+        &mut im,
+        &mut mgr,
+        ex,
+        0x0030,
+        0x00,
+        0,
+        |w, t| {
+            w.start_struct(t)?;
+            w.write_u16(&cx(0), 0)?;
+            w.write_u64(&cx(1), 0)?;
+            w.end_container()
+        },
+        &mut out,
+    );
+    assert_eq!(resp_command(&out[..len]).0, 0x01, "ArmFailSafeResponse");
+
+    assert_eq!(
+        im.data_model().opcreds.fabrics().len(),
+        0,
+        "fabric rolled back"
+    );
+    assert_eq!(
+        im.data_model().acl.borrow().len(),
+        0,
+        "ACL entries purged for removed fabric"
+    );
+    assert!(
+        !im.data_model().gc.fail_safe().is_armed(),
+        "fail-safe disarmed"
+    );
+
+    // pending も破棄されている: 直後の AddNOC(root/CSR なし)は InvalidNOC。
+    let len = invoke(
+        &mut im,
+        &mut mgr,
+        ex,
+        0x003E,
+        0x06,
+        0,
+        |w, t| {
+            w.start_struct(t)?;
+            w.write_bytes(&cx(0), &[0u8; 4])?;
+            w.write_bytes(&cx(2), &[0x44u8; 16])?;
+            w.write_u64(&cx(3), 1)?;
+            w.write_u16(&cx(4), 0xFFF1)?;
+            w.end_container()
+        },
+        &mut out,
+    );
+    let (_, f) = resp_command(&out[..len]);
+    assert_eq!(field_uint(f, 0), Some(3), "InvalidNOC (pending cleared)");
+}
+
+/// (b) AddNOC 後にタイマ期限経過 → 同様に巻き戻る(ACL・当該 fabric セッション close 込み)。
+#[test]
+fn failsafe_timer_expiry_rolls_back_uncommitted_commissioning() {
+    let (mut im, mut mgr, ex) = setup();
+    let crypto = RustCrypto::new(DummyRng);
+    commission_to_addnoc(&mut im, &mut mgr, ex, &crypto, 60);
+    assert_eq!(im.data_model().opcreds.fabrics().len(), 1);
+    assert_eq!(im.data_model().acl.borrow().len(), 1);
+    // AddNOC で PASE セッションは fabric 1 へ昇格済み。
+    assert_eq!(
+        mgr.get(ex.session()).unwrap().mode(),
+        SessionMode::Pase { fabric_idx: 1 }
+    );
+
+    // fail-safe deadline = 60s。タイマ経過を模す(stack.drive_ticks 相当)。
+    im.data_model_mut().on_tick(60_001);
+    let idx = im
+        .data_model_mut()
+        .take_removed_fabric()
+        .expect("fabric removed on failsafe timer expiry");
+    im.purge_fabric(idx, None, &mut mgr);
+
+    assert_eq!(
+        im.data_model().opcreds.fabrics().len(),
+        0,
+        "fabric rolled back on timer"
+    );
+    assert_eq!(
+        im.data_model().acl.borrow().len(),
+        0,
+        "ACL entries purged on timer"
+    );
+    assert!(
+        mgr.get(ex.session()).is_none(),
+        "promoted session closed on timer cleanup"
+    );
+}
+
+/// (c) CommissioningComplete 完了後は fail-safe 経過/ArmFailSafe(0) でも fabric が残る。
+#[test]
+fn commissioning_complete_makes_fabric_survive_failsafe() {
+    let (mut im, mut mgr, ex) = setup();
+    let crypto = RustCrypto::new(DummyRng);
+    commission_to_addnoc(&mut im, &mut mgr, ex, &crypto, 60);
+
+    // CommissioningComplete で fabric 確定。
+    let mut out = [0u8; 512];
+    let len = invoke(
+        &mut im,
+        &mut mgr,
+        ex,
+        0x0030,
+        0x04,
+        0,
+        |w, t| {
+            w.start_struct(t)?;
+            w.end_container()
+        },
+        &mut out,
+    );
+    assert_eq!(resp_command(&out[..len]).0, 0x05, "CommissioningComplete");
+
+    // 再 ArmFailSafe(60) → ArmFailSafe(0): 確定済みなので fabric は残る。
+    for expiry in [60u16, 0u16] {
+        let len = invoke(
+            &mut im,
+            &mut mgr,
+            ex,
+            0x0030,
+            0x00,
+            0,
+            |w, t| {
+                w.start_struct(t)?;
+                w.write_u16(&cx(0), expiry)?;
+                w.write_u64(&cx(1), 0)?;
+                w.end_container()
+            },
+            &mut out,
+        );
+        assert_eq!(resp_command(&out[..len]).0, 0x01);
+    }
+    assert_eq!(
+        im.data_model().opcreds.fabrics().len(),
+        1,
+        "fabric kept after CommissioningComplete + ArmFailSafe(0)"
+    );
+
+    // タイマ経過でも残る。
+    let len = invoke(
+        &mut im,
+        &mut mgr,
+        ex,
+        0x0030,
+        0x00,
+        0,
+        |w, t| {
+            w.start_struct(t)?;
+            w.write_u16(&cx(0), 60)?;
+            w.write_u64(&cx(1), 0)?;
+            w.end_container()
+        },
+        &mut out,
+    );
+    assert_eq!(resp_command(&out[..len]).0, 0x01);
+    im.data_model_mut().on_tick(60_001);
+    assert!(
+        im.data_model_mut().take_removed_fabric().is_none(),
+        "no fabric removed after CommissioningComplete"
+    );
+    assert_eq!(im.data_model().opcreds.fabrics().len(), 1);
 }
 
 #[test]

@@ -115,6 +115,8 @@ pub struct Light<'s, const NF: usize> {
     pub onoff: OnOffCluster,
     /// EP1 の Descriptor クラスタ。
     pub desc1: DescriptorCluster,
+    /// fail-safe タイマ経過で削除した fabric index の退避先(stack が take する)。
+    pub removed_fabric: Option<core::num::NonZeroU8>,
 }
 
 impl<const NF: usize> DataModel for Light<'_, NF> {
@@ -158,9 +160,21 @@ impl<const NF: usize> DataModel for Light<'_, NF> {
     }
     fn on_tick(&mut self, now_ms: u64) -> Option<u64> {
         if self.gc.on_tick(now_ms) {
-            self.opcreds.on_failsafe_expired();
+            if let Some(idx) = self.opcreds.on_failsafe_expired() {
+                self.removed_fabric = Some(idx);
+            }
         }
         None
+    }
+    fn on_failsafe_cleanup(&mut self) -> Option<core::num::NonZeroU8> {
+        self.gc.disarm();
+        self.opcreds.on_failsafe_expired()
+    }
+    fn on_commissioning_complete(&mut self) {
+        self.opcreds.on_commissioning_complete();
+    }
+    fn take_removed_fabric(&mut self) -> Option<core::num::NonZeroU8> {
+        self.removed_fabric.take()
     }
 }
 
@@ -181,6 +195,7 @@ pub fn build_light<const NF: usize>(fabrics: &RefCell<FabricTable<Backend, NF>>)
         desc0: DescriptorCluster::new(EndpointId(0), EP0_DT, EP0_SERVERS, &[], EP0_PARTS),
         onoff: OnOffCluster::new(),
         desc1: DescriptorCluster::new(EndpointId(1), EP1_DT, EP1_SERVERS, &[], EP1_PARTS),
+        removed_fabric: None,
     }
 }
 

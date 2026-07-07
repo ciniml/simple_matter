@@ -297,6 +297,8 @@ pub struct CmdResponder<'w, 'b> {
     promote_fabric: Option<core::num::NonZeroU8>,
     case_admin_acl: Option<(core::num::NonZeroU8, u64)>,
     removed_fabric: Option<core::num::NonZeroU8>,
+    failsafe_cleanup: bool,
+    commissioning_complete: bool,
     cluster_status: Option<u8>,
     deferred: bool,
 }
@@ -310,6 +312,8 @@ impl<'w, 'b> CmdResponder<'w, 'b> {
             promote_fabric: None,
             case_admin_acl: None,
             removed_fabric: None,
+            failsafe_cleanup: false,
+            commissioning_complete: false,
             cluster_status: None,
             deferred: false,
         }
@@ -376,6 +380,30 @@ impl<'w, 'b> CmdResponder<'w, 'b> {
     /// 要求された fabric 連動削除(あれば)。
     pub const fn requested_fabric_removed(&self) -> Option<core::num::NonZeroU8> {
         self.removed_fabric
+    }
+
+    /// ArmFailSafe(0) 成功時に、仕様準拠の fail-safe クリーンアップ(未 CommissioningComplete の
+    /// fabric / ACL / セッション破棄、Core Spec §11.10)を要求する。IM エンジンが invoke 後に
+    /// [`DataModel::on_failsafe_cleanup`](crate::dm::DataModel::on_failsafe_cleanup) を呼ぶ。
+    pub fn request_failsafe_cleanup(&mut self) {
+        self.failsafe_cleanup = true;
+    }
+
+    /// fail-safe クリーンアップが要求されたか。
+    pub const fn requested_failsafe_cleanup(&self) -> bool {
+        self.failsafe_cleanup
+    }
+
+    /// CommissioningComplete 成功時に、fail-safe 中に追加した fabric の確定
+    /// ([`DataModel::on_commissioning_complete`](crate::dm::DataModel::on_commissioning_complete))を
+    /// 要求する。IM エンジンが invoke 後に呼ぶ。
+    pub fn request_commissioning_complete(&mut self) {
+        self.commissioning_complete = true;
+    }
+
+    /// CommissioningComplete の確定が要求されたか。
+    pub const fn requested_commissioning_complete(&self) -> bool {
+        self.commissioning_complete
     }
 
     /// このコマンドの応答を **保留(遅延)** するよう宣言する(設計 `port-esp32-device.md` §E7.1)。

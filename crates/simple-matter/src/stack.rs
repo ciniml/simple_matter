@@ -294,6 +294,21 @@ impl<
             .on_tick(&mut self.sessions, now_ms);
         self.mgr.handler_mut().im.on_tick(now_ms);
         let _ = self.mgr.handler_mut().im.data_model_mut().on_tick(now_ms);
+        // fail-safe タイマ経過で fabric を巻き戻していたら(Core Spec §11.10)、その fabric の
+        // ACL エントリと全セッションを掃除する(タイマ経過には残すべき「現在のセッション」が
+        // 無いため keep=None で全て閉じる。ArmFailSafe(0) の invoke 経路は engine 内で処理)。
+        let removed = self
+            .mgr
+            .handler_mut()
+            .im
+            .data_model_mut()
+            .take_removed_fabric();
+        if let Some(idx) = removed {
+            self.mgr
+                .handler_mut()
+                .im
+                .purge_fabric(idx, None, &mut self.sessions);
+        }
     }
 
     /// 受信 datagram を処理し、送るべき応答があれば [`SendDirective`] を返す(sans-IO)。

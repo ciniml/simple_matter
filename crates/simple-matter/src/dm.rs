@@ -232,6 +232,34 @@ pub trait DataModel {
         None
     }
 
+    /// ArmFailSafe(0) 受信時の仕様準拠 fail-safe クリーンアップ(Core Spec §11.10)。
+    ///
+    /// IM エンジンが invoke の副作用として呼ぶ。実装は General Commissioning の fail-safe を
+    /// 解除し、Operational Credentials の
+    /// [`on_failsafe_expired`](crate::dm::clusters::OpCredsCluster::on_failsafe_expired) で
+    /// pending を破棄しつつ未 CommissioningComplete の fabric を削除し、その index を返す
+    /// (fail-safe を持つデバイスが上書き実装する)。返した index の ACL エントリとセッションは
+    /// エンジン/統合層が掃除する。既定は `None`(fail-safe を持たないデバイス)。
+    fn on_failsafe_cleanup(&mut self) -> Option<core::num::NonZeroU8> {
+        None
+    }
+
+    /// CommissioningComplete 成功時のフック(Core Spec §11.10)。
+    ///
+    /// fail-safe 中に追加した fabric を確定し、以降の fail-safe クリーンアップで巻き戻さない
+    /// ようにする(OpCreds の
+    /// [`on_commissioning_complete`](crate::dm::clusters::OpCredsCluster::on_commissioning_complete)
+    /// へ配線)。既定は no-op。
+    fn on_commissioning_complete(&mut self) {}
+
+    /// fail-safe タイマ経過([`on_tick`](DataModel::on_tick))で削除した fabric index を取り出す。
+    ///
+    /// タイマ経過は返り値でしか index を運べないため、アプリの `on_tick` がフィールドに退避し、
+    /// 統合層([`crate::stack`])が本メソッドで回収して ACL / セッションを掃除する。既定は `None`。
+    fn take_removed_fabric(&mut self) -> Option<core::num::NonZeroU8> {
+        None
+    }
+
     /// このデバイスの ACL(`docs/design/acl.md` §3)。
     ///
     /// `Some` を返すデバイスは IM エンジンが full ACL(per-entry 照合)で権限判定する。

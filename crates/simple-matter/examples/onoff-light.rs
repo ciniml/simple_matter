@@ -180,6 +180,8 @@ struct Light<'s> {
     desc0: DescriptorCluster,
     onoff: OnOffCluster,
     desc1: DescriptorCluster,
+    /// fail-safe タイマ経過で削除した fabric index の退避先(stack が take する)。
+    removed_fabric: Option<core::num::NonZeroU8>,
 }
 
 impl DataModel for Light<'_> {
@@ -227,11 +229,25 @@ impl DataModel for Light<'_> {
     }
     fn on_tick(&mut self, now_ms: u64) -> Option<u64> {
         if self.gc.on_tick(now_ms) {
-            self.opcreds.on_failsafe_expired();
+            // fail-safe 期限切れ: pending 破棄 + 未 CommissioningComplete の fabric 巻き戻し。
+            // 削除した index は stack が take_removed_fabric で回収し ACL/セッションを掃除する。
+            if let Some(idx) = self.opcreds.on_failsafe_expired() {
+                self.removed_fabric = Some(idx);
+            }
         }
         // コミッショニング窓のタイムアウト自動クローズ(admin-commissioning.md §2)。
         let _ = self.admin.on_tick(now_ms);
         None
+    }
+    fn on_failsafe_cleanup(&mut self) -> Option<core::num::NonZeroU8> {
+        self.gc.disarm();
+        self.opcreds.on_failsafe_expired()
+    }
+    fn on_commissioning_complete(&mut self) {
+        self.opcreds.on_commissioning_complete();
+    }
+    fn take_removed_fabric(&mut self) -> Option<core::num::NonZeroU8> {
+        self.removed_fabric.take()
     }
     fn acl(&self) -> Option<&dyn AclHandle> {
         // full ACL(per-entry 照合)を有効化する(docs/design/acl.md §3)。
@@ -260,6 +276,7 @@ fn build_light<'s>(
             println!("[onoff] light is now {}", if on { "ON" } else { "OFF" });
         }),
         desc1: DescriptorCluster::new(EndpointId(1), EP1_DT, EP1_SERVERS, &[], EP1_PARTS),
+        removed_fabric: None,
     }
 }
 

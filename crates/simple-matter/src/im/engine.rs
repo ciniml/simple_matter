@@ -989,6 +989,46 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
                 acl.remove_fabric(fabric);
             }
         }
+        // CommissioningComplete: fail-safe 中に追加した fabric を確定する(Core Spec §11.10)。
+        if effects.commissioning_complete {
+            self.dm.on_commissioning_complete();
+        }
+        // ArmFailSafe(0): 仕様準拠 fail-safe クリーンアップ(Core Spec §11.10)。GC の解除 +
+        // OpCreds の pending 破棄 + 未 CommissioningComplete の fabric 削除を dm が行い、削除した
+        // fabric index の ACL エントリと当該 fabric のセッションを掃除する。応答送出に使う現在の
+        // セッション(ArmFailSafe を送ってきた PASE)は残す割り切り(直後に応答が必要なため。
+        // このセッションはコミッショナが CloseSession するか失効で消える)。
+        if effects.failsafe_cleanup {
+            if let Some(fabric) = self.dm.on_failsafe_cleanup() {
+                self.purge_fabric(fabric, Some(session), sessions);
+            }
+        }
+    }
+
+    /// 削除した `fabric` の ACL エントリと、その fabric に紐づくセッションを掃除する。
+    ///
+    /// `keep` に与えたセッション(応答送出中の現在セッション)は残す。それ以外の当該 fabric
+    /// セッションは [`SessionManager::remove`] で閉じ、購読/継続/Timed を
+    /// [`on_session_closed`](Self::on_session_closed) で掃除する。fail-safe クリーンアップ
+    /// (invoke 経路、`keep = Some`)とタイマ経過経路(`stack`、`keep = None`)で共用する。
+    pub fn purge_fabric<const SN: usize>(
+        &mut self,
+        fabric: NonZeroU8,
+        keep: Option<SessionId>,
+        sessions: &mut SessionManager<SN>,
+    ) {
+        if let Some(acl) = self.dm.acl() {
+            acl.remove_fabric(fabric);
+        }
+        loop {
+            let victim = sessions
+                .iter()
+                .find(|s| Some(s.id()) != keep && s.mode().fabric_idx() == fabric.get())
+                .map(|s| s.id());
+            let Some(id) = victim else { break };
+            sessions.remove(id);
+            self.on_session_closed(id);
+        }
     }
 
     // ----------------------------------------------------------------------
@@ -1460,6 +1500,10 @@ struct InvokeEffects {
     case_admin: Option<(NonZeroU8, u64)>,
     /// fabric 削除に連動する ACL エントリ削除(RemoveFabric)。
     removed_fabric: Option<NonZeroU8>,
+    /// ArmFailSafe(0) の fail-safe クリーンアップ(Core Spec §11.10)。
+    failsafe_cleanup: bool,
+    /// CommissioningComplete の fabric 確定(Core Spec §11.10)。
+    commissioning_complete: bool,
 }
 
 impl InvokeEffects {
@@ -1474,6 +1518,8 @@ impl InvokeEffects {
         if other.removed_fabric.is_some() {
             self.removed_fabric = other.removed_fabric;
         }
+        self.failsafe_cleanup |= other.failsafe_cleanup;
+        self.commissioning_complete |= other.commissioning_complete;
     }
 }
 
@@ -1561,6 +1607,8 @@ fn invoke_one<D: DataModel + ?Sized>(
                 promote: resp.requested_promotion(),
                 case_admin: resp.requested_case_admin_acl(),
                 removed_fabric: resp.requested_fabric_removed(),
+                failsafe_cleanup: resp.requested_failsafe_cleanup(),
+                commissioning_complete: resp.requested_commissioning_complete(),
             };
             (
                 result,
