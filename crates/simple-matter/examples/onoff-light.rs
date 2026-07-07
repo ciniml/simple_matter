@@ -22,6 +22,7 @@
 use std::cell::RefCell;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket};
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use simple_matter::acl::{AclHandle, AclTable};
@@ -38,8 +39,10 @@ use simple_matter::dm::clusters::{
 };
 use simple_matter::dm::meta::{ClusterId, DeviceType, EndpointId, EndpointMeta};
 use simple_matter::dm::{DataModel, ServerCluster};
+use simple_matter::error::{Error, Result as SmResult};
 use simple_matter::fabric::FabricTable;
 use simple_matter::im::engine::InteractionModel;
+use simple_matter::kvs::Kvs;
 use simple_matter::sc::{PaseConfig, SecureChannel};
 use simple_matter::stack::{DefaultStack, MatterStack, SharedFabricCreds};
 use simple_matter::transport::net::{PeerAddr, MAX_RX_PACKET_SIZE};
@@ -84,6 +87,56 @@ impl Rng for DemoRng {
             *b = (self.0 >> 33) as u8;
         }
         Ok(())
+    }
+}
+
+/// std のファイルベース [`Kvs`](環境変数 `SM_STATE_DIR` が指すディレクトリ)。
+///
+/// キーごとに `<dir>/<hex(key)>.bin` の 1 ファイルへ格納する。実機の flash KVS
+/// (ESP32 の `EspKvs` 等)の PC 代替で、fabric / ACL / CASE resumption を再起動後も
+/// 復元できるようにする(未設定なら永続化しない = 完全メモリ内で従来フローを保つ)。
+struct FileKvs {
+    dir: PathBuf,
+}
+
+impl FileKvs {
+    fn new(dir: PathBuf) -> std::io::Result<Self> {
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self { dir })
+    }
+    fn path(&self, key: &[u8]) -> PathBuf {
+        let mut name = String::with_capacity(key.len() * 2 + 4);
+        for b in key {
+            name.push_str(&format!("{b:02x}"));
+        }
+        name.push_str(".bin");
+        self.dir.join(name)
+    }
+}
+
+impl Kvs for FileKvs {
+    fn get(&mut self, key: &[u8], buf: &mut [u8]) -> SmResult<Option<usize>> {
+        match std::fs::read(self.path(key)) {
+            Ok(bytes) => {
+                if buf.len() < bytes.len() {
+                    return Err(Error::NoSpace);
+                }
+                buf[..bytes.len()].copy_from_slice(&bytes);
+                Ok(Some(bytes.len()))
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(Error::InvalidState),
+        }
+    }
+    fn set(&mut self, key: &[u8], value: &[u8]) -> SmResult<()> {
+        std::fs::write(self.path(key), value).map_err(|_| Error::InvalidState)
+    }
+    fn remove(&mut self, key: &[u8]) -> SmResult<()> {
+        match std::fs::remove_file(self.path(key)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(Error::InvalidState),
+        }
     }
 }
 
@@ -225,6 +278,52 @@ fn main() -> std::io::Result<()> {
     let im = InteractionModel::new(build_light(&fabrics, &acl, &window));
     let mut stack: DefaultStack<Backend, DemoRng, Light> = MatterStack::new(&crypto, sc, im);
 
+    // --- KVS 永続化(環境変数 SM_STATE_DIR 設定時のみ)---
+    // 未設定なら None = 完全メモリ内(従来フロー)。設定時は起動直後に
+    // fabrics/ACL/resumption を復元し、以降 generation 変化を検知して保存する。
+    // 分業: いつ・どこに保存するかはこの app 層、コアは export/import のみ。
+    let mut kvs: Option<FileKvs> = match std::env::var_os("SM_STATE_DIR") {
+        Some(dir) => match FileKvs::new(PathBuf::from(&dir)) {
+            Ok(k) => {
+                println!(
+                    "[kvs] persistence enabled at {}",
+                    PathBuf::from(&dir).display()
+                );
+                Some(k)
+            }
+            Err(e) => {
+                println!("[kvs] cannot open SM_STATE_DIR ({e}); running in-memory");
+                None
+            }
+        },
+        None => None,
+    };
+    if let Some(kvs) = kvs.as_mut() {
+        // 壁時計を持つが Matter epoch 変換は省き、検証時刻は 0 起点で持ち上げる
+        // (fabric persist の now=0 と同じ扱い。ports/esp32 の EspKvs 復元と揃える)。
+        match fabrics.borrow_mut().load_from(kvs, &crypto, 0) {
+            Ok(n) => println!("[kvs] restored {n} fabrics"),
+            Err(e) => {
+                println!("[kvs] fabric restore failed: {e:?}; starting with empty table");
+                *fabrics.borrow_mut() = FabricTable::new();
+            }
+        }
+        match acl.borrow_mut().load_from(kvs) {
+            Ok(n) => println!("[kvs] restored {n} ACL entries"),
+            Err(e) => println!("[kvs] ACL restore failed: {e:?}"),
+        }
+        match stack.load_resumptions_from(kvs) {
+            Ok(n) => println!("[kvs] restored {n} resumptions"),
+            Err(e) => println!("[kvs] resumption restore failed: {e:?}"),
+        }
+    }
+    // 復元後の fabric 数。>0 なら「既にコミッショニング済み」として起動する。
+    let restored_fabric_count = fabrics.borrow().len();
+    if restored_fabric_count > 0 {
+        // 起動時コミッショニング窓を開かず、PASE を無効化する(再コミッショニング不要)。
+        stack.set_pase_enabled(false);
+    }
+
     // Matter 運用 UDP はデュアルスタック(v6only=false)で bind する。AAAA で解決した
     // コントローラが IPv6(fe80 リンクローカル含む)で CASE を張れるようにするため
     // (docs/design/mdns-ipv6.md §1)。v4 ピアは ::ffff: mapped で届き、セッション照合は
@@ -263,10 +362,25 @@ fn main() -> std::io::Result<()> {
             mode,
         )
     };
-    mdns.set_commissionable(Some(commissionable(
-        DISCRIMINATOR,
-        CommissioningMode::Standard,
-    )));
+    // 復元済み(fabric>0)なら commissionable は出さず operational のみ広告する。
+    if restored_fabric_count == 0 {
+        mdns.set_commissionable(Some(commissionable(
+            DISCRIMINATOR,
+            CommissioningMode::Standard,
+        )));
+    } else {
+        let ops: Vec<Operational> = fabrics
+            .borrow()
+            .iter()
+            .map(|f| Operational {
+                sii: sii_ms,
+                sai: sai_ms,
+                ..Operational::new(f.compressed_fabric_id(), f.node_id())
+            })
+            .collect();
+        mdns.set_operational(ops);
+        println!("[kvs] advertising operational for {restored_fabric_count} restored fabric(s)");
+    }
     let mdns_socket = open_mdns_socket();
     // IPv6(ff02::fb)側の mDNS ソケット(リンクローカルが取れたときのみ)。
     let mdns_socket_v6 = local_ipv6.and_then(|(_, scope)| open_mdns_socket_v6(scope));
@@ -291,10 +405,14 @@ fn main() -> std::io::Result<()> {
     let mut tx = [0u8; MAX_RX_PACKET_SIZE];
     let mut mdns_rx = [0u8; 1500];
     let mut mdns_tx = [0u8; 1500];
-    // 直近に広告済みの fabric 世代(変化検知に使う)。
+    // 直近に広告済みの fabric 世代(変化検知に使う)。復元済み内容を基準値に取る。
     let mut last_generation = fabrics.borrow().generation();
+    // CASE resumption ストアの世代(変化検知で KVS 保存)。復元後の値を基準に取ることで
+    // 復元直後の不要な再保存を避ける(secure-channel.md §7.4)。
+    let mut last_resumption_gen = stack.resumption_generation();
     // 起動時コミッショニング窓(未コミッショニング時の announcement 窓)が開いているか。
-    let mut boot_window_open = true;
+    // 復元で fabric>0 のときは閉じた状態で起動する。
+    let mut boot_window_open = restored_fabric_count == 0;
     // 直近の fabric 数(窓経由コミッショニング完了の検知に使う)。
     let mut last_fabric_count = fabrics.borrow().len();
 
@@ -343,6 +461,17 @@ fn main() -> std::io::Result<()> {
         let gen = fabrics.borrow().generation();
         if gen != last_generation {
             last_generation = gen;
+            // fabric / ACL を KVS へ保存(有効時。§E4.4 と同じ generation 監視)。
+            if let Some(kvs) = kvs.as_mut() {
+                match fabrics.borrow().save_to(kvs) {
+                    Ok(()) => println!("[kvs] saved {} fabrics", fabrics.borrow().len()),
+                    Err(e) => println!("[kvs] fabric save error: {e:?}"),
+                }
+                match acl.borrow().save_to(kvs) {
+                    Ok(()) => println!("[kvs] saved ACL"),
+                    Err(e) => println!("[kvs] ACL save error: {e:?}"),
+                }
+            }
             let ops: Vec<Operational> = fabrics
                 .borrow()
                 .iter()
@@ -379,6 +508,19 @@ fn main() -> std::io::Result<()> {
                 )));
                 mdns.notify_change(now_ms(&start));
                 println!("[window] all fabrics removed; reopening initial commissioning window");
+            }
+        }
+
+        // 3.2) CASE resumption ストアの世代変化を検知して KVS へ保存する(§7.4)。
+        //      フル CASE 成功・resumption ローテート・fabric 削除に伴う破棄で変化する。
+        let rgen = stack.resumption_generation();
+        if rgen != last_resumption_gen {
+            last_resumption_gen = rgen;
+            if let Some(kvs) = kvs.as_mut() {
+                match stack.save_resumptions_to(kvs) {
+                    Ok(()) => println!("[kvs] saved resumptions"),
+                    Err(e) => println!("[kvs] resumption save error: {e:?}"),
+                }
             }
         }
 

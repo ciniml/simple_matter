@@ -15,11 +15,13 @@
 //! 値渡しする(固定長バッファ、ヒープレス。esp-radio の `StationConfig` が要求する
 //! `String` への変換は wifi_task 側でのみ行う)。
 
+use core::cell::RefCell;
 use core::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 
 use alloc::string::String;
 use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::signal::Signal;
 use embassy_time::Timer;
 use esp_println::println;
@@ -40,11 +42,29 @@ pub struct WifiRequest {
 }
 
 impl WifiRequest {
-    fn ssid(&self) -> &[u8] {
+    /// 実効 SSID(有効長ぶんのスライス)。資格情報の永続化(統合層)にも使う。
+    pub fn ssid(&self) -> &[u8] {
         &self.ssid[..self.ssid_len]
     }
-    fn pass(&self) -> &[u8] {
+    /// 実効パスフレーズ(有効長ぶんのスライス)。資格情報の永続化(統合層)にも使う。
+    pub fn pass(&self) -> &[u8] {
         &self.pass[..self.pass_len]
+    }
+
+    /// SSID / パスフレーズから要求を組む(長さは 32 / 64 バイトへ切り詰め)。
+    ///
+    /// [`EspWifiDriver::connect`] の内部組み立てと、KVS から復元した資格情報での
+    /// 自動再 join(統合層)の両方が使う。
+    pub fn new(ssid: &[u8], pass: &[u8]) -> Self {
+        let mut req = WifiRequest {
+            ssid: [0; 32],
+            ssid_len: ssid.len().min(32),
+            pass: [0; 64],
+            pass_len: pass.len().min(64),
+        };
+        req.ssid[..req.ssid_len].copy_from_slice(&ssid[..req.ssid_len]);
+        req.pass[..req.pass_len].copy_from_slice(&pass[..req.pass_len]);
+        req
     }
 }
 
@@ -56,6 +76,21 @@ const STATE_FAILED: u8 = 3;
 
 /// ドライバハンドル(pump 内の cluster)→ [`wifi_task`] への join 要求。
 static WIFI_REQUEST: Signal<CriticalSectionRawMutex, WifiRequest> = Signal::new();
+/// 直近の join 要求の「永続化待ち」コピー(統合層が KVS 保存のために取り出す)。
+///
+/// [`WIFI_REQUEST`](Signal)とは別に持つ: Signal は wifi_task が consume するため、
+/// 統合層(pump)が同じ要求を観測できない。こちらは [`take_pending_credentials`] が
+/// 取り出すまで保持される(複数回 connect が来たら最新のみ残る = 保存すべきは最新)。
+static WIFI_PENDING_SAVE: Mutex<CriticalSectionRawMutex, RefCell<Option<WifiRequest>>> =
+    Mutex::new(RefCell::new(None));
+
+/// 未保存の join 資格情報があれば取り出す(なければ `None`。取り出すと消える)。
+///
+/// 統合層(pump ループ)が poll し、KVS(キー `b"wifc"`)へ保存する。ConnectNetwork の
+/// invoke ハンドラ(コア)には手を入れず、ポートローカルで資格情報の永続化を実現する。
+pub fn take_pending_credentials() -> Option<WifiRequest> {
+    WIFI_PENDING_SAVE.lock(|cell| cell.borrow_mut().take())
+}
 /// 現在の接続状態([`STATE_IDLE`] など)。
 static WIFI_STATE: AtomicU8 = AtomicU8::new(STATE_IDLE);
 /// 直近の失敗理由(esp-radio の DisconnectReason 由来のコード)。
@@ -70,14 +105,9 @@ pub struct EspWifiDriver;
 
 impl WifiDriver for EspWifiDriver {
     fn connect(&mut self, ssid: &[u8], creds: &[u8]) {
-        let mut req = WifiRequest {
-            ssid: [0; 32],
-            ssid_len: ssid.len().min(32),
-            pass: [0; 64],
-            pass_len: creds.len().min(64),
-        };
-        req.ssid[..req.ssid_len].copy_from_slice(&ssid[..req.ssid_len]);
-        req.pass[..req.pass_len].copy_from_slice(&creds[..req.pass_len]);
+        let req = WifiRequest::new(ssid, creds);
+        // 統合層の永続化用コピー(take_pending_credentials で取り出す)。
+        WIFI_PENDING_SAVE.lock(|cell| *cell.borrow_mut() = Some(req.clone()));
         WIFI_STATE.store(STATE_CONNECTING, Ordering::Release);
         WIFI_REQUEST.signal(req);
     }

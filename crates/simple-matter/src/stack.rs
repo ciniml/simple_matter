@@ -189,6 +189,36 @@ impl<
         self.mgr.handler_mut().sc.set_pase_enabled(enabled);
     }
 
+    /// 保持している CASE resumption レコード数(ログ・診断用。§7.4)。
+    pub fn resumption_count(&self) -> usize {
+        self.mgr.handler().sc.resumption_count()
+    }
+
+    /// CASE resumption ストアの世代番号(永続化トリガ判定用。secure-channel.md §7.4)。
+    ///
+    /// 統合層はこの値の変化を検知して [`save_resumptions_to`](Self::save_resumptions_to)
+    /// を呼ぶ([`FabricTable::generation`](crate::fabric::FabricTable::generation) と同じ
+    /// 分業: いつ・どこに保存するかはアプリ層、コアは export/import のみ)。
+    pub fn resumption_generation(&self) -> u32 {
+        self.mgr.handler().sc.resumption_generation()
+    }
+
+    /// CASE resumption ストアを `kvs` へ保存する(単一キー `b"rsmp"`。§7.4)。
+    pub fn save_resumptions_to<K: crate::kvs::Kvs>(&self, kvs: &mut K) -> crate::error::Result<()> {
+        self.mgr.handler().sc.save_resumptions_to(kvs)
+    }
+
+    /// CASE resumption ストアを `kvs` から復元し、復元件数を返す(空ストアにのみ呼べる)。
+    ///
+    /// fabric 復元直後に呼ぶこと(復元後の [`resumption_generation`](Self::resumption_generation)
+    /// を保存トリガの基準値に取る)。
+    pub fn load_resumptions_from<K: crate::kvs::Kvs>(
+        &mut self,
+        kvs: &mut K,
+    ) -> crate::error::Result<usize> {
+        self.mgr.handler_mut().sc.load_resumptions_from(kvs)
+    }
+
     /// 次に [`poll`](Self::poll) すべき最も早い絶対時刻(ミリ秒)。
     ///
     /// MRP 再送/ACK 期限([`ExchangeManager::next_deadline`])と IM 購読レポート期限

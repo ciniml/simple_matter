@@ -20,6 +20,7 @@ use crate::crypto::spake2p::{compute_verifier, Spake2pVerifier, Spake2pVerifierP
 use crate::crypto::{Crypto, P256Keypair, P256PublicKey, Rng, Sha256};
 use crate::error::{Error, Result};
 use crate::exchange::{HandlerAction, ProtocolHandler, RxMessage};
+use crate::kvs::Kvs;
 use crate::transport::session::{SessionInit, SessionManager, SessionMode};
 
 use super::case::creds::{Fabric, FabricStore, NocResolver};
@@ -173,6 +174,25 @@ impl<'c, C: Crypto, R: Rng, F, const H: usize> SecureChannel<'c, C, R, F, H> {
     /// 保持している CASE resumption レコード数を返す(§7.4)。
     pub fn resumption_count(&self) -> usize {
         self.resumptions.len()
+    }
+
+    /// CASE resumption ストアの世代番号(永続化トリガ判定用。§7.4)。
+    ///
+    /// 統合層はこの値の変化を検知して [`save_resumptions_to`](Self::save_resumptions_to)
+    /// を呼ぶ([`FabricTable::generation`](crate::fabric::FabricTable::generation) と同じ
+    /// 用途)。復元後は `load_resumptions_from` 後の値を基準に取ること。
+    pub fn resumption_generation(&self) -> u32 {
+        self.resumptions.generation()
+    }
+
+    /// CASE resumption ストアを `kvs` へ保存する(単一キー `b"rsmp"`。§7.4)。
+    pub fn save_resumptions_to<K: Kvs>(&self, kvs: &mut K) -> Result<()> {
+        self.resumptions.save_to(kvs)
+    }
+
+    /// CASE resumption ストアを `kvs` から復元し、復元件数を返す(空ストアにのみ呼べる)。
+    pub fn load_resumptions_from<K: Kvs>(&mut self, kvs: &mut K) -> Result<usize> {
+        self.resumptions.load_from(kvs)
     }
 
     /// 期限切れ(60s 超過)のハンドシェイク slot を回収し、予約セッションを解放する。

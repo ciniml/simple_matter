@@ -1036,6 +1036,217 @@ fn case_resumption_round_trip() {
     );
 }
 
+/// テスト用インメモリ KVS(単一キー `rsmp` のみ扱う。デバイス再起動シミュレーション用)。
+struct MemKvs {
+    used: bool,
+    key: [u8; 8],
+    klen: usize,
+    val: [u8; crate::sc::resumption::RESUMPTION_STORE_BUF_LEN],
+    vlen: usize,
+}
+impl MemKvs {
+    fn new() -> Self {
+        Self {
+            used: false,
+            key: [0; 8],
+            klen: 0,
+            val: [0; crate::sc::resumption::RESUMPTION_STORE_BUF_LEN],
+            vlen: 0,
+        }
+    }
+    fn matches(&self, key: &[u8]) -> bool {
+        self.used && &self.key[..self.klen] == key
+    }
+}
+impl crate::kvs::Kvs for MemKvs {
+    fn get(&mut self, key: &[u8], buf: &mut [u8]) -> CrateResult<Option<usize>> {
+        if !self.matches(key) {
+            return Ok(None);
+        }
+        buf[..self.vlen].copy_from_slice(&self.val[..self.vlen]);
+        Ok(Some(self.vlen))
+    }
+    fn set(&mut self, key: &[u8], value: &[u8]) -> CrateResult<()> {
+        self.used = true;
+        self.klen = key.len();
+        self.key[..key.len()].copy_from_slice(key);
+        self.vlen = value.len();
+        self.val[..value.len()].copy_from_slice(value);
+        Ok(())
+    }
+    fn remove(&mut self, key: &[u8]) -> CrateResult<()> {
+        if self.matches(key) {
+            self.used = false;
+        }
+        Ok(())
+    }
+}
+
+/// デバイス再起動シミュレーション(§7.4 KVS 永続化): フル CASE → responder が
+/// resumption ストアを KVS へ保存 → **新しい `SecureChannel`** を KVS から復元(fabric は
+/// 外部保持のまま)→ initiator の resumption 素材による 2 本目が Sigma2_Resume 経路で成立する。
+#[test]
+fn resumption_survives_device_reboot_via_kvs() {
+    let crypto = crypto();
+    let ids = build_identities(&crypto);
+    // fabric テーブルは外部所有(再起動で失われない = flash 永続化済み相当)。
+    let resp_table = device_table(&crypto, &ids, &[0x33; 32]);
+    let init_table = controller_table(&crypto, &ids);
+    let init_fabric = NonZeroU8::new(1).unwrap();
+
+    // --- 起動 1 回目: フル CASE ---
+    let resp_creds = TestCreds {
+        table: &resp_table,
+        crypto: &crypto,
+        now: NOW_SECS,
+    };
+    let config = PaseConfig::from_passcode(PASSCODE, &SALT, ITERATIONS).unwrap();
+    let sc: SecureChannel<'_, Backend, SeqRng, _, 1> =
+        SecureChannel::new(&crypto, SeqRng(0xD00D_5001), config, resp_creds);
+    let mut resp_mgr: ExchangeManager<ProtocolMux<_, ImPlaceholder>, 4> =
+        ExchangeManager::new(ProtocolMux::new(sc, ImPlaceholder));
+    let mut resp_sessions: SessionManager<4> = SessionManager::new();
+    resp_sessions
+        .insert(SessionInit::plaintext(peer(), 0, 1), NOW)
+        .unwrap();
+    let mut resp_pool: BufferPool<3, 1600> = BufferPool::new();
+
+    let init_creds = TestCreds {
+        table: &init_table,
+        crypto: &crypto,
+        now: NOW_SECS,
+    };
+    let init = ScInitiator::new(&crypto, SeqRng(0xBEEF_5002), init_creds);
+    let mut init_mgr: ExchangeManager<ProtocolMux<_, ImPlaceholder>, 4> =
+        ExchangeManager::new(ProtocolMux::new(init, ImPlaceholder));
+    let mut init_sessions: SessionManager<4> = SessionManager::new();
+    let init_unsec = init_sessions
+        .insert(SessionInit::plaintext(peer(), 0, 1), NOW)
+        .unwrap();
+    let mut init_pool: BufferPool<3, 1600> = BufferPool::new();
+
+    let ex1 = init_mgr.open_initiator(init_unsec).unwrap();
+    let reserved1 = init_sessions.reserve(peer(), NOW).unwrap();
+    let ssid1 = init_sessions.get(reserved1).unwrap().local_session_id();
+    let mut payload = [0u8; 512];
+    let plen = init_mgr
+        .handler_mut()
+        .sc
+        .start_case(
+            ex1,
+            reserved1,
+            ssid1,
+            init_fabric,
+            DEVICE_NODE,
+            &mut payload,
+            NOW,
+        )
+        .unwrap();
+    pump_handshake(
+        &crypto,
+        &mut init_mgr,
+        &mut init_sessions,
+        &mut init_pool,
+        &mut resp_mgr,
+        &mut resp_sessions,
+        &mut resp_pool,
+        ex1,
+        OpCode::CaseSigma1 as u8,
+        &payload[..plen],
+        peer(),
+    );
+    match init_mgr.handler_mut().sc.take_event() {
+        Some(ScEvent::CaseEstablished { resumed: false, .. }) => {}
+        other => panic!("expected full CaseEstablished, got {other:?}"),
+    }
+    assert_eq!(resp_mgr.handler().sc.resumption_count(), 1);
+
+    // --- 再起動境界: responder が resumption ストアを KVS へ保存 ---
+    let mut kvs = MemKvs::new();
+    resp_mgr.handler().sc.save_resumptions_to(&mut kvs).unwrap();
+    let saved_gen = resp_mgr.handler().sc.resumption_generation();
+    // 旧 responder スタックを破棄する(メモリ内ストアも失われる)。
+    drop(resp_mgr);
+
+    // --- 起動 2 回目: 新しい SecureChannel を KVS から復元(fabric は resp_table 継続)---
+    let resp_creds2 = TestCreds {
+        table: &resp_table,
+        crypto: &crypto,
+        now: NOW_SECS,
+    };
+    let config2 = PaseConfig::from_passcode(PASSCODE, &SALT, ITERATIONS).unwrap();
+    let sc2: SecureChannel<'_, Backend, SeqRng, _, 1> =
+        SecureChannel::new(&crypto, SeqRng(0xD00D_5003), config2, resp_creds2);
+    let mut resp_mgr2: ExchangeManager<ProtocolMux<_, ImPlaceholder>, 4> =
+        ExchangeManager::new(ProtocolMux::new(sc2, ImPlaceholder));
+    let restored = resp_mgr2
+        .handler_mut()
+        .sc
+        .load_resumptions_from(&mut kvs)
+        .unwrap();
+    assert_eq!(restored, 1, "1 record restored from KVS");
+    assert_eq!(resp_mgr2.handler().sc.resumption_count(), 1);
+    // 復元後の generation を保存トリガの基準値に取る(即再保存が走らない前提)。
+    assert_eq!(resp_mgr2.handler().sc.resumption_generation(), saved_gen);
+    let mut resp_sessions2: SessionManager<4> = SessionManager::new();
+    resp_sessions2
+        .insert(SessionInit::plaintext(peer(), 0, 1), NOW)
+        .unwrap();
+    let mut resp_pool2: BufferPool<3, 1600> = BufferPool::new();
+
+    // --- 2 本目: initiator の resumption 素材で Sigma1 を送る → Sigma2_Resume 成立 ---
+    // 再起動したデバイスに対しコントローラは新しいセッションで再接続する(デバイスは
+    // メッセージカウンタをリセットしているため、旧 unsecured セッションの再生窓は使わない)。
+    // resumption 素材(SC ハンドラ内)は init_mgr が保持し続ける。
+    let mut init_sessions2: SessionManager<4> = SessionManager::new();
+    let init_unsec2 = init_sessions2
+        .insert(SessionInit::plaintext(peer(), 0, 1), NOW)
+        .unwrap();
+    let mut init_pool2: BufferPool<3, 1600> = BufferPool::new();
+    let ex2 = init_mgr.open_initiator(init_unsec2).unwrap();
+    let reserved2 = init_sessions2.reserve(peer(), NOW).unwrap();
+    let ssid2 = init_sessions2.get(reserved2).unwrap().local_session_id();
+    let plen2 = init_mgr
+        .handler_mut()
+        .sc
+        .start_case(
+            ex2,
+            reserved2,
+            ssid2,
+            init_fabric,
+            DEVICE_NODE,
+            &mut payload,
+            NOW,
+        )
+        .unwrap();
+    pump_handshake(
+        &crypto,
+        &mut init_mgr,
+        &mut init_sessions2,
+        &mut init_pool2,
+        &mut resp_mgr2,
+        &mut resp_sessions2,
+        &mut resp_pool2,
+        ex2,
+        OpCode::CaseSigma1 as u8,
+        &payload[..plen2],
+        peer(),
+    );
+    let s2 = match init_mgr.handler_mut().sc.take_event() {
+        Some(ScEvent::CaseEstablished {
+            session,
+            resumed: true,
+        }) => session,
+        other => panic!("expected resumed CaseEstablished after reboot, got {other:?}"),
+    };
+    let is = init_sessions2.get(s2).unwrap();
+    assert!(matches!(is.mode(), SessionMode::Case { .. }));
+    assert_eq!(is.peer_node_id(), Some(DEVICE_NODE));
+    assert_mirror_keys(&init_sessions2, s2, &resp_sessions2, ssid2);
+    // resumption でローテートされ generation が進む(再保存トリガになる)。
+    assert_ne!(resp_mgr2.handler().sc.resumption_generation(), saved_gen);
+}
+
 /// responder がレコードを失った場合(再起動相当 = 新しい SecureChannel)、initiator の
 /// resumption 要求つき Sigma1 に対しフル Sigma2 が返り、フル CASE として確立する
 /// (`resumed: false` フォールバック。§7.4)。

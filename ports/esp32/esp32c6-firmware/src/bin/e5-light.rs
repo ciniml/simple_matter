@@ -81,7 +81,8 @@ use simple_matter::wifi::WifiDriver;
 use esp32c6_firmware::ble::{gatt_worker, BtpGattServer, GattChannels, TroubleGattPeripheral};
 use esp32c6_firmware::kvs::EspKvs;
 use esp32c6_firmware::net::{peer_v4, peer_v6, v4_as_mapped, EspUdp};
-use esp32c6_firmware::wifi::{wifi_task, EspWifiDriver};
+use esp32c6_firmware::wifi::{take_pending_credentials, wifi_task, EspWifiDriver, WifiRequest};
+use simple_matter::kvs::Kvs;
 use esp32c6_firmware::EspRng;
 
 // ESP-IDF 2nd stage bootloader が要求するアプリディスクリプタ(全 bin に必須。
@@ -245,6 +246,42 @@ fn trace(dir: &str, frag: &[u8]) {
 }
 
 /// 単調時刻(ms)。BTP / スタックの `now_ms` 注入に使う(embassy-time の Instant 起点)。
+/// WiFi 資格情報レコードの KVS キー(ポートローカル。コアの TLV 流儀は使わない)。
+const WIFI_CREDS_KEY: &[u8] = b"wifc";
+/// レコードのフォーマットバージョン。
+const WIFI_CREDS_VERSION: u8 = 1;
+/// 固定長レイアウト: [version(1)][ssid_len(1)][ssid(32)][pass_len(1)][pass(64)] = 99 B。
+const WIFI_CREDS_RECORD_LEN: usize = 1 + 1 + 32 + 1 + 64;
+
+/// join 要求を固定長レコードへエンコードする。
+fn encode_wifi_creds(req: &WifiRequest) -> [u8; WIFI_CREDS_RECORD_LEN] {
+    let mut rec = [0u8; WIFI_CREDS_RECORD_LEN];
+    rec[0] = WIFI_CREDS_VERSION;
+    let ssid = req.ssid();
+    let pass = req.pass();
+    rec[1] = ssid.len() as u8;
+    rec[2..2 + ssid.len()].copy_from_slice(ssid);
+    rec[34] = pass.len() as u8;
+    rec[35..35 + pass.len()].copy_from_slice(pass);
+    rec
+}
+
+/// 固定長レコードをデコードする。バージョン不一致・長さ不正は `None`(従来動作へ)。
+fn decode_wifi_creds(rec: &[u8]) -> Option<WifiRequest> {
+    if rec.len() != WIFI_CREDS_RECORD_LEN || rec[0] != WIFI_CREDS_VERSION {
+        return None;
+    }
+    let ssid_len = rec[1] as usize;
+    let pass_len = rec[34] as usize;
+    if ssid_len > 32 || pass_len > 64 || ssid_len == 0 {
+        return None;
+    }
+    Some(WifiRequest::new(
+        &rec[2..2 + ssid_len],
+        &rec[35..35 + pass_len],
+    ))
+}
+
 fn now_ms(start: Instant) -> u64 {
     start.elapsed().as_millis()
 }
@@ -365,6 +402,8 @@ async fn pump(
     let mut led_on = false;
     // fabric 永続化: 直近に保存(または復元)した時点の generation。
     let mut saved_gen = fabrics.borrow().generation();
+    // CASE resumption 永続化: 復元後の世代を基準に取り、変化時に flash 保存する(§7.4)。
+    let mut saved_resumption_gen = stack.resumption_generation();
     // 運用 mDNS レスポンダ(DHCP で IPv4 を取得してから構築する)。
     let mut mdns: Option<MdnsResponder<NF>> = None;
 
@@ -656,6 +695,34 @@ async fn pump(
             }
         }
 
+        // --- CASE resumption ストアの世代変化を検知して flash 保存(§7.4)---
+        let rgen = stack.resumption_generation();
+        if rgen != saved_resumption_gen {
+            saved_resumption_gen = rgen;
+            match stack.save_resumptions_to(kvs) {
+                Ok(()) => println!("[kvs] saved {} resumptions", stack.resumption_count()),
+                Err(e) => println!("[kvs] resumption save error: {:?}", e),
+            }
+        }
+
+        // --- WiFi 資格情報の保存(ConnectNetwork で新しい join 要求が来たら)---
+        // 起動時の自動再 join も pending に載るが、既存レコードと同一なら書き込みを
+        // スキップする(flash 摩耗回避)。
+        if let Some(req) = take_pending_credentials() {
+            let rec = encode_wifi_creds(&req);
+            let mut existing = [0u8; WIFI_CREDS_RECORD_LEN];
+            let same = matches!(
+                kvs.get(WIFI_CREDS_KEY, &mut existing),
+                Ok(Some(len)) if existing[..len] == rec[..]
+            );
+            if !same {
+                match kvs.set(WIFI_CREDS_KEY, &rec) {
+                    Ok(()) => println!("[kvs] saved wifi credentials"),
+                    Err(e) => println!("[kvs] wifi credentials save error: {:?}", e),
+                }
+            }
+        }
+
         // --- mDNS の定期 announce(未回答の gratuitous 広告。v4 + v6 両ファミリ)---
         if let Some(r) = mdns.as_mut() {
             if let Some(len) = r.poll_announce(now_ms(start), &mut mdns_tx) {
@@ -800,6 +867,31 @@ async fn main(_spawner: Spawner) {
         "[stack] DefaultStack ready ({} bytes, on main stack)",
         core::mem::size_of::<LightStack<'static>>()
     );
+
+    // CASE resumption 素材を flash KVS から復元する(fabric 復元直後。secure-channel.md §7.4)。
+    match stack.load_resumptions_from(&mut kvs) {
+        Ok(n) => println!("[kvs] restored {} resumptions", n),
+        Err(e) => println!("[kvs] resumption restore failed: {:?}", e),
+    }
+
+    // WiFi 資格情報を flash KVS から復元し、自動再 join を仕掛ける(リブート後 E2E 用)。
+    // connect() は WIFI_REQUEST(Signal)へ置くだけなので、wifi_task(後段の join5 で
+    // 起動)が最初の wait() で受け取る。バージョン不一致・破損は無視して従来動作
+    // (コミッショニングで ConnectNetwork を待つ)。
+    {
+        let mut rec = [0u8; WIFI_CREDS_RECORD_LEN];
+        match kvs.get(WIFI_CREDS_KEY, &mut rec) {
+            Ok(Some(len)) => match decode_wifi_creds(&rec[..len]) {
+                Some(req) => {
+                    println!("[kvs] restored wifi credentials; auto-joining");
+                    EspWifiDriver.connect(req.ssid(), req.pass());
+                }
+                None => println!("[kvs] wifi credentials record invalid; ignoring"),
+            },
+            Ok(None) => {}
+            Err(e) => println!("[kvs] wifi credentials read failed: {:?}", e),
+        }
+    }
 
     // --- BLE controller(esp-radio HCI)→ TrouBLE host(E2〜E4 と同じ)---
     let connector = BleConnector::new(peripherals.BT, esp_radio::ble::Config::default())

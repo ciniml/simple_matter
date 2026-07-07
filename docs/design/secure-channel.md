@@ -596,10 +596,9 @@ Matter 仕様 §4.14.4。フル CASE で確立した `SharedSecret` と `resumpt
 再接続時に証明書鎖検証・署名・ECDH を省いた 1 往復 + StatusReport でセッションを再確立する。
 参照実装 connectedhomeip `CASESession.cpp` と一致させる(定数・salt 構成とも)。
 
-#### 状態保持(SessionResumption record・メモリ内のみ)
+#### 状態保持(SessionResumption record)
 
-`sc/resumption.rs` の固定容量ストア(KVS 永続化は今回スコープ外 = プロセス内メモリのみ。
-将来 KVS 接続時はレコードの直列化を足す):
+`sc/resumption.rs` の固定容量ストア(メモリ内。KVS 永続化は下記「#### KVS 永続化」):
 
 ```rust
 pub struct ResumptionRecord {
@@ -667,9 +666,55 @@ rx Sigma1(ctx6/ctx7 あり)
   (TT には resumption フィールド込みの Sigma1 生バイトが投入済みなので整合)。
 - フル CASE 成功時は TBE2 から取り出した resumptionID(ctx4)+ SharedSecret を保存する。
 
+#### KVS 永続化(デバイス側 responder / initiator 共通の export-import)
+
+resumption ストアを [`Kvs`] へ versioned TLV で書き出し、リブート後に復元する。目的は
+「再起動後も resumption を効かせてフル CASE(証明書鎖検証・署名・ECDH)を省く」こと。
+分業は fabric 永続化(`fabric/persist.rs`)・ACL 永続化と同じ流儀:
+
+> **管理(いつ・どこに保存)はアプリ層、コアは export/import(`save_to` / `load_from`)のみ。**
+
+- **API**(`ResumptionStore` に追加。`SecureChannel` / `MatterStack` へ passthrough):
+  - `save_to<K: Kvs>(&self, kvs)` / `load_from<K: Kvs>(&mut self, kvs) -> Result<usize>`
+    (復元件数を返す。**空ストアにのみ**呼べる = fabric persist と同一契約)。
+  - `generation() -> u32`(内容変化のたびに単調増加)。アプリ層はこの値の変化を検知して
+    `save_to` を呼ぶ(`FabricTable::generation` と同じ用途)。`load_from` は復元 1 件ごとに
+    内部 `save` を通すため generation を進める。**アプリ層は復元後の `generation()` を保存
+    トリガの基準値に取る**(復元直後の不要な再保存を避ける)。
+- **キー**: 単一キー `b"rsmp"`。レコードが 0 件のときはキーを削除する(削除済みレコードが
+  リブート後に復活しないように。fabric persist の空スロット削除と同じ発想)。
+- **TLV スキーマ**(schema version 1。不一致は `Error::Decode`):
+
+  ```text
+  struct {
+    cx0: version(u8) = 1,
+    cx1: array of struct {
+      cx1: fabric_index(u8),
+      cx2: peer_node_id(u64),
+      cx3: resumption_id(bytes16),
+      cx4: shared_secret(bytes32),
+    }
+  }
+  ```
+
+  エンコードは固定長スタック配列(`RESUMPTION_STORE_BUF_LEN` = 外側 +
+  `RESUMPTION_CACHE_LEN` × `MAX_RESUMPTION_RECORD_LEN`)。`shared_secret` を平文で載せるため
+  エンコード/デコードの中間バッファは `Zeroizing` でスコープ抜けにゼロ化する。
+- **配線**: `SecureChannel`(responder)→ `resumption_generation` /
+  `save_resumptions_to` / `load_resumptions_from`。`MatterStack` に同名 passthrough。
+  統合層(PC の `examples/onoff-light.rs` は `SM_STATE_DIR` 設定時のみ、ports/esp32 の
+  `EspKvs`)は fabric 復元直後に `load_resumptions_from`、メインループで
+  `resumption_generation()` 変化時に `save_resumptions_to` を呼ぶ。
+
+**セキュリティ注記**: `shared_secret` を flash に平文で置くと、物理アクセスで CASE
+セッションを再確立できる素材になる。ただし同じ flash に NOC 運用秘密鍵・IPK も置いており
+(fabric 永続化、port-esp32-device.md §E4)、脅威モデル上の追加露出は限定的。プラット
+フォームの flash 暗号化(ESP32 Flash Encryption 等)での保護を推奨する。永続化しなくても
+再起動でフル CASE へフォールバックするだけで機能劣化はない(安全側)。
+
 #### 仕様との差分/割り切り
 
-- 永続化なし(メモリ内のみ)。プロセス再起動でフル CASE に戻るだけで安全側。
+- 永続化は KVS export-import(上記)。未接続なら再起動でフル CASE に戻るだけで安全側。
 - Sigma2_Resume の MRP `session_parameters`(ctx4)は送らない(optional。フル Sigma2 と同じ)。
 - CAT(CASE Authenticated Tags)はレコードに保存しない(本実装は ACL の CAT 未対応のため。
   chip は保存する)。

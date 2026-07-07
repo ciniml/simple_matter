@@ -331,6 +331,8 @@ async fn pump(
     let mut led_on = false;
     // fabric 永続化: 直近に保存(または復元)した時点の generation。
     let mut saved_gen = fabrics.borrow().generation();
+    // CASE resumption 永続化: 復元後の世代を基準に取り、変化時に flash 保存する(§7.4)。
+    let mut saved_resumption_gen = stack.resumption_generation();
 
     let start = Instant::now();
     let mut buf = [0u8; 512];
@@ -492,6 +494,16 @@ async fn pump(
                 Err(e) => println!("[kvs] save error: {:?}", e),
             }
         }
+
+        // --- CASE resumption ストアの世代変化を検知して flash 保存(§7.4)---
+        let rgen = stack.resumption_generation();
+        if rgen != saved_resumption_gen {
+            saved_resumption_gen = rgen;
+            match stack.save_resumptions_to(kvs) {
+                Ok(()) => println!("[kvs] saved {} resumptions", stack.resumption_count()),
+                Err(e) => println!("[kvs] resumption save error: {:?}", e),
+            }
+        }
     }
 }
 
@@ -565,6 +577,12 @@ async fn main(_spawner: Spawner) {
         "[stack] DefaultStack ready ({} bytes, on main stack)",
         core::mem::size_of::<LightStack<'static>>()
     );
+
+    // CASE resumption 素材を flash KVS から復元する(fabric 復元直後。secure-channel.md §7.4)。
+    match stack.load_resumptions_from(&mut kvs) {
+        Ok(n) => println!("[kvs] restored {} resumptions", n),
+        Err(e) => println!("[kvs] resumption restore failed: {:?}", e),
+    }
 
     // --- BLE controller(esp-radio HCI)→ TrouBLE host(E2 と同じ)---
     let connector = BleConnector::new(peripherals.BT, esp_radio::ble::Config::default())
