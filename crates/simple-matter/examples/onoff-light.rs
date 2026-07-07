@@ -242,10 +242,19 @@ fn main() -> std::io::Result<()> {
     let mac = MDNS_INSTANCE_ID.to_be_bytes(); // 下位 6 バイトをホスト名(MAC 相当)に使う
     let host = Host::from_mac(&mac[2..8], local_ipv6.map(|(ip, _)| ip), Some(local_ipv4));
     let mut mdns: MdnsResponder<NF> = MdnsResponder::new(host, MATTER_PORT);
+    // VPN 運用ガイド(matter-over-vpn.md V2): SM_MDNS_SII_MS / SM_MDNS_SAI_MS を
+    // TXT の SII/SAI として広告する。DERP リレー経由等で RTT が伸びる環境では
+    // SAI を大きめ(≥500ms 目安)に広告すると MRP の偽再送を抑えられる。
+    let (sii_ms, sai_ms) = mdns_intervals();
+    if sii_ms.is_some() || sai_ms.is_some() {
+        println!("  mDNS TXT SII/SAI advertised: SII={sii_ms:?}ms SAI={sai_ms:?}ms");
+    }
     // commissionable 広告の組み立て(起動時 CM=1 / ECM 窓オープン時 CM=2 で再利用)。
     let commissionable = |discriminator: u16, mode: CommissioningMode| Commissionable {
         device_type: Some(0x0100),
         device_name: Some(CFG.product_name),
+        sii: sii_ms,
+        sai: sai_ms,
         ..Commissionable::new(
             MDNS_INSTANCE_ID,
             discriminator,
@@ -337,7 +346,11 @@ fn main() -> std::io::Result<()> {
             let ops: Vec<Operational> = fabrics
                 .borrow()
                 .iter()
-                .map(|f| Operational::new(f.compressed_fabric_id(), f.node_id()))
+                .map(|f| Operational {
+                    sii: sii_ms,
+                    sai: sai_ms,
+                    ..Operational::new(f.compressed_fabric_id(), f.node_id())
+                })
                 .collect();
             mdns.set_operational(ops);
             mdns.notify_change(now_ms(&start));
@@ -478,6 +491,15 @@ fn open_mdns_socket() -> Option<UdpSocket> {
         .ok()?;
     socket.set_nonblocking(true).ok()?;
     Some(socket)
+}
+
+/// `SM_MDNS_SII_MS` / `SM_MDNS_SAI_MS` から mDNS TXT の SII/SAI(ミリ秒)を読む。
+///
+/// VPN 運用(matter-over-vpn.md V2)で MRP を緩めるための広告値。未設定・不正値は
+/// `None`(既定の広告挙動 = TXT に SII/SAI を載せない)。
+fn mdns_intervals() -> (Option<u32>, Option<u32>) {
+    let read = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u32>().ok());
+    (read("SM_MDNS_SII_MS"), read("SM_MDNS_SAI_MS"))
 }
 
 /// ローカルの IPv4 アドレスを推定する(外部宛 UDP ソケットの `local_addr` から)。

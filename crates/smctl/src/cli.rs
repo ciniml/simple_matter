@@ -37,6 +37,11 @@ pub struct Globals {
     /// `--paa-trust-store-path <dir>`: 指定時、pairing で device attestation を検証する
     /// (ディレクトリ内の `*.der` を PAA 信頼ストアとして読む)。未指定は検証スキップ。
     pub paa_trust_store_path: Option<PathBuf>,
+    /// `--at <ip>[,<ip>...]`: VPN 越しのユニキャスト mDNS 直叩き(matter-over-vpn.md V1/C1)。
+    /// 指定時、mDNS 発見はマルチキャスト browse の代わりに各ホストの `:5353` へ QU クエリを
+    /// ユニキャスト送信し、応答の A/AAAA でなく**クエリ宛先 IP** を接続先に採用する。
+    /// discover commissionable/operational・pairing onnetwork[-long]・CASE 再解決に効く。
+    pub at: Option<Vec<IpAddr>>,
 }
 
 impl Globals {
@@ -51,6 +56,7 @@ impl Globals {
             passcode: None,
             timed_ms: None,
             paa_trust_store_path: None,
+            at: None,
         }
     }
 }
@@ -66,6 +72,7 @@ impl Clone for Globals {
             passcode: self.passcode,
             timed_ms: self.timed_ms,
             paa_trust_store_path: self.paa_trust_store_path.clone(),
+            at: self.at.clone(),
         }
     }
 }
@@ -211,6 +218,24 @@ fn parse_globals(args: &[String], base: &Globals) -> Result<(Globals, Vec<String
                     .next()
                     .ok_or("--paa-trust-store-path requires a directory")?;
                 g.paa_trust_store_path = Some(PathBuf::from(v));
+            }
+            "--at" => {
+                let v = it.next().ok_or("--at requires <ip>[,<ip>...]")?;
+                let mut ips = Vec::new();
+                for part in v.split(',') {
+                    let part = part.trim();
+                    if part.is_empty() {
+                        continue;
+                    }
+                    let ip: IpAddr = part
+                        .parse()
+                        .map_err(|_| format!("invalid --at ip: {part:?}"))?;
+                    ips.push(ip);
+                }
+                if ips.is_empty() {
+                    return Err("--at requires at least one ip".into());
+                }
+                g.at = Some(ips);
             }
             "-h" | "--help" => {
                 pos.clear();
@@ -851,6 +876,13 @@ OPTIONS:
   --timeout <sec>       overall operation timeout (default 30)
   --label <text>        label recorded in the address book on pairing
   --discriminator <n>   filter for `discover commissionable`
+  --at <ip>[,<ip>...]   resolve over VPN by unicast mDNS instead of multicast:
+                        send a QU query to each <ip>:5353 and adopt the query
+                        destination IP (not the advertised A/AAAA) as the connect
+                        address, with the port from the SRV reply. IPs may be v4
+                        or v6 literals (fe80 gets its link-local scope filled).
+                        Applies to discover commissionable/operational, pairing
+                        onnetwork[-long], and CASE re-resolution (matter-over-vpn V1)
   --passcode <n>        passcode for `admincommissioning open-window` (default: random)
   --timed <ms>          send cluster command invokes as timed interactions
                         (TimedRequest -> Invoke); required by some commands
@@ -1128,6 +1160,26 @@ mod tests {
         assert_eq!(g.timed_ms, Some(10_000));
         assert!(matches!(cmd, Cmd::Invoke { .. }));
         assert!(parse_err("--timed x onoff toggle 1 1").contains("invalid --timed"));
+    }
+
+    #[test]
+    fn at_flag_parses() {
+        use std::net::IpAddr;
+        // 単一 v4。
+        let (g, _) = parse_ok("--at 100.64.0.1 discover commissionable");
+        assert_eq!(g.at.as_deref(), Some(&["100.64.0.1".parse().unwrap()][..]));
+        // 複数(v4 + v6 リテラル)、カンマ区切り。
+        let (g, cmd) = parse_ok("discover operational 1 --at 100.64.0.1,fd7a::1,fe80::abcd");
+        let want: Vec<IpAddr> = ["100.64.0.1", "fd7a::1", "fe80::abcd"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        assert_eq!(g.at.as_deref(), Some(&want[..]));
+        assert!(matches!(cmd, Cmd::DiscoverOperational { node: 1 }));
+        // 不正な IP はエラー。
+        assert!(parse_err("--at nope discover commissionable").contains("invalid --at ip"));
+        // 値なしはエラー。
+        assert!(parse_err("--at").contains("--at requires"));
     }
 
     #[test]

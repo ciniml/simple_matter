@@ -36,6 +36,9 @@ use crate::OsRng;
 const BROWSE_TIMEOUT_MIN: Duration = Duration::from_secs(35);
 /// operational mDNS 解決のタイムアウト。
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(20);
+/// CASE 再解決フォールバックで last_addr ホストへ QU 直叩きする短めの窓
+/// (失敗したらマルチキャスト再解決へ。matter-over-vpn V1)。
+const RERESOLVE_AT_TIMEOUT: Duration = Duration::from_secs(6);
 /// キャッシュアドレスへの CASE 試行の窓(失敗したら mDNS 再解決へフォールバック)。
 const CACHED_CASE_TIMEOUT: Duration = Duration::from_secs(5);
 /// コマンド完了後に ACK を流し切るための静穏化の上限。
@@ -107,7 +110,10 @@ pub fn pairing_list(g: &Globals) -> Result<(), String> {
 
 /// `discover commissionable`: ブラウズ期間中に見つかった commissionable ノードを一覧表示。
 pub fn discover_commissionable(g: &Globals, discriminator: Option<u16>) -> Result<(), String> {
-    let n = mdns::browse_commissionable_list(discriminator, g.timeout)?;
+    let n = match &g.at {
+        Some(targets) => mdns::browse_commissionable_list_at(discriminator, targets, g.timeout)?,
+        None => mdns::browse_commissionable_list(discriminator, g.timeout)?,
+    };
     if n == 0 {
         return Err("no commissionable device found (is the device in commissioning mode?)".into());
     }
@@ -124,7 +130,12 @@ pub fn discover_operational(g: &Globals, node_id: u64) -> Result<(), String> {
         ca_state::load(&state.ca_path(), &crypto)?
             .ok_or("no CA state; commission a device first (`smctl pairing ...`)")?
     };
-    let addr = mdns::resolve_operational(&ca, node_id, g.timeout.min(RESOLVE_TIMEOUT))?;
+    let addr = match &g.at {
+        Some(targets) => {
+            mdns::resolve_operational_at(&ca, node_id, targets, g.timeout.min(RESOLVE_TIMEOUT))?
+        }
+        None => mdns::resolve_operational(&ca, node_id, g.timeout.min(RESOLVE_TIMEOUT))?,
+    };
     if json::enabled() {
         Obj::new("operational")
             .num("nodeId", node_id)
@@ -478,10 +489,20 @@ impl<'a> Exec<'a> {
                 info!("[target] using explicit address {a}");
                 a
             }
-            Target::Browse(disc) => {
-                info!("[discovery] browsing _matterc._udp.local via mDNS...");
-                mdns::browse_commissionable(*disc, self.g.timeout.max(BROWSE_TIMEOUT_MIN))?
-            }
+            Target::Browse(disc) => match &self.g.at {
+                Some(targets) => {
+                    info!("[discovery] resolving commissionable via unicast mDNS (--at)...");
+                    mdns::browse_commissionable_at(
+                        *disc,
+                        targets,
+                        self.g.timeout.max(BROWSE_TIMEOUT_MIN),
+                    )?
+                }
+                None => {
+                    info!("[discovery] browsing _matterc._udp.local via mDNS...");
+                    mdns::browse_commissionable(*disc, self.g.timeout.max(BROWSE_TIMEOUT_MIN))?
+                }
+            },
         };
         info!(
             "[ca] fabric_id={:#018x} controller_node_id={:#018x}",
@@ -628,7 +649,7 @@ impl<'a> Exec<'a> {
         let (session, used_addr) = match got {
             Some(x) => x,
             None => {
-                let resolved = mdns::resolve_operational(self.ca, node_id, RESOLVE_TIMEOUT)?;
+                let resolved = self.reresolve_operational(node_id, &entry)?;
                 eprintln!("[case] operational node resolved at {resolved}");
                 let s = if pending_to == Some(resolved) {
                     // アドレスは正しかった(デバイスが一時的に無応答なだけ)。新規
@@ -681,6 +702,34 @@ impl<'a> Exec<'a> {
         }
         self.cases.push((node_id, session));
         Ok(session)
+    }
+
+    /// CASE 再解決(キャッシュアドレスへの CASE 失敗後)。
+    ///
+    /// - `--at` 指定時: 指定ホスト群へ QU 直叩きで解決する(VPN 経路、matter-over-vpn V1)。
+    /// - 未指定時: まず nodes.tlv の `last_addr` ホストへ QU ユニキャスト直叩きを試み
+    ///   (マルチキャストが死んでいる VPN 環境でも last_addr が生きていれば当たる)、
+    ///   失敗したら通常のマルチキャスト再解決へフォールバックする(design 案 C1/D)。
+    fn reresolve_operational(
+        &mut self,
+        node_id: u64,
+        entry: &nodes::NodeEntry,
+    ) -> Result<SocketAddr, String> {
+        if let Some(targets) = &self.g.at {
+            return mdns::resolve_operational_at(self.ca, node_id, targets, RESOLVE_TIMEOUT);
+        }
+        // last_addr ホストへの QU 直叩き(短めの窓)を先に試す。
+        if entry.last_addr.port() != 0 {
+            let ip = entry.last_addr.ip();
+            eprintln!("[case] trying unicast mDNS re-resolution to cached host {ip}");
+            if let Ok(addr) =
+                mdns::resolve_operational_at(self.ca, node_id, &[ip], RERESOLVE_AT_TIMEOUT)
+            {
+                return Ok(addr);
+            }
+            eprintln!("[case] unicast re-resolution failed; falling back to multicast mDNS");
+        }
+        mdns::resolve_operational(self.ca, node_id, RESOLVE_TIMEOUT)
     }
 
     /// 1 回の CASE 試行(Sigma1 送出 + 決着待ち)。

@@ -232,6 +232,31 @@ Border Router の SRP + `default.service.arpa` 相当)。サイト側に DNS サ
 | **V3: C2 = サイトリレー(必要時)** | `smctl mdns-proxy`(または新 bin): サイト側でマルチキャスト browse、mDNS ワイヤフォーマットのまま VPN ユニキャストで往復。コントローラは `--at <relay-ip>` の C1 経路をそのまま流用 | 新サブコマンド/新 bin | 2〜3 日 |
 | (見送り) B unicast DNS-SD | MagicDNS split DNS + サイト DNS + 登録デーモン | — | 大 |
 
+## 5.1 V1/V2 実装記録(2026-07-07)
+
+**V1 実装済み**: smctl グローバル `--at <ip>[,<ip>…]`。
+- 適用先: `discover commissionable` / `discover operational` /
+  `pairing onnetwork(-long)` / CASE 前の再解決。
+- 動作: 既存の QU クエリビルダ(W3 の unicast_response=true)で各 `<ip>:5353` へ
+  ユニキャスト直送し、応答の広告 A/AAAA ではなく**クエリ宛先 IP + SRV ポート**を
+  採用する(VPN でデバイスの LAN 広告アドレスが不達でも到達可能アドレスで接続)。
+  fe80 リテラルは scope_id 補完。トレースは `SM_MDNS_TRACE=1` の `(at)` タグ。
+- 再解決フォールバック: `--at` 未指定でも、キャッシュ CASE 失敗時はまず
+  `nodes.tlv` の `last_addr` ホストへ QU 直叩き(6 秒)→ 従来のマルチキャストへ。
+- デバイス側変更ゼロ(QU ユニキャスト応答は W3 実装済みを確認)。
+
+**V2(軽量版)実装済み**: PC examples(onoff-light / ble-onoff-light)が
+`SM_MDNS_SII_MS` / `SM_MDNS_SAI_MS` 環境変数で TXT の SII/SAI 広告値を設定可能
+(コアの TXT 対応は実装済みで値が None だっただけ)。controller 側 MrpConfig の
+CLI 化は未着手(V2 後半、必要時)。
+
+**E2E(同一ホスト代替、実 VPN 対向なし)**:
+- `--at 127.0.0.1`: pairing onnetwork → toggle → discover operational
+  (宛先 IP 採用をトレースで確認: `(at) operational node adopted at 127.0.0.1:5540`)。
+- `--at 192.168.2.14`(LAN IP): pairing → toggle。
+- SII=5000/SAI=800 を生 QU クエリで TXT 実測確認。
+- 実 VPN 対向での §6 検証(wg/tailscale、DERP、MTU1280)は引き続き未実施。
+
 ## 6. E2E 検証項目(実 VPN 対向が用意できたとき)
 
 1. **(b) の裏取り**: onoff-light を LAN 側で起動し、VPN 対向から

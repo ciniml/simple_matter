@@ -250,7 +250,7 @@ pub fn browse_commissionable_list(
                 }
                 if ingest == Ingest::Added {
                     if let Some(node) = set.iter().last() {
-                        print_commissionable(node);
+                        print_commissionable(node, None);
                     }
                 }
             }
@@ -261,7 +261,13 @@ pub fn browse_commissionable_list(
 }
 
 /// commissionable ノード 1 件を 1 行で表示する(`--json` では 1 行 JSON)。
-fn print_commissionable(node: &simple_matter::discovery::client::DiscoveredCommissionable) {
+///
+/// `at` が `Some` のとき(`--at` 経由)は、広告の A/AAAA でなく採用したユニキャスト
+/// 宛先アドレスを表示する(VPN 到達性のため)。
+fn print_commissionable(
+    node: &simple_matter::discovery::client::DiscoveredCommissionable,
+    at: Option<SocketAddr>,
+) {
     let instance = String::from_utf8_lossy(node.instance()).into_owned();
     if crate::json::enabled() {
         let port = if node.port != 0 {
@@ -269,11 +275,14 @@ fn print_commissionable(node: &simple_matter::discovery::client::DiscoveredCommi
         } else {
             MATTER_PORT
         };
-        let addrs: Vec<String> = node
-            .addrs
-            .iter()
-            .map(|a| format!("\"{}\"", crate::json::escape(&a.to_string())))
-            .collect();
+        let addrs: Vec<String> = match at {
+            Some(a) => vec![format!("\"{}\"", crate::json::escape(&a.to_string()))],
+            None => node
+                .addrs
+                .iter()
+                .map(|a| format!("\"{}\"", crate::json::escape(&a.to_string())))
+                .collect(),
+        };
         let mut o = crate::json::Obj::new("commissionable")
             .str("instance", &instance)
             .num("port", port)
@@ -307,7 +316,10 @@ fn print_commissionable(node: &simple_matter::discovery::client::DiscoveredCommi
     } else {
         MATTER_PORT
     };
-    let addrs: Vec<String> = node.addrs.iter().map(|a| a.to_string()).collect();
+    let addrs: Vec<String> = match at {
+        Some(a) => vec![a.to_string()],
+        None => node.addrs.iter().map(|a| a.to_string()).collect(),
+    };
     println!(
         "[found] {instance}  discriminator={disc} vid/pid={vp} cm={cm} port={port} addrs=[{}]",
         addrs.join(", ")
@@ -393,6 +405,283 @@ pub fn resolve_operational(
     Err(format!(
         "operational node {node_id:#x} not resolved within {timeout:?}"
     ))
+}
+
+// ==========================================================================
+// --at: VPN 越しのユニキャスト mDNS 直叩き(matter-over-vpn.md V1 / 案 C1)
+// ==========================================================================
+
+/// `--at <ip>...` 用のユニキャスト QU クエリソケット群。
+///
+/// マルチキャスト browse の代わりに、指定ホスト群の `:5353` へ QU クエリを
+/// **ユニキャスト**で送る。デバイスは W3 の QU 対応により送信元へユニキャスト応答するので、
+/// 応答中の A/AAAA(デバイスの LAN アドレス。VPN からは到達できない)は捨て、
+/// **クエリを送った宛先 IP** + 応答 SRV のポートを接続先に採用する(design §4 案 C1)。
+struct UnicastAt {
+    /// v4 宛先がある場合のエフェメラルポート v4 ソケット。
+    v4: Option<UdpSocket>,
+    /// v6 宛先がある場合のエフェメラルポート v6 ソケット。
+    v6: Option<UdpSocket>,
+    /// クエリ宛先(`:5353`、fe80 は scope 補完済み)。
+    dests: Vec<SocketAddr>,
+}
+
+impl UnicastAt {
+    /// 宛先 IP 群からソケットを開く。fe80 リテラルは scope を補完する。
+    fn open(targets: &[IpAddr]) -> Result<Self, String> {
+        let mut need_v4 = false;
+        let mut need_v6 = false;
+        let mut dests = Vec::with_capacity(targets.len());
+        for &ip in targets {
+            match ip {
+                IpAddr::V4(_) => need_v4 = true,
+                IpAddr::V6(_) => need_v6 = true,
+            }
+            // クエリは常に 5353 宛。fe80 は CASE 接続と揃うよう scope_id を補完する。
+            dests.push(fill_link_local_scope(SocketAddr::new(ip, MDNS_PORT)));
+        }
+        let v4 = if need_v4 {
+            let s = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+                .map_err(|e| format!("bind unicast v4 socket: {e}"))?;
+            s.set_nonblocking(true).ok();
+            Some(s)
+        } else {
+            None
+        };
+        let v6 = if need_v6 {
+            let s = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0))
+                .map_err(|e| format!("bind unicast v6 socket: {e}"))?;
+            s.set_nonblocking(true).ok();
+            Some(s)
+        } else {
+            None
+        };
+        Ok(Self { v4, v6, dests })
+    }
+
+    /// QU クエリを各宛先へ送る(build は常に QU モードで組む)。
+    fn send_query<F>(&self, build: F)
+    where
+        F: Fn(&mut [u8; 128]) -> Result<usize, simple_matter::Error>,
+    {
+        let mut buf = [0u8; 128];
+        let Ok(len) = build(&mut buf) else { return };
+        for dst in &self.dests {
+            let sock = match dst {
+                SocketAddr::V4(_) => self.v4.as_ref(),
+                SocketAddr::V6(_) => self.v6.as_ref(),
+            };
+            if let Some(s) = sock {
+                let _ = s.send_to(&buf[..len], dst);
+            }
+        }
+    }
+
+    /// いずれかのソケットから 1 パケット受信する(nonblocking)。
+    fn recv(&self, buf: &mut [u8]) -> Option<(usize, SocketAddr)> {
+        for s in [self.v4.as_ref(), self.v6.as_ref()].into_iter().flatten() {
+            match s.recv_from(buf) {
+                Ok(x) => return Some(x),
+                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
+                Err(_) => {}
+            }
+        }
+        None
+    }
+
+    /// 応答元に一致する**クエリ宛先**(scope 補完済み)を接続先として採用し、
+    /// SRV ポートを差し込む。A/AAAA は使わない(VPN 到達性のため)。
+    fn adopt(&self, src: SocketAddr, port: u16) -> SocketAddr {
+        let mut addr = self
+            .dests
+            .iter()
+            .find(|d| d.ip() == src.ip())
+            .copied()
+            .unwrap_or_else(|| fill_link_local_scope(src));
+        addr.set_port(if port != 0 { port } else { MATTER_PORT });
+        addr
+    }
+}
+
+/// `--at`: 指定ホスト群へ QU 直叩きして operational ノードを解決する。
+///
+/// 応答 SRV のポート + クエリ宛先 IP を採用する(A/AAAA は無視)。
+pub fn resolve_operational_at(
+    ca: &Ca<Backend>,
+    node_id: u64,
+    targets: &[IpAddr],
+    timeout: Duration,
+) -> Result<SocketAddr, String> {
+    let trace = std::env::var_os("SM_MDNS_TRACE").is_some();
+    let compressed = ca.compressed_fabric_id_bytes();
+    let socks = UnicastAt::open(targets)?;
+    let build = |buf: &mut [u8; 128]| {
+        MdnsClient::build_resolve_operational(buf, &compressed, node_id, true)
+    };
+    eprintln!(
+        "[discovery] resolving _matter._tcp for {:016X}-{node_id:016X} via unicast mDNS \
+         (at {} host(s))...",
+        u64::from_be_bytes(compressed),
+        targets.len()
+    );
+
+    let start = Instant::now();
+    let mut last_query = Instant::now() - MDNS_REQUERY_INTERVAL;
+    let mut rx = [0u8; 1500];
+    while start.elapsed() < timeout {
+        if last_query.elapsed() >= MDNS_REQUERY_INTERVAL {
+            socks.send_query(build);
+            last_query = Instant::now();
+            if trace {
+                eprintln!(
+                    "[mdns-trace] (at) operational query sent to {} host(s)",
+                    targets.len()
+                );
+            }
+        }
+        match socks.recv(&mut rx) {
+            Some((n, src)) => {
+                let parsed = MdnsClient::parse_operational(&rx[..n], &compressed, node_id);
+                if trace {
+                    eprintln!(
+                        "[mdns-trace] (at) rx {n}B from {src} parse={}",
+                        if parsed.is_some() {
+                            "operational"
+                        } else {
+                            "no-match"
+                        }
+                    );
+                }
+                if let Some(node) = parsed {
+                    let addr = socks.adopt(src, node.port);
+                    eprintln!("[discovery] (at) operational node adopted at {addr}");
+                    return Ok(addr);
+                }
+            }
+            None => std::thread::sleep(MDNS_POLL_SLEEP),
+        }
+    }
+    Err(format!(
+        "operational node {node_id:#x} not resolved via unicast mDNS (--at) within {timeout:?}"
+    ))
+}
+
+/// `--at`: QU 直叩きで最初に見つかった commissionable ノードの接続先を返す
+/// (pairing onnetwork[-long] 用)。
+pub fn browse_commissionable_at(
+    discriminator: Option<u16>,
+    targets: &[IpAddr],
+    timeout: Duration,
+) -> Result<SocketAddr, String> {
+    let trace = std::env::var_os("SM_MDNS_TRACE").is_some();
+    let socks = UnicastAt::open(targets)?;
+    let build = |buf: &mut [u8; 128]| match discriminator {
+        Some(d) => MdnsClient::build_browse_discriminator(buf, d, true),
+        None => MdnsClient::build_browse_commissionable(buf, true),
+    };
+
+    let start = Instant::now();
+    let mut last_query = Instant::now() - MDNS_REQUERY_INTERVAL;
+    let mut rx = [0u8; 1500];
+    while start.elapsed() < timeout {
+        if last_query.elapsed() >= MDNS_REQUERY_INTERVAL {
+            socks.send_query(build);
+            last_query = Instant::now();
+            if trace {
+                eprintln!(
+                    "[mdns-trace] (at) browse query sent to {} host(s)",
+                    targets.len()
+                );
+            }
+        }
+        match socks.recv(&mut rx) {
+            Some((n, src)) => {
+                let parsed = MdnsClient::parse_commissionable(&rx[..n]);
+                if trace {
+                    eprintln!(
+                        "[mdns-trace] (at) rx {n}B from {src} parse={}",
+                        if parsed.is_some() {
+                            "commissionable"
+                        } else {
+                            "no-match"
+                        }
+                    );
+                }
+                let Some(node) = parsed else { continue };
+                if let Some(want) = discriminator {
+                    if node.discriminator != Some(want) {
+                        continue;
+                    }
+                }
+                let disc = node
+                    .discriminator
+                    .map(|d| d.to_string())
+                    .unwrap_or_else(|| "?".into());
+                let addr = socks.adopt(src, node.port);
+                eprintln!(
+                    "[discovery] (at) found commissionable node at {addr} (discriminator={disc})"
+                );
+                return Ok(addr);
+            }
+            None => std::thread::sleep(MDNS_POLL_SLEEP),
+        }
+    }
+    Err(format!(
+        "no commissionable device found via unicast mDNS (--at) within {timeout:?}"
+    ))
+}
+
+/// `--at`: `discover commissionable` の一覧版。QU 直叩きで見つかった各ノードを、
+/// 採用アドレス(クエリ宛先 IP + SRV ポート)付きで 1 行ずつ表示し総数を返す。
+pub fn browse_commissionable_list_at(
+    discriminator: Option<u16>,
+    targets: &[IpAddr],
+    timeout: Duration,
+) -> Result<usize, String> {
+    let trace = std::env::var_os("SM_MDNS_TRACE").is_some();
+    let socks = UnicastAt::open(targets)?;
+    let build = |buf: &mut [u8; 128]| match discriminator {
+        Some(d) => MdnsClient::build_browse_discriminator(buf, d, true),
+        None => MdnsClient::build_browse_commissionable(buf, true),
+    };
+    eprintln!(
+        "[discover] unicast mDNS browse (at {} host(s)) for {timeout:?} \
+         (discriminator filter: {})...",
+        targets.len(),
+        discriminator
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "none".into())
+    );
+
+    let mut set: CommissionableSet<16> = CommissionableSet::default();
+    let start = Instant::now();
+    let mut last_query = Instant::now() - MDNS_REQUERY_INTERVAL;
+    let mut rx = [0u8; 1500];
+    while start.elapsed() < timeout {
+        if last_query.elapsed() >= MDNS_REQUERY_INTERVAL {
+            socks.send_query(build);
+            last_query = Instant::now();
+        }
+        match socks.recv(&mut rx) {
+            Some((n, src)) => {
+                let ingest = match discriminator {
+                    Some(d) => set.ingest_filtered(&rx[..n], d),
+                    None => set.ingest(&rx[..n]),
+                };
+                if trace {
+                    eprintln!("[mdns-trace] (at) rx {n}B from {src} ingest={ingest:?}");
+                }
+                if ingest == Ingest::Added {
+                    if let Some(node) = set.iter().last() {
+                        let adopted = socks.adopt(src, node.port);
+                        print_commissionable(node, Some(adopted));
+                    }
+                }
+            }
+            None => std::thread::sleep(MDNS_POLL_SLEEP),
+        }
+    }
+    Ok(set.len())
 }
 
 /// commissionable ブラウズ用ソケット。戻りの `bool` は「QU(unicast-response)モードか」。
