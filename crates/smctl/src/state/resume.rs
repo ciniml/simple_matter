@@ -65,6 +65,15 @@ pub fn save(path: &Path, m: &ResumeMaterial) -> Result<(), String> {
     std::fs::write(path, &buf[..len]).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
+/// resumption 素材ファイルを削除する(`pairing unpair`。存在しなければ何もしない)。
+pub fn remove(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("remove {}: {e}", path.display())),
+    }
+}
+
 fn encode(w: &mut TlvWriter, m: &ResumeMaterial) -> MResult<()> {
     w.start_struct(&TlvTag::Anonymous)?;
     w.write_u8(&cx(0), RESUME_VERSION)?;

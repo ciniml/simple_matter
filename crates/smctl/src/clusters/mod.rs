@@ -7,10 +7,12 @@
 
 use simple_matter::dm::meta::{AttributeId, ClusterId, CommandId};
 
+pub mod access_control;
 pub mod administrator_commissioning;
 pub mod basic_information;
 pub mod descriptor;
 pub mod general_commissioning;
+pub mod general_diagnostics;
 pub mod identify;
 pub mod level_control;
 pub mod names;
@@ -123,9 +125,11 @@ pub static CLUSTERS: &[&ClusterDef] = &[
     &on_off::DEF,                      // 0x0006
     &level_control::DEF,               // 0x0008
     &descriptor::DEF,                  // 0x001D
+    &access_control::DEF,              // 0x001F
     &basic_information::DEF,           // 0x0028
     &general_commissioning::DEF,       // 0x0030
     &network_commissioning::DEF,       // 0x0031
+    &general_diagnostics::DEF,         // 0x0033
     &administrator_commissioning::DEF, // 0x003C
     &operational_credentials::DEF,     // 0x003E
 ];
@@ -229,6 +233,43 @@ mod tests {
         }
         assert!(def.attr_by_name("bogus").is_none());
         assert!(def.cmd_by_name("bogus").is_none());
+    }
+
+    #[test]
+    fn access_control_and_general_diagnostics_registered() {
+        // Access Control(0x001F): 属性のみ、コマンド無し。
+        let ac = by_name("access-control").expect("access-control in registry");
+        assert_eq!(ac.id, ClusterId(0x001F));
+        assert!(std::ptr::eq(by_id(ClusterId(0x001F)).unwrap(), ac));
+        assert_eq!(ac.attr_by_name("acl").unwrap().id, AttributeId(0x0000));
+        assert!(ac.attr_by_name("acl").unwrap().writable);
+        assert_eq!(
+            ac.attr_by_name("access-control-entries-per-fabric")
+                .unwrap()
+                .id,
+            AttributeId(0x0004)
+        );
+        assert!(ac.cmds.is_empty());
+
+        // General Diagnostics(0x0033): 属性 + test-event-trigger / time-snapshot。
+        let gd = by_name("general-diagnostics").expect("general-diagnostics in registry");
+        assert_eq!(gd.id, ClusterId(0x0033));
+        assert!(std::ptr::eq(by_id(ClusterId(0x0033)).unwrap(), gd));
+        assert_eq!(gd.attr_by_name("up-time").unwrap().kind, ValueKind::U64);
+        assert_eq!(
+            gd.attr_by_id(AttributeId(0x0004)).unwrap().name,
+            "boot-reason"
+        );
+        let te = gd
+            .cmd_by_name("test-event-trigger")
+            .expect("test-event-trigger");
+        assert_eq!(te.id, CommandId(0x00));
+        assert_eq!(te.fields.len(), 2);
+        assert_eq!(te.fields[0].name, "enable-key");
+        assert_eq!(te.fields[0].kind, ValueKind::Bytes);
+        let ts = gd.cmd_by_name("time-snapshot").expect("time-snapshot");
+        assert_eq!(ts.id, CommandId(0x01));
+        assert!(ts.fields.is_empty());
     }
 
     #[test]

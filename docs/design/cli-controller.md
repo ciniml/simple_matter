@@ -80,6 +80,7 @@ smctl pairing ble-wifi   <node-id> <passcode> <ssid> <password> [discriminator]
                                      # chip-tool 相当: BLE で AddNOC + WiFi プロビジョン
                                      # (AddOrUpdateWiFiNetwork→ConnectNetwork)→ BLE close
                                      # → 運用 mDNS 解決 → CASE over UDP → Complete
+smctl pairing unpair     <node-id>                            # 自 fabric を RemoveFabric → 状態削除
 smctl pairing list                                            # アドレス帳の一覧
 
 # 発見のみ
@@ -460,7 +461,7 @@ cluster_def! {
 | G6 | イベント Read / EventPath 未実装 | `read-event` | 将来(コア側) |
 | G7 | 複数 fabric(`FabricTable<C,1>`) | `--fabric` | パス設計のみ先取り(§7.3) |
 | G8 | mDNS ブラウズが IPv4 のみ | `discover`、IPv6 only 機器 | 将来(コア + runner) |
-| G9 | ノード削除(RemoveFabric)の高レベル化 | `pairing unpair` | `any invoke`(0x3E/0x0A)で代替可。C3 で opcreds テーブル収載により名前でも可能 |
+| G9 | ~~ノード削除(RemoveFabric)の高レベル化~~ **解消済み(2026-07-08)** | `pairing unpair <node-id>` | CASE 確立 → OperationalCredentials(0x3E)の CurrentFabricIndex(0x0005)を read → その index で RemoveFabric(0x3E/0x0A)を invoke(自 fabric の削除、timed 不要)。成功判定は NOCResponse.statusCode==0(取れれば厳密)または IM status Success。connectedhomeip は応答を返してからセッションを破棄するため invoke 応答受信で成功とみなす。成功時のみ `nodes.tlv` エントリと `resume/<node-id>.tlv` を削除(失敗・不達時はローカル状態を温存 = 安全側) |
 | G10 | ~~WiFi credentials の実投入(デバイス側シム)~~ **解消済み(2026-07-07)** | `pairing ble-wifi` | コア `Commissioner::set_wifi_credentials` が AddNOC 後に AddOrUpdateWiFiNetwork(0x31/0x02)→ConnectNetwork(0x31/0x06)フェーズを挿入。E5 NanoC6 実機で BLE→WiFi join→運用 mDNS→CASE over UDP→Complete→onoff toggle を検証済み。運用 mDNS 解決は Unix では 5353 共有 bind(定期 announce の受動受信。AP がホスト→デバイス方向マルチキャストを落とす環境対策)、Windows は QU + エフェメラル(W3)のまま |
 
 いずれも smctl の骨格(§2〜§5)には影響せず、解消され次第コマンドを足すだけの
@@ -588,21 +589,22 @@ clippy 0 + E2E(onoff-light 相手に `-v`/`-vv` で pairing/toggle/read、BLE �
 
 **クラスタ名注釈**(`clusters/names.rs`):
 
-- クラスタレジストリ(§5、フル定義 9 クラスタ)未収載の ID にも、Matter 1.x
+- クラスタレジストリ(§5、フル定義。2026-07-08 に access-control(0x1F)/
+  general-diagnostics(0x33)を追加し 11 クラスタ)未収載の ID にも、Matter 1.x
   標準クラスタの **ID→名前だけの注釈テーブル**(110 件超、ID 昇順 + 二分探索)で
-  `[im]`/`[tlv]` ログと `any read` の表示に `0x0033(GeneralDiagnostics)` の形で
+  `[im]`/`[tlv]` ログと `any read` の表示に `0x0035(ThreadNetworkDiagnostics)` の形で
   名前を添える。属性は **global 属性(0xFFF8〜0xFFFD)のみ**名前解決
   (`0xfffb(AttributeList)`)。フル定義(型付き・kebab-case 名で CLI から操作可)は
   従来どおりレジストリ収載分のみ。
 - 表記を意図的に変えている: レジストリ収載 = `onoff(0x0006)`(名前が主)、
-  名前注釈のみ = `0x0033(GeneralDiagnostics)`(ID が主、仕様名 CamelCase)。
+  名前注釈のみ = `0x0035(ThreadNetworkDiagnostics)`(ID が主、仕様名 CamelCase)。
   どちらのテーブルで解決されたかがログから読み取れる。
 
-実出力例(`-v any read 1 0 0x0033 0xfffb`、デバイス側に 0x0033 が無い場合):
+実出力例(`-v any read 1 0 0x0035 0xfffb`、デバイス側に 0x0035 が無い場合):
 
 ```text
-[   258][im] ReadRequest node=1 path: endpoint=0 cluster=0x0033(GeneralDiagnostics) attribute=0xfffb(AttributeList)
-[   278][im] ReportData ep0 0x0033(GeneralDiagnostics)/0xfffb(AttributeList) status=UnsupportedCluster
+[   258][im] ReadRequest node=1 path: endpoint=0 cluster=0x0035(ThreadNetworkDiagnostics) attribute=0xfffb(AttributeList)
+[   278][im] ReportData ep0 0x0035(ThreadNetworkDiagnostics)/0xfffb(AttributeList) status=UnsupportedCluster
 ```
 
 ゲート実績(2026-07-07): 単体(色判定マトリクス・names 引き・ログファイル書き込み
@@ -611,3 +613,38 @@ clippy 0 + E2E(onoff-light 相手に `-v`/`-vv` で pairing/toggle/read、BLE �
 ファイル無色・trace 全量 43 行 vs 画面 info 2 行)、`any read 0x0033` の
 UnsupportedCluster 注釈、`--log-file` open 失敗の warn 継続を確認。
 Windows クロスビルド(`cargo xwin`、`--features ble`)green。
+
+## 10. 追補(2026-07-08): unpair・クラスタ拡充・`--ble-address` の見送り
+
+### 10.1 `pairing unpair`(G9 解消)
+
+`crate::ops::Exec::unpair` に実装。CASE(キャッシュ/resumption 経由も可)確立 →
+CurrentFabricIndex read → RemoveFabric invoke → 成功時のみローカル状態削除、の 3 段。
+状態削除は `state::nodes::remove`(node_id 一致エントリを消し全量書き戻し)と
+`state::resume::remove`(`resume/<node-id>.tlv` を unlink、無ければ no-op)。NOCResponse の
+StatusCode 抽出は `ops::decode_noc_status_code`(連結 InvokeResponseIB →
+CommandDataIB(0) → NOCResponse fields(1) → statusCode(0) を手書き TLV walk で辿る。
+取れなければ IM status 判定にフォールバック)。単体で CLI パース・状態削除・NOCResponse
+デコードを固定(smctl 41→46)。実機 E2E は未実施(親のゲートに委ねる)。
+
+### 10.2 クラスタテーブル拡充
+
+`access-control`(0x1F、属性のみ・コマンド無し。acl/extension は fabric-scoped struct
+list なので `Raw` rw)と `general-diagnostics`(0x33、test-event-trigger/time-snapshot
+コマンド付き)をレジストリへ ID 昇順で追加。既存 0x30/0x31/0x3C/0x3E は仕様と突き合わせ
+確認のみで欠落なし(0x3E の attestation/CSR/NOC 応答はコマンド応答であり cmd 定義不要)。
+0x33/0x1F がフル定義化したので、§9.5 の「未収載クラスタの名前注釈」例は 0x35
+(ThreadNetworkDiagnostics)へ差し替えた。
+
+### 10.3 `--ble-address <mac>` は見送り(理由を明記)
+
+BLE スキャンの MAC 照合は、発見デバイスの列挙と広告パースが `simple-matter-ble` の
+`GattCentral::scan` 内ループで完結し、最初の一致で `ScanResult` を返す構造のため、
+アドレス照合を足すにはコア crate の公開 API `ScanFilter`(`simple-matter/src/btp/gatt.rs`)
+にフィルタ項目を追加してループへ通す必要がある。これは (1) コア公開 API の変更(本プロジェクトの
+慣行では設計 doc 先行が望ましい)、(2) btleplug は Windows で peripheral を不透明な
+`PeripheralId`(GUID)で識別し `PeripheralProperties.address` が得られない/ゼロになる
+ことが多い(WinRT の既知制約 = 本ポートの主対象 Windows でフィルタが機能しない)、
+(3) 本環境に BLE アダプタが無く検証不能、の 3 点から今回は見送る。実装する場合は
+`ScanFilter` に `Option<[u8;6]>` を足し、`scan` ループで `props.address` を正規化比較
+(大文字小文字・区切り無視)する形が素直。Windows では `PeripheralId` ベースの別手段が要る。

@@ -72,6 +72,19 @@ pub fn upsert(path: &Path, entry: NodeEntry) -> Result<(), String> {
     save(path, &entries)
 }
 
+/// `node_id` 一致のエントリを削除する(`pairing unpair`)。削除したら `Ok(true)`、
+/// 該当エントリが無ければ `Ok(false)`。
+pub fn remove(path: &Path, node_id: u64) -> Result<bool, String> {
+    let mut entries = load(path)?;
+    let before = entries.len();
+    entries.retain(|e| e.node_id != node_id);
+    if entries.len() == before {
+        return Ok(false);
+    }
+    save(path, &entries)?;
+    Ok(true)
+}
+
 /// キャッシュアドレスを更新する(エントリが無ければ何もしない)。
 pub fn update_addr(path: &Path, node_id: u64, addr: SocketAddr) -> Result<(), String> {
     let mut entries = load(path)?;
@@ -166,4 +179,46 @@ fn decode_entry(r: &mut TlvReader) -> MResult<NodeEntry> {
         label,
         last_addr: SocketAddr::new(ip, port),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(node_id: u64, label: &str, addr: &str) -> NodeEntry {
+        NodeEntry {
+            node_id,
+            label: label.to_string(),
+            last_addr: addr.parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn upsert_and_remove_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("smctl-nodes-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nodes.tlv");
+
+        // 空ファイルは空 Vec。
+        assert!(load(&path).unwrap().is_empty());
+
+        upsert(&path, entry(1, "one", "10.0.0.1:5540")).unwrap();
+        upsert(&path, entry(2, "two", "10.0.0.2:5540")).unwrap();
+        let got = load(&path).unwrap();
+        assert_eq!(got.len(), 2);
+
+        // 該当ノードだけ消える。存在しないノードは false。
+        assert!(remove(&path, 1).unwrap());
+        assert!(!remove(&path, 99).unwrap());
+        let got = load(&path).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].node_id, 2);
+        assert_eq!(got[0].label, "two");
+
+        // 最後の 1 件も消せる。
+        assert!(remove(&path, 2).unwrap());
+        assert!(load(&path).unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

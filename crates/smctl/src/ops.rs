@@ -293,6 +293,7 @@ impl<'a> Exec<'a> {
                 passcode,
             } => self.admin_open_window(*node, *timeout_s, *discriminator, *passcode),
             Cmd::AdminRevoke { node } => self.admin_revoke(*node),
+            Cmd::Unpair { node } => self.unpair(*node),
             Cmd::Subscribe {
                 node,
                 ep,
@@ -1155,6 +1156,141 @@ impl<'a> Exec<'a> {
         )
     }
 
+    /// `pairing unpair <node-id>`: 自 fabric をデバイスから削除し、成功後にローカル状態を消す。
+    ///
+    /// CASE を張り、OperationalCredentials(0x003E)の CurrentFabricIndex(0x0005)を読み、
+    /// その index で RemoveFabric(0x0A)を invoke する(= 自 fabric の削除)。RemoveFabric は
+    /// timed invoke 不要。
+    ///
+    /// 成功判定: InvokeResponse を受信し、NOCResponse.statusCode == Ok(0)(取れれば厳密判定)
+    /// または IM status = Success。connectedhomeip は NOCResponse を**返してから**セッションを
+    /// 破棄するので、応答受信をもって成功とみなせる。応答が来ないままデバイスがセッションを
+    /// 落とす実装があった場合はここがタイムアウト Err になり、ローカル状態は消さない(安全側:
+    /// 実際に消えたか不明なエントリを残す)。
+    ///
+    /// 成功時のみ nodes.tlv エントリと resume/<node-id>.tlv を削除する(失敗時は温存)。
+    fn unpair(&mut self, node_id: u64) -> Result<(), String> {
+        let session = self.case_session(node_id)?;
+
+        // 1) 自分の fabric index を読む(自 fabric を消すため相手視点の index が要る)。
+        let fabric_index = self.read_current_fabric_index(node_id, session)?;
+        info!(
+            "[unpair] node {node_id} reports our fabric index = {fabric_index}; \
+             sending RemoveFabric"
+        );
+
+        // 2) RemoveFabric(0x003E/0x0A){ 0 => fabric-index }。
+        let path = CommandPath::new(EndpointId(0), ClusterId(0x003E), CommandId(0x0A));
+        let now = self.now_ms();
+        let dir = self
+            .stack
+            .start_invoke(
+                session,
+                path,
+                move |w: &mut TlvWriter<'_>, t: &TlvTag| {
+                    w.start_struct(t)?;
+                    w.write_u8(&TlvTag::ContextSpecific(0), fabric_index)?;
+                    w.end_container()
+                },
+                now,
+                &mut self.tx,
+            )
+            .map_err(|e| format!("start_invoke(RemoveFabric): {e:?}"))?;
+        send_dir(&self.socket, &self.tx, &dir);
+
+        match self.wait_txn_event(Instant::now() + self.g.timeout)? {
+            Some(ImEvent::InvokeDone { status }) => {
+                if !status.is_success() {
+                    return Err(format!(
+                        "RemoveFabric failed: IM status {status:?} (local state kept)"
+                    ));
+                }
+                // NOCResponse.statusCode を best-effort で厳密確認(取れなければ IM status に委ねる)。
+                if let Some(code) = decode_noc_status_code(self.stack.im_result()) {
+                    if code != 0 {
+                        return Err(format!(
+                            "RemoveFabric returned NOCResponse statusCode={code} \
+                             (0=Ok; local state kept)"
+                        ));
+                    }
+                }
+            }
+            Some(ev) => return Err(format!("RemoveFabric failed: {ev:?} (local state kept)")),
+            None => return self.op_timeout(node_id, "unpair (RemoveFabric)"),
+        }
+
+        // デバイス側はこの後セッションを破棄する。プロセス内キャッシュから外す
+        // (以後このノードへ操作すると新規 CASE を張ろうとする)。
+        self.cases.retain(|(n, _)| *n != node_id);
+
+        // 3) ローカル状態を削除する。
+        {
+            let _lock = self.state.lock()?;
+            let removed = nodes::remove(&self.state.nodes_path(), node_id)?;
+            resume::remove(&self.state.resume_path(node_id))?;
+            if !removed {
+                logf!(
+                    Level::Warn,
+                    "ctl",
+                    "node {node_id} was not in the address book (removed fabric anyway)"
+                );
+            }
+        }
+        if json::enabled() {
+            Obj::new("unpair")
+                .num("node", node_id)
+                .num("fabricIndex", fabric_index as u64)
+                .emit();
+        } else {
+            println!(
+                "[unpair] node {node_id} removed from device (fabric index {fabric_index}); \
+                 local state cleared"
+            );
+        }
+        Ok(())
+    }
+
+    /// OperationalCredentials(0x003E)の CurrentFabricIndex(0x0005、ep0)を読んで返す。
+    fn read_current_fabric_index(
+        &mut self,
+        node_id: u64,
+        session: SessionId,
+    ) -> Result<u8, String> {
+        const OPCREDS: ClusterId = ClusterId(0x003E);
+        const CURRENT_FABRIC_INDEX: AttributeId = AttributeId(0x0005);
+        let path = AttributePath::concrete(EndpointId(0), OPCREDS, CURRENT_FABRIC_INDEX);
+        let now = self.now_ms();
+        let dir = self
+            .stack
+            .start_read(session, &[path], now, &mut self.tx)
+            .map_err(|e| format!("start_read(CurrentFabricIndex): {e:?}"))?;
+        send_dir(&self.socket, &self.tx, &dir);
+        match self.wait_txn_event(Instant::now() + self.g.timeout)? {
+            Some(ImEvent::ReadDone) => {}
+            Some(ev) => return Err(format!("reading CurrentFabricIndex failed: {ev:?}")),
+            None => {
+                self.op_timeout(node_id, "unpair (read CurrentFabricIndex)")?;
+                unreachable!()
+            }
+        }
+        let mut value: Option<u64> = None;
+        for report in self.stack.read_reports() {
+            if let Ok(AttributeReportRef::Data(d)) = report {
+                if d.path.attribute == Some(CURRENT_FABRIC_INDEX) {
+                    let mut r = d.value();
+                    if let Ok(Some(e)) = r.read_next() {
+                        if let TlvValue::UnsignedInteger(v) = e.value {
+                            value = Some(v);
+                        }
+                    }
+                }
+            }
+        }
+        let v =
+            value.ok_or("device did not report CurrentFabricIndex (0x003E/0x0005)".to_string())?;
+        u8::try_from(v).map_err(|_| format!("CurrentFabricIndex out of range: {v}"))
+    }
+
     /// 属性 Subscribe。
     ///
     /// - 単発モード: 常駐(レポートを表示し続け、SubscriptionLost で非 0 終了)。
@@ -1602,6 +1738,84 @@ fn transcode_element(
 }
 
 // ==========================================================================
+// NOCResponse(RemoveFabric/AddNOC/UpdateNOC の応答)の StatusCode 抽出
+// ==========================================================================
+
+/// `im_result`(連結 InvokeResponseIB 列)から最初の NOCResponse の StatusCode を取り出す。
+///
+/// InvokeResponseIB = struct{ command(0): CommandDataIB | status(1): CommandStatusIB }、
+/// CommandDataIB = struct{ path(0), fields(1): NOCResponse, ... }、
+/// NOCResponse = struct{ statusCode(0): u8, fabricIndex(1), debugText(2) }。
+/// フィールドが見つからない/デコードできない場合は `None`(呼び出し側は IM status で判定)。
+fn decode_noc_status_code(result: &[u8]) -> Option<u8> {
+    let mut r = TlvReader::new(result);
+    while let Ok(Some(e)) = r.read_next() {
+        // トップレベルは InvokeResponseIB(struct)の並び。それ以外は読み飛ばす。
+        if !matches!(e.value, TlvValue::ContainerStart(ContainerType::Structure)) {
+            let _ = r.skip(&e);
+            continue;
+        }
+        if let Some(code) = invoke_response_status_code(&mut r) {
+            return Some(code);
+        }
+    }
+    None
+}
+
+/// InvokeResponseIB 本体(struct 開始消費済み)を走査。command(0) の CommandDataIB を辿る。
+fn invoke_response_status_code(r: &mut TlvReader) -> Option<u8> {
+    let mut out = None;
+    while let Ok(Some(e)) = r.read_next() {
+        match (e.tag, &e.value) {
+            (_, TlvValue::ContainerEnd) => break,
+            (TlvTag::ContextSpecific(0), TlvValue::ContainerStart(ContainerType::Structure)) => {
+                if let Some(code) = command_data_status_code(r) {
+                    out = Some(code);
+                }
+            }
+            _ => {
+                let _ = r.skip(&e);
+            }
+        }
+    }
+    out
+}
+
+/// CommandDataIB 本体(struct 開始消費済み)を走査。fields(1) の NOCResponse struct を辿る。
+fn command_data_status_code(r: &mut TlvReader) -> Option<u8> {
+    let mut out = None;
+    while let Ok(Some(e)) = r.read_next() {
+        match (e.tag, &e.value) {
+            (_, TlvValue::ContainerEnd) => break,
+            (TlvTag::ContextSpecific(1), TlvValue::ContainerStart(ContainerType::Structure)) => {
+                if let Some(code) = noc_fields_status_code(r) {
+                    out = Some(code);
+                }
+            }
+            _ => {
+                let _ = r.skip(&e);
+            }
+        }
+    }
+    out
+}
+
+/// NOCResponse 本体(struct 開始消費済み)から statusCode(context 0、u8)を取り出す。
+fn noc_fields_status_code(r: &mut TlvReader) -> Option<u8> {
+    let mut out = None;
+    while let Ok(Some(e)) = r.read_next() {
+        match (e.tag, &e.value) {
+            (_, TlvValue::ContainerEnd) => break,
+            (TlvTag::ContextSpecific(0), TlvValue::UnsignedInteger(v)) => out = Some(*v as u8),
+            _ => {
+                let _ = r.skip(&e);
+            }
+        }
+    }
+    out
+}
+
+// ==========================================================================
 // レポート表示(名前テーブルは可読性を足すだけ。無くても生 TLV ダンプで常に成立)
 // ==========================================================================
 
@@ -1917,14 +2131,16 @@ mod annotate_tests {
             "endpoint=1 cluster=onoff(0x0006) attribute=on-off(0x0000)"
         );
         // レジストリ未収載の標準クラスタ: 名前注釈テーブルで 0xID(Name) 表記(§9.5)。
+        // (0x0033 GeneralDiagnostics と 0x001F AccessControl はフル定義済みになったので、
+        //  未収載例には 0x0035 ThreadNetworkDiagnostics を使う。)
         assert_eq!(
-            annotate_path(0, ClusterId(0x0033), None, None),
-            "endpoint=0 cluster=0x0033(GeneralDiagnostics)"
+            annotate_path(0, ClusterId(0x0035), None, None),
+            "endpoint=0 cluster=0x0035(ThreadNetworkDiagnostics)"
         );
         // global 属性はレジストリ収載/未収載どちらでも名前が付く。
         assert_eq!(
-            annotate_path(0, ClusterId(0x0033), Some(AttributeId(0xFFFB)), None),
-            "endpoint=0 cluster=0x0033(GeneralDiagnostics) attribute=0xfffb(AttributeList)"
+            annotate_path(0, ClusterId(0x0035), Some(AttributeId(0xFFFB)), None),
+            "endpoint=0 cluster=0x0035(ThreadNetworkDiagnostics) attribute=0xfffb(AttributeList)"
         );
         assert_eq!(
             annotate_path(1, ClusterId(0x0006), Some(AttributeId(0xFFFD)), None),
@@ -1940,13 +2156,80 @@ mod annotate_tests {
     #[test]
     fn format_concrete_uses_names_table() {
         assert_eq!(
-            format_concrete(ClusterId(0x0033), Some(AttributeId(0xFFFB)), 0),
-            "ep0 0x0033(GeneralDiagnostics)/0xfffb(AttributeList)"
+            format_concrete(ClusterId(0x0035), Some(AttributeId(0xFFFB)), 0),
+            "ep0 0x0035(ThreadNetworkDiagnostics)/0xfffb(AttributeList)"
         );
         assert_eq!(
             format_concrete(ClusterId(0x0006), Some(AttributeId(0x0000)), 1),
             "ep1 onoff/on-off"
         );
         assert_eq!(format_concrete(ClusterId(0xFC01), None, 2), "ep2 0xfc01");
+    }
+}
+
+#[cfg(test)]
+mod noc_tests {
+    use super::*;
+
+    /// RemoveFabric の NOCResponse を 1 個含む InvokeResponseIB を組む
+    /// (unpair の応答判定が実際のワイヤ形状で成立することを固定する)。
+    fn build_removefabric_response(status_code: u8, fabric_index: u8) -> Vec<u8> {
+        let mut buf = vec![0u8; 128];
+        let len = {
+            let mut w = TlvWriter::new(&mut buf);
+            // InvokeResponseIB
+            w.start_struct(&TlvTag::Anonymous).unwrap();
+            // command(0) = CommandDataIB
+            w.start_struct(&TlvTag::ContextSpecific(0)).unwrap();
+            // path(0) = CommandPath(list)。unpair の抽出では skip される。
+            w.start_container(&TlvTag::ContextSpecific(0), ContainerType::List)
+                .unwrap();
+            w.write_u16(&TlvTag::ContextSpecific(0), 0).unwrap(); // endpoint
+            w.write_u32(&TlvTag::ContextSpecific(1), 0x003E).unwrap(); // cluster
+            w.write_u32(&TlvTag::ContextSpecific(2), 0x08).unwrap(); // NOCResponse cmd id
+            w.end_container().unwrap();
+            // fields(1) = NOCResponse struct { 0: statusCode, 1: fabricIndex }
+            w.start_struct(&TlvTag::ContextSpecific(1)).unwrap();
+            w.write_u8(&TlvTag::ContextSpecific(0), status_code)
+                .unwrap();
+            w.write_u8(&TlvTag::ContextSpecific(1), fabric_index)
+                .unwrap();
+            w.end_container().unwrap();
+            w.end_container().unwrap(); // CommandDataIB
+            w.end_container().unwrap(); // InvokeResponseIB
+            w.len()
+        };
+        buf.truncate(len);
+        buf
+    }
+
+    #[test]
+    fn decode_noc_status_code_extracts_status() {
+        assert_eq!(
+            decode_noc_status_code(&build_removefabric_response(0, 1)),
+            Some(0)
+        );
+        // 11 = InvalidFabricIndex(RemoveFabric の失敗コード例)。
+        assert_eq!(
+            decode_noc_status_code(&build_removefabric_response(11, 1)),
+            Some(11)
+        );
+    }
+
+    #[test]
+    fn decode_noc_status_code_none_when_absent() {
+        // 空/NOCResponse を含まない応答は None(IM status 判定へフォールバック)。
+        assert_eq!(decode_noc_status_code(&[]), None);
+        // Status(1) だけの InvokeResponseIB(コマンド応答無し)も None。
+        let mut buf = vec![0u8; 64];
+        let len = {
+            let mut w = TlvWriter::new(&mut buf);
+            w.start_struct(&TlvTag::Anonymous).unwrap();
+            w.start_struct(&TlvTag::ContextSpecific(1)).unwrap(); // CommandStatusIB
+            w.end_container().unwrap();
+            w.end_container().unwrap();
+            w.len()
+        };
+        assert_eq!(decode_noc_status_code(&buf[..len]), None);
     }
 }

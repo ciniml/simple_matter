@@ -96,6 +96,11 @@ impl Clone for Globals {
 pub enum Cmd {
     Help,
     PairingList,
+    /// `pairing unpair <node-id>`: 自 fabric をデバイスから削除(RemoveFabric)し、
+    /// 成功したらローカル状態(アドレス帳エントリ + resumption 素材)を消す。
+    Unpair {
+        node: u64,
+    },
     /// UDP コミッショニング(onnetwork / onnetwork-long / address)。
     Pair {
         node: u64,
@@ -482,9 +487,17 @@ fn parse_pairing(args: &[String]) -> Result<Cmd, String> {
             })
         }
         "list" => Ok(Cmd::PairingList),
+        "unpair" => {
+            let [node] = expect_args(args, 1, 1, "pairing unpair <node-id>")?[..] else {
+                unreachable!()
+            };
+            Ok(Cmd::Unpair {
+                node: parse_u64(node)?,
+            })
+        }
         _ => Err(
             "usage: smctl pairing <onnetwork|onnetwork-long|address|ble|ble-handoff|ble-wifi|\
-             list> ... (see `smctl help`)"
+             unpair|list> ... (see `smctl help`)"
                 .into(),
         ),
     }
@@ -884,6 +897,7 @@ USAGE:
   smctl pairing ble-handoff     <node-id> <passcode> [discriminator]   (AddNOC over BLE -> CASE over UDP)
   smctl pairing ble-wifi        <node-id> <passcode> <ssid> <password> [discriminator]
                                 (BLE commissioning + WiFi provisioning -> CASE over UDP)
+  smctl pairing unpair          <node-id>   (RemoveFabric own fabric, then drop local state)
   smctl pairing list
   smctl admincommissioning open-window <node-id> <timeout-s> <discriminator> [--passcode N]
                                 (open an enhanced commissioning window; prints the
@@ -1106,6 +1120,17 @@ mod tests {
             "s".repeat(33)
         ))
         .contains("invalid ssid"));
+    }
+
+    #[test]
+    fn pairing_unpair() {
+        let (_, cmd) = parse_ok("pairing unpair 7");
+        assert!(matches!(cmd, Cmd::Unpair { node: 7 }));
+        let (_, cmd) = parse_ok("pairing unpair 0x1234");
+        assert!(matches!(cmd, Cmd::Unpair { node: 0x1234 }));
+        assert!(parse_err("pairing unpair").starts_with("usage:"));
+        assert!(parse_err("pairing unpair 1 2").starts_with("usage:"));
+        assert!(parse_err("pairing unpair x").contains("invalid"));
     }
 
     #[test]
