@@ -1,4 +1,5 @@
-//! ESP32-C6 向け simple-matter ポート — フェーズ E5: Wi-Fi 実 join + UDP/mDNS。
+//! ESP32-C6 向け simple-matter ポート — フェーズ E5: Wi-Fi 実 join + UDP/mDNS
+//! (+ Dimmable Light 化: Level Control 0x0008 + LEDC PWM)。
 //!
 //! `docs/design/port-esp32-device.md` §8「E5」/ §E5 の実装。E4(`e4-ble-light.rs`、
 //! BLE コミッショニング + fabric 永続化)に **実 Wi-Fi + UDP dual-transport** を足す:
@@ -16,6 +17,14 @@
 //! これで chip-tool の `pairing ble-wifi` が最後まで通る:
 //! BLE で PASE→CSR→AddNOC→AddOrUpdateWiFiNetwork→ConnectNetwork → Wi-Fi join →
 //! DHCP → 運用 mDNS 発見 → **CASE over UDP** → CommissioningComplete → OnOff。
+//!
+//! # Dimmable Light 化(`docs/design/interaction-model.md` §15)
+//!
+//! EP1 を Dimmable Light(0x0101)にし、Level Control クラスタ(0x0008)を追加。
+//! NanoC6 の青 LED(GPIO7)は esp-hal の **LEDC(PWM、LowSpeed timer0 13bit/1kHz)** で
+//! 輝度制御し、CurrentLevel × OnOff に追従させる。TransitionTime の時間遷移はコアの
+//! `ServerCluster::tick`(`tick_clusters`、設計 §15.1)が pump ループの `stack.poll` から
+//! 駆動されるため、この bin は duty の反映だけを行う。
 //!
 //! # pump ループの非自明な制約(E3/E4 から継承。ble-btp.md §6.2 / §11-4)
 //!
@@ -43,9 +52,13 @@ use embassy_net::StackResources;
 use embassy_time::{Instant, Timer};
 
 use esp_hal::clock::CpuClock;
-use esp_hal::gpio::{Level, Output, OutputConfig};
+use esp_hal::gpio::DriveMode;
 use esp_hal::interrupt::software::SoftwareInterruptControl;
+use esp_hal::ledc::channel::{self, Channel as LedcChannel, ChannelHW, ChannelIFace};
+use esp_hal::ledc::timer::{self as ledc_timer, TimerIFace};
+use esp_hal::ledc::{LSGlobalClkSource, Ledc, LowSpeed};
 use esp_hal::rng::{Trng, TrngSource};
+use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println::println;
 
@@ -62,10 +75,10 @@ use simple_matter::discovery::{
 };
 use simple_matter::dm::clusters::{
     BasicInfoConfig, BasicInformationCluster, DescriptorCluster, GeneralCommissioning,
-    NetworkCommissioningWifi, OnOffCluster, OpCredsCluster, TestDacProvider,
+    LevelControlCluster, NetworkCommissioningWifi, OnOffCluster, OpCredsCluster, TestDacProvider,
 };
 use simple_matter::dm::meta::{ClusterId, DeviceType, EndpointId, EndpointMeta};
-use simple_matter::dm::{DataModel, ServerCluster};
+use simple_matter::dm::{tick_clusters, DataModel, ServerCluster};
 use simple_matter::error::Result as MResult;
 use simple_matter::fabric::FabricTable;
 use simple_matter::im::engine::InteractionModel;
@@ -82,8 +95,8 @@ use esp32c6_firmware::ble::{gatt_worker, BtpGattServer, GattChannels, TroubleGat
 use esp32c6_firmware::kvs::EspKvs;
 use esp32c6_firmware::net::{peer_v4, peer_v6, v4_as_mapped, EspUdp};
 use esp32c6_firmware::wifi::{take_pending_credentials, wifi_task, EspWifiDriver, WifiRequest};
-use simple_matter::kvs::Kvs;
 use esp32c6_firmware::EspRng;
+use simple_matter::kvs::Kvs;
 
 // ESP-IDF 2nd stage bootloader が要求するアプリディスクリプタ(全 bin に必須。
 // 無いとブートローダがアプリを起動できず TG0 WDT リセットループになる)。
@@ -122,13 +135,13 @@ fn esp_rng() -> EspRng {
 static CFG: BasicInfoConfig = BasicInfoConfig {
     vendor_name: "SimpleMatter",
     vendor_id: 0xFFF1,
-    product_name: "OnOffLight",
-    product_id: 0x8001,
+    product_name: "DimmableLight",
+    product_id: 0x8002,
     hardware_version: 1,
     hardware_version_string: "HW1",
     software_version: 0x0001_0000,
     software_version_string: "1.0.0",
-    serial_number: "SM-ONOFF-0001",
+    serial_number: "SM-DIM-0002",
 };
 
 static EP0_SERVERS: &[ClusterId] = &[
@@ -138,9 +151,10 @@ static EP0_SERVERS: &[ClusterId] = &[
     ClusterId(0x003E),
     ClusterId(0x001D),
 ];
-static EP1_SERVERS: &[ClusterId] = &[ClusterId(0x0006), ClusterId(0x001D)];
+static EP1_SERVERS: &[ClusterId] = &[ClusterId(0x0006), ClusterId(0x0008), ClusterId(0x001D)];
 static EP0_DT: &[DeviceType] = &[DeviceType::new(0x0016, 1)];
-static EP1_DT: &[DeviceType] = &[DeviceType::new(0x0100, 3)];
+// Dimmable Light(0x0101)。Level Control 追加に伴い 0x0100(On/Off Light)から変更。
+static EP1_DT: &[DeviceType] = &[DeviceType::new(0x0101, 3)];
 static EP0_PARTS: &[EndpointId] = &[EndpointId(1)];
 static EP1_PARTS: &[EndpointId] = &[];
 
@@ -155,6 +169,7 @@ struct Light<'s> {
     opcreds: OpCreds<'s>,
     desc0: DescriptorCluster,
     onoff: OnOffCluster,
+    level: LevelControlCluster,
     desc1: DescriptorCluster,
     /// fail-safe タイマ経過で削除した fabric index の退避先(stack が take する)。
     removed_fabric: Option<core::num::NonZeroU8>,
@@ -183,6 +198,7 @@ impl DataModel for Light<'_> {
             (0, 0x003E) => Some(&self.opcreds),
             (0, 0x001D) => Some(&self.desc0),
             (1, 0x0006) => Some(&self.onoff),
+            (1, 0x0008) => Some(&self.level),
             (1, 0x001D) => Some(&self.desc1),
             _ => None,
         }
@@ -195,6 +211,7 @@ impl DataModel for Light<'_> {
             (0, 0x003E) => Some(&mut self.opcreds),
             (0, 0x001D) => Some(&mut self.desc0),
             (1, 0x0006) => Some(&mut self.onoff),
+            (1, 0x0008) => Some(&mut self.level),
             (1, 0x001D) => Some(&mut self.desc1),
             _ => None,
         }
@@ -206,7 +223,19 @@ impl DataModel for Light<'_> {
                 self.removed_fabric = Some(idx);
             }
         }
-        None
+        // on_tick を手書きで上書きしているため、クラスタ tick(Level Control の時間遷移)は
+        // tick_clusters を明示的に呼ぶ(設計 §15.1)。
+        let next = tick_clusters(self, now_ms);
+        // OnOff 連動の仲介(設計 §15.3): Level → OnOff の要求適用と、外部要因の
+        // OnOff 変化(On/Off/Toggle コマンド)の Level への通知。
+        if let Some(on) = self.level.take_on_off_request() {
+            self.onoff.set(on);
+        }
+        let on = self.onoff.is_on();
+        if on != self.level.coupled_on() {
+            self.level.notify_on_off(on);
+        }
+        next
     }
     fn on_failsafe_cleanup(&mut self) -> Option<core::num::NonZeroU8> {
         self.gc.disarm();
@@ -231,6 +260,10 @@ fn build_light(fabrics: &RefCell<FabricTable<Backend, NF>>) -> Light<'_> {
         desc0: DescriptorCluster::new(EndpointId(0), EP0_DT, EP0_SERVERS, &[], EP0_PARTS),
         onoff: OnOffCluster::new().with_listener(|on| {
             println!("[onoff] light is now {}", if on { "ON" } else { "OFF" });
+        }),
+        level: LevelControlCluster::new().with_listener(|lvl| match lvl {
+            Some(v) => println!("[level] CurrentLevel={}", v),
+            None => println!("[level] CurrentLevel=null"),
         }),
         desc1: DescriptorCluster::new(EndpointId(1), EP1_DT, EP1_SERVERS, &[], EP1_PARTS),
         removed_fabric: None,
@@ -398,7 +431,7 @@ async fn route_send(
 async fn pump(
     gatt: &mut TroubleGattPeripheral<'_>,
     stack: &mut LightStack<'_>,
-    led: &mut Output<'_>,
+    led: &LedcChannel<'_, LowSpeed>,
     fabrics: &RefCell<FabricTable<Backend, NF>>,
     kvs: &mut EspKvs,
     net_stack: embassy_net::Stack<'_>,
@@ -413,8 +446,9 @@ async fn pump(
     // indicate は捨てられるため、subscribe 済みになるまで送出を保留する(E2〜E4 と同じ)。
     let mut subscribed = false;
     let mut established_logged = false;
-    // GPIO7 の青 LED(M5Stack NanoC6、active-high)の現在値。OnOff 属性に追従させる。
-    let mut led_on = false;
+    // GPIO7 の青 LED(M5Stack NanoC6、active-high)の現在 PWM duty(13bit、0..=8191)。
+    // OnOff × CurrentLevel に追従させる(Dimmable Light 化)。
+    let mut led_duty: u32 = 0;
     // fabric 永続化: 直近に保存(または復元)した時点の generation。
     let mut saved_gen = fabrics.borrow().generation();
     // CASE resumption 永続化: 復元後の世代を基準に取り、変化時に flash 保存する(§7.4)。
@@ -436,13 +470,18 @@ async fn pump(
         let now = now_ms(start);
         if now >= next_heartbeat_ms {
             println!(
-                "[alive] t={}s conn={:?} subscribed={} wifi={:?} ip={:?} light={}",
+                "[alive] t={}s conn={:?} subscribed={} wifi={:?} ip={:?} light={} duty={}",
                 now / 1000,
                 conn.map(|c| c.0),
                 subscribed,
                 stack.device().net.driver().status(),
                 net_stack.config_v4().map(|c| c.address),
-                if led_on { "ON" } else { "OFF" }
+                if stack.device().onoff.is_on() {
+                    "ON"
+                } else {
+                    "OFF"
+                },
+                led_duty
             );
             next_heartbeat_ms = now + 10_000;
         }
@@ -638,11 +677,16 @@ async fn pump(
         // --- Wi-Fi join の結果(バックグラウンド)を NetworkCommissioning 属性へ反映 ---
         stack.device_mut().net.update_from_driver();
 
-        // --- OnOff 属性を実 LED(GPIO7)へ反映する ---
+        // --- OnOff × CurrentLevel を実 LED(GPIO7、LEDC PWM)へ反映する ---
+        // duty = CurrentLevel(1..=254)の 13bit 線形写像。Off または level null は消灯。
+        // Level Control の時間遷移(tick)は stack.poll → DataModel::on_tick が進めるので、
+        // ここでは現在値を duty に写すだけで LED がなめらかに変わる。
         let on = stack.device().onoff.is_on();
-        if on != led_on {
-            led_on = on;
-            led.set_level(if on { Level::High } else { Level::Low });
+        let lvl = stack.device().level.current_level().unwrap_or(0) as u32;
+        let duty = if on { (lvl * 8191 + 127) / 254 } else { 0 };
+        if duty != led_duty {
+            led_duty = duty;
+            led.set_duty_hw(duty);
         }
 
         // --- DHCP で IPv4 を取得したら運用 mDNS を開始する(doc §E5.5)---
@@ -788,8 +832,26 @@ async fn main(_spawner: Spawner) {
         addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]
     );
 
-    // M5Stack NanoC6 の青 LED(GPIO7、active-high)。OnOff 属性を実表示する。
-    let mut led = Output::new(peripherals.GPIO7, Level::Low, OutputConfig::default());
+    // M5Stack NanoC6 の青 LED(GPIO7、active-high)。Dimmable 化に伴い単純 GPIO から
+    // LEDC(PWM)へ変更し、CurrentLevel を輝度として実表示する。
+    // LowSpeed timer0 = 13bit @ 1kHz(APB 80MHz、13bit の上限 ~9.7kHz 内)。
+    let mut ledc = Ledc::new(peripherals.LEDC);
+    ledc.set_global_slow_clock(LSGlobalClkSource::APBClk);
+    let mut ledc_timer0 = ledc.timer::<LowSpeed>(ledc_timer::Number::Timer0);
+    ledc_timer0
+        .configure(ledc_timer::config::Config {
+            duty: ledc_timer::config::Duty::Duty13Bit,
+            clock_source: ledc_timer::LSClockSource::APBClk,
+            frequency: Rate::from_khz(1),
+        })
+        .expect("LEDC timer configure");
+    let mut led = ledc.channel::<LowSpeed>(channel::Number::Channel0, peripherals.GPIO7);
+    led.configure(channel::config::Config {
+        timer: &ledc_timer0,
+        duty_pct: 0,
+        drive_mode: DriveMode::PushPull,
+    })
+    .expect("LEDC channel configure");
 
     // --- Wi-Fi station(esp-radio、BLE と coex)+ embassy-net(DHCPv4)---
     let (wifi_controller, wifi_interfaces) = esp_radio::wifi::new(
@@ -967,7 +1029,7 @@ async fn main(_spawner: Spawner) {
         pump(
             &mut gatt,
             &mut stack,
-            &mut led,
+            &led,
             &fabrics,
             &mut kvs,
             net_stack,

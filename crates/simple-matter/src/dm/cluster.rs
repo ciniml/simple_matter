@@ -7,6 +7,7 @@
 
 use crate::dm::codec::AttrEncoder;
 use crate::dm::meta::{is_global_attribute, AttributeId, ClusterMeta, GLOBAL_ATTRIBUTE_IDS};
+use crate::dm::DataModel;
 use crate::im::wire::ImStatus;
 
 // ==========================================================================
@@ -89,6 +90,39 @@ pub fn read_global_attribute(
 /// `attr` がグローバル属性かを返す(再エクスポート便宜)。
 pub const fn is_global(attr: AttributeId) -> bool {
     is_global_attribute(attr)
+}
+
+// ==========================================================================
+// クラスタ tick 走査ヘルパ(設計 §15.1)
+// ==========================================================================
+
+/// 全 (endpoint, cluster) の [`ServerCluster::tick`](crate::dm::ServerCluster::tick) を走査し、
+/// 返された次回時刻の最小値を返す(設計 §15.1)。
+///
+/// [`DataModel::on_tick`] の既定実装と、手書きデバイスの `on_tick`(fail-safe/窓配線の後)から
+/// 呼ぶ。borrow 衝突を避けるため、endpoint / cluster は毎回 [`DataModel::endpoints`] /
+/// [`DataModel::clusters_on`] を引き直して ID(`Copy`)を index で取り出してから
+/// [`DataModel::cluster_mut`] を可変借用する。
+pub fn tick_clusters<D: DataModel + ?Sized>(dm: &mut D, now_ms: u64) -> Option<u64> {
+    let mut next: Option<u64> = None;
+    let ep_count = dm.endpoints().len();
+    for ei in 0..ep_count {
+        // endpoint ID を Copy で取り出してから可変借用に入る(borrow 衝突回避)。
+        let ep_id = dm.endpoints()[ei].id;
+        let cl_count = dm.clusters_on(ep_id).len();
+        for ci in 0..cl_count {
+            let cl_id = dm.clusters_on(ep_id)[ci];
+            if let Some(c) = dm.cluster_mut(ep_id, cl_id) {
+                if let Some(t) = c.tick(now_ms) {
+                    next = Some(match next {
+                        Some(n) => n.min(t),
+                        None => t,
+                    });
+                }
+            }
+        }
+    }
+    next
 }
 
 // ==========================================================================
@@ -220,6 +254,7 @@ macro_rules! cluster {
             revision: $rev:literal,
             feature_map: $fmap:literal,
             dirty: $dirty:tt,
+            $( tick: $tick:ident, )?
             invoke: $invoke:tt,
             attributes: [
                 $(
@@ -306,6 +341,12 @@ macro_rules! cluster {
             fn take_dirty(&mut self) -> bool {
                 $crate::__cluster_dirty!($dirty, self)
             }
+
+            $(
+                fn tick(&mut self, now_ms: u64) -> ::core::option::Option<u64> {
+                    self.$tick(now_ms)
+                }
+            )?
         }
     };
 }

@@ -25,7 +25,7 @@ pub mod codec;
 pub mod expand;
 pub mod meta;
 
-pub use cluster::{read_global_attribute, Dirty};
+pub use cluster::{read_global_attribute, tick_clusters, Dirty};
 pub use expand::PathExpandCursor;
 
 use crate::acl::AclHandle;
@@ -35,7 +35,7 @@ use crate::dm::meta::{
 };
 use crate::error::Error;
 use crate::im::wire::ImStatus;
-use crate::tlv::{TlvElement, TlvReader};
+use crate::tlv::{TlvElement, TlvReader, TlvValue};
 
 /// list 属性書き込みの操作種別(`docs/design/acl.md` §4)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +93,19 @@ impl<'a> AttrWrite<'a> {
             .value
             .as_unsigned()
             .map_err(|_| ImStatus::InvalidDataType)
+    }
+
+    /// 先頭要素を符号付き整数として読む(i16 setpoint 等。設計 §15.2)。
+    pub fn as_i64(&self) -> Result<i64, ImStatus> {
+        self.element()?
+            .value
+            .as_signed()
+            .map_err(|_| ImStatus::InvalidDataType)
+    }
+
+    /// 先頭要素が null かを返す(nullable 属性の write 判定。設計 §15.2)。
+    pub fn is_null(&self) -> bool {
+        matches!(self.element(), Ok(e) if matches!(e.value, TlvValue::Null))
     }
 
     /// 先頭要素を真偽値として読む。
@@ -173,6 +186,16 @@ pub trait ServerCluster {
         false
     }
 
+    /// 時間駆動フック(設計 §15.1)。`now_ms` 時点でクラスタ内部状態を進め、次に呼んでほしい
+    /// 絶対時刻(あれば)を返す。Level Control の TransitionTime 遷移のように、invoke 後も
+    /// 時間とともに属性が変わるクラスタが実装する。既定は no-op(`None`)で object-safe を保つ。
+    ///
+    /// 駆動源は統合層([`crate::stack`])の `on_tick`(→ [`tick_clusters`](crate::dm::tick_clusters))。
+    fn tick(&mut self, now_ms: u64) -> Option<u64> {
+        let _ = now_ms;
+        None
+    }
+
     /// **遅延 InvokeResponse** の完了を問い合わせる(設計 `port-esp32-device.md` §E7.1)。
     ///
     /// 直前の [`invoke_command`](ServerCluster::invoke_command) が
@@ -228,8 +251,13 @@ pub trait DataModel {
     /// を配線する。[`device!`](crate::device) マクロが生成する実装は既定のまま(汎用的に
     /// どのクラスタが fail-safe を持つか判定できないため、乖離。手書き `DataModel` 実装で
     /// 配線するか、将来の `device!` 拡張で対応)。返り値は次に処理すべき絶対時刻(あれば)。
-    fn on_tick(&mut self, _now_ms: u64) -> Option<u64> {
-        None
+    ///
+    /// 既定実装は全 (endpoint, cluster) の [`ServerCluster::tick`] を走査する
+    /// [`tick_clusters`] を呼ぶ(設計 §15.1)。これで `device!` 生成のデバイスと
+    /// 「on_tick を上書きしない」デバイスは自動でクラスタ tick が回る。on_tick を上書きする
+    /// 手書きデバイス(fail-safe/窓の手動配線がある例)は自分で `tick_clusters` も呼ぶ。
+    fn on_tick(&mut self, now_ms: u64) -> Option<u64> {
+        tick_clusters(self, now_ms)
     }
 
     /// ArmFailSafe(0) 受信時の仕様準拠 fail-safe クリーンアップ(Core Spec §11.10)。

@@ -7,7 +7,7 @@ use core::num::NonZeroU8;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::dm::clusters::{
-    BasicInfoConfig, BasicInformationCluster, DescriptorCluster, OnOffCluster,
+    BasicInfoConfig, BasicInformationCluster, DescriptorCluster, LevelControlCluster, OnOffCluster,
 };
 use crate::dm::codec::AttrEncoder;
 use crate::dm::meta::{
@@ -543,4 +543,74 @@ fn dyn_composition_two_endpoints() {
     let (_, res) = read_attr(sc, 0x0000, &mut buf);
     res.unwrap();
     assert_eq!(scalar(&buf), TlvValue::Boolean(true));
+}
+
+// ==========================================================================
+// 8. tick_clusters ヘルパ(設計 §15.1)
+// ==========================================================================
+
+/// Level Control を 1 個だけ載せた最小デバイス(tick_clusters 検証用)。
+struct DimDevice {
+    desc: DescriptorCluster,
+    level: LevelControlCluster,
+}
+
+crate::device! {
+    DimDevice {
+        endpoint 1 {
+            device_types: [ (0x0101, 3) ],
+            parts: [],
+            clusters: [ (0x001D, desc), (0x0008, level) ],
+        }
+    }
+}
+
+#[test]
+fn tick_clusters_drives_level_transition() {
+    let mut dev = DimDevice {
+        desc: DescriptorCluster::new(
+            EndpointId(1),
+            DimDevice::device_types(EndpointId(1)),
+            DimDevice::server_list(EndpointId(1)),
+            &[],
+            DimDevice::parts(EndpointId(1)),
+        ),
+        level: LevelControlCluster::new(),
+    };
+
+    // On にして MoveToLevel 201 を 10.0s(transitionTime=100)で開始する。
+    dev.level.notify_on_off(true);
+    let mut buf = [0u8; 64];
+    let n = {
+        let mut w = TlvWriter::new(&mut buf);
+        w.start_container(&TlvTag::Anonymous, ContainerType::Structure)
+            .unwrap();
+        w.write_u8(&TlvTag::ContextSpecific(0), 201).unwrap();
+        w.write_u16(&TlvTag::ContextSpecific(1), 100).unwrap();
+        w.end_container().unwrap();
+        w.len()
+    };
+    {
+        let sc = dev.cluster_mut(EndpointId(1), ClusterId(0x0008)).unwrap();
+        let mut fr = TlvReader::new(&buf[..n]);
+        let mut respbuf = [0u8; 16];
+        let mut rw = TlvWriter::new(&mut respbuf);
+        let mut resp = crate::dm::codec::CmdResponder::new(&mut rw);
+        let a = AccessContext::new(SessionKind::Case, NonZeroU8::new(1), 0, Privilege::Operate)
+            .with_env(0, [0u8; 16]);
+        sc.invoke_command(CommandId(0x00), &mut fr, &mut resp, &a)
+            .unwrap();
+    }
+    assert_eq!(dev.level.current_level(), Some(1));
+
+    // tick_clusters を DataModel 経由(on_tick 既定実装)で刻む。返り値は次回時刻あり。
+    let next = dev.on_tick(5_000);
+    assert!(next.is_some());
+    // 5s で中間値 ~101。
+    assert_eq!(dev.level.current_level(), Some(101));
+
+    // 完了まで進めると次回時刻は消える(遷移終了)。
+    let next = dev.on_tick(10_000);
+    assert_eq!(next, None);
+    assert_eq!(dev.level.current_level(), Some(201));
 }

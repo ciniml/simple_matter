@@ -114,6 +114,40 @@ impl<'w, 'b> AttrEncoder<'w, 'b> {
         self.write_i64(v as i64)
     }
 
+    /// `i8` を書く(設計 §15.2。TLV は最小幅符号化なのでワイヤ互換)。
+    pub fn write_i8(&mut self, v: i8) -> Result<(), ImStatus> {
+        self.write_i64(v as i64)
+    }
+
+    /// `i16` を書く(設計 §15.2)。
+    pub fn write_i16(&mut self, v: i16) -> Result<(), ImStatus> {
+        self.write_i64(v as i64)
+    }
+
+    /// nullable `u8`(`None` は null。設計 §15.2)。
+    pub fn write_nullable_u8(&mut self, v: Option<u8>) -> Result<(), ImStatus> {
+        match v {
+            Some(x) => self.write_u8(x),
+            None => self.write_null(),
+        }
+    }
+
+    /// nullable `u16`(`None` は null。設計 §15.2)。
+    pub fn write_nullable_u16(&mut self, v: Option<u16>) -> Result<(), ImStatus> {
+        match v {
+            Some(x) => self.write_u16(x),
+            None => self.write_null(),
+        }
+    }
+
+    /// nullable `i16`(`None` は null。設計 §15.2)。
+    pub fn write_nullable_i16(&mut self, v: Option<i16>) -> Result<(), ImStatus> {
+        match v {
+            Some(x) => self.write_i16(x),
+            None => self.write_null(),
+        }
+    }
+
     /// 配列(TLV array)属性を書く。`f` に [`ArrayEncoder`] を渡して要素を積む。
     pub fn write_array<F>(&mut self, f: F) -> Result<(), ImStatus>
     where

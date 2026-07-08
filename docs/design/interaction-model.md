@@ -1199,3 +1199,132 @@ cluster / event 省略)対応。`EventFilters` の `eventMin` があれば `even
 ChainedHandler から `&dyn` registry へ(型爆発回避)、(c) コード生成を macro_rules に絞り proc-macro を
 初期は持たない、(d) Subscribe device 発を IM 駆動 API + 統合層送信に分離(sans-IO 送受信分離の保持)、
 (e) ACL を初期スコープで明示的に近似する。
+
+---
+
+## 15. 複雑クラスタの実証 — Level Control(0x0008)/ Thermostat(0x0201)と cluster! 拡張
+
+第5段階までのクラスタは bool/u16/list が中心だった。本節は「複雑なクラスタ定義」の型実証として
+Dimmable Light(Level Control)と Thermostat を追加し、そのために必要な**最小の拡張**
+(tick フック / signed・nullable エンコード)を定義する。単一ソース原則(§8)は維持する。
+
+### 15.1 拡張 1: 時間駆動フック(`ServerCluster::tick` + `cluster!` の `tick:` 注釈)
+
+Level Control の TransitionTime 遷移は「invoke 後も時間とともに属性が変わる」初のクラスタ。
+既存の時間駆動は `DataModel::on_tick`(デバイス全体、fail-safe/窓タイムアウト用)しかなく、
+クラスタ単位のフックが無い。以下を追加する:
+
+```rust
+// dm.rs — ServerCluster に既定 no-op のメソッドを追加(object-safe 維持)
+fn tick(&mut self, now_ms: u64) -> Option<u64> { None }  // 返り値 = 次に呼んでほしい絶対時刻
+
+// dm/cluster.rs — 全クラスタ走査ヘルパ(手書き DataModel の on_tick から呼ぶ)
+pub fn tick_clusters<D: DataModel + ?Sized>(dm: &mut D, now_ms: u64) -> Option<u64>;
+```
+
+- `DataModel::on_tick` の**既定実装を `tick_clusters(self, now_ms)` に変更**する。これで
+  `device!` 生成のデバイスと「on_tick を上書きしない」デバイスは自動で tick が回る。
+  on_tick を上書きする example(fail-safe/窓の手動配線がある)は自分で `tick_clusters` も呼ぶ。
+- `cluster!` に**任意の `tick:` アーム**を追加する(`dirty:` と同形式)。`tick: on_tick` と書くと
+  `ServerCluster::tick` が `self.on_tick(now_ms)` へ委譲される。省略時は既定(no-op)のまま。
+  既存クラスタの宣言は無変更(後方互換)。
+- 駆動源は従来どおり統合層(`stack::poll`/`handle_rx` → `im.data_model_mut().on_tick(now)`)。
+  ループ周期(PC example 20ms / ESP32 pump)がそのまま遷移の分解能になる。十分。
+
+### 15.2 拡張 2: codec の signed / nullable 便宜メソッド
+
+- `AttrEncoder::write_i8 / write_i16`(既存 `write_i64` 委譲。TLV は最小幅符号化なのでワイヤ互換)。
+- `AttrEncoder::write_nullable_u8 / write_nullable_u16 / write_nullable_i16`(`Option<T>`、
+  `None` は `write_null`)。nullable 属性(CurrentLevel / OnLevel / LocalTemperature)の定石を 1 行にする。
+- `AttrWrite::as_i64()`(既存 `TlvValue::as_signed` 委譲)と `AttrWrite::is_null()`。
+  nullable 属性の write(OnLevel = null)と i16 属性の write(setpoint)に使う。
+- `StructEncoder::field_i8 / field_i16` は現時点で不要(生成レスポンスに signed フィールドを持つ
+  クラスタが無い)。必要になったら同型で足す。
+
+enum 検証・複合フィールドコマンドのパースは**クラスタ実装の手書きロジック**で行う(§8.1 の判断
+どおりマクロは dispatch 骨格まで。AdminCommissioning の OCW パースと同じパターン)。
+
+### 15.3 Level Control(0x0008)— `dm/clusters/level_control.rs`
+
+**feature_map = 0x03(OnOff bit0 | Lighting bit1)**、revision 6。LT を立てる根拠: 本タスクの要件
+(nullable CurrentLevel / RemainingTime)が LT の必須集合とほぼ一致し、chip-tool の Dimmable Light
+想定とも合う。LT に伴い MinLevel=1 / MaxLevel=254、StartUpCurrentLevel を持つ。
+
+| ID | 属性 | 型 | 備考 |
+|---|---|---|---|
+| 0x0000 | CurrentLevel | nullable u8, N S | 初期値 = MinLevel(=1) |
+| 0x0001 | RemainingTime | u16(0.1s) | 遷移中の残り時間 |
+| 0x0002 | MinLevel | u8 = 1 | 固定 |
+| 0x0003 | MaxLevel | u8 = 254 | 固定 |
+| 0x000F | Options | map8 rw | bit0 ExecuteIfOff / bit1 CoupleColorTemp。0..=3 以外は ConstraintError |
+| 0x0010 | OnOffTransitionTime | u16 rw(0.1s) | 既定 0 |
+| 0x0011 | OnLevel | nullable u8 rw | 1..=254 または null。範囲外 ConstraintError |
+| 0x4000 | StartUpCurrentLevel | nullable u8 rw, N | 実装は保持のみ(再起動反映はアプリ責務) |
+
+コマンド(0x00-0x07): MoveToLevel / Move / Step / Stop と各 WithOnOff 変種。フィールドパースは
+context タグの手書き match。TransitionTime は nullable u16 — **null または 0 = 即時**(Matter 仕様
+「as fast as able」の解釈)。Move の Rate も nullable u8 — null = 即時に min/max へ。
+
+**遷移エンジン**(`tick`): invoke 時に `(start_level, target, start_ms, end_ms, with_onoff)` を記録
+(`acc.now_ms` を利用)。tick で線形補間(整数演算)し、量子化後の CurrentLevel が変わったときだけ
+dirty を立てる。RemainingTime は値としては毎 tick 更新するが、**dirty は遷移の開始/終了時のみ**
+(仕様 §1.6.6.2 の報告抑制の趣旨)。完了時に target を確定し RemainingTime=0。
+
+**OnOff 連動(仕様 §1.6 の最小実装)** — クラスタ間結合は他クラスタ直参照を避け、
+AdminCommissioning の窓と同じ「アプリ(DataModel 実装)が仲介する契約」にする:
+
+```rust
+impl LevelControlCluster {
+    pub fn take_on_off_request(&mut self) -> Option<bool>; // Level → OnOff(WithOnOff 変種の要求)
+    pub fn notify_on_off(&mut self, on: bool);             // OnOff → Level(外部要因の変化通知)
+    pub fn coupled_on(&self) -> bool;                      // 現在把握している OnOff 状態
+}
+// デバイスの on_tick(tick_clusters の後):
+// if let Some(on) = level.take_on_off_request() { onoff.set(on); }
+// let on = onoff.is_on();
+// if on != level.coupled_on() { level.notify_on_off(on); }
+```
+
+- WithOnOff 変種: 目標 > MinLevel なら**開始時に** On 要求、目標 = MinLevel なら**遷移完了時に**
+  Off 要求。
+- `notify_on_off(true)`(外部の On コマンド等): OnLevel が非 null なら CurrentLevel = OnLevel
+  (即時反映)。`notify_on_off(false)`: 遷移中なら中断。
+- 非 WithOnOff コマンドは Off 中は **ExecuteIfOff**(Options bit0、optionsMask/optionsOverride で
+  一時上書き)が立っていない限り無効果で Success(仕様どおり discard)。
+- 割り切り: OnOff クラスタ側の LT feature(On/Off 遷移で level をランプする §1.5.7)は導入しない。
+  OnOff クラスタは従来の feature_map=0 のまま。
+
+### 15.4 Thermostat(0x0201)— `dm/clusters/thermostat.rs`
+
+**feature_map = 0x03(HEAT bit0 | COOL bit1)**、revision 6。最小実機能セット:
+
+| ID | 属性 | 型 | 備考 |
+|---|---|---|---|
+| 0x0000 | LocalTemperature | nullable i16(0.01℃) | 外部注入 `set_local_temperature(Option<i16>)` |
+| 0x0011 | OccupiedCoolingSetpoint | i16 rw | 既定 2600 |
+| 0x0012 | OccupiedHeatingSetpoint | i16 rw | 既定 2000 |
+| 0x0015-0x0018 | Min/MaxHeat・Min/MaxCool Limit | i16 固定 | 700/3000/1600/3200(仕様既定) |
+| 0x001B | ControlSequenceOfOperation | enum8 rw | 既定 4(CoolingAndHeating)。0..=5 以外 ConstraintError |
+| 0x001C | SystemMode | enum8 rw | 既定 1→ **Off(0)/Cool(3)/Heat(4)+Auto は不可** |
+
+- setpoint write の検証: Min/Max 範囲外 → ConstraintError。**相互制約**: AUTO feature は持たないが
+  型実証として deadband(内部定数 `DEADBAND = 250` = 2.5℃)を強制し、
+  heating > cooling − deadband となる write を ConstraintError にする(仕様の
+  AUTO 時制約の準用。doc 明記の割り切り)。
+- SystemMode write の検証(enum 検証の実証): 値が {0,3,4} 以外 → ConstraintError
+  (AUTO 無しなので 1=Auto も拒否)。ControlSequenceOfOperation との整合(例: CoolingOnly で
+  Heat 拒否)も検証する。
+- **SetpointRaiseLower(0x00)**(複合フィールドコマンドの実証): `{ 0: mode enum8, 1: amount i8 }`。
+  mode 0=Heat / 1=Cool / 2=Both(それ以外 ConstraintError)。amount は **0.1℃ 単位** → ×10 して
+  setpoint に加算し、**Min/Max と deadband へクランプ**(仕様どおりエラーにしない)。
+- LocalTemperature の擬似センサ(setpoint へ漸近するシム)は example 側(`on_tick` 駆動)。
+  クラスタはあくまで値の器 + 検証ロジック。
+
+### 15.5 デバイスタイプと必須クラスタ束(現状方針の明記)
+
+デバイスタイプ(EP1 = 0x0101 Dimmable Light / 0x0301 Thermostat)の必須クラスタ束は、従来どおり
+**DataModel 構成(手書き struct / device! マクロの宣言)で表現する**。宣言したデバイスタイプに
+対する必須クラスタの機械的強制(zap の conformance チェック相当)は導入しない — 本実装の
+DataModel は「構成 = 宣言」であり、束の検証は E2E(chip-tool)が事実上のゲートになる。
+Identify / Groups 等、デバイスタイプ仕様上は必須だが未実装のクラスタは割り切りとして記録する
+(chip-tool は enforcement しない)。
