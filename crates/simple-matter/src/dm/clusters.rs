@@ -6,11 +6,15 @@
 pub mod access_control;
 pub mod administrator_commissioning;
 pub mod basic_information;
+pub mod boolean_state;
 pub(crate) mod cmd;
 pub mod descriptor;
 pub mod general_commissioning;
+pub mod identify;
 pub mod level_control;
+pub mod measurement;
 pub mod network_commissioning;
+pub mod occupancy_sensing;
 pub mod on_off;
 pub mod operational_credentials;
 pub mod thermostat;
@@ -20,10 +24,17 @@ pub use administrator_commissioning::{
     AdminCommissioningCluster, CommissioningWindow, WindowEvent,
 };
 pub use basic_information::{BasicInfoConfig, BasicInformationCluster};
+pub use boolean_state::BooleanStateCluster;
 pub use descriptor::DescriptorCluster;
 pub use general_commissioning::{FailSafe, GeneralCommissioning};
+pub use identify::IdentifyCluster;
 pub use level_control::LevelControlCluster;
+pub use measurement::{
+    FlowMeasurementCluster, IlluminanceMeasurementCluster, PressureMeasurementCluster,
+    RelativeHumidityMeasurementCluster, TemperatureMeasurementCluster,
+};
 pub use network_commissioning::{NetworkCommissioning, NetworkCommissioningWifi};
+pub use occupancy_sensing::OccupancySensingCluster;
 pub use on_off::OnOffCluster;
 pub use operational_credentials::{DacProvider, OpCredsCluster, TestDacProvider};
 pub use thermostat::ThermostatCluster;

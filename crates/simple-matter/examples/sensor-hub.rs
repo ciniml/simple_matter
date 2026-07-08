@@ -1,26 +1,26 @@
-//! std 上の Dimmable Light サンプル(ロードマップ第5段階 §15 の型実証)。
+//! std 上のマルチ EP センサハブサンプル(`docs/design/basic-clusters.md` §1.5)。
 //!
-//! [`onoff-light`](../onoff-light.rs) をベースに、EP1 を **Dimmable Light**
-//! (DeviceType 0x0101)にして On/Off(0x0006)+ Level Control(0x0008)+ Descriptor を
-//! 載せる。Level Control の TransitionTime 遷移は
-//! [`ServerCluster::tick`](simple_matter::dm::ServerCluster::tick) を
-//! [`tick_clusters`](simple_matter::dm::tick_clusters) 経由で駆動する(設計 §15.1)。
-//! OnOff ⇔ Level の連動はアプリ(この example)が
-//! [`take_on_off_request`](simple_matter::dm::clusters::LevelControlCluster::take_on_off_request)/
-//! [`notify_on_off`](simple_matter::dm::clusters::LevelControlCluster::notify_on_off) で仲介する
-//! (設計 §15.3)。
+//! [`thermostat`](../thermostat.rs) をベースに、EP1-7 に 7 種のセンサデバイスタイプを載せて
+//! Identify + 各センサクラスタ + Descriptor を手書き [`DataModel`] で構成する(共有 OpCreds の
+//! ライフタイムのため `device!` マクロは使えない)。擬似センサを `on_tick`(約 1 秒周期)で駆動する。
 //!
-//! # 構成
+//! # 構成(EP メタは各 EP のコメント参照。Device Library の必須/実装済み/省略を明記)
 //!
-//! - EP0: Basic Information / General Commissioning / Network Commissioning /
-//!   Operational Credentials / AccessControl / AdminCommissioning / Descriptor
-//! - EP1: On/Off / Level Control / Descriptor
-//! - パスコード 20202021 + テスト DAC([`TestDacProvider`])。On/Off / CurrentLevel 変化を `println!`。
+//! - EP0: Root Node(0x0016)。既存 7 種(BasicInformation / GeneralCommissioning /
+//!   NetworkCommissioning / OperationalCredentials / AccessControl / AdminCommissioning /
+//!   Descriptor)。
+//! - EP1: Temperature Sensor(0x0302)/ EP2: Humidity Sensor(0x0307)/
+//!   EP3: Contact Sensor(0x0015)/ EP4: Occupancy Sensor(0x0107)/
+//!   EP5: Light Sensor(0x0106)/ EP6: Pressure Sensor(0x0305)/ EP7: Flow Sensor(0x0306)。
 //!
-//! mDNS ディスカバリは [`MdnsResponder`](simple_matter::discovery::MdnsResponder) で駆動する。
-//! mDNS インスタンス ID は onoff-light と別値にして、同一ホストで併走しても衝突しないようにする。
+//! # 擬似センサ(設計 §1.5)
 //!
-//! 実行: `cargo run --example dimmable-light`
+//! - 温度 2150±100 / 湿度 5000±500 / 照度 30000±1000 / 気圧 1013±20 / 流量 100±50 を三角波で揺らす。
+//! - 接点は 15 秒ごとにトグルし、StateChange イベントを pending に積む(main loop が
+//!   [`take_state_change`](simple_matter::dm::clusters::BooleanStateCluster::take_state_change) で
+//!   回収して `stack.post_event` する)。在室は 20 秒ごとにトグル。
+//!
+//! 実行: `cargo run --example sensor-hub`
 
 use std::cell::RefCell;
 use std::io::ErrorKind;
@@ -37,8 +37,10 @@ use simple_matter::discovery::{
 };
 use simple_matter::dm::clusters::{
     AccessControlCluster, AdminCommissioningCluster, BasicInfoConfig, BasicInformationCluster,
-    CommissioningWindow, DescriptorCluster, GeneralCommissioning, IdentifyCluster,
-    LevelControlCluster, NetworkCommissioning, OnOffCluster, OpCredsCluster, TestDacProvider,
+    BooleanStateCluster, CommissioningWindow, DescriptorCluster, FlowMeasurementCluster,
+    GeneralCommissioning, IdentifyCluster, IlluminanceMeasurementCluster, NetworkCommissioning,
+    OccupancySensingCluster, OpCredsCluster, PressureMeasurementCluster,
+    RelativeHumidityMeasurementCluster, TemperatureMeasurementCluster, TestDacProvider,
     WindowEvent,
 };
 use simple_matter::dm::meta::{ClusterId, DeviceType, EndpointId, EndpointMeta, EventId};
@@ -61,11 +63,13 @@ const NACL: usize = 20;
 
 /// コミッショニング discriminator(12 ビット)。chip-tool の既定テスト値。
 const DISCRIMINATOR: u16 = 3840;
-/// mDNS インスタンス識別子。onoff-light(0x0011_2233_4455_6677)と別値にして
-/// 同一ホスト併走時の衝突を避ける(設計 §15.4 の割り切り)。
-const MDNS_INSTANCE_ID: u64 = 0x0011_2233_4455_66AA;
-/// Dimmable Light デバイスタイプ ID(mDNS 広告と Descriptor で使う)。
-const DEVICE_TYPE_DIMMABLE: u32 = 0x0101;
+/// mDNS インスタンス識別子。他 example と別値にして同一ホスト併走時の衝突を避ける(設計 §1.5)。
+const MDNS_INSTANCE_ID: u64 = 0x0011_2233_4455_66CC;
+/// mDNS 広告用のデバイスタイプ ID(先頭機能 EP = Temperature Sensor)。
+const DEVICE_TYPE_SENSOR: u32 = 0x0302;
+
+/// 擬似センサの駆動周期(ms)。設計 §1.5: 約 1 秒ごとに更新。
+const SENSOR_PERIOD_MS: u64 = 1_000;
 
 type Backend = RustCrypto<DemoRng>;
 type Dac = TestDacProvider<Backend>;
@@ -147,15 +151,16 @@ impl Kvs for FileKvs {
 static CFG: BasicInfoConfig = BasicInfoConfig {
     vendor_name: "SimpleMatter",
     vendor_id: 0xFFF1,
-    product_name: "DimmableLight",
-    product_id: 0x8002,
+    product_name: "SensorHub",
+    product_id: 0x8004,
     hardware_version: 1,
     hardware_version_string: "HW1",
     software_version: 0x0001_0000,
     software_version_string: "1.0.0",
-    serial_number: "SM-DIM-0001",
+    serial_number: "SM-SENSOR-0004",
 };
 
+// EP0 = Root Node(0x0016)。既存 7 種(必須すべて実装済み)。
 static EP0_SERVERS: &[ClusterId] = &[
     ClusterId(0x001F),
     ClusterId(0x0028),
@@ -165,19 +170,60 @@ static EP0_SERVERS: &[ClusterId] = &[
     ClusterId(0x003E),
     ClusterId(0x001D),
 ];
-// EP1 = Dimmable Light: On/Off(0x0006)+ Level Control(0x0008)+ Descriptor(0x001D)。
-static EP1_SERVERS: &[ClusterId] = &[
-    ClusterId(0x0003),
-    ClusterId(0x0006),
-    ClusterId(0x0008),
-    ClusterId(0x001D),
-];
-static EP0_DT: &[DeviceType] = &[DeviceType::new(0x0016, 1)];
-static EP1_DT: &[DeviceType] = &[DeviceType::new(DEVICE_TYPE_DIMMABLE, 3)];
-static EP0_PARTS: &[EndpointId] = &[EndpointId(1)];
-static EP1_PARTS: &[EndpointId] = &[];
+// EP1 = Temperature Sensor(0x0302、rev 2)。
+//   必須: Identify(実装済み)/ TemperatureMeasurement(実装済み)/ Descriptor(実装済み)。
+//   省略: なし(Device Library の Temperature Sensor は Groups/Scenes を必須にしない)。
+static EP1_SERVERS: &[ClusterId] = &[ClusterId(0x0003), ClusterId(0x001D), ClusterId(0x0402)];
+// EP2 = Humidity Sensor(0x0307、rev 2)。必須: Identify / RelativeHumidity / Descriptor(実装済み)。
+static EP2_SERVERS: &[ClusterId] = &[ClusterId(0x0003), ClusterId(0x001D), ClusterId(0x0405)];
+// EP3 = Contact Sensor(0x0015、rev 1)。必須: Identify / BooleanState / Descriptor(実装済み)。
+static EP3_SERVERS: &[ClusterId] = &[ClusterId(0x0003), ClusterId(0x001D), ClusterId(0x0045)];
+// EP4 = Occupancy Sensor(0x0107、rev 3)。必須: Identify / OccupancySensing / Descriptor(実装済み)。
+static EP4_SERVERS: &[ClusterId] = &[ClusterId(0x0003), ClusterId(0x001D), ClusterId(0x0406)];
+// EP5 = Light Sensor(0x0106、rev 2)。必須: Identify / IlluminanceMeasurement / Descriptor(実装済み)。
+static EP5_SERVERS: &[ClusterId] = &[ClusterId(0x0003), ClusterId(0x001D), ClusterId(0x0400)];
+// EP6 = Pressure Sensor(0x0305、rev 2)。必須: Identify / PressureMeasurement / Descriptor(実装済み)。
+static EP6_SERVERS: &[ClusterId] = &[ClusterId(0x0003), ClusterId(0x001D), ClusterId(0x0403)];
+// EP7 = Flow Sensor(0x0306、rev 2)。必須: Identify / FlowMeasurement / Descriptor(実装済み)。
+static EP7_SERVERS: &[ClusterId] = &[ClusterId(0x0003), ClusterId(0x001D), ClusterId(0x0404)];
 
-struct Light<'s> {
+static EP0_DT: &[DeviceType] = &[DeviceType::new(0x0016, 1)];
+static EP1_DT: &[DeviceType] = &[DeviceType::new(0x0302, 2)];
+static EP2_DT: &[DeviceType] = &[DeviceType::new(0x0307, 2)];
+static EP3_DT: &[DeviceType] = &[DeviceType::new(0x0015, 1)];
+static EP4_DT: &[DeviceType] = &[DeviceType::new(0x0107, 3)];
+static EP5_DT: &[DeviceType] = &[DeviceType::new(0x0106, 2)];
+static EP6_DT: &[DeviceType] = &[DeviceType::new(0x0305, 2)];
+static EP7_DT: &[DeviceType] = &[DeviceType::new(0x0306, 2)];
+
+// Root(EP0)の子エンドポイントは EP1-7。機能 EP は子を持たない。
+static EP0_PARTS: &[EndpointId] = &[
+    EndpointId(1),
+    EndpointId(2),
+    EndpointId(3),
+    EndpointId(4),
+    EndpointId(5),
+    EndpointId(6),
+    EndpointId(7),
+];
+static NO_PARTS: &[EndpointId] = &[];
+
+/// 三角波(base±amp、`step` 刻み)。周期は `4*amp/step` tick(設計 §1.5)。
+fn triangle(ticks: u64, base: i32, amp: i32, step: i32) -> i32 {
+    if amp <= 0 || step <= 0 {
+        return base;
+    }
+    let period = (4 * amp / step) as u64;
+    // 0..4*amp のこぎり位置。
+    let p = ((ticks % period) as i32) * step;
+    if p <= 2 * amp {
+        base - amp + p
+    } else {
+        base + amp - (p - 2 * amp)
+    }
+}
+
+struct SensorHub<'s> {
     acl: &'s RefCell<AclTable<NACL>>,
     access_control: AccessControlCluster<'s, NACL>,
     basic: BasicInformationCluster,
@@ -186,19 +232,70 @@ struct Light<'s> {
     admin: AdminCommissioningCluster<'s>,
     opcreds: OpCreds<'s>,
     desc0: DescriptorCluster,
-    identify: IdentifyCluster,
-    onoff: OnOffCluster,
-    level: LevelControlCluster,
+    // EP1-7 の Identify(各 EP 独立の IdentifyTime を持つ)。
+    identify1: IdentifyCluster,
+    identify2: IdentifyCluster,
+    identify3: IdentifyCluster,
+    identify4: IdentifyCluster,
+    identify5: IdentifyCluster,
+    identify6: IdentifyCluster,
+    identify7: IdentifyCluster,
+    // 各センサクラスタ。
+    temp: TemperatureMeasurementCluster,
+    humidity: RelativeHumidityMeasurementCluster,
+    contact: BooleanStateCluster,
+    occupancy: OccupancySensingCluster,
+    illuminance: IlluminanceMeasurementCluster,
+    pressure: PressureMeasurementCluster,
+    flow: FlowMeasurementCluster,
+    // 機能 EP の Descriptor。
     desc1: DescriptorCluster,
+    desc2: DescriptorCluster,
+    desc3: DescriptorCluster,
+    desc4: DescriptorCluster,
+    desc5: DescriptorCluster,
+    desc6: DescriptorCluster,
+    desc7: DescriptorCluster,
     /// fail-safe タイマ経過で削除した fabric index の退避先(stack が take する)。
     removed_fabric: Option<core::num::NonZeroU8>,
+    /// 擬似センサの経過 tick(約 1 秒ごとに 1 増える)。
+    sensor_ticks: u64,
+    /// 擬似センサを最後に進めた時刻(ms)。
+    last_sensor_ms: u64,
 }
 
-impl DataModel for Light<'_> {
+impl SensorHub<'_> {
+    /// 擬似センサを 1 ステップ進める(設計 §1.5)。
+    fn step_sensors(&mut self) {
+        let t = self.sensor_ticks;
+        self.temp
+            .set_measured(Some(triangle(t, 2150, 100, 10) as i16));
+        self.humidity
+            .set_measured(Some(triangle(t, 5000, 500, 50) as u16));
+        self.illuminance
+            .set_measured(Some(triangle(t, 30000, 1000, 100) as u16));
+        self.pressure
+            .set_measured(Some(triangle(t, 1013, 20, 2) as i16));
+        self.flow.set_measured(Some(triangle(t, 100, 50, 5) as u16));
+        // 接点は 15 秒ごとにトグル(StateChange イベントは main loop が post する)。
+        self.contact.set_state((t / 15) % 2 == 1);
+        // 在室は 20 秒ごとにトグル。
+        self.occupancy.set_occupied((t / 20) % 2 == 1);
+        self.sensor_ticks = self.sensor_ticks.wrapping_add(1);
+    }
+}
+
+impl DataModel for SensorHub<'_> {
     fn endpoints(&self) -> &[EndpointMeta] {
         static EPS: &[EndpointMeta] = &[
             EndpointMeta::new(EndpointId(0), EP0_DT, EP0_SERVERS),
             EndpointMeta::new(EndpointId(1), EP1_DT, EP1_SERVERS),
+            EndpointMeta::new(EndpointId(2), EP2_DT, EP2_SERVERS),
+            EndpointMeta::new(EndpointId(3), EP3_DT, EP3_SERVERS),
+            EndpointMeta::new(EndpointId(4), EP4_DT, EP4_SERVERS),
+            EndpointMeta::new(EndpointId(5), EP5_DT, EP5_SERVERS),
+            EndpointMeta::new(EndpointId(6), EP6_DT, EP6_SERVERS),
+            EndpointMeta::new(EndpointId(7), EP7_DT, EP7_SERVERS),
         ];
         EPS
     }
@@ -206,6 +303,12 @@ impl DataModel for Light<'_> {
         match ep.0 {
             0 => EP0_SERVERS,
             1 => EP1_SERVERS,
+            2 => EP2_SERVERS,
+            3 => EP3_SERVERS,
+            4 => EP4_SERVERS,
+            5 => EP5_SERVERS,
+            6 => EP6_SERVERS,
+            7 => EP7_SERVERS,
             _ => &[],
         }
     }
@@ -218,10 +321,27 @@ impl DataModel for Light<'_> {
             (0, 0x003C) => Some(&self.admin),
             (0, 0x003E) => Some(&self.opcreds),
             (0, 0x001D) => Some(&self.desc0),
-            (1, 0x0003) => Some(&self.identify),
-            (1, 0x0006) => Some(&self.onoff),
-            (1, 0x0008) => Some(&self.level),
+            (1, 0x0003) => Some(&self.identify1),
+            (1, 0x0402) => Some(&self.temp),
             (1, 0x001D) => Some(&self.desc1),
+            (2, 0x0003) => Some(&self.identify2),
+            (2, 0x0405) => Some(&self.humidity),
+            (2, 0x001D) => Some(&self.desc2),
+            (3, 0x0003) => Some(&self.identify3),
+            (3, 0x0045) => Some(&self.contact),
+            (3, 0x001D) => Some(&self.desc3),
+            (4, 0x0003) => Some(&self.identify4),
+            (4, 0x0406) => Some(&self.occupancy),
+            (4, 0x001D) => Some(&self.desc4),
+            (5, 0x0003) => Some(&self.identify5),
+            (5, 0x0400) => Some(&self.illuminance),
+            (5, 0x001D) => Some(&self.desc5),
+            (6, 0x0003) => Some(&self.identify6),
+            (6, 0x0403) => Some(&self.pressure),
+            (6, 0x001D) => Some(&self.desc6),
+            (7, 0x0003) => Some(&self.identify7),
+            (7, 0x0404) => Some(&self.flow),
+            (7, 0x001D) => Some(&self.desc7),
             _ => None,
         }
     }
@@ -234,10 +354,27 @@ impl DataModel for Light<'_> {
             (0, 0x003C) => Some(&mut self.admin),
             (0, 0x003E) => Some(&mut self.opcreds),
             (0, 0x001D) => Some(&mut self.desc0),
-            (1, 0x0003) => Some(&mut self.identify),
-            (1, 0x0006) => Some(&mut self.onoff),
-            (1, 0x0008) => Some(&mut self.level),
+            (1, 0x0003) => Some(&mut self.identify1),
+            (1, 0x0402) => Some(&mut self.temp),
             (1, 0x001D) => Some(&mut self.desc1),
+            (2, 0x0003) => Some(&mut self.identify2),
+            (2, 0x0405) => Some(&mut self.humidity),
+            (2, 0x001D) => Some(&mut self.desc2),
+            (3, 0x0003) => Some(&mut self.identify3),
+            (3, 0x0045) => Some(&mut self.contact),
+            (3, 0x001D) => Some(&mut self.desc3),
+            (4, 0x0003) => Some(&mut self.identify4),
+            (4, 0x0406) => Some(&mut self.occupancy),
+            (4, 0x001D) => Some(&mut self.desc4),
+            (5, 0x0003) => Some(&mut self.identify5),
+            (5, 0x0400) => Some(&mut self.illuminance),
+            (5, 0x001D) => Some(&mut self.desc5),
+            (6, 0x0003) => Some(&mut self.identify6),
+            (6, 0x0403) => Some(&mut self.pressure),
+            (6, 0x001D) => Some(&mut self.desc6),
+            (7, 0x0003) => Some(&mut self.identify7),
+            (7, 0x0404) => Some(&mut self.flow),
+            (7, 0x001D) => Some(&mut self.desc7),
             _ => None,
         }
     }
@@ -250,16 +387,12 @@ impl DataModel for Light<'_> {
         }
         // コミッショニング窓のタイムアウト自動クローズ(admin-commissioning.md §2)。
         let _ = self.admin.on_tick(now_ms);
-        // クラスタ tick(Level Control の遷移エンジン)を回す(設計 §15.1)。
-        // on_tick を手書きで上書きしているため、tick_clusters は明示的に呼ぶ。
+        // クラスタ tick(Identify の IdentifyTime 減衰)を回す(設計 §1.1/§15.1)。
         let next = tick_clusters(self, now_ms);
-        // OnOff ⇔ Level の連動 sync(設計 §15.3 のコード断片どおり)。
-        if let Some(on) = self.level.take_on_off_request() {
-            self.onoff.set(on);
-        }
-        let on = self.onoff.is_on();
-        if on != self.level.coupled_on() {
-            self.level.notify_on_off(on);
+        // 擬似センサ: 約 1 秒周期で各センサ値を更新する(設計 §1.5)。
+        if now_ms.saturating_sub(self.last_sensor_ms) >= SENSOR_PERIOD_MS {
+            self.last_sensor_ms = now_ms;
+            self.step_sensors();
         }
         next
     }
@@ -278,11 +411,11 @@ impl DataModel for Light<'_> {
     }
 }
 
-fn build_light<'s>(
+fn build_sensor_hub<'s>(
     fabrics: &'s RefCell<FabricTable<Backend, NF>>,
     acl: &'s RefCell<AclTable<NACL>>,
     window: &'s RefCell<CommissioningWindow>,
-) -> Light<'s> {
+) -> SensorHub<'s> {
     let dac_crypto = RustCrypto::new(DemoRng::from_time());
     let dac = if std::env::var_os("SM_TAMPER_CD").is_some() {
         eprintln!("[dac] SM_TAMPER_CD set: serving a tampered Certification Declaration");
@@ -290,7 +423,7 @@ fn build_light<'s>(
     } else {
         TestDacProvider::new(&dac_crypto).expect("test DAC")
     };
-    Light {
+    SensorHub {
         acl,
         access_control: AccessControlCluster::new(acl),
         basic: BasicInformationCluster::new(&CFG),
@@ -299,21 +432,47 @@ fn build_light<'s>(
         admin: AdminCommissioningCluster::new(window),
         opcreds: OpCredsCluster::new_shared(fabrics, RustCrypto::new(DemoRng::from_time()), dac),
         desc0: DescriptorCluster::new(EndpointId(0), EP0_DT, EP0_SERVERS, &[], EP0_PARTS),
-        // 識別中/終了を println で通知する。
-        identify: IdentifyCluster::new().with_listener(|on| {
-            println!("[identify] {}", if on { "identifying" } else { "stopped" });
-        }),
-        // On/Off 変化を println で通知する。
-        onoff: OnOffCluster::new().with_listener(|on| {
-            println!("[onoff] light is now {}", if on { "ON" } else { "OFF" });
-        }),
-        // CurrentLevel 変化を println で通知する(設計 §15.3)。
-        level: LevelControlCluster::new().with_listener(|lvl| match lvl {
-            Some(v) => println!("[level] CurrentLevel={v}"),
-            None => println!("[level] CurrentLevel=null"),
-        }),
-        desc1: DescriptorCluster::new(EndpointId(1), EP1_DT, EP1_SERVERS, &[], EP1_PARTS),
+        // 各 EP の Identify: 識別中/終了を println で通知する(EP 番号付き)。
+        identify1: IdentifyCluster::new()
+            .with_listener(|on| println!("[identify] EP1 {}", ident_state(on))),
+        identify2: IdentifyCluster::new()
+            .with_listener(|on| println!("[identify] EP2 {}", ident_state(on))),
+        identify3: IdentifyCluster::new()
+            .with_listener(|on| println!("[identify] EP3 {}", ident_state(on))),
+        identify4: IdentifyCluster::new()
+            .with_listener(|on| println!("[identify] EP4 {}", ident_state(on))),
+        identify5: IdentifyCluster::new()
+            .with_listener(|on| println!("[identify] EP5 {}", ident_state(on))),
+        identify6: IdentifyCluster::new()
+            .with_listener(|on| println!("[identify] EP6 {}", ident_state(on))),
+        identify7: IdentifyCluster::new()
+            .with_listener(|on| println!("[identify] EP7 {}", ident_state(on))),
+        temp: TemperatureMeasurementCluster::new(Some(-4000), Some(12500)),
+        humidity: RelativeHumidityMeasurementCluster::new(Some(0), Some(10000)),
+        contact: BooleanStateCluster::new(),
+        occupancy: OccupancySensingCluster::new(),
+        illuminance: IlluminanceMeasurementCluster::new(Some(1), Some(0xFFFE)),
+        pressure: PressureMeasurementCluster::new(Some(0), Some(10000)),
+        flow: FlowMeasurementCluster::new(Some(0), Some(0xFFFE)),
+        desc1: DescriptorCluster::new(EndpointId(1), EP1_DT, EP1_SERVERS, &[], NO_PARTS),
+        desc2: DescriptorCluster::new(EndpointId(2), EP2_DT, EP2_SERVERS, &[], NO_PARTS),
+        desc3: DescriptorCluster::new(EndpointId(3), EP3_DT, EP3_SERVERS, &[], NO_PARTS),
+        desc4: DescriptorCluster::new(EndpointId(4), EP4_DT, EP4_SERVERS, &[], NO_PARTS),
+        desc5: DescriptorCluster::new(EndpointId(5), EP5_DT, EP5_SERVERS, &[], NO_PARTS),
+        desc6: DescriptorCluster::new(EndpointId(6), EP6_DT, EP6_SERVERS, &[], NO_PARTS),
+        desc7: DescriptorCluster::new(EndpointId(7), EP7_DT, EP7_SERVERS, &[], NO_PARTS),
         removed_fabric: None,
+        sensor_ticks: 0,
+        last_sensor_ms: 0,
+    }
+}
+
+/// Identify リスナのメッセージ断片。
+fn ident_state(on: bool) -> &'static str {
+    if on {
+        "identifying"
+    } else {
+        "stopped"
     }
 }
 
@@ -326,8 +485,8 @@ fn main() -> std::io::Result<()> {
     let config = PaseConfig::from_passcode_default(PASSCODE, &SALT).expect("PASE config");
     let creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
     let sc = SecureChannel::new(&crypto, DemoRng::from_time(), config, creds);
-    let im = InteractionModel::new(build_light(&fabrics, &acl, &window));
-    let mut stack: DefaultStack<Backend, DemoRng, Light> = MatterStack::new(&crypto, sc, im);
+    let im = InteractionModel::new(build_sensor_hub(&fabrics, &acl, &window));
+    let mut stack: DefaultStack<Backend, DemoRng, SensorHub> = MatterStack::new(&crypto, sc, im);
 
     let _ = stack.post_startup_event(CFG.software_version, 0);
 
@@ -384,9 +543,9 @@ fn main() -> std::io::Result<()> {
     if sii_ms.is_some() || sai_ms.is_some() {
         println!("  mDNS TXT SII/SAI advertised: SII={sii_ms:?}ms SAI={sai_ms:?}ms");
     }
-    // commissionable 広告(Dimmable Light は device_type=0x0101 を広告する)。
+    // commissionable 広告(先頭機能 EP の device_type=0x0302 を広告する)。
     let commissionable = |discriminator: u16, mode: CommissioningMode| Commissionable {
-        device_type: Some(DEVICE_TYPE_DIMMABLE),
+        device_type: Some(DEVICE_TYPE_SENSOR),
         device_name: Some(CFG.product_name),
         sii: sii_ms,
         sai: sai_ms,
@@ -421,7 +580,7 @@ fn main() -> std::io::Result<()> {
     let mdns_v6_dst: Option<SocketAddr> = local_ipv6
         .map(|(_, scope)| SocketAddr::V6(SocketAddrV6::new(MDNS_IPV6, MDNS_PORT, 0, scope)));
 
-    println!("simple-matter Dimmable light listening on UDP/5540 (dual-stack)");
+    println!("simple-matter SensorHub listening on UDP/5540 (dual-stack)");
     println!("  passcode: {PASSCODE}  discriminator: {DISCRIMINATOR}");
     match &mdns_socket {
         Some(_) => println!("  mDNS advertising on 224.0.0.251:5353 (A record: {local_ipv4})"),
@@ -440,7 +599,6 @@ fn main() -> std::io::Result<()> {
     let mut mdns_tx = [0u8; 1500];
     let mut last_generation = fabrics.borrow().generation();
     let mut last_resumption_gen = stack.resumption_generation();
-    let mut last_on = stack.device().onoff.is_on();
     let mut boot_window_open = restored_fabric_count == 0;
     let mut last_fabric_count = fabrics.borrow().len();
 
@@ -482,19 +640,18 @@ fn main() -> std::io::Result<()> {
             }
         }
 
-        // 2b) OnOff 状態変化を OnOff クラスタ(0x0006)のイベント(id 0x00)として post する。
-        let on_now = stack.device().onoff.is_on();
-        if on_now != last_on {
-            last_on = on_now;
+        // 2b) 接点センサ(EP3、Boolean State 0x0045)の StateChange を回収してイベント post。
+        //     payload は struct { 0: stateValue(bool) }(設計 §1.5)。
+        if let Some(state) = stack.device_mut().contact.take_state_change() {
             let _ = stack.post_event(
-                EndpointId(1),
-                ClusterId(0x0006),
+                EndpointId(3),
+                ClusterId(0x0045),
                 EventId(0),
                 PRIORITY_INFO,
                 now,
                 |w, tag| {
                     w.start_struct(tag)?;
-                    w.write_bool(&TlvTag::ContextSpecific(0), on_now)?;
+                    w.write_bool(&TlvTag::ContextSpecific(0), state)?;
                     w.end_container()
                 },
             );
@@ -632,7 +789,7 @@ fn main() -> std::io::Result<()> {
             }
         }
 
-        // ビジーループ回避のため短くスリープする(この 20ms 周期が遷移の分解能になる)。
+        // ビジーループ回避のため短くスリープする(この 20ms 周期が擬似センサの分解能になる)。
         std::thread::sleep(Duration::from_millis(20));
     }
 }

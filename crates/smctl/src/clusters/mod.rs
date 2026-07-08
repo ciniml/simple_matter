@@ -10,16 +10,23 @@ use simple_matter::dm::meta::{AttributeId, ClusterId, CommandId, EventId};
 pub mod access_control;
 pub mod administrator_commissioning;
 pub mod basic_information;
+pub mod boolean_state;
 pub mod descriptor;
 pub mod device_types;
+pub mod flow_measurement;
 pub mod general_commissioning;
 pub mod general_diagnostics;
 pub mod identify;
+pub mod illuminance_measurement;
 pub mod level_control;
 pub mod names;
 pub mod network_commissioning;
+pub mod occupancy_sensing;
 pub mod on_off;
 pub mod operational_credentials;
+pub mod pressure_measurement;
+pub mod relative_humidity_measurement;
+pub mod temperature_measurement;
 pub mod thermostat;
 
 /// 値の型(表示とリテラルパースの両方に使う)。TLV のワイヤ型と 1:1。
@@ -164,18 +171,25 @@ impl ClusterDef {
 
 /// クラスタレジストリ。新クラスタ対応はここに 1 行足すだけ(設計 doc §5.2)。ID 昇順。
 pub static CLUSTERS: &[&ClusterDef] = &[
-    &identify::DEF,                    // 0x0003
-    &on_off::DEF,                      // 0x0006
-    &level_control::DEF,               // 0x0008
-    &descriptor::DEF,                  // 0x001D
-    &access_control::DEF,              // 0x001F
-    &basic_information::DEF,           // 0x0028
-    &general_commissioning::DEF,       // 0x0030
-    &network_commissioning::DEF,       // 0x0031
-    &general_diagnostics::DEF,         // 0x0033
-    &administrator_commissioning::DEF, // 0x003C
-    &operational_credentials::DEF,     // 0x003E
-    &thermostat::DEF,                  // 0x0201
+    &identify::DEF,                      // 0x0003
+    &on_off::DEF,                        // 0x0006
+    &level_control::DEF,                 // 0x0008
+    &descriptor::DEF,                    // 0x001D
+    &access_control::DEF,                // 0x001F
+    &basic_information::DEF,             // 0x0028
+    &general_commissioning::DEF,         // 0x0030
+    &network_commissioning::DEF,         // 0x0031
+    &general_diagnostics::DEF,           // 0x0033
+    &administrator_commissioning::DEF,   // 0x003C
+    &operational_credentials::DEF,       // 0x003E
+    &boolean_state::DEF,                 // 0x0045
+    &thermostat::DEF,                    // 0x0201
+    &illuminance_measurement::DEF,       // 0x0400
+    &temperature_measurement::DEF,       // 0x0402
+    &pressure_measurement::DEF,          // 0x0403
+    &flow_measurement::DEF,              // 0x0404
+    &relative_humidity_measurement::DEF, // 0x0405
+    &occupancy_sensing::DEF,             // 0x0406
 ];
 
 /// クラスタを名前で引く。

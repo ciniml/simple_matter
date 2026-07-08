@@ -39,8 +39,8 @@ use simple_matter::discovery::{
 };
 use simple_matter::dm::clusters::{
     AccessControlCluster, AdminCommissioningCluster, BasicInfoConfig, BasicInformationCluster,
-    CommissioningWindow, DescriptorCluster, GeneralCommissioning, NetworkCommissioning,
-    OpCredsCluster, TestDacProvider, ThermostatCluster, WindowEvent,
+    CommissioningWindow, DescriptorCluster, GeneralCommissioning, IdentifyCluster,
+    NetworkCommissioning, OpCredsCluster, TestDacProvider, ThermostatCluster, WindowEvent,
 };
 use simple_matter::dm::meta::{ClusterId, DeviceType, EndpointId, EndpointMeta};
 use simple_matter::dm::{tick_clusters, DataModel, ServerCluster};
@@ -173,8 +173,8 @@ static EP0_SERVERS: &[ClusterId] = &[
     ClusterId(0x003E),
     ClusterId(0x001D),
 ];
-// EP1 = Thermostat: Thermostat(0x0201)+ Descriptor(0x001D)。
-static EP1_SERVERS: &[ClusterId] = &[ClusterId(0x0201), ClusterId(0x001D)];
+// EP1 = Thermostat: Identify(0x0003)+ Thermostat(0x0201)+ Descriptor(0x001D)。
+static EP1_SERVERS: &[ClusterId] = &[ClusterId(0x0003), ClusterId(0x0201), ClusterId(0x001D)];
 static EP0_DT: &[DeviceType] = &[DeviceType::new(0x0016, 1)];
 static EP1_DT: &[DeviceType] = &[DeviceType::new(DEVICE_TYPE_THERMOSTAT, 3)];
 static EP0_PARTS: &[EndpointId] = &[EndpointId(1)];
@@ -189,6 +189,7 @@ struct Thermostat<'s> {
     admin: AdminCommissioningCluster<'s>,
     opcreds: OpCreds<'s>,
     desc0: DescriptorCluster,
+    identify: IdentifyCluster,
     thermostat: ThermostatCluster,
     desc1: DescriptorCluster,
     /// fail-safe タイマ経過で削除した fabric index の退避先(stack が take する)。
@@ -246,6 +247,7 @@ impl DataModel for Thermostat<'_> {
             (0, 0x003C) => Some(&self.admin),
             (0, 0x003E) => Some(&self.opcreds),
             (0, 0x001D) => Some(&self.desc0),
+            (1, 0x0003) => Some(&self.identify),
             (1, 0x0201) => Some(&self.thermostat),
             (1, 0x001D) => Some(&self.desc1),
             _ => None,
@@ -260,6 +262,7 @@ impl DataModel for Thermostat<'_> {
             (0, 0x003C) => Some(&mut self.admin),
             (0, 0x003E) => Some(&mut self.opcreds),
             (0, 0x001D) => Some(&mut self.desc0),
+            (1, 0x0003) => Some(&mut self.identify),
             (1, 0x0201) => Some(&mut self.thermostat),
             (1, 0x001D) => Some(&mut self.desc1),
             _ => None,
@@ -319,6 +322,10 @@ fn build_thermostat<'s>(
         admin: AdminCommissioningCluster::new(window),
         opcreds: OpCredsCluster::new_shared(fabrics, RustCrypto::new(DemoRng::from_time()), dac),
         desc0: DescriptorCluster::new(EndpointId(0), EP0_DT, EP0_SERVERS, &[], EP0_PARTS),
+        // 識別中/終了を println で通知する。
+        identify: IdentifyCluster::new().with_listener(|on| {
+            println!("[identify] {}", if on { "identifying" } else { "stopped" });
+        }),
         thermostat: ThermostatCluster::new(),
         desc1: DescriptorCluster::new(EndpointId(1), EP1_DT, EP1_SERVERS, &[], EP1_PARTS),
         removed_fabric: None,

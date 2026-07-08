@@ -34,11 +34,11 @@ use simple_matter::discovery::{
 };
 use simple_matter::dm::clusters::{
     AccessControlCluster, AdminCommissioningCluster, BasicInfoConfig, BasicInformationCluster,
-    CommissioningWindow, DescriptorCluster, GeneralCommissioning, NetworkCommissioning,
-    OnOffCluster, OpCredsCluster, TestDacProvider, WindowEvent,
+    CommissioningWindow, DescriptorCluster, GeneralCommissioning, IdentifyCluster,
+    NetworkCommissioning, OnOffCluster, OpCredsCluster, TestDacProvider, WindowEvent,
 };
 use simple_matter::dm::meta::{ClusterId, DeviceType, EndpointId, EndpointMeta, EventId};
-use simple_matter::dm::{DataModel, ServerCluster};
+use simple_matter::dm::{tick_clusters, DataModel, ServerCluster};
 use simple_matter::error::{Error, Result as SmResult};
 use simple_matter::fabric::FabricTable;
 use simple_matter::im::engine::InteractionModel;
@@ -165,7 +165,7 @@ static EP0_SERVERS: &[ClusterId] = &[
     ClusterId(0x003E),
     ClusterId(0x001D),
 ];
-static EP1_SERVERS: &[ClusterId] = &[ClusterId(0x0006), ClusterId(0x001D)];
+static EP1_SERVERS: &[ClusterId] = &[ClusterId(0x0003), ClusterId(0x0006), ClusterId(0x001D)];
 static EP0_DT: &[DeviceType] = &[DeviceType::new(0x0016, 1)];
 static EP1_DT: &[DeviceType] = &[DeviceType::new(0x0100, 3)];
 static EP0_PARTS: &[EndpointId] = &[EndpointId(1)];
@@ -180,6 +180,7 @@ struct Light<'s> {
     admin: AdminCommissioningCluster<'s>,
     opcreds: OpCreds<'s>,
     desc0: DescriptorCluster,
+    identify: IdentifyCluster,
     onoff: OnOffCluster,
     desc1: DescriptorCluster,
     /// fail-safe タイマ経過で削除した fabric index の退避先(stack が take する)。
@@ -210,6 +211,7 @@ impl DataModel for Light<'_> {
             (0, 0x003C) => Some(&self.admin),
             (0, 0x003E) => Some(&self.opcreds),
             (0, 0x001D) => Some(&self.desc0),
+            (1, 0x0003) => Some(&self.identify),
             (1, 0x0006) => Some(&self.onoff),
             (1, 0x001D) => Some(&self.desc1),
             _ => None,
@@ -224,6 +226,7 @@ impl DataModel for Light<'_> {
             (0, 0x003C) => Some(&mut self.admin),
             (0, 0x003E) => Some(&mut self.opcreds),
             (0, 0x001D) => Some(&mut self.desc0),
+            (1, 0x0003) => Some(&mut self.identify),
             (1, 0x0006) => Some(&mut self.onoff),
             (1, 0x001D) => Some(&mut self.desc1),
             _ => None,
@@ -239,7 +242,8 @@ impl DataModel for Light<'_> {
         }
         // コミッショニング窓のタイムアウト自動クローズ(admin-commissioning.md §2)。
         let _ = self.admin.on_tick(now_ms);
-        None
+        // クラスタ tick(Identify の IdentifyTime 減衰)を回す(設計 §1.1)。
+        tick_clusters(self, now_ms)
     }
     fn on_failsafe_cleanup(&mut self) -> Option<core::num::NonZeroU8> {
         self.gc.disarm();
@@ -280,6 +284,10 @@ fn build_light<'s>(
         admin: AdminCommissioningCluster::new(window),
         opcreds: OpCredsCluster::new_shared(fabrics, RustCrypto::new(DemoRng::from_time()), dac),
         desc0: DescriptorCluster::new(EndpointId(0), EP0_DT, EP0_SERVERS, &[], EP0_PARTS),
+        // 識別中/終了を println で通知する。
+        identify: IdentifyCluster::new().with_listener(|on| {
+            println!("[identify] {}", if on { "identifying" } else { "stopped" });
+        }),
         // On/Off 変化を println で通知する。
         onoff: OnOffCluster::new().with_listener(|on| {
             println!("[onoff] light is now {}", if on { "ON" } else { "OFF" });
