@@ -148,6 +148,21 @@ impl<'w, 'b> AttrEncoder<'w, 'b> {
         }
     }
 
+    /// `f32`(TLV single)を書く(`docs/design/airq-port.md` §4.2)。
+    pub fn write_f32(&mut self, v: f32) -> Result<(), ImStatus> {
+        self.writer.write_f32(&self.tag, v).map_err(map_err)?;
+        self.wrote = true;
+        Ok(())
+    }
+
+    /// nullable `f32`(`None` は null。`docs/design/airq-port.md` §4.2)。
+    pub fn write_nullable_f32(&mut self, v: Option<f32>) -> Result<(), ImStatus> {
+        match v {
+            Some(x) => self.write_f32(x),
+            None => self.write_null(),
+        }
+    }
+
     /// 配列(TLV array)属性を書く。`f` に [`ArrayEncoder`] を渡して要素を積む。
     pub fn write_array<F>(&mut self, f: F) -> Result<(), ImStatus>
     where

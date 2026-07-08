@@ -2,8 +2,11 @@
 
 対象: M5Stack AirQ(Air Quality Kit)向けの Matter ファームウェアを、既存の
 esp-matter/ESP-IDF 実装(`/home/kenta/repos/m5stack_matter_examples`)から
-simple-matter ベース(Rust / no_std)へ再実装する検討。本書は調査・設計のみで
-コード変更を含まない。
+simple-matter ベース(Rust / no_std)へ再実装する検討。本書は調査・設計
+(+フェーズ進捗の記録)。
+
+**進捗**: フェーズ A1(クラスタ実装 + PC シム E2E)**完了(2026-07-09)**。
+記録は §7.1 の表と直下の注記。
 
 前提となる現状(2026-07-08 時点):
 
@@ -266,6 +269,12 @@ Matter の TVOC/NO2 Concentration クラスタに ppm/ppb として入れるの�
   場合のみ、既存 FW と同じ「index 値を MeasuredValue に入れる」割り切りを feature 的に
   提供(その場合も MeasurementUnit=PPB 等の詐称はせず、doc に明記)。
 
+**A1 での判断(2026-07-09)**: TVOC(0x042E)/ NO2(0x0413)の**クラスタ型は
+コアに実装済み**(`concentration_cluster!` の 2 宣言。将来較正済み濃度センサを
+使うデバイスのため)。ただし `air-quality-sensor` example / AirQ ファームには
+**搭載しない**(上記方針どおり。既存 FW のバグ 2 の是正)。dead-code 除去により
+未使用クラスタのフットプリント影響はゼロ(flash-probe 実測 102259B、増分なし)。
+
 ### 4.4 smctl / example
 
 - smctl: `air-quality` + concentration 族 6 種の `cluster_def!` 追加(read/subscribe 確認用)。
@@ -317,7 +326,7 @@ sensor-hub と同じ「1 計測ドメイン = 1 EP」の分離構成を採る。
 
 | フェーズ | 範囲 | 検証ゲート | 工数感 |
 |---|---|---|---|
-| **A1: クラスタ実装(PC シム E2E)** | `concentration_cluster!` マクロ + 6 クラスタ、AirQuality 0x005B、`AttrEncoder::write_nullable_f32`、`examples/air-quality-sensor.rs`、smctl cluster_def 追加 | chip-tool: pairing → 0x002C の device-type-list / airquality read / co2・pm25 subscribe。smctl read --names | **M**(マクロ流用で圧縮。basic-clusters バッチ 1 と同規模) |
+| **A1: クラスタ実装(PC シム E2E)** | `concentration_cluster!` マクロ + 6 クラスタ、AirQuality 0x005B、`AttrEncoder::write_nullable_f32`、`examples/air-quality-sensor.rs`、smctl cluster_def 追加 | chip-tool: pairing → 0x002C の device-type-list / airquality read / co2・pm25 subscribe。smctl read --names | **✅ 完了(2026-07-09)** |
 | **A2: ハード選定 / ツールチェーン確認** | C6 ブリッジ機材(NanoC6 + SEN55 5V 供給 + SCD40)手配・配線。espup/S3 の最新状況・esp-hal S3 の coex 実績を再調査(§3.1 の再確認) | I2C スキャンで 0x69/0x62 応答(素の esp-hal bin) | **S** |
 | **A3: センサドライバ統合(C6)** | `sen5x-rs`/`scd4x`(async)を embassy タスクに統合、SCD4x 初期化シーケンス移植(§1.3)、AirQualityEnum 算出ロジック、`airq-c6` bin(e5-light ベース) | シリアルで実測値ログ(既存 FW と同一個体センサの値比較)| **M** |
 | **A4: C6 実機 E2E** | chip-tool `pairing ble-wifi` → 全属性 read / subscribe(30s/10s 周期更新の配信)、リブート後 CASE 再確立(E4 資産) | chip-tool + smctl のフル E2E、フットプリント実測を README に記録 | **S〜M** |
@@ -327,6 +336,34 @@ sensor-hub と同じ「1 計測ドメイン = 1 EP」の分離構成を採る。
 
 A1 と A2 は並行可能。総工数感: **A1-A4 で L 相当**(C6 ベース完成まで)、
 A5 が追加で L。
+
+**A1 完了記録(2026-07-09)**:
+
+- コア: `dm/clusters/air_quality.rs`(0x005B、rev 1、FeatureMap=0x0F、`AirQualityEnum`
+  は `Ord` 導出で worst-of 合成可)+ `dm/clusters/concentration.rs`
+  (`concentration_cluster!` マクロ → CO2/PM1/PM2.5/PM10/TVOC/NO2 の 6 宣言。
+  FeatureMap=MEA、MeasuredValue f32 nullable + Min/Max + MeasurementUnit/Medium)。
+  codec に `AttrEncoder::write_f32` / `write_nullable_f32` を追加。
+- **revision は本書の表どおり 3(Matter 1.3)を採用**。research の ZAP XML は
+  1.6 世代で rev 5 に上がっているが、実装済み属性集合は 1.3 と同一(chip-tool
+  v1.5.1 との相互運用に影響なし)。
+- example: `examples/air-quality-sensor.rs`(§5 の 3 EP 構成)。擬似センサは
+  CO2 400-1200ppm 三角波 + PM2.5 0-50µg/m³ 三角波 + 240 秒周期の汚染エピソード
+  スパイク(最大 +250µg/m³、全レベル遷移の実証用)。**AirQuality は毎 tick
+  CO2/PM2.5 の worst-of で算出・更新**(バグ 1 是正。閾値は屋内 IAQ / US EPA AQI
+  相当のデバイスポリシー)。TVOC/NO2 は非搭載(バグ 2 是正、§4.3)。
+- smctl: `air-quality` + concentration 族 6 種の cluster_def!(f32 の
+  parse/表示経路は既存実装で完備)。device_types.rs の 0x002C は登録済みだった。
+- E2E 実測(PC、chip-tool v1.5.1 snap + smctl): pairing already-discovered
+  (--paa-trust-store-path、attestation 実検証)→ `airquality read air-quality`
+  (3→2 変動)/ CO2 read = 1100.0(f32、unit=PPM)/ PM2.5 read = 30.0(f32、
+  unit=UGM3)/ descriptor device-type-list = 44(Air Quality Sensor)。
+  OCW manual code 経由で smctl を 2 fabric 目としてコミッショニングし、
+  `--names` で device-type-list = `0x002c(AirQualitySensor)`、
+  `air-quality subscribe` で **1-6 全レベルの変化レポートをライブ受信**
+  (6→5→4→3→2→1→2→3、70 秒間)。
+- ゲート: テスト 518(コア +7)+ 58(smctl +1)、clippy 0、no_std 3 ターゲット
+  green、ports/esp32 ビルド green、flash-probe 102259B(増分ゼロ)。
 
 ### 7.2 リスク表
 

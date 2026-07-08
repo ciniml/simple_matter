@@ -5,10 +5,12 @@
 
 pub mod access_control;
 pub mod administrator_commissioning;
+pub mod air_quality;
 pub mod basic_information;
 pub mod boolean_state;
 pub(crate) mod cmd;
 pub mod color_control;
+pub mod concentration;
 pub mod descriptor;
 pub mod door_lock;
 pub mod fan_control;
@@ -30,9 +32,15 @@ pub use access_control::AccessControlCluster;
 pub use administrator_commissioning::{
     AdminCommissioningCluster, CommissioningWindow, WindowEvent,
 };
+pub use air_quality::{AirQualityCluster, AirQualityEnum};
 pub use basic_information::{BasicInfoConfig, BasicInformationCluster};
 pub use boolean_state::BooleanStateCluster;
 pub use color_control::{ColorControlCluster, ColorState};
+pub use concentration::{
+    CarbonDioxideConcentrationCluster, ConcentrationUnit, NitrogenDioxideConcentrationCluster,
+    Pm10ConcentrationCluster, Pm1ConcentrationCluster, Pm25ConcentrationCluster,
+    TvocConcentrationCluster,
+};
 pub use descriptor::DescriptorCluster;
 pub use door_lock::{DoorLockCluster, LockOperationEvent};
 pub use fan_control::FanControlCluster;

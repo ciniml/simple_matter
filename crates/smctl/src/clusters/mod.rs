@@ -9,9 +9,11 @@ use simple_matter::dm::meta::{AttributeId, ClusterId, CommandId, EventId};
 
 pub mod access_control;
 pub mod administrator_commissioning;
+pub mod air_quality;
 pub mod basic_information;
 pub mod boolean_state;
 pub mod color_control;
+pub mod concentration;
 pub mod descriptor;
 pub mod device_types;
 pub mod door_lock;
@@ -193,6 +195,7 @@ pub static CLUSTERS: &[&ClusterDef] = &[
     &operational_credentials::DEF,       // 0x003E
     &group_key_management::DEF,          // 0x003F
     &boolean_state::DEF,                 // 0x0045
+    &air_quality::DEF,                   // 0x005B
     &door_lock::DEF,                     // 0x0101
     &window_covering::DEF,               // 0x0102
     &thermostat::DEF,                    // 0x0201
@@ -204,6 +207,12 @@ pub static CLUSTERS: &[&ClusterDef] = &[
     &flow_measurement::DEF,              // 0x0404
     &relative_humidity_measurement::DEF, // 0x0405
     &occupancy_sensing::DEF,             // 0x0406
+    &concentration::CO2_DEF,             // 0x040D
+    &concentration::NO2_DEF,             // 0x0413
+    &concentration::PM25_DEF,            // 0x042A
+    &concentration::PM1_DEF,             // 0x042C
+    &concentration::PM10_DEF,            // 0x042D
+    &concentration::TVOC_DEF,            // 0x042E
 ];
 
 /// クラスタを名前で引く。
@@ -419,6 +428,45 @@ mod tests {
             onoff.attr_by_name("on-off").unwrap().semantic,
             Semantic::None
         );
+    }
+
+    #[test]
+    fn air_quality_and_concentration_registered() {
+        // Air Quality(0x005B): enum8 属性 1 個、コマンド無し。
+        let aq = by_name("air-quality").expect("air-quality in registry");
+        assert_eq!(aq.id, ClusterId(0x005B));
+        assert!(std::ptr::eq(by_id(ClusterId(0x005B)).unwrap(), aq));
+        let attr = aq.attr_by_name("air-quality").unwrap();
+        assert_eq!(attr.id, AttributeId(0x0000));
+        assert_eq!(attr.kind, ValueKind::U8);
+        assert!(aq.cmds.is_empty());
+
+        // Concentration 族 6 種: measured-value は f32、unit/medium は enum8。
+        for (name, id) in [
+            ("carbon-dioxide-concentration", 0x040Du32),
+            ("nitrogen-dioxide-concentration", 0x0413),
+            ("pm25-concentration", 0x042A),
+            ("pm1-concentration", 0x042C),
+            ("pm10-concentration", 0x042D),
+            ("tvoc-concentration", 0x042E),
+        ] {
+            let def = by_name(name).expect(name);
+            assert_eq!(def.id, ClusterId(id), "{name}");
+            assert_eq!(
+                def.attr_by_name("measured-value").unwrap().kind,
+                ValueKind::F32,
+                "{name}: measured-value must be f32"
+            );
+            assert_eq!(
+                def.attr_by_name("measurement-unit").unwrap().id,
+                AttributeId(0x0008)
+            );
+            assert_eq!(
+                def.attr_by_name("measurement-medium").unwrap().id,
+                AttributeId(0x0009)
+            );
+            assert!(def.cmds.is_empty());
+        }
     }
 
     #[test]
