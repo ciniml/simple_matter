@@ -11,6 +11,7 @@ pub mod access_control;
 pub mod administrator_commissioning;
 pub mod basic_information;
 pub mod boolean_state;
+pub mod color_control;
 pub mod descriptor;
 pub mod device_types;
 pub mod fan_control;
@@ -190,6 +191,7 @@ pub static CLUSTERS: &[&ClusterDef] = &[
     &window_covering::DEF,               // 0x0102
     &thermostat::DEF,                    // 0x0201
     &fan_control::DEF,                   // 0x0202
+    &color_control::DEF,                 // 0x0300
     &illuminance_measurement::DEF,       // 0x0400
     &temperature_measurement::DEF,       // 0x0402
     &pressure_measurement::DEF,          // 0x0403

@@ -214,6 +214,17 @@ InitialPress/ShortRelease 受信。
 
 ## 5. 割り切り一覧(実装後に追記)
 
+### バッチ 3(実装済み)
+
+- Color Control の初期値: Hue=0 / Sat=0 / CT=250mireds / ColorMode=HS(0)(doc 未指定の
+  ため任意選択)。
+- Options write は定義ビットが ExecuteIfOff(bit0)のみのため 0..=1 以外を
+  ConstraintError(Level Control の Options 検証方針に合わせた)。
+- hue 円環は 0x00-0xFE の 255 値(0xFF 不使用)。transitionTime は非 nullable u16
+  (未指定は 0=即時)。
+- ESP32 は PC example のみ(doc §3 のとおり NanoC6 単色 LED では CT/HS を表現できず、
+  輝度換算は Level Control と区別がつかないため見送り。e5-light は Dimmable のまま)。
+
 ### バッチ 2(実装済み)
 
 - LatchingSwitch の `set_position` は**変化時のみ** SwitchLatched を発火(同一位置への

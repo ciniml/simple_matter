@@ -8,6 +8,7 @@ pub mod administrator_commissioning;
 pub mod basic_information;
 pub mod boolean_state;
 pub(crate) mod cmd;
+pub mod color_control;
 pub mod descriptor;
 pub mod fan_control;
 pub mod general_commissioning;
@@ -28,6 +29,7 @@ pub use administrator_commissioning::{
 };
 pub use basic_information::{BasicInfoConfig, BasicInformationCluster};
 pub use boolean_state::BooleanStateCluster;
+pub use color_control::{ColorControlCluster, ColorState};
 pub use descriptor::DescriptorCluster;
 pub use fan_control::FanControlCluster;
 pub use general_commissioning::{FailSafe, GeneralCommissioning};
