@@ -87,6 +87,10 @@ pub enum SessionKind {
     Pase,
     /// CASE(運用セッション)。
     Case,
+    /// groupcast(グループメッセージ。セッションレス、`docs/design/group-messaging.md` §4)。
+    ///
+    /// subject は group node id(`0xFFFF_FFFF_FFFF_0000 | group_id`)。
+    Group,
 }
 
 /// 1 セッションが保持できる CASE Authenticated Tag(CAT)の最大数。

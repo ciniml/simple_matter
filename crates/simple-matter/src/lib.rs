@@ -30,6 +30,7 @@ pub mod dm;
 pub mod error;
 pub mod exchange;
 pub mod fabric;
+pub mod groups;
 pub mod im;
 pub mod kvs;
 pub mod sc;

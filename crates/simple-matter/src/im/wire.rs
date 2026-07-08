@@ -1469,6 +1469,24 @@ impl<'a> InvokeRequestRef<'a> {
             }
         }
     }
+
+    /// group invoke 用の `CommandDataIB` 列イテレータを返す
+    /// (`docs/design/group-messaging.md` §5.2)。
+    ///
+    /// groupcast の CommandPathIB は endpoint を持たない(chip
+    /// `ProcessGroupCommandDataIB` は cluster/command のみ読む)ため、
+    /// [`CommandDataRef`] とは別に endpoint 無しでパースする。
+    pub fn group_invoke_requests(&self) -> Result<GroupCmdDataIter<'a>> {
+        match field_reader(self.msg, 2)? {
+            None => Ok(GroupCmdDataIter::empty()),
+            Some(mut r) => {
+                if r.enter_container()? != ContainerType::Array {
+                    return Err(Error::Decode);
+                }
+                Ok(GroupCmdDataIter { r, done: false })
+            }
+        }
+    }
 }
 
 /// InvokeResponse のヘッダ。
@@ -1764,6 +1782,77 @@ impl<'a> CommandDataRef<'a> {
             fields,
             command_ref,
         })
+    }
+}
+
+/// group invoke の CommandDataIB 借用デコードビュー(`docs/design/group-messaging.md` §5.2)。
+///
+/// groupcast の CommandPathIB は endpoint を持たない(`{1: cluster, 2: command}`)。
+/// 配送先 endpoint は group メンバーシップから展開する(IM エンジンの `invoke_group`)。
+#[derive(Debug, Clone, Copy)]
+pub struct GroupCommandDataRef<'a> {
+    /// クラスタ。
+    pub cluster: ClusterId,
+    /// コマンド。
+    pub command: CommandId,
+    /// コマンドフィールドの生 TLV バイト列(あれば。元の context タグ 1 を含む)。
+    pub fields: Option<&'a [u8]>,
+}
+
+impl<'a> GroupCommandDataRef<'a> {
+    fn decode_body(r: &mut TlvReader<'a>) -> Result<Self> {
+        let mut cluster = None;
+        let mut command = None;
+        let mut fields = None;
+        while let Some(tag) = next_ctx(r)? {
+            match tag {
+                0 => {
+                    // CommandPathIB(list)。endpoint(0)があっても無視する。
+                    expect_container(r, ContainerType::List)?;
+                    while let Some(ptag) = next_ctx(r)? {
+                        match ptag {
+                            1 => cluster = Some(ClusterId(read_u32(r)?)),
+                            2 => command = Some(CommandId(read_u32(r)?)),
+                            _ => skip_field(r)?,
+                        }
+                    }
+                }
+                1 => fields = Some(r.take_element_raw()?),
+                _ => skip_field(r)?,
+            }
+        }
+        Ok(Self {
+            cluster: cluster.ok_or(Error::Decode)?,
+            command: command.ok_or(Error::Decode)?,
+            fields,
+        })
+    }
+}
+
+/// [`GroupCommandDataRef`] の配列イテレータ(group invoke 用)。
+#[derive(Debug, Clone)]
+pub struct GroupCmdDataIter<'a> {
+    r: TlvReader<'a>,
+    done: bool,
+}
+
+impl GroupCmdDataIter<'_> {
+    fn empty() -> Self {
+        Self {
+            r: TlvReader::new(&[]),
+            done: true,
+        }
+    }
+}
+
+impl<'a> Iterator for GroupCmdDataIter<'a> {
+    type Item = Result<GroupCommandDataRef<'a>>;
+    fn next(&mut self) -> Option<Self::Item> {
+        iter_struct_element(
+            &mut self.r,
+            &mut self.done,
+            GroupCommandDataRef::decode_body,
+        )
     }
 }
 

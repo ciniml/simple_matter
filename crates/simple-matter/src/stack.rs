@@ -38,18 +38,23 @@ use core::cell::{Ref, RefCell};
 use core::num::NonZeroU8;
 
 use crate::buf::BufferPool;
+use crate::crypto::AES_CCM_TAG_LEN;
 use crate::crypto::{Crypto, Rng};
 use crate::dm::DataModel;
 use crate::exchange::{
     ExchangeId, ExchangeManager, HandlerAction, Outgoing, PollAction, ProtocolMux, SendTiming,
 };
 use crate::fabric::{FabricCredentials, FabricEntry, FabricTable};
+use crate::groups::GroupKeyResolver;
 use crate::im::engine::InteractionModel;
 use crate::im::wire::{ImOpCode, PROTO_ID_INTERACTION_MODEL};
 use crate::sc::case::creds::{Fabric, FabricStore, NocResolver, PeerIdentity};
 use crate::sc::SecureChannel;
-use crate::transport::header::{PacketHeader, PayloadHeader};
-use crate::transport::net::PeerAddr;
+use crate::transport::counter::PeerWindow;
+use crate::transport::header::{DstNodeId, PacketHeader, PayloadHeader, SecFlags};
+use crate::transport::net::{PeerAddr, MAX_RX_PACKET_SIZE};
+use crate::transport::secure::SecureCodec;
+use crate::transport::session::fixed::FixedVec;
 use crate::transport::session::{SessionId, SessionInit, SessionManager};
 use crate::transport::util::{ParseBuf, WriteBuf};
 
@@ -114,6 +119,31 @@ pub struct MatterStack<
     tx_pool: BufferPool<TX_BUFS, MAX_PACKET_SIZE>,
     /// ハンドラが応答 payload を書く作業バッファ(平文)。
     resp: [u8; MAX_PACKET_SIZE],
+    /// groupcast 復号鍵のリゾルバ(`docs/design/group-messaging.md` §5.1)。
+    /// `None` = groupcast 受信無効(既定)。
+    group_keys: Option<&'s dyn GroupKeyResolver>,
+    /// groupcast 送信元別のメッセージカウンタ窓(trust-first、設計 §5.1 手順 3)。
+    group_peers: FixedVec<GroupPeer, GROUP_PEERS>,
+}
+
+/// groupcast 送信元 `(fabric, node)` ごとの trust-first カウンタ状態。
+#[derive(Debug, Clone)]
+struct GroupPeer {
+    fabric_idx: NonZeroU8,
+    node_id: u64,
+    window: PeerWindow,
+    last_use: u64,
+}
+
+/// groupcast 送信元カウンタテーブルの容量(満杯時は LRU 上書き)。
+const GROUP_PEERS: usize = 8;
+
+/// datagram の平文ヘッダを覗き、groupcast(Session Type = group)なら `true`。
+///
+/// PacketHeader のレイアウトは `flags(1) || session_id(2) || sec_flags(1) || ...`
+/// (`crate::transport::header`)。復号なしに 4 バイト目の Security Flags だけを見る。
+fn is_group_datagram(datagram: &[u8]) -> bool {
+    datagram.len() > 3 && SecFlags::from_bits(datagram[3]).is_group_session()
 }
 
 impl<
@@ -147,7 +177,17 @@ impl<
             mgr: ExchangeManager::new(ProtocolMux::new(sc, im)),
             tx_pool: BufferPool::new(),
             resp: [0u8; MAX_PACKET_SIZE],
+            group_keys: None,
+            group_peers: FixedVec::new(),
         }
+    }
+
+    /// groupcast 復号鍵のリゾルバを設定する(`docs/design/group-messaging.md` §5.1)。
+    ///
+    /// 統合層が所有する `RefCell<GroupStore>` への参照を渡す(GroupKeyManagement /
+    /// Groups クラスタと同一のストア)。未設定(既定)の間、groupcast は全て drop される。
+    pub fn set_group_keys(&mut self, keys: &'s dyn GroupKeyResolver) {
+        self.group_keys = Some(keys);
     }
 
     /// セッションテーブルへの共有参照。
@@ -324,6 +364,15 @@ impl<
         tx_out: &mut [u8],
     ) -> Option<SendDirective> {
         self.drive_ticks(now_ms);
+
+        // groupcast(Session Type = group)はユニキャスト経路(セッションテーブル /
+        // exchange / MRP)に入れず、専用経路で復号 → IM 配送する(応答なし)。
+        // `docs/design/group-messaging.md` §5.1。
+        if is_group_datagram(datagram) {
+            self.handle_group_rx(datagram, now_ms);
+            return None;
+        }
+
         self.ensure_unsecured_session(datagram, peer, now_ms);
 
         let report = match self.mgr.recv(
@@ -452,6 +501,124 @@ impl<
         // いずれかを必須とするため)。
         init.peer_node_id = hdr.src_node_id;
         let _ = self.sessions.insert(init, now_ms);
+    }
+
+    /// groupcast datagram を復号して IM(invoke)へ配送する(応答なし。
+    /// `docs/design/group-messaging.md` §5.1)。
+    ///
+    /// 不正・未対応(P/C フラグ、鍵候補なし、MIC 不一致、リプレイ、IM InvokeRequest
+    /// 以外)は全て黙って drop する。
+    fn handle_group_rx(&mut self, datagram: &[u8], now_ms: u64) {
+        let Some(keys) = self.group_keys else {
+            return;
+        };
+        if datagram.len() > MAX_RX_PACKET_SIZE {
+            return;
+        }
+
+        // 1. ヘッダ検証(復号なしで覗く)。
+        let mut scratch = [0u8; PacketHeader::MAX_LEN];
+        let n = datagram.len().min(scratch.len());
+        scratch[..n].copy_from_slice(&datagram[..n]);
+        let mut pb = ParseBuf::new(&mut scratch[..n]);
+        let Ok(hdr) = PacketHeader::decode(&mut pb) else {
+            return;
+        };
+        // P(privacy)/ C(control)は非対応(設計 §9 の割り切り)。S フラグと
+        // group 宛先は必須(仕様 §4.6.2)。
+        if hdr.sec_flags.is_privacy() || hdr.sec_flags.is_control() {
+            return;
+        }
+        let Some(src_node_id) = hdr.src_node_id else {
+            return;
+        };
+        let DstNodeId::Group(gid) = hdr.dst else {
+            return;
+        };
+
+        // 2. 試行復号: GKH(= ワイヤ session id)と宛先 group id に紐づく鍵候補を
+        //    順に試す。復号は in-place のため、試行ごとに datagram をコピーし直す。
+        let mut idx = 0usize;
+        let (fabric, payload_hdr, payload_off, payload_len, work) = loop {
+            let Some((fabric, key)) = keys.key_candidate(hdr.session_id, gid, idx) else {
+                return; // 候補が尽きた(鍵不一致 or 未設定)。
+            };
+            idx += 1;
+
+            let mut work = [0u8; MAX_RX_PACKET_SIZE];
+            work[..datagram.len()].copy_from_slice(datagram);
+            let mut buf = ParseBuf::new(&mut work[..datagram.len()]);
+            let Ok(pkt) = PacketHeader::decode(&mut buf) else {
+                return;
+            };
+            match SecureCodec::decrypt(self.crypto, Some(&key), &pkt, src_node_id, &mut buf) {
+                Ok(phdr) => {
+                    // 平文 payload は復号済み work の「MIC を除いた末尾」に位置する。
+                    let payload_len = buf.as_slice().len();
+                    let payload_off = datagram.len() - AES_CCM_TAG_LEN - payload_len;
+                    break (fabric, phdr, payload_off, payload_len, work);
+                }
+                Err(_) => continue, // MIC 不一致 → 次の候補。
+            }
+        };
+
+        // 3. 送信元別カウンタ(trust-first)。未知ピアは受信値で窓を初期化して受理する。
+        if !self.accept_group_ctr(fabric, src_node_id, hdr.ctr, now_ms) {
+            return;
+        }
+
+        // 4. PayloadHeader 検証: IM InvokeRequest のみ受理。R フラグ(ACK 要求)付き
+        //    groupcast は仕様違反 → drop(chip 同様)。
+        if payload_hdr.proto_id != PROTO_ID_INTERACTION_MODEL
+            || payload_hdr.proto_opcode != ImOpCode::InvokeRequest as u8
+            || payload_hdr.is_reliable()
+        {
+            return;
+        }
+
+        // 5. IM へ配送(応答なし)。
+        let payload = &work[payload_off..payload_off + payload_len];
+        self.mgr
+            .handler_mut()
+            .im
+            .invoke_group(payload, gid, fabric, now_ms);
+    }
+
+    /// groupcast 送信元 `(fabric, node)` のカウンタを trust-first 方針で検査する。
+    ///
+    /// 未知ピアは受信カウンタで窓を初期化して受理(trust-first)。既知ピアは
+    /// [`PeerWindow::accept`]。テーブル満杯時は LRU を上書きする。
+    fn accept_group_ctr(&mut self, fabric: NonZeroU8, node_id: u64, ctr: u32, now_ms: u64) -> bool {
+        let existing = self
+            .group_peers
+            .iter()
+            .position(|p| p.fabric_idx == fabric && p.node_id == node_id);
+        if let Some(i) = existing {
+            let p = &mut self.group_peers[i];
+            p.last_use = now_ms;
+            return p.window.accept(ctr, true);
+        }
+        let peer = GroupPeer {
+            fabric_idx: fabric,
+            node_id,
+            window: PeerWindow::new(ctr),
+            last_use: now_ms,
+        };
+        if self.group_peers.is_full() {
+            // LRU を上書き。
+            let mut lru = 0usize;
+            let mut oldest = u64::MAX;
+            for (i, p) in self.group_peers.iter().enumerate() {
+                if p.last_use < oldest {
+                    oldest = p.last_use;
+                    lru = i;
+                }
+            }
+            self.group_peers[lru] = peer;
+        } else {
+            let _ = self.group_peers.push(peer);
+        }
+        true
     }
 
     /// ハンドラが `self.resp` に書いた応答 payload をワイヤ化して `tx_out` に置く。

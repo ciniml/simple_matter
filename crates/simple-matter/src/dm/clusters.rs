@@ -12,6 +12,8 @@ pub mod color_control;
 pub mod descriptor;
 pub mod fan_control;
 pub mod general_commissioning;
+pub mod group_key_management;
+pub mod groups;
 pub mod identify;
 pub mod level_control;
 pub mod measurement;
@@ -33,6 +35,8 @@ pub use color_control::{ColorControlCluster, ColorState};
 pub use descriptor::DescriptorCluster;
 pub use fan_control::FanControlCluster;
 pub use general_commissioning::{FailSafe, GeneralCommissioning};
+pub use group_key_management::GroupKeyManagementCluster;
+pub use groups::GroupsCluster;
 pub use identify::IdentifyCluster;
 pub use level_control::LevelControlCluster;
 pub use measurement::{

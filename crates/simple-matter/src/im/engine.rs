@@ -112,6 +112,9 @@ fn allowed<D: DataModel + ?Sized>(
         None => match acc.kind {
             SessionKind::Pase => is_commissioning_cluster(cl),
             SessionKind::Case => acc.has_privilege(required),
+            // full ACL 無しデバイスの groupcast は Operate 近似で許可
+            // (`docs/design/group-messaging.md` §4。CASE の近似と整合)。
+            SessionKind::Group => (required as u8) <= (Privilege::Operate as u8),
         },
     }
 }
@@ -636,6 +639,67 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
     /// データモデルへの可変参照(アプリからの状態変更。dirty はクラスタが立てる)。
     pub fn data_model_mut(&mut self) -> &mut D {
         &mut self.dm
+    }
+
+    /// groupcast InvokeRequest を配送する(`docs/design/group-messaging.md` §5.2)。
+    ///
+    /// groupcast は応答禁止のため、応答・ステータスを一切生成しない(失敗も黙って捨てる)。
+    /// CommandPathIB は endpoint を持たないため
+    /// [`DataModel::group_endpoints`] で所属 endpoint に展開し、各 (endpoint, cluster) に
+    /// ACL([`SessionKind::Group`])を適用して invoke する。timed 必須コマンドは
+    /// 黙って捨てる(chip `ProcessGroupCommandDataIB` 同様)。invoke の副作用
+    /// (InvokeEffects)は group では発生しない前提で無視する(AddNOC 等の Administer
+    /// コマンドは ACL 制約(Group に Administer 付与不可)で到達しない)。
+    pub fn invoke_group(&mut self, payload: &[u8], group_id: u16, fabric: NonZeroU8, now_ms: u64) {
+        let Ok(req) = InvokeRequestRef::new(payload) else {
+            return;
+        };
+        let Ok(items) = req.group_invoke_requests() else {
+            return;
+        };
+        // コマンドは状態を変えうるため DataVersion を進める(unicast invoke と同じ)。
+        self.data_version = self.data_version.wrapping_add(1);
+        let acc = AccessContext::new(
+            SessionKind::Group,
+            Some(fabric),
+            crate::groups::group_node_id(group_id),
+            Privilege::Operate,
+        )
+        .with_env(now_ms, [0u8; 16]);
+        for item in items {
+            let Ok(item) = item else {
+                return;
+            };
+            let mut idx = 0usize;
+            while let Some(ep) = self.dm.group_endpoints(fabric, group_id, idx) {
+                idx += 1;
+                let Some(c) = self.dm.cluster(ep, item.cluster) else {
+                    continue;
+                };
+                let (required, needs_timed) = c
+                    .meta()
+                    .accepted_commands
+                    .iter()
+                    .find(|m| m.id == item.command)
+                    .map(|m| (m.access, m.timed))
+                    .unwrap_or((Privilege::Operate, false));
+                if needs_timed {
+                    // groupcast に timed interaction は存在しない → 黙って捨てる。
+                    continue;
+                }
+                if !allowed(&self.dm, &acc, ep, item.cluster, required) {
+                    continue;
+                }
+                let Some(cluster) = self.dm.cluster_mut(ep, item.cluster) else {
+                    continue;
+                };
+                let mut fr = TlvReader::new(item.fields.unwrap_or(&[]));
+                let mut scratch = [0u8; INVOKE_SCRATCH];
+                let mut sw = TlvWriter::new(&mut scratch);
+                let mut resp = CmdResponder::new(&mut sw);
+                let _ = cluster.invoke_command(item.command, &mut fr, &mut resp, &acc);
+            }
+        }
     }
 
     /// 確立中/確立済みの購読数。

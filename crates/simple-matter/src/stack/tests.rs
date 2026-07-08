@@ -133,6 +133,8 @@ struct Dev<'s, N: ServerCluster = NetworkCommissioning> {
     desc1: DescriptorCluster,
     /// fail-safe タイマ経過で削除した fabric index の退避先(stack が take する)。
     removed_fabric: Option<NonZeroU8>,
+    /// group メンバーシップ(groupcast テスト用。`None` = group 非対応)。
+    groups: Option<&'s RefCell<crate::groups::DefaultGroupStore>>,
 }
 
 // device! マクロはライフタイム付きデバイスに使えないため DataModel を手書きする(乖離)。
@@ -197,6 +199,12 @@ impl<N: ServerCluster> DataModel for Dev<'_, N> {
     fn take_removed_fabric(&mut self) -> Option<NonZeroU8> {
         self.removed_fabric.take()
     }
+
+    fn group_endpoints(&self, fabric: NonZeroU8, group_id: u16, idx: usize) -> Option<EndpointId> {
+        let store = self.groups?.borrow();
+        let eps = store.member_endpoints(fabric, group_id)?;
+        eps.get(idx).map(|&e| EndpointId(e))
+    }
 }
 
 fn build_device(fabrics: &RefCell<FabricTable<Crb, 5>>) -> Dev<'_> {
@@ -216,6 +224,7 @@ fn build_device_tampered_cd(fabrics: &RefCell<FabricTable<Crb, 5>>) -> Dev<'_> {
         onoff: OnOffCluster::new(),
         desc1: DescriptorCluster::new(EndpointId(1), EP1_DT, EP1_SERVERS, &[], EP1_PARTS),
         removed_fabric: None,
+        groups: None,
     }
 }
 
@@ -235,6 +244,7 @@ fn build_device_with<N: ServerCluster>(
         onoff: OnOffCluster::new(),
         desc1: DescriptorCluster::new(EndpointId(1), EP1_DT, EP1_SERVERS, &[], EP1_PARTS),
         removed_fabric: None,
+        groups: None,
     }
 }
 
@@ -2728,4 +2738,147 @@ mod controller_e2e {
             "全メッセージが単一フラグメントに収まった(セグメント化経路を踏んでいない)"
         );
     }
+}
+
+// ==========================================================================
+// groupcast(group messaging 受信)E2E(`docs/design/group-messaging.md` §8)
+// ==========================================================================
+
+/// groupcast E2E: 運用グループ鍵で暗号化した OnOff Toggle のマルチキャスト datagram を
+/// バイト列で組み、`handle_rx` が (a) 応答なしで状態を反転させ、(b) 同一カウンタの
+/// 再送(リプレイ)を捨て、(c) 鍵未設定 group を捨てることを固定する。
+#[test]
+fn groupcast_toggle_end_to_end() {
+    use crate::groups::{DefaultGroupStore, EpochKeyInput};
+
+    const GID: u16 = 0x0101;
+    const SRC_NODE: u64 = 0x0000_0000_C0DE_CAFE;
+    let fabric = NonZeroU8::new(1).unwrap();
+
+    let crypto = Crb::new(SeqRng(0x6006_0001));
+    let fabrics: RefCell<FabricTable<Crb, 5>> = RefCell::new(FabricTable::new());
+    let groups: RefCell<DefaultGroupStore> = RefCell::new(DefaultGroupStore::new());
+
+    // 鍵設定(KeySetWrite + GroupKeyMap + AddGroup 相当を直接ストアに投入)。
+    let cfid = [0x87, 0xe1, 0xb0, 0x04, 0xe2, 0x35, 0xa1, 0x30];
+    groups
+        .borrow_mut()
+        .set_keyset(
+            fabric,
+            42,
+            0,
+            &[EpochKeyInput {
+                key: *b"\xd0\xd1\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9\xda\xdb\xdc\xdd\xde\xdf",
+                start_time_us: 2_220_000,
+            }],
+            &crypto,
+            &cfid,
+        )
+        .unwrap();
+    groups.borrow_mut().add_map(fabric, GID, 42).unwrap();
+    groups.borrow_mut().add_member(fabric, GID, 1).unwrap(); // EP1 が加入
+
+    let (op_key, gkh) = {
+        let s = groups.borrow();
+        let e = &s.keyset(fabric, 42).unwrap().epochs()[0];
+        (*e.op_key(), e.gkh())
+    };
+
+    let mut dev = build_device(&fabrics);
+    dev.groups = Some(&groups);
+    let config = PaseConfig::from_passcode(PASSCODE, &SALT, ITERATIONS).unwrap();
+    let creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
+    let sc = SecureChannel::new(&crypto, SeqRng(0x5C00_0002), config, creds);
+    let im = InteractionModel::new(dev);
+    let mut stack: TestStack<'_> = MatterStack::new(&crypto, sc, im);
+    stack.set_group_keys(&groups);
+
+    // groupcast datagram(OnOff Toggle)をバイト列で組むヘルパ。
+    let build = |ctr: u32, gid: u16, session_id: u16, out: &mut [u8]| -> usize {
+        // InvokeRequest: {0: suppress=true, 1: timed=false, 2: [ {0: path list {1: cluster, 2: cmd}} ]}
+        let mut payload = [0u8; 128];
+        let plen = {
+            let mut w = TlvWriter::new(&mut payload);
+            w.start_struct(&TlvTag::Anonymous).unwrap();
+            w.write_bool(&cx(0), true).unwrap();
+            w.write_bool(&cx(1), false).unwrap();
+            w.start_array(&cx(2)).unwrap();
+            w.start_struct(&TlvTag::Anonymous).unwrap();
+            w.start_list(&cx(0)).unwrap();
+            w.write_u32(&cx(1), 0x0006).unwrap(); // OnOff
+            w.write_u32(&cx(2), 0x02).unwrap(); // Toggle
+            w.end_container().unwrap();
+            w.end_container().unwrap();
+            w.end_container().unwrap();
+            w.end_container().unwrap();
+            w.len()
+        };
+        let pkt = PacketHeader {
+            session_id,
+            sec_flags: SecFlags::from_bits(SecFlags::GROUP_SESSION),
+            ctr,
+            src_node_id: Some(SRC_NODE),
+            dst: DstNodeId::Group(gid),
+        };
+        let phdr = PayloadHeader {
+            exch_flags: ExchFlags::from_bits(ExchFlags::INITIATOR),
+            proto_opcode: ImOpCode::InvokeRequest as u8,
+            exch_id: 0x4747,
+            proto_id: 0x0001,
+            vendor_id: None,
+            ack_ctr: None,
+        };
+        let headroom = PacketHeader::MAX_LEN + PayloadHeader::MAX_LEN;
+        let mut store = [0u8; 256];
+        let mut w = WriteBuf::new(&mut store, headroom).unwrap();
+        w.append(&payload[..plen]).unwrap();
+        SecureCodec::encrypt(&crypto, Some(&op_key), &pkt, &phdr, SRC_NODE, &mut w).unwrap();
+        out[..w.len()].copy_from_slice(w.as_slice());
+        w.len()
+    };
+
+    let mut tx = [0u8; 1600];
+    assert!(!stack.device().onoff.is_on());
+
+    // (a) groupcast Toggle → 応答なしで On になる。
+    let mut wire = [0u8; 256];
+    let n = build(100, GID, gkh, &mut wire);
+    assert!(stack
+        .handle_rx(&mut wire[..n], peer(), NOW, &mut tx)
+        .is_none());
+    assert!(stack.device().onoff.is_on(), "groupcast Toggle が届く");
+
+    // (b) 同一カウンタの再送 = リプレイ → 捨てる(状態不変)。
+    let n = build(100, GID, gkh, &mut wire);
+    assert!(stack
+        .handle_rx(&mut wire[..n], peer(), NOW + 10, &mut tx)
+        .is_none());
+    assert!(stack.device().onoff.is_on(), "リプレイは配送されない");
+
+    // (c) 新しいカウンタは受理 → Off へ戻る。
+    let n = build(101, GID, gkh, &mut wire);
+    stack.handle_rx(&mut wire[..n], peer(), NOW + 20, &mut tx);
+    assert!(!stack.device().onoff.is_on());
+
+    // (d) 鍵がマップされていない group 宛(鍵候補なし)→ 捨てる。
+    let n = build(102, 0x0202, gkh, &mut wire);
+    stack.handle_rx(&mut wire[..n], peer(), NOW + 30, &mut tx);
+    assert!(!stack.device().onoff.is_on());
+
+    // (e) ワイヤ session id(GKH)不一致 → 捨てる(MIC 検証まで到達しない)。
+    let n = build(103, GID, gkh.wrapping_add(1), &mut wire);
+    stack.handle_rx(&mut wire[..n], peer(), NOW + 40, &mut tx);
+    assert!(!stack.device().onoff.is_on());
+
+    // (f) P(privacy)フラグ付きは非対応 → 捨てる。
+    let n = build(104, GID, gkh, &mut wire);
+    wire[3] |= SecFlags::PRIVACY;
+    stack.handle_rx(&mut wire[..n], peer(), NOW + 50, &mut tx);
+    assert!(!stack.device().onoff.is_on());
+
+    // (g) メンバーでない endpoint しか無い group(メンバーシップ除去後)→ 配送されない。
+    groups.borrow_mut().remove_member(fabric, GID, 1);
+    let n = build(105, GID, gkh, &mut wire);
+    stack.handle_rx(&mut wire[..n], peer(), NOW + 60, &mut tx);
+    assert!(!stack.device().onoff.is_on());
 }

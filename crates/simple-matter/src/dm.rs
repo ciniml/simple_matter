@@ -296,6 +296,23 @@ pub trait DataModel {
     fn acl(&self) -> Option<&dyn AclHandle> {
         None
     }
+
+    /// `(fabric, group_id)` に所属する endpoint を `idx` 順に返す
+    /// (`docs/design/group-messaging.md` §5.2/§6)。
+    ///
+    /// groupcast invoke の配送先展開に使う。group 対応デバイスは共有
+    /// [`GroupStore`](crate::groups::GroupStore) の `member_endpoints` へ委譲して
+    /// 上書き実装する。既定の `None` は「group メンバーシップなし」(groupcast は
+    /// どの endpoint にも配送されない)。
+    fn group_endpoints(
+        &self,
+        fabric: core::num::NonZeroU8,
+        group_id: u16,
+        idx: usize,
+    ) -> Option<EndpointId> {
+        let _ = (fabric, group_id, idx);
+        None
+    }
 }
 
 #[cfg(test)]

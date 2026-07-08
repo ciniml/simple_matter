@@ -34,13 +34,15 @@ use simple_matter::discovery::{
 };
 use simple_matter::dm::clusters::{
     AccessControlCluster, AdminCommissioningCluster, BasicInfoConfig, BasicInformationCluster,
-    CommissioningWindow, DescriptorCluster, GeneralCommissioning, IdentifyCluster,
-    NetworkCommissioning, OnOffCluster, OpCredsCluster, TestDacProvider, WindowEvent,
+    CommissioningWindow, DescriptorCluster, GeneralCommissioning, GroupKeyManagementCluster,
+    GroupsCluster, IdentifyCluster, NetworkCommissioning, OnOffCluster, OpCredsCluster,
+    TestDacProvider, WindowEvent,
 };
 use simple_matter::dm::meta::{ClusterId, DeviceType, EndpointId, EndpointMeta, EventId};
 use simple_matter::dm::{tick_clusters, DataModel, ServerCluster};
 use simple_matter::error::{Error, Result as SmResult};
 use simple_matter::fabric::FabricTable;
+use simple_matter::groups::{group_multicast_addr, DefaultGroupStore};
 use simple_matter::im::engine::InteractionModel;
 use simple_matter::im::events::PRIORITY_INFO;
 use simple_matter::kvs::Kvs;
@@ -163,9 +165,15 @@ static EP0_SERVERS: &[ClusterId] = &[
     ClusterId(0x0031),
     ClusterId(0x003C),
     ClusterId(0x003E),
+    ClusterId(0x003F),
     ClusterId(0x001D),
 ];
-static EP1_SERVERS: &[ClusterId] = &[ClusterId(0x0003), ClusterId(0x0006), ClusterId(0x001D)];
+static EP1_SERVERS: &[ClusterId] = &[
+    ClusterId(0x0003),
+    ClusterId(0x0004),
+    ClusterId(0x0006),
+    ClusterId(0x001D),
+];
 static EP0_DT: &[DeviceType] = &[DeviceType::new(0x0016, 1)];
 static EP1_DT: &[DeviceType] = &[DeviceType::new(0x0100, 3)];
 static EP0_PARTS: &[EndpointId] = &[EndpointId(1)];
@@ -179,10 +187,14 @@ struct Light<'s> {
     net: NetworkCommissioning,
     admin: AdminCommissioningCluster<'s>,
     opcreds: OpCreds<'s>,
+    gkm: GroupKeyManagementCluster<'s, Backend, NF, 6, 8, 8>,
     desc0: DescriptorCluster,
     identify: IdentifyCluster,
+    groups_cl: GroupsCluster<'s, 6, 8, 8>,
     onoff: OnOffCluster,
     desc1: DescriptorCluster,
+    /// group ストア(GroupKeyManagement / Groups / stack の groupcast 復号が共有)。
+    groups: &'s RefCell<DefaultGroupStore>,
     /// fail-safe タイマ経過で削除した fabric index の退避先(stack が take する)。
     removed_fabric: Option<core::num::NonZeroU8>,
 }
@@ -210,8 +222,10 @@ impl DataModel for Light<'_> {
             (0, 0x0031) => Some(&self.net),
             (0, 0x003C) => Some(&self.admin),
             (0, 0x003E) => Some(&self.opcreds),
+            (0, 0x003F) => Some(&self.gkm),
             (0, 0x001D) => Some(&self.desc0),
             (1, 0x0003) => Some(&self.identify),
+            (1, 0x0004) => Some(&self.groups_cl),
             (1, 0x0006) => Some(&self.onoff),
             (1, 0x001D) => Some(&self.desc1),
             _ => None,
@@ -225,8 +239,10 @@ impl DataModel for Light<'_> {
             (0, 0x0031) => Some(&mut self.net),
             (0, 0x003C) => Some(&mut self.admin),
             (0, 0x003E) => Some(&mut self.opcreds),
+            (0, 0x003F) => Some(&mut self.gkm),
             (0, 0x001D) => Some(&mut self.desc0),
             (1, 0x0003) => Some(&mut self.identify),
+            (1, 0x0004) => Some(&mut self.groups_cl),
             (1, 0x0006) => Some(&mut self.onoff),
             (1, 0x001D) => Some(&mut self.desc1),
             _ => None,
@@ -243,7 +259,23 @@ impl DataModel for Light<'_> {
         // コミッショニング窓のタイムアウト自動クローズ(admin-commissioning.md §2)。
         let _ = self.admin.on_tick(now_ms);
         // クラスタ tick(Identify の IdentifyTime 減衰)を回す(設計 §1.1)。
-        tick_clusters(self, now_ms)
+        let next = tick_clusters(self, now_ms);
+        // 識別状態を Groups クラスタへ仲介する(AddGroupIfIdentifying のゲート、
+        // group-messaging.md §3)。
+        let identifying = self.identify.is_identifying();
+        self.groups_cl.set_identifying(identifying);
+        next
+    }
+    fn group_endpoints(
+        &self,
+        fabric: core::num::NonZeroU8,
+        group_id: u16,
+        idx: usize,
+    ) -> Option<EndpointId> {
+        // groupcast の配送先展開(group-messaging.md §5.2/§6)。
+        let store = self.groups.borrow();
+        let eps = store.member_endpoints(fabric, group_id)?;
+        eps.get(idx).map(|&e| EndpointId(e))
     }
     fn on_failsafe_cleanup(&mut self) -> Option<core::num::NonZeroU8> {
         self.gc.disarm();
@@ -265,6 +297,7 @@ fn build_light<'s>(
     fabrics: &'s RefCell<FabricTable<Backend, NF>>,
     acl: &'s RefCell<AclTable<NACL>>,
     window: &'s RefCell<CommissioningWindow>,
+    groups: &'s RefCell<DefaultGroupStore>,
 ) -> Light<'s> {
     let dac_crypto = RustCrypto::new(DemoRng::from_time());
     // SM_TAMPER_CD=1: CD を 1 バイト改竄した DAC provider(コミッショナ側 CD CMS 検証の
@@ -283,6 +316,11 @@ fn build_light<'s>(
         net: NetworkCommissioning::new(b"eth0"),
         admin: AdminCommissioningCluster::new(window),
         opcreds: OpCredsCluster::new_shared(fabrics, RustCrypto::new(DemoRng::from_time()), dac),
+        gkm: GroupKeyManagementCluster::new_shared(
+            groups,
+            fabrics,
+            RustCrypto::new(DemoRng::from_time()),
+        ),
         desc0: DescriptorCluster::new(EndpointId(0), EP0_DT, EP0_SERVERS, &[], EP0_PARTS),
         // 識別中/終了を println で通知する。
         identify: IdentifyCluster::new().with_listener(|on| {
@@ -292,8 +330,10 @@ fn build_light<'s>(
         onoff: OnOffCluster::new().with_listener(|on| {
             println!("[onoff] light is now {}", if on { "ON" } else { "OFF" });
         }),
+        groups_cl: GroupsCluster::new_shared(groups, 1),
         desc1: DescriptorCluster::new(EndpointId(1), EP1_DT, EP1_SERVERS, &[], EP1_PARTS),
         removed_fabric: None,
+        groups,
     }
 }
 
@@ -305,12 +345,16 @@ fn main() -> std::io::Result<()> {
     let acl: RefCell<AclTable<NACL>> = RefCell::new(AclTable::new());
     // コミッショニング窓(AdminCommissioning クラスタと app ループが共有)。
     let window: RefCell<CommissioningWindow> = RefCell::new(CommissioningWindow::new());
+    // group ストア(GroupKeyManagement / Groups クラスタと groupcast 復号が共有)。
+    let groups: RefCell<DefaultGroupStore> = RefCell::new(DefaultGroupStore::new());
 
     let config = PaseConfig::from_passcode_default(PASSCODE, &SALT).expect("PASE config");
     let creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
     let sc = SecureChannel::new(&crypto, DemoRng::from_time(), config, creds);
-    let im = InteractionModel::new(build_light(&fabrics, &acl, &window));
+    let im = InteractionModel::new(build_light(&fabrics, &acl, &window, &groups));
     let mut stack: DefaultStack<Backend, DemoRng, Light> = MatterStack::new(&crypto, sc, im);
+    // groupcast 受信の復号鍵リゾルバ(group-messaging.md §5.1)。
+    stack.set_group_keys(&groups);
 
     // 起動イベント(BasicInformation StartUp、CRITICAL、{ softwareVersion })を積む。
     // SystemTimestamp は起動起点 0ms。chip-tool の `read-event` で観測できる。
@@ -349,6 +393,10 @@ fn main() -> std::io::Result<()> {
         match acl.borrow_mut().load_from(kvs) {
             Ok(n) => println!("[kvs] restored {n} ACL entries"),
             Err(e) => println!("[kvs] ACL restore failed: {e:?}"),
+        }
+        match groups.borrow_mut().load_from(kvs) {
+            Ok(()) => println!("[kvs] restored group store"),
+            Err(e) => println!("[kvs] group store restore failed: {e:?}"),
         }
         match stack.load_resumptions_from(kvs) {
             Ok(n) => println!("[kvs] restored {n} resumptions"),
@@ -445,6 +493,10 @@ fn main() -> std::io::Result<()> {
     let mut mdns_tx = [0u8; 1500];
     // 直近に広告済みの fabric 世代(変化検知に使う)。復元済み内容を基準値に取る。
     let mut last_generation = fabrics.borrow().generation();
+    // group ストアの世代(KVS 保存 + マルチキャスト join 同期のトリガ)。
+    let mut last_group_gen = groups.borrow().generation();
+    // join 済みの group マルチキャストアドレス(重複 join 回避)。
+    let mut joined_groups: Vec<Ipv6Addr> = Vec::new();
     // CASE resumption ストアの世代(変化検知で KVS 保存)。復元後の値を基準に取ることで
     // 復元直後の不要な再保存を避ける(secure-channel.md §7.4)。
     let mut last_resumption_gen = stack.resumption_generation();
@@ -455,6 +507,8 @@ fn main() -> std::io::Result<()> {
     let mut boot_window_open = restored_fabric_count == 0;
     // 直近の fabric 数(窓経由コミッショニング完了の検知に使う)。
     let mut last_fabric_count = fabrics.borrow().len();
+    // KVS 復元済みの group メンバーシップに対する起動時 join。
+    sync_group_joins(&socket, &groups, &fabrics, &mut joined_groups, local_ipv6);
 
     loop {
         // 1) Matter UDP の受信処理。
@@ -573,6 +627,20 @@ fn main() -> std::io::Result<()> {
 
         // 3.2) CASE resumption ストアの世代変化を検知して KVS へ保存する(§7.4)。
         //      フル CASE 成功・resumption ローテート・fabric 削除に伴う破棄で変化する。
+        // 4.5) group ストアの変化を検知: KVS 保存 + group マルチキャスト join 同期
+        //      (group-messaging.md §5.3。leave は行わない = 割り切り)。
+        let ggen = groups.borrow().generation();
+        if ggen != last_group_gen {
+            last_group_gen = ggen;
+            if let Some(kvs) = kvs.as_mut() {
+                match groups.borrow().save_to(kvs) {
+                    Ok(()) => println!("[kvs] saved group store"),
+                    Err(e) => println!("[kvs] group store save error: {e:?}"),
+                }
+            }
+            sync_group_joins(&socket, &groups, &fabrics, &mut joined_groups, local_ipv6);
+        }
+
         let rgen = stack.resumption_generation();
         if rgen != last_resumption_gen {
             last_resumption_gen = rgen;
@@ -719,6 +787,45 @@ fn discover_local_ipv4() -> Ipv4Addr {
             SocketAddr::V6(_) => None,
         })
         .unwrap_or(Ipv4Addr::LOCALHOST)
+}
+
+/// group メンバーシップに対応する group マルチキャストアドレスへ join する
+/// (group-messaging.md §5.3。leave は行わない = 割り切り。復号鍵が無いため実害なし)。
+fn sync_group_joins(
+    socket: &UdpSocket,
+    groups: &RefCell<DefaultGroupStore>,
+    fabrics: &RefCell<FabricTable<Backend, NF>>,
+    joined: &mut Vec<Ipv6Addr>,
+    local_ipv6: Option<(Ipv6Addr, u32)>,
+) {
+    let store = groups.borrow();
+    let fabrics = fabrics.borrow();
+    for g in store.groups_iter_all() {
+        let Some(f) = fabrics.get(g.fabric_idx()) else {
+            continue;
+        };
+        let addr = group_multicast_addr(f.fabric_id(), g.group_id());
+        if joined.contains(&addr) {
+            continue;
+        }
+        // 既定経路 iface(scope)と iface 指定なし(0 = カーネル既定)の両方で join を
+        // 試みる(mDNS の join パターンに倣う。重複 join 等のエラーは無視)。
+        let mut ok = false;
+        if let Some((_, scope)) = local_ipv6 {
+            ok |= socket.join_multicast_v6(&addr, scope).is_ok();
+        }
+        ok |= socket.join_multicast_v6(&addr, 0).is_ok();
+        if ok {
+            println!(
+                "[groups] joined multicast {addr} (fabric 0x{:016x} group 0x{:04x})",
+                f.fabric_id(),
+                g.group_id()
+            );
+            joined.push(addr);
+        } else {
+            println!("[groups] multicast join failed for {addr}");
+        }
+    }
 }
 
 /// Matter 運用 UDP(5540)をデュアルスタック(v6only=false)で bind する。

@@ -57,6 +57,12 @@ impl SecFlags {
     /// グループセッションビット(下位 Session Type = 1)。
     pub const GROUP_SESSION: u8 = 0x01;
 
+    /// P(privacy)ビット。ヘッダの一部が難読化されている(本実装は非対応 = drop)。
+    pub const PRIVACY: u8 = 0x80;
+
+    /// C(control message)ビット(MCSP。本実装は非対応 = drop)。
+    pub const CONTROL: u8 = 0x40;
+
     /// 生の 1 バイトから全ビットを保持して生成する。
     pub const fn from_bits(bits: u8) -> Self {
         Self(bits)
@@ -70,6 +76,16 @@ impl SecFlags {
     /// グループセッションであれば `true`。
     pub const fn is_group_session(self) -> bool {
         self.0 & Self::GROUP_SESSION != 0
+    }
+
+    /// privacy 難読化(P フラグ)されていれば `true`。
+    pub const fn is_privacy(self) -> bool {
+        self.0 & Self::PRIVACY != 0
+    }
+
+    /// control message(C フラグ)であれば `true`。
+    pub const fn is_control(self) -> bool {
+        self.0 & Self::CONTROL != 0
     }
 }
 

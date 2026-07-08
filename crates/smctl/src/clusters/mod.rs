@@ -18,6 +18,8 @@ pub mod fan_control;
 pub mod flow_measurement;
 pub mod general_commissioning;
 pub mod general_diagnostics;
+pub mod group_key_management;
+pub mod groups;
 pub mod identify;
 pub mod illuminance_measurement;
 pub mod level_control;
@@ -176,6 +178,7 @@ impl ClusterDef {
 /// クラスタレジストリ。新クラスタ対応はここに 1 行足すだけ(設計 doc §5.2)。ID 昇順。
 pub static CLUSTERS: &[&ClusterDef] = &[
     &identify::DEF,                      // 0x0003
+    &groups::DEF,                        // 0x0004
     &on_off::DEF,                        // 0x0006
     &level_control::DEF,                 // 0x0008
     &descriptor::DEF,                    // 0x001D
@@ -187,6 +190,7 @@ pub static CLUSTERS: &[&ClusterDef] = &[
     &switch::DEF,                        // 0x003B
     &administrator_commissioning::DEF,   // 0x003C
     &operational_credentials::DEF,       // 0x003E
+    &group_key_management::DEF,          // 0x003F
     &boolean_state::DEF,                 // 0x0045
     &window_covering::DEF,               // 0x0102
     &thermostat::DEF,                    // 0x0201
@@ -347,6 +351,55 @@ mod tests {
         let ts = gd.cmd_by_name("time-snapshot").expect("time-snapshot");
         assert_eq!(ts.id, CommandId(0x01));
         assert!(ts.fields.is_empty());
+    }
+
+    #[test]
+    fn groups_and_group_key_management_registered() {
+        // Groups(0x0004): get-group-membership は list フィールドを省略しているので
+        // 引数無しコマンドとして収載されていることを確認する。
+        let g = by_name("groups").expect("groups in registry");
+        assert_eq!(g.id, ClusterId(0x0004));
+        assert!(std::ptr::eq(by_id(ClusterId(0x0004)).unwrap(), g));
+        assert_eq!(
+            g.attr_by_name("name-support").unwrap().id,
+            AttributeId(0x0000)
+        );
+        for (name, id, nfields) in [
+            ("add-group", 0x00, 2),
+            ("view-group", 0x01, 1),
+            ("get-group-membership", 0x02, 0),
+            ("remove-group", 0x03, 1),
+            ("remove-all-groups", 0x04, 0),
+            ("add-group-if-identifying", 0x05, 2),
+        ] {
+            let cmd = g.cmd_by_name(name).expect(name);
+            assert_eq!(cmd.id, CommandId(id));
+            assert_eq!(cmd.fields.len(), nfields, "{name}: field count");
+        }
+
+        // GroupKeyManagement(0x003F): key-set-write はネスト struct 引数のため
+        // 未収載(コメント参照)。read/remove/read-all-indices のみ。
+        let gkm = by_name("groupkeymanagement").expect("groupkeymanagement in registry");
+        assert_eq!(gkm.id, ClusterId(0x003F));
+        assert!(std::ptr::eq(by_id(ClusterId(0x003F)).unwrap(), gkm));
+        let map = gkm.attr_by_name("group-key-map").unwrap();
+        assert_eq!(map.kind, ValueKind::Raw);
+        assert!(map.writable);
+        let table = gkm.attr_by_name("group-table").unwrap();
+        assert_eq!(table.kind, ValueKind::Raw);
+        assert!(!table.writable);
+        assert_eq!(
+            gkm.attr_by_name("max-groups-per-fabric").unwrap().kind,
+            ValueKind::U16
+        );
+        assert!(gkm.cmd_by_name("key-set-write").is_none());
+        for (name, id) in [
+            ("key-set-read", 0x01),
+            ("key-set-remove", 0x03),
+            ("key-set-read-all-indices", 0x04),
+        ] {
+            assert_eq!(gkm.cmd_by_name(name).expect(name).id, CommandId(id));
+        }
     }
 
     #[test]

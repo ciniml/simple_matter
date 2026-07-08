@@ -381,3 +381,92 @@ fn retain_fabrics_drops_unknown() {
     assert_eq!(t.len(), 1);
     assert_eq!(t.iter().next().unwrap().fabric_idx(), f(2));
 }
+
+// ---------------------------------------------------------------------------
+// Group 認証(groupcast、`docs/design/group-messaging.md` §4)
+// ---------------------------------------------------------------------------
+
+/// group node id 形式の subject を作る。
+fn gsub(gid: u16) -> u64 {
+    0xFFFF_FFFF_FFFF_0000 | gid as u64
+}
+
+fn group_acc(fabric: u8, gid: u16) -> AccessContext {
+    AccessContext::new(
+        SessionKind::Group,
+        NonZeroU8::new(fabric),
+        gsub(gid),
+        Privilege::Operate,
+    )
+}
+
+#[test]
+fn group_entry_subject_validation() {
+    // Group エントリの subject は group node id 形式のみ有効。
+    let mut e = AclEntry::new(f(1), Privilege::Operate, AuthMode::Group);
+    e.add_subject(gsub(0x0101)).unwrap();
+    assert!(e.is_valid());
+
+    // 素の group id(16bit 値)は不可。
+    let mut e = AclEntry::new(f(1), Privilege::Operate, AuthMode::Group);
+    e.add_subject(0x0101).unwrap();
+    assert!(!e.is_valid());
+
+    // gid 0 の group node id は不可。
+    let mut e = AclEntry::new(f(1), Privilege::Operate, AuthMode::Group);
+    e.add_subject(gsub(0)).unwrap();
+    assert!(!e.is_valid());
+
+    // subjects 空の Group エントリは可(全 group ワイルドカード)。
+    let e = AclEntry::new(f(1), Privilege::Operate, AuthMode::Group);
+    assert!(e.is_valid());
+}
+
+#[test]
+fn group_check_matches_group_entries_only() {
+    let mut t: AclTable<8> = AclTable::new();
+    // fabric1: group 0x0101 に Operate 付与。
+    let mut e = AclEntry::new(f(1), Privilege::Operate, AuthMode::Group);
+    e.add_subject(gsub(0x0101)).unwrap();
+    t.add(e).unwrap();
+    // fabric1: CASE admin エントリ(Group 判定では使われない)。
+    t.add(AclEntry::case_admin(f(1), 0x1111)).unwrap();
+
+    // 一致 group → Operate 許可、Manage は不可。
+    assert!(t.check(&group_acc(1, 0x0101), EP1, ONOFF, Privilege::Operate));
+    assert!(!t.check(&group_acc(1, 0x0101), EP1, ONOFF, Privilege::Manage));
+    // 別 group / 別 fabric は不許可。
+    assert!(!t.check(&group_acc(1, 0x0202), EP1, ONOFF, Privilege::Operate));
+    assert!(!t.check(&group_acc(2, 0x0101), EP1, ONOFF, Privilege::Operate));
+    // fabric 未確定は不許可。
+    let mut acc = group_acc(1, 0x0101);
+    acc.fabric_idx = None;
+    assert!(!t.check(&acc, EP1, ONOFF, Privilege::Operate));
+
+    // CASE アクセスは Group エントリにマッチしない(subject が偶然一致しても)。
+    assert!(!t.check(&case_acc(1, gsub(0x0101)), EP1, ONOFF, Privilege::Operate));
+}
+
+#[test]
+fn group_check_wildcard_and_targets() {
+    let mut t: AclTable<8> = AclTable::new();
+    // subjects 空 = 全 group、target = OnOff クラスタ限定。
+    let mut e = AclEntry::new(f(1), Privilege::Operate, AuthMode::Group);
+    e.add_target(AclTarget {
+        cluster: Some(0x0006),
+        endpoint: None,
+        device_type: None,
+    })
+    .unwrap();
+    t.add(e).unwrap();
+
+    assert!(t.check(&group_acc(1, 0x0101), EP1, ONOFF, Privilege::Operate));
+    assert!(t.check(&group_acc(1, 0x7777), EP1, ONOFF, Privilege::Operate));
+    // target 外クラスタは不許可。
+    assert!(!t.check(
+        &group_acc(1, 0x0101),
+        EP1,
+        ClusterId(0x0008),
+        Privilege::Operate
+    ));
+}

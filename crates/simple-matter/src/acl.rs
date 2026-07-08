@@ -40,6 +40,11 @@ pub const ACL_ENTRIES_PER_FABRIC: usize = 4;
 /// NodeId 上の CAT(CASE Authenticated Tag)領域の上位 32 ビット(§2.5.5.1)。
 const CAT_PREFIX: u64 = 0xFFFF_FFFD;
 
+/// group node id の上位 48 ビット(`0xFFFF_FFFF_FFFF_0000`、§2.5.5)。
+///
+/// AuthMode::Group エントリの subject はこの形式のみ有効(`docs/design/group-messaging.md` §4)。
+const GROUP_NODE_ID_PREFIX: u64 = 0xFFFF_FFFF_FFFF_0000;
+
 /// 認証モード(AccessControlEntryAuthModeEnum、§9.10.4.3)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -219,12 +224,22 @@ impl AclEntry {
     ///
     /// - `auth_mode == Pase` のエントリは不可(implicit 専用)。
     /// - Administer は CASE のみに付与できる(Group への付与禁止)。
+    /// - Group エントリの subject は group node id 形式
+    ///   (`0xFFFF_FFFF_FFFF_0000 | gid`、gid != 0)のみ有効(chip `IsValidGroupNodeId`)。
     pub fn is_valid(&self) -> bool {
         if matches!(self.auth_mode, AuthMode::Pase) {
             return false;
         }
         if matches!(self.privilege, Privilege::Administer)
             && !matches!(self.auth_mode, AuthMode::Case)
+        {
+            return false;
+        }
+        if matches!(self.auth_mode, AuthMode::Group)
+            && !self
+                .subjects()
+                .iter()
+                .all(|&s| (s >> 16) == (GROUP_NODE_ID_PREFIX >> 16) && (s & 0xFFFF) != 0)
         {
             return false;
         }
@@ -395,6 +410,20 @@ impl<const E: usize> AclTable<E> {
                     matches!(e.auth_mode, AuthMode::Case)
                         && privilege_grants(e.privilege, required)
                         && e.subject_matches(acc)
+                        && e.target_matches(ep, cl)
+                })
+            }
+            // groupcast: AuthMode::Group エントリのみ対象。subject は group node id の
+            // 等値照合(CAT 照合なし)、subjects 空 = 全 group(chip AccessControl.cpp と
+            // 同じ)。`docs/design/group-messaging.md` §4。
+            SessionKind::Group => {
+                let Some(fabric) = acc.fabric_idx else {
+                    return false;
+                };
+                self.iter_fabric(fabric).any(|e| {
+                    matches!(e.auth_mode, AuthMode::Group)
+                        && privilege_grants(e.privilege, required)
+                        && (e.nsubjects == 0 || e.subjects().contains(&acc.subject))
                         && e.target_matches(ep, cl)
                 })
             }
