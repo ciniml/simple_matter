@@ -13,6 +13,7 @@ pub mod level_control;
 pub mod network_commissioning;
 pub mod on_off;
 pub mod operational_credentials;
+pub mod thermostat;
 
 pub use access_control::AccessControlCluster;
 pub use administrator_commissioning::{
@@ -25,6 +26,7 @@ pub use level_control::LevelControlCluster;
 pub use network_commissioning::{NetworkCommissioning, NetworkCommissioningWifi};
 pub use on_off::OnOffCluster;
 pub use operational_credentials::{DacProvider, OpCredsCluster, TestDacProvider};
+pub use thermostat::ThermostatCluster;
 
 #[cfg(all(test, feature = "rustcrypto"))]
 mod commissioning_tests;

@@ -19,6 +19,7 @@ pub mod names;
 pub mod network_commissioning;
 pub mod on_off;
 pub mod operational_credentials;
+pub mod thermostat;
 
 /// 値の型(表示とリテラルパースの両方に使う)。TLV のワイヤ型と 1:1。
 ///
@@ -150,6 +151,7 @@ pub static CLUSTERS: &[&ClusterDef] = &[
     &general_diagnostics::DEF,         // 0x0033
     &administrator_commissioning::DEF, // 0x003C
     &operational_credentials::DEF,     // 0x003E
+    &thermostat::DEF,                  // 0x0201
 ];
 
 /// クラスタを名前で引く。

@@ -1319,6 +1319,10 @@ impl LevelControlCluster {
   setpoint に加算し、**Min/Max と deadband へクランプ**(仕様どおりエラーにしない)。
 - LocalTemperature の擬似センサ(setpoint へ漸近するシム)は example 側(`on_tick` 駆動)。
   クラスタはあくまで値の器 + 検証ロジック。
+- SystemMode の既定は **0(Off)**(表の「既定 1」は誤記。AUTO 無しのため 1=Auto は選べない)。
+- **ESP32 版はスコープ外**(タスク上の任意項目)。Thermostat は実センサ/アクチュエータを
+  持たないため実機化の追加実証価値が薄く、PC example + chip-tool/smctl E2E で完結させる。
+  実機化する場合は e5-light と同じ形(EP1 差し替え + `set_local_temperature` へ実センサ注入)。
 
 ### 15.5 デバイスタイプと必須クラスタ束(現状方針の明記)
 
