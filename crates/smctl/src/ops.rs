@@ -27,7 +27,7 @@ use simple_matter::transport::net::{PeerAddr, MAX_RX_PACKET_SIZE};
 use simple_matter::transport::session::SessionId;
 
 use crate::cli::{Cmd, Globals};
-use crate::clusters::{self, ValueKind};
+use crate::clusters::{self, Semantic, ValueKind};
 use crate::json::{self, info, Obj};
 use crate::log::{logf, Level};
 use crate::runner::udp::{open_dual_stack_udp, pump_commissioner, send_dir};
@@ -417,6 +417,7 @@ impl<'a> Exec<'a> {
                         &format!("[report +{ts}s sub={subscription_id}] "),
                         "report",
                         Some(subscription_id),
+                        self.g.names,
                     );
                 }
                 if let Some(s) = self.subs.iter_mut().find(|s| s.id == subscription_id) {
@@ -942,7 +943,7 @@ impl<'a> Exec<'a> {
             Some(ev) => return Err(format!("read failed: {ev:?}")),
             None => return self.op_timeout(node_id, "read"),
         }
-        print_reports(self.stack.read_reports(), "", "read", None);
+        print_reports(self.stack.read_reports(), "", "read", None, self.g.names);
         self.flush();
         Ok(())
     }
@@ -1990,7 +1991,10 @@ fn format_concrete(cluster: ClusterId, attr: Option<AttributeId>, ep: u16) -> St
 ///
 /// `--json` では人間可読行の代わりにレポート毎の 1 行 JSON
 /// (`event` = `"read"` | `"report"`、購読なら `subscriptionId` 付き)を出す。
-fn print_reports<'r, I>(reports: I, prefix: &str, event: &str, sub_id: Option<u32>)
+///
+/// `names` は `--names` の値表示デコード(意味注釈付き属性の ID→名前。設計 doc §11)。
+/// 人間可読行のみに効き、JSON の値表現は変えない(スキーマ一貫性重視)。
+fn print_reports<'r, I>(reports: I, prefix: &str, event: &str, sub_id: Option<u32>, names: bool)
 where
     I: Iterator<Item = MResult<AttributeReportRef<'r>>>,
 {
@@ -2045,8 +2049,13 @@ where
         match report {
             Ok(AttributeReportRef::Data(d)) => {
                 let path = format_path(&d.path);
+                let sem = if names {
+                    path_semantic(&d.path)
+                } else {
+                    Semantic::None
+                };
                 let mut r = d.value();
-                let value = fmt_next_value(&mut r).unwrap_or_else(|| "<empty>".into());
+                let value = fmt_next_value_named(&mut r, sem).unwrap_or_else(|| "<empty>".into());
                 println!("{prefix}{path} = {value}");
             }
             Ok(AttributeReportRef::Status(s)) => {
@@ -2372,6 +2381,118 @@ fn fmt_element(r: &mut TlvReader, e: &TlvElement) -> String {
     }
 }
 
+// ==========================================================================
+// --names: 意味注釈付き属性の ID→名前デコード表示(設計 doc §11)
+// ==========================================================================
+
+/// レポートパスの属性の意味注釈をレジストリから引く(未収載は `None` 注釈)。
+///
+/// ワイルドカード read の応答は属性ごとの具体パスで返るので、descriptor の
+/// ワイルドカード read でも属性単位で正しい注釈が付く。
+fn path_semantic(path: &AttributePath) -> Semantic {
+    path.cluster
+        .and_then(clusters::by_id)
+        .zip(path.attribute)
+        .and_then(|(def, a)| def.attr_by_id(a))
+        .map(|a| a.semantic)
+        .unwrap_or(Semantic::None)
+}
+
+/// [`fmt_next_value`] の意味注釈対応版。`sem` が [`Semantic::None`] なら従来表示。
+fn fmt_next_value_named(r: &mut TlvReader, sem: Semantic) -> Option<String> {
+    let e = r.read_next().ok()??;
+    Some(fmt_element_named(r, &e, sem))
+}
+
+/// 意味注釈に従って要素を整形する。想定外の TLV 形状は従来の汎用ダンプへ
+/// フォールバックする(注釈は可読性を足すだけで、表示は常に成立させる)。
+fn fmt_element_named(r: &mut TlvReader, e: &TlvElement, sem: Semantic) -> String {
+    match (sem, &e.value) {
+        (Semantic::None, _) => fmt_element(r, e),
+        // list 全体(通常の read 応答)。要素ごとにデコードする。
+        (_, TlvValue::ContainerStart(ContainerType::Array | ContainerType::List)) => {
+            let mut parts = Vec::new();
+            loop {
+                match r.read_next() {
+                    Ok(Some(c)) if matches!(c.value, TlvValue::ContainerEnd) => break,
+                    Ok(Some(c)) => parts.push(fmt_list_item_named(r, &c, sem)),
+                    _ => break,
+                }
+            }
+            format!("[{}]", parts.join(", "))
+        }
+        // chunked レポート(list_index 付き)等、要素単体で来た場合もデコードする。
+        _ => fmt_list_item_named(r, e, sem),
+    }
+}
+
+/// list の要素 1 個を意味注釈に従って整形する。
+fn fmt_list_item_named(r: &mut TlvReader, e: &TlvElement, sem: Semantic) -> String {
+    match (sem, &e.value) {
+        // server-list/client-list: cluster ID(unsigned)→ `6(onoff)`。
+        (Semantic::ClusterIdList, TlvValue::UnsignedInteger(v)) => fmt_cluster_id_value(*v),
+        // device-type-list: `{0: deviceType, 1: revision}` struct →
+        // `{device-type: 0x0101(DimmableLight), revision: 3}`。
+        (Semantic::DeviceTypeStructList, TlvValue::ContainerStart(ContainerType::Structure)) => {
+            fmt_device_type_struct(r)
+        }
+        _ => fmt_element(r, e),
+    }
+}
+
+/// cluster ID 値を `6(onoff)` / `53(ThreadNetworkDiagnostics)` の形にする。
+///
+/// 名前はレジストリ(kebab-case)→ 名前注釈テーブル(CamelCase)の順で解決し、
+/// どちらにも無ければ数値のまま(従来表示と同じ)。
+fn fmt_cluster_id_value(v: u64) -> String {
+    let name = u32::try_from(v).ok().map(ClusterId).and_then(|id| {
+        clusters::by_id(id)
+            .map(|d| d.name)
+            .or_else(|| clusters::names::cluster_name(id))
+    });
+    match name {
+        Some(n) => format!("{v}({n})"),
+        None => v.to_string(),
+    }
+}
+
+/// DeviceTypeStruct(struct 開始消費済み)を
+/// `{device-type: 0x0101(DimmableLight), revision: 3}` の形にする。
+fn fmt_device_type_struct(r: &mut TlvReader) -> String {
+    let mut parts = Vec::new();
+    loop {
+        match r.read_next() {
+            Ok(Some(c)) if matches!(c.value, TlvValue::ContainerEnd) => break,
+            Ok(Some(c)) => {
+                let part = match (c.tag, &c.value) {
+                    (TlvTag::ContextSpecific(0), TlvValue::UnsignedInteger(v)) => {
+                        let name = u32::try_from(*v)
+                            .ok()
+                            .and_then(clusters::device_types::device_type_name);
+                        match name {
+                            Some(n) => format!("device-type: {v:#06x}({n})"),
+                            None => format!("device-type: {v:#06x}"),
+                        }
+                    }
+                    (TlvTag::ContextSpecific(1), TlvValue::UnsignedInteger(v)) => {
+                        format!("revision: {v}")
+                    }
+                    (tag, _) => {
+                        let body = fmt_element(r, &c);
+                        match tag {
+                            TlvTag::ContextSpecific(n) => format!("{n}: {body}"),
+                            _ => body,
+                        }
+                    }
+                };
+                parts.push(part);
+            }
+            _ => break,
+        }
+    }
+    format!("{{{}}}", parts.join(", "))
+}
+
 #[cfg(test)]
 mod admin_tests {
     use super::*;
@@ -2446,6 +2567,116 @@ mod annotate_tests {
             "ep1 onoff/on-off"
         );
         assert_eq!(format_concrete(ClusterId(0xFC01), None, 2), "ep2 0xfc01");
+    }
+}
+
+#[cfg(test)]
+mod names_tests {
+    use super::*;
+
+    /// TLV を組んで `fmt_next_value_named` に通すヘルパ。
+    fn fmt_with(sem: Semantic, build: impl FnOnce(&mut TlvWriter)) -> String {
+        let mut buf = [0u8; 256];
+        let n = {
+            let mut w = TlvWriter::new(&mut buf);
+            build(&mut w);
+            w.len()
+        };
+        let mut r = TlvReader::new(&buf[..n]);
+        fmt_next_value_named(&mut r, sem).expect("value")
+    }
+
+    fn build_server_list(w: &mut TlvWriter) {
+        w.start_array(&TlvTag::Anonymous).unwrap();
+        w.write_u16(&TlvTag::Anonymous, 0x0006).unwrap(); // レジストリ収載(onoff)
+        w.write_u16(&TlvTag::Anonymous, 0x001D).unwrap(); // レジストリ収載(descriptor)
+        w.write_u16(&TlvTag::Anonymous, 0x0035).unwrap(); // 名前注釈のみ
+        w.write_u16(&TlvTag::Anonymous, 0xFC01).unwrap(); // 未知(vendor 域)
+        w.end_container().unwrap();
+    }
+
+    #[test]
+    fn cluster_id_list_decodes_names() {
+        assert_eq!(
+            fmt_with(Semantic::ClusterIdList, build_server_list),
+            "[6(onoff), 29(descriptor), 53(ThreadNetworkDiagnostics), 64513]"
+        );
+    }
+
+    #[test]
+    fn semantic_none_keeps_legacy_output() {
+        // --names 無し(注釈 None)は従来の汎用ダンプのまま。
+        assert_eq!(
+            fmt_with(Semantic::None, build_server_list),
+            "[6, 29, 53, 64513]"
+        );
+    }
+
+    #[test]
+    fn cluster_id_single_element_decodes() {
+        // chunked レポート(list_index 付き)で要素単体が来ても名前が付く。
+        let s = fmt_with(Semantic::ClusterIdList, |w| {
+            w.write_u16(&TlvTag::Anonymous, 0x0006).unwrap();
+        });
+        assert_eq!(s, "6(onoff)");
+    }
+
+    #[test]
+    fn device_type_struct_list_decodes_names() {
+        let s = fmt_with(Semantic::DeviceTypeStructList, |w| {
+            w.start_array(&TlvTag::Anonymous).unwrap();
+            for (dt, rev) in [(0x0101u32, 3u16), (0x0016, 1), (0xFC00, 2)] {
+                w.start_struct(&TlvTag::Anonymous).unwrap();
+                w.write_u32(&TlvTag::ContextSpecific(0), dt).unwrap();
+                w.write_u16(&TlvTag::ContextSpecific(1), rev).unwrap();
+                w.end_container().unwrap();
+            }
+            w.end_container().unwrap();
+        });
+        assert_eq!(
+            s,
+            "[{device-type: 0x0101(DimmableLight), revision: 3}, \
+             {device-type: 0x0016(RootNode), revision: 1}, \
+             {device-type: 0xfc00, revision: 2}]"
+        );
+    }
+
+    #[test]
+    fn unexpected_shape_falls_back_to_generic_dump() {
+        // 注釈と実データの形が合わないときは汎用ダンプで常に成立させる。
+        let s = fmt_with(Semantic::DeviceTypeStructList, |w| {
+            w.start_array(&TlvTag::Anonymous).unwrap();
+            w.write_utf8(&TlvTag::Anonymous, "bogus").unwrap();
+            w.end_container().unwrap();
+        });
+        assert_eq!(s, "[\"bogus\"]");
+    }
+
+    #[test]
+    fn path_semantic_resolves_from_registry() {
+        let sem = |cid: u32, aid: u32| {
+            path_semantic(&AttributePath::concrete(
+                EndpointId(1),
+                ClusterId(cid),
+                AttributeId(aid),
+            ))
+        };
+        assert_eq!(sem(0x001D, 0x0000), Semantic::DeviceTypeStructList);
+        assert_eq!(sem(0x001D, 0x0001), Semantic::ClusterIdList);
+        assert_eq!(sem(0x001D, 0x0002), Semantic::ClusterIdList);
+        assert_eq!(sem(0x001D, 0x0003), Semantic::None); // parts-list は注釈なし
+        assert_eq!(sem(0x0006, 0x0000), Semantic::None); // 他クラスタ
+        assert_eq!(sem(0xFC01, 0x0000), Semantic::None); // レジストリ未収載
+                                                         // ワイルドカード(attribute 無し)のパスも None。
+        let wild = AttributePath {
+            endpoint: Some(EndpointId(1)),
+            cluster: Some(ClusterId(0x001D)),
+            attribute: None,
+            list_index: None,
+            list_append: false,
+            enable_tag_compression: false,
+        };
+        assert_eq!(path_semantic(&wild), Semantic::None);
     }
 }
 

@@ -30,6 +30,11 @@ pub struct Globals {
     pub discriminator: Option<u16>,
     /// 機械可読 JSON 出力(1 行 1 オブジェクト)。情報行は stderr へ逃がす。
     pub json: bool,
+    /// `--names`: read/subscribe の値表示で、意味注釈付き属性
+    /// (Descriptor の server-list/client-list/device-type-list)の ID を
+    /// 名前にデコードして添える(`6(onoff)` / `0x0101(DimmableLight)`)。
+    /// 人間可読表示のみに効く(`--json` の値は不変。設計 doc §11)。
+    pub names: bool,
     /// `admincommissioning open-window --passcode N`(省略時は乱数生成)。
     pub passcode: Option<u32>,
     /// `--timed <ms>`: invoke を timed interaction(TimedRequest → Invoke)で行う。
@@ -60,6 +65,7 @@ impl Globals {
             label: None,
             discriminator: None,
             json: false,
+            names: false,
             passcode: None,
             timed_ms: None,
             paa_trust_store_path: None,
@@ -79,6 +85,7 @@ impl Clone for Globals {
             label: self.label.clone(),
             discriminator: self.discriminator,
             json: self.json,
+            names: self.names,
             passcode: self.passcode,
             timed_ms: self.timed_ms,
             paa_trust_store_path: self.paa_trust_store_path.clone(),
@@ -228,6 +235,7 @@ fn parse_globals(args: &[String], base: &Globals) -> Result<(Globals, Vec<String
                 g.discriminator = Some(d);
             }
             "--json" => g.json = true,
+            "--names" => g.names = true,
             "--passcode" => {
                 let v = it.next().ok_or("--passcode requires a value")?;
                 let p: u32 = v
@@ -1007,6 +1015,13 @@ OPTIONS:
                         stdout (read/write/invoke/subscribe reports/discover);
                         human-readable progress moves to stderr. Works in
                         batch mode too (per-line override allowed)
+  --names               decode well-known IDs in read/subscribe value output:
+                        descriptor server-list/client-list cluster IDs as
+                        6(onoff) / 53(ThreadNetworkDiagnostics), and
+                        device-type-list entries as
+                        {{device-type: 0x0101(DimmableLight), revision: N}}.
+                        Unknown IDs stay numeric; affects human-readable
+                        output only (--json values are unchanged)
 
 ENVIRONMENT:
   SMCTL_LOG=<level>   default log level (overridden by --log-level/-v/-vv)
@@ -1281,6 +1296,26 @@ mod tests {
         assert!(parse_err("admincommissioning open-window 1 300 5000").contains("out of range"));
         assert!(parse_err("admincommissioning open-window 1").starts_with("usage:"));
         assert!(parse_err("admincommissioning bogus").starts_with("usage:"));
+    }
+
+    #[test]
+    fn names_flag_parses() {
+        // 既定 off(従来表示)。
+        let (g, _) = parse_ok("descriptor read server-list 1 1");
+        assert!(!g.names);
+        // グローバルフラグとしてどこに書いてもよい。
+        let (g, cmd) = parse_ok("descriptor read server-list 1 1 --names");
+        assert!(g.names);
+        assert!(matches!(
+            cmd,
+            Cmd::Read {
+                cluster: ClusterId(0x001D),
+                attr: Some(AttributeId(0x0001)),
+                ..
+            }
+        ));
+        let (g, _) = parse_ok("--names descriptor read device-type-list 1 1");
+        assert!(g.names);
     }
 
     #[test]

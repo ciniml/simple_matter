@@ -648,3 +648,68 @@ BLE スキャンの MAC 照合は、発見デバイスの列挙と広告パー�
 (3) 本環境に BLE アダプタが無く検証不能、の 3 点から今回は見送る。実装する場合は
 `ScanFilter` に `Option<[u8;6]>` を足し、`scan` ループで `props.address` を正規化比較
 (大文字小文字・区切り無視)する形が素直。Windows では `PeripheralId` ベースの別手段が要る。
+
+## 11. 追補(2026-07-09): `--names` — Descriptor 属性の ID→名前デコード表示
+
+### 11.1 オプション仕様
+
+`--names`(グローバルフラグ、既定 off)。**read / subscribe の人間可読の値表示**で、
+意味注釈付き属性(現状 Descriptor 0x001D の 3 属性)の ID を名前にデコードして添える:
+
+```text
+$ smctl descriptor read device-type-list 1 1 --names
+ep1 descriptor/device-type-list (0x001d/0x0000) = [{device-type: 0x0101(DimmableLight), revision: 3}]
+$ smctl descriptor read server-list 1 1 --names
+ep1 descriptor/server-list (0x001d/0x0001) = [6(onoff), 8(level-control), 29(descriptor)]
+# --names 無しは従来表示のまま:
+ep1 descriptor/device-type-list (0x001d/0x0000) = [{0: 257, 1: 3}]
+ep1 descriptor/server-list (0x001d/0x0001) = [6, 8, 29]
+```
+
+- server-list / client-list(list of cluster-id): 要素を `6(onoff)` 形式に。名前は
+  クラスタレジストリ(kebab-case)→ 名前注釈テーブル §9.5(仕様名 CamelCase)の順で
+  解決し、どちらにも無い ID(vendor 域等)は数値のまま。§9.5 と同じく
+  「どちらのテーブルで解決されたか」が表記から読み取れる
+  (chip-lighting-app 相手の実出力: `4(Groups)`、`63(GroupKeyManagement)` 等)。
+- device-type-list(list of `{0: deviceType, 1: revision}` struct):
+  `{device-type: 0x0101(DimmableLight), revision: N}` 形式。デバイスタイプ名は新設の
+  **デバイスタイプ名注釈テーブル**(`clusters/device_types.rs`、Matter 1.x Device
+  Library の標準デバイスタイプ 68 件、ID 昇順 + 二分探索。names.rs と同じ流儀)。
+  未知 ID は `{device-type: 0xfc00, revision: N}`(hex のみ)。
+- parts-list は endpoint 番号のままで十分読めるので注釈しない(従来表示)。
+- **`--json` の値表現は変えない**(スキーマ一貫性重視。パスの `clusterName`/
+  `attributeName` は従来どおり付くが、`value` は生の数値/構造のまま。機械可読側は
+  ID で処理するのが前提で、`--names` は human 表示専用)。
+
+### 11.2 設計: `cluster_def!` の意味注釈(`@<Semantic>`)
+
+表示層(ops.rs)に「descriptor の 0x0001 なら cluster-id リスト」というハードコードを
+持ち込まず、`AttrDef` に意味注釈 `Semantic`(`None` / `ClusterIdList` /
+`DeviceTypeStructList`)を追加して cluster_def! で宣言する(単一ソース原則 =
+クラスタの知識はテーブルに集約):
+
+```rust
+0x0000 => "device-type-list": Raw @DeviceTypeStructList;
+0x0001 => "server-list": Raw @ClusterIdList;
+```
+
+- `ValueKind` はワイヤ型(TLV 型と 1:1)なので触らない(Raw のまま)。意味は直交する
+  別軸として `AttrDef.semantic` に載せる。将来 Binding の cluster フィールド等にも
+  同じ機構で注釈できる。
+- 区切りトークンが `as` でなく `@` なのは、macro_rules の `ident` フラグメント
+  (`rw` フラグ)がキーワード `as` にもマッチしてローカル曖昧になるため。
+- 表示は `ops::path_semantic()`(レポートパス → レジストリ → 注釈)+
+  `fmt_next_value_named()`。ワイルドカード read も応答は属性ごとの具体パスなので
+  属性単位で正しく注釈が付き、chunked レポート(list_index 付き・要素単体)も
+  デコードする。**想定外の TLV 形状は従来の汎用ダンプへフォールバック**
+  (注釈は可読性を足すだけで、表示は常に成立させる)。
+
+### 11.3 ゲート実績(2026-07-09)
+
+単体(デバイスタイプテーブルの sorted/unique+引き、`--names` パース、ClusterIdList/
+DeviceTypeStructList/フォールバック/chunk 単体のフォーマット、path_semantic)で
+smctl 46→56、コア 444 とも green、clippy 0。E2E: dimmable-light(ep1 =
+`0x0101(DimmableLight)`/`6(onoff), 8(level-control)`、ep0 = `0x0016(RootNode)`)、
+thermostat(`0x0301(Thermostat)`/`513(thermostat)`)、chip-lighting-app(レジストリ名
+kebab と注釈名 CamelCase の混在解決、ep0 の 20 クラスタ)で `--names` 有り/無し/
+`--json`(値不変)を確認。Windows クロスビルド(cargo xwin、--features ble)green。

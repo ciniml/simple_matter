@@ -11,6 +11,7 @@ pub mod access_control;
 pub mod administrator_commissioning;
 pub mod basic_information;
 pub mod descriptor;
+pub mod device_types;
 pub mod general_commissioning;
 pub mod general_diagnostics;
 pub mod identify;
@@ -67,12 +68,35 @@ impl ValueKind {
     }
 }
 
+/// 属性値の意味注釈(設計 doc §11)。
+///
+/// [`ValueKind`] はワイヤ型(TLV 型と 1:1)なので、「この Raw リストの要素は
+/// cluster ID である」といった**意味**は載らない。`--names` の ID→名前デコード表示は
+/// この注釈で駆動する(表示層に特定クラスタのハードコードを持ち込まない。
+/// 単一ソース原則 = クラスタの知識は cluster_def! に集約)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Semantic {
+    /// 注釈なし(従来表示)。
+    #[default]
+    None,
+    /// 要素が cluster ID の list(Descriptor の ServerList/ClientList)。
+    ClusterIdList,
+    /// 要素が `{0: deviceType, 1: revision}` struct の list
+    /// (Descriptor の DeviceTypeList)。
+    DeviceTypeStructList,
+}
+
 /// 属性の名前テーブルエントリ。
 pub struct AttrDef {
     pub id: AttributeId,
     /// kebab-case の属性名。
     pub name: &'static str,
     pub kind: ValueKind,
+    /// 値の意味注釈(`@<Semantic>` 指定。既定 [`Semantic::None`])。
+    ///
+    /// マクロの区切りが `as` でなく `@` なのは、`as` が `ident` フラグメント
+    /// (`rw` フラグ)にもマッチして macro_rules がローカル曖昧になるため。
+    pub semantic: Semantic,
     /// Write 可能属性か(`rw` 指定)。
     pub writable: bool,
 }
@@ -172,6 +196,7 @@ pub fn by_id(id: ClusterId) -> Option<&'static ClusterDef> {
 ///         attrs {
 ///             0x0000 => "on-off": Bool;          // 読み取り専用
 ///             0x4001 => "on-time": U16 rw;       // writable は末尾に `rw`
+///             0x0001 => "server-list": Raw @ClusterIdList; // 意味注釈(--names 用)
 ///         }
 ///         cmds {
 ///             0x02 => "toggle" {}
@@ -183,7 +208,7 @@ pub fn by_id(id: ClusterId) -> Option<&'static ClusterDef> {
 macro_rules! cluster_def {
     (
         pub $def:ident = cluster($cid:expr, $cname:literal) {
-            attrs { $( $aid:expr => $aname:literal : $akind:ident $($aflag:ident)? ; )* }
+            attrs { $( $aid:expr => $aname:literal : $akind:ident $(@ $asem:ident)? $($aflag:ident)? ; )* }
             cmds { $( $mid:expr => $mname:literal { $( $ftag:expr => $fname:literal : $fkind:ident $($fflag:ident)? ; )* } )* }
             $( events { $( $eid:expr => $ename:literal ; )* } )?
         }
@@ -196,6 +221,7 @@ macro_rules! cluster_def {
                     id: simple_matter::dm::meta::AttributeId($aid),
                     name: $aname,
                     kind: crate::clusters::ValueKind::$akind,
+                    semantic: cluster_def!(@sem $($asem)?),
                     writable: cluster_def!(@wflag $($aflag)?),
                 },)*
             ],
@@ -223,6 +249,8 @@ macro_rules! cluster_def {
     };
     (@wflag) => { false };
     (@wflag rw) => { true };
+    (@sem) => { crate::clusters::Semantic::None };
+    (@sem $sem:ident) => { crate::clusters::Semantic::$sem };
     (@oflag) => { false };
     (@oflag opt) => { true };
 }
@@ -297,6 +325,23 @@ mod tests {
         let ts = gd.cmd_by_name("time-snapshot").expect("time-snapshot");
         assert_eq!(ts.id, CommandId(0x01));
         assert!(ts.fields.is_empty());
+    }
+
+    #[test]
+    fn descriptor_semantic_annotations() {
+        // --names のデコード表示は cluster_def! の意味注釈で駆動する(設計 doc §11)。
+        let d = by_name("descriptor").expect("descriptor in registry");
+        let sem = |name: &str| d.attr_by_name(name).unwrap().semantic;
+        assert_eq!(sem("device-type-list"), Semantic::DeviceTypeStructList);
+        assert_eq!(sem("server-list"), Semantic::ClusterIdList);
+        assert_eq!(sem("client-list"), Semantic::ClusterIdList);
+        // parts-list(endpoint 番号)と他クラスタの属性は注釈なし。
+        assert_eq!(sem("parts-list"), Semantic::None);
+        let onoff = by_name("onoff").unwrap();
+        assert_eq!(
+            onoff.attr_by_name("on-off").unwrap().semantic,
+            Semantic::None
+        );
     }
 
     #[test]
