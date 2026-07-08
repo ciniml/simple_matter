@@ -418,10 +418,9 @@ async fn pump(
                             let dir =
                                 stack.handle_rx(&mut sdu[..slen], PeerAddr::Ble(c), now, &mut txd);
                             if let Some(d) = dir {
-                                if let Err(e) = send_ble(
-                                    gatt, &mut btp, d, &txd[..d.len], mtu, subscribed, now,
-                                )
-                                .await
+                                if let Err(e) =
+                                    send_ble(gatt, &mut btp, d, &txd[..d.len], mtu, subscribed, now)
+                                        .await
                                 {
                                     println!("[stack] send(rx) error: {:?}", e);
                                 }
@@ -570,10 +569,9 @@ async fn main(_spawner: Spawner) {
     } = ble_stack.build();
 
     // GATT サーバ(GAP + Matter BTP service)。
-    let server = BtpGattServer::new_with_config(trouble_host::gap::GapConfig::default(
-        "simple-matter",
-    ))
-    .expect("GATT server build");
+    let server =
+        BtpGattServer::new_with_config(trouble_host::gap::GapConfig::default("simple-matter"))
+            .expect("GATT server build");
 
     // GattPeripheral 実装(channel で worker と接続)。
     let channels = GattChannels::new();

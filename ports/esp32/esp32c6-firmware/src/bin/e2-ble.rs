@@ -229,10 +229,7 @@ async fn pump(gatt: &mut TroubleGattPeripheral<'_>) -> ! {
                         // 再組立できた Matter メッセージは E2 では受信ログのみ
                         // (MatterStack への接続は E3 スコープ)。
                         while let Some(n) = take_sdu(&mut btp, &mut sdu) {
-                            println!(
-                                "[btp] rx sdu: len={} (matter message; ignored in E2)",
-                                n
-                            );
+                            println!("[btp] rx sdu: len={} (matter message; ignored in E2)", n);
                         }
                     }
                     PeripheralEvent::Disconnected { conn: c } => {
@@ -325,8 +322,8 @@ async fn main(_spawner: Spawner) {
 
     // 同時 1 接続・L2CAP 追加チャネルなし(ATT は組み込み)・広告セット 1。
     let mut resources: HostResources<DefaultPacketPool, 1, 1> = HostResources::new();
-    let stack = trouble_host::new(controller, &mut resources)
-        .set_random_address(Address::random(addr));
+    let stack =
+        trouble_host::new(controller, &mut resources).set_random_address(Address::random(addr));
     let Host {
         mut peripheral,
         mut runner,
@@ -334,10 +331,9 @@ async fn main(_spawner: Spawner) {
     } = stack.build();
 
     // GATT サーバ(GAP + Matter BTP service)。
-    let server = BtpGattServer::new_with_config(trouble_host::gap::GapConfig::default(
-        "simple-matter",
-    ))
-    .expect("GATT server build");
+    let server =
+        BtpGattServer::new_with_config(trouble_host::gap::GapConfig::default("simple-matter"))
+            .expect("GATT server build");
 
     // GattPeripheral 実装(channel で worker と接続)。
     let channels = GattChannels::new();
@@ -354,7 +350,10 @@ async fn main(_spawner: Spawner) {
         .await
         .expect("start_advertising");
 
-    println!("[boot] discriminator={} vid={:#06x} pid={:#06x}", DISCRIMINATOR, VENDOR_ID, PRODUCT_ID);
+    println!(
+        "[boot] discriminator={} vid={:#06x} pid={:#06x}",
+        DISCRIMINATOR, VENDOR_ID, PRODUCT_ID
+    );
     println!("[boot] commission with: cargo run -p simple-matter-ble --features commissioner --example ble-commissioner -- 20202021 {}", DISCRIMINATOR);
 
     // TrouBLE host runner / GATT worker / BTP pump を単一 executor 上で並走させる。

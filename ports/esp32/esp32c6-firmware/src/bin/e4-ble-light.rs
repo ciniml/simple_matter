@@ -425,10 +425,9 @@ async fn pump(
                             let dir =
                                 stack.handle_rx(&mut sdu[..slen], PeerAddr::Ble(c), now, &mut txd);
                             if let Some(d) = dir {
-                                if let Err(e) = send_ble(
-                                    gatt, &mut btp, d, &txd[..d.len], mtu, subscribed, now,
-                                )
-                                .await
+                                if let Err(e) =
+                                    send_ble(gatt, &mut btp, d, &txd[..d.len], mtu, subscribed, now)
+                                        .await
                                 {
                                     println!("[stack] send(rx) error: {:?}", e);
                                 }
@@ -574,7 +573,10 @@ async fn main(_spawner: Spawner) {
         Ok(n) => println!("[kvs] restored {} fabrics", n),
         Err(e) => {
             // 部分復元の可能性があるためテーブルを空に作り直す(初回起動相当で続行)。
-            println!("[kvs] restore failed: {:?}; starting with empty fabric table", e);
+            println!(
+                "[kvs] restore failed: {:?}; starting with empty fabric table",
+                e
+            );
             *fabrics.borrow_mut() = FabricTable::new();
         }
     }
@@ -617,10 +619,9 @@ async fn main(_spawner: Spawner) {
     } = ble_stack.build();
 
     // GATT サーバ(GAP + Matter BTP service)。
-    let server = BtpGattServer::new_with_config(trouble_host::gap::GapConfig::default(
-        "simple-matter",
-    ))
-    .expect("GATT server build");
+    let server =
+        BtpGattServer::new_with_config(trouble_host::gap::GapConfig::default("simple-matter"))
+            .expect("GATT server build");
 
     // GattPeripheral 実装(channel で worker と接続)。
     let channels = GattChannels::new();
@@ -642,7 +643,10 @@ async fn main(_spawner: Spawner) {
         PASSCODE, DISCRIMINATOR, CFG.vendor_id, CFG.product_id
     );
     println!("[boot] commission with: cargo run -p simple-matter-ble --features commissioner --example ble-commissioner -- {} {}", PASSCODE, DISCRIMINATOR);
-    println!("[boot] after reboot   : ... -- {} {} --operational (CASE only)", PASSCODE, DISCRIMINATOR);
+    println!(
+        "[boot] after reboot   : ... -- {} {} --operational (CASE only)",
+        PASSCODE, DISCRIMINATOR
+    );
 
     // TrouBLE host runner / GATT worker / 統合層 pump を単一 executor 上で並走させる。
     join3(

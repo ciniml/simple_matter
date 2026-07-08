@@ -181,12 +181,7 @@ pub async fn wifi_task(mut controller: WifiController<'_>) -> ! {
                 );
                 WIFI_STATE.store(STATE_CONNECTED, Ordering::Release);
                 // 切断イベント or 新しい join 要求を待つ。
-                match select(
-                    WIFI_REQUEST.wait(),
-                    controller.wait_for_disconnect_async(),
-                )
-                .await
-                {
+                match select(WIFI_REQUEST.wait(), controller.wait_for_disconnect_async()).await {
                     Either::First(new_req) => req = new_req,
                     Either::Second(res) => {
                         println!("[wifi] disconnected: {:?}; rejoining", res);

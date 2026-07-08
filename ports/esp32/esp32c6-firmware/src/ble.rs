@@ -75,7 +75,11 @@ pub const MAX_FRAG: usize = 248;
 #[gatt_service(uuid = "0000fff6-0000-1000-8000-00805f9b34fb")]
 pub struct MatterBtpService {
     /// C1: 上り BTP フラグメント。
-    #[characteristic(uuid = "18ee2ef5-263d-4559-959f-4f9c429f9d11", write, write_without_response)]
+    #[characteristic(
+        uuid = "18ee2ef5-263d-4559-959f-4f9c429f9d11",
+        write,
+        write_without_response
+    )]
     pub c1: heapless::Vec<u8, MAX_FRAG>,
     /// C2: 下り BTP フラグメント(indicate)。
     #[characteristic(uuid = "18ee2ef5-263d-4559-959f-4f9c429f9d12", indicate)]
@@ -233,7 +237,9 @@ impl GattPeripheral for TroubleGattPeripheral<'_> {
                     return Ok(PeripheralEvent::C2Subscribed { conn });
                 }
                 RawEvent::Disconnected => {
-                    let Some(conn) = self.conn.take() else { continue };
+                    let Some(conn) = self.conn.take() else {
+                        continue;
+                    };
                     return Ok(PeripheralEvent::Disconnected { conn });
                 }
             }
