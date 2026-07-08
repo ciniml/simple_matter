@@ -214,6 +214,15 @@ InitialPress/ShortRelease 受信。
 
 ## 5. 割り切り一覧(実装後に追記)
 
+### バッチ 2(実装済み)
+
+- LatchingSwitch の `set_position` は**変化時のみ** SwitchLatched を発火(同一位置への
+  再設定でスプリアスイベントを出さない)。momentary の press/release は動作イベントの
+  ため常に発火。
+- Switch の pending イベントリング(4)は満杯時に最古を上書き(press+release=2 件で
+  容量に十分収まる)。
+- Fan の PercentCurrent ランプは 1%/100ms tick(=10%/秒)。
+
 ### バッチ 1(実装済み)
 
 - 計測系の Min/MaxMeasuredValue はいずれも nullable のため、コンストラクタは

@@ -13,6 +13,7 @@ pub mod basic_information;
 pub mod boolean_state;
 pub mod descriptor;
 pub mod device_types;
+pub mod fan_control;
 pub mod flow_measurement;
 pub mod general_commissioning;
 pub mod general_diagnostics;
@@ -26,8 +27,10 @@ pub mod on_off;
 pub mod operational_credentials;
 pub mod pressure_measurement;
 pub mod relative_humidity_measurement;
+pub mod switch;
 pub mod temperature_measurement;
 pub mod thermostat;
+pub mod window_covering;
 
 /// 値の型(表示とリテラルパースの両方に使う)。TLV のワイヤ型と 1:1。
 ///
@@ -180,10 +183,13 @@ pub static CLUSTERS: &[&ClusterDef] = &[
     &general_commissioning::DEF,         // 0x0030
     &network_commissioning::DEF,         // 0x0031
     &general_diagnostics::DEF,           // 0x0033
+    &switch::DEF,                        // 0x003B
     &administrator_commissioning::DEF,   // 0x003C
     &operational_credentials::DEF,       // 0x003E
     &boolean_state::DEF,                 // 0x0045
+    &window_covering::DEF,               // 0x0102
     &thermostat::DEF,                    // 0x0201
+    &fan_control::DEF,                   // 0x0202
     &illuminance_measurement::DEF,       // 0x0400
     &temperature_measurement::DEF,       // 0x0402
     &pressure_measurement::DEF,          // 0x0403
