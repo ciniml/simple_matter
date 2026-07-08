@@ -243,3 +243,53 @@ InitialPress/ShortRelease 受信。
 - センサ系デバイスタイプ(0x0302/0x0307/0x0015/0x0107/0x0106/0x0305/0x0306)は
   Groups/Scenes を必須にしないため、sensor-hub EP1-7 に省略クラスタは無し
   (必須 = Identify + 計測系 + Descriptor をすべて実装)。
+
+## 6. バッチ 4 — Door Lock(0x0101、最小実用)
+
+- revision 7(1.3/1.4 XML とも 7)。feature_map = 0(PIN/USR/COTA/WDSCH 等すべて off)。
+- 属性: LockState(0x0000、**nullable** enum8 {0 NotFullyLocked, 1 Locked, 2 Unlocked,
+  3 Unlatched}、subscribe、初期 1=Locked)、LockType(0x0001、enum8、コンストラクタ指定、
+  既定 2=DeadBolt)、ActuatorEnabled(0x0002、bool、固定 true)、OperatingMode(0x0025、
+  enum8 0-4、rw、範囲外 ConstraintError、**保存のみ**=動作連動なし・割り切り)、
+  SupportedOperatingModes(0x0026、map16、固定 0xFFF6 = XML 既定。ビット反転表現)。
+- コマンド: LockDoor(0x00、**@timed**、{0: PINCode octstr 任意 → 受理して無視 =
+  割り切り})、UnlockDoor(0x01、**@timed**)。feature 無し構成では
+  requirePINforRemoteOperation 属性自体が存在せず、PIN なし Lock/Unlock が仕様上許可される
+  (chip door-lock-server.cpp の requirePin=false 経路)。timed 必須は既存の
+  `@timed` 注釈 + エンジンの NeedsTimedInteraction 強制で実現(chip-tool は
+  `--timedInteractionTimeoutMs` を明示指定する必要がある)。
+- イベント: LockOperation(0x02、CRITICAL、{0: lockOperationType enum8(0=Lock/
+  1=Unlock)、1: operationSource enum8(7=Remote)、2: userIndex null、
+  3: fabricIndex nullable、4: sourceNode nullable})。クラスタ内 pending キュー(4)→
+  アプリが `take_event()` で `stack.post_event` へ運ぶ(BooleanState/Switch と同じ契約)。
+  fabricIndex/sourceNode は invoke の AccessContext から取る。
+  DoorLockAlarm / LockOperationError / DoorStateChange はスコープ外。
+- **credential 管理はスコープ外**: SetCredential/GetCredentialStatus/SetUser 等の
+  USR/PIN feature 系、Schedule 系(WDSCH/YDSCH/HDSCH)、AutoRelockTime、
+  DoorOpenEvents 等の任意属性は非実装(将来リスト)。
+- example: `examples/door-lock.rs`(EP1 = Door Lock 0x000A rev 2: 必須 = Identify +
+  DoorLock + Descriptor。Lock/Unlock を println、自動シムなし = 操作駆動のみ)。
+- smctl: door-lock の cluster_def!(lock-state/lock-type/actuator-enabled/
+  operating-mode(rw)/supported-operating-modes、lock-door/unlock-door、
+  events 0x02 lock-operation)。
+- E2E: chip-tool `doorlock lock-door 1 1 --timedInteractionTimeoutMs 1000` /
+  `unlock-door` / `read lock-state` / `read-event lock-operation`、timed フラグ
+  無し invoke が NEEDS_TIMED_INTERACTION(0xc6)で拒否されること、smctl
+  `door-lock lock-door <node> 1 --timed 1000` + `read lock-state`。
+
+### バッチ 4 の割り切り(実装後に追記)
+
+- (実装済み)LockOperation は「操作イベント」なので状態が同じでも発火する
+  (施錠済みへの再施錠でもイベントは出る。dirty は状態遷移時のみ)。pending リングは
+  4 件で満杯時は最古を上書き。
+- operationSource は 7(Remote)固定(物理操作 API を持たないため)。userIndex は
+  常に null(credential 非対応)。
+- OperatingMode は 0-4 の範囲検証のみで動作連動なし(NoRemoteLockUnlock でも
+  リモート操作を拒否しない = 割り切り)。SupportedOperatingModes は XML 既定 0xFFF6 固定。
+- PINCode フィールドは受理して無視(検証しない)。
+- E2E 実測(2026-07-09、chip-tool snap v1.5.1 + smctl): timed 無し invoke =
+  NEEDS_TIMED_INTERACTION(0xc6)拒否 / `--timedInteractionTimeoutMs 1000` で
+  lock-door・unlock-door 成功 + LockState 反映 / read-event lock-operation で
+  fabricIndex・sourceNode(112233)入りイベント / operating-mode write 5 =
+  CONSTRAINT_ERROR / smctl `--timed 1000` + subscribe-event で CRITICAL イベントの
+  ライブ受信、を確認。

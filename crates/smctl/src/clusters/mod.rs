@@ -14,6 +14,7 @@ pub mod boolean_state;
 pub mod color_control;
 pub mod descriptor;
 pub mod device_types;
+pub mod door_lock;
 pub mod fan_control;
 pub mod flow_measurement;
 pub mod general_commissioning;
@@ -192,6 +193,7 @@ pub static CLUSTERS: &[&ClusterDef] = &[
     &operational_credentials::DEF,       // 0x003E
     &group_key_management::DEF,          // 0x003F
     &boolean_state::DEF,                 // 0x0045
+    &door_lock::DEF,                     // 0x0101
     &window_covering::DEF,               // 0x0102
     &thermostat::DEF,                    // 0x0201
     &fan_control::DEF,                   // 0x0202
