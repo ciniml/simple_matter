@@ -293,3 +293,46 @@ InitialPress/ShortRelease 受信。
   fabricIndex・sourceNode(112233)入りイベント / operating-mode write 5 =
   CONSTRAINT_ERROR / smctl `--timed 1000` + subscribe-event で CRITICAL イベントの
   ライブ受信、を確認。
+
+## 7. ScenesManagement 0x0062 — 調査とスキップ判断(2026-07-09)
+
+Matter 1.3 で旧 Scenes(0x0005)は deprecated となり、後継は ScenesManagement
+(0x0062)。実装コストと価値を調査した結果、**今回はスキップ**する(調査結果のみ記録)。
+
+### 調査結果(research/connectedhomeip 1.4 系 scene.xml + chip-tool snap v1.5.1 実測)
+
+- **正典**: `scene.xml` に 0x0062 として収録(専用 XML は無い)。`apiMaturity="provisional"`、
+  revision 1、feature bit0 = SN(SceneNames)。属性は SceneTableSize(0x0001)と
+  **FabricSceneInfo**(0x0002、fabric-scoped list<SceneInfoStruct>。SceneCount /
+  CurrentScene / CurrentGroup / SceneValid / RemainingCapacity、fabricSensitive
+  フィールドあり)。旧 0x0005 の SceneCount 等の単純属性は struct 内へ移動した。
+- **コマンド**: AddScene(0x00)/ ViewScene / RemoveScene / RemoveAllScenes /
+  StoreScene / RecallScene / GetSceneMembership(各 Response 付き、計 7+7)+
+  CopyScene(0x40)。AddScene は GroupID / SceneID / TransitionTime / SceneName /
+  **ExtensionFieldSetStructs[]** を取る。
+- **核心コスト = ExtensionFieldSet**: ExtensionFieldSetStruct = {ClusterID,
+  AttributeValueList<AttributeValuePairStruct>}。AttributeValuePairStruct は
+  AttributeID + **型別 Value フィールド(ValueUnsigned8/Signed8/…/Unsigned64/Signed64
+  の choice union)**(旧 0x0005 の単一 INT32U から 1.3+ で型付きに拡張)。
+  - StoreScene = 「同一 endpoint の他クラスタの現在属性値を型付きで収集して保存」
+  - RecallScene = 「保存値を各クラスタ属性へ(遷移時間付きで)書き戻し」
+  - つまり **クラスタ横断の汎用属性シリアライズ/デシリアライズ基盤**と、対応クラスタ
+    ごとのハンドラ登録(chip の `SceneHandler` 機構相当)が必要。本実装の cluster!
+    マクロ/AttrEncoder は IM ワイヤ向けで、scene 用の型付き往復は別基盤になる。
+  - fabric-scoped scene テーブル(SceneTableSize 既定 16 × ExtensionFieldSet)の
+    RAM/永続化も大きい。
+- **chip-tool**: v1.5.1 に `scenesmanagement` CLI あり(add-scene / recall-scene 等。
+  E2E 自体は可能)。
+- **依存関係**: group scene(GroupID != 0)の Recall は groupcast 配送が本来の想定
+  (バッチ 1 の group messaging 受信で下地はできた)が、unicast Recall でも動作する。
+
+### スキップ判断の理由
+
+1. **実装コストが Groups + GroupKeyManagement 合算より大きい見込み**(ExtensionFieldSet
+   の汎用属性往復基盤 + per-cluster ハンドラ + scene テーブル永続化)に対し、
+2. **仕様上 provisional**(1.3/1.4 とも)で、実装済みデバイスタイプの必須クラスタでもない
+   (旧 Scenes 必須だったタイプも 0x0005 が deprecated となり事実上任意)、
+3. chip エコシステムでも利用例が少なく、相互運用検証の価値が現時点で薄い。
+
+やるなら「OnOff のみ対応の限定 Scene(ExtensionFieldSet を OnOff の bool 1 個に限定)」
+から始めるのが現実的(将来課題)。OTA / ICD は引き続きスコープ外(§0-5 の将来リスト)。
