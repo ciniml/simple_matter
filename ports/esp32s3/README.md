@@ -9,8 +9,8 @@ workspace**。S3 は espup の esp channel(rustc フォーク)を要求し、
 `rust-toolchain.toml` が stable 前提の両者と衝突するため、workspace 分離が
 必須(airq-port.md §3.3)。
 
-> **状態(2026-07-09)**: 段階 1(espup スパイク = ツールチェーン + スモーク bin)
-> ビルド green。**AirQ 実機は未検証(未接続)**。実機ゲートは
+> **状態(2026-07-09)**: A5 段階 1-3(ツールチェーン + 全 bin)ビルド green・
+> clippy 0。**AirQ 実機は未検証(未接続)**。実機ゲートは
 > 「AirQ 接続後のチェックリスト」(airq-port.md §7.3)を参照。
 
 ## ツールチェーン(C6 との最大の違い)
@@ -61,9 +61,18 @@ ports/esp32s3/
 ├── Cargo.toml              # 別 workspace(members = ["esp32s3-firmware"])
 ├── rust-toolchain.toml     # channel = "esp"(espup)
 ├── .cargo/config.toml      # xtensa-esp32s3-none-elf 既定・build-std・gcc リンカ引数
-└── esp32s3-firmware/
+└── esp32s3-firmware/       # lib + 複数 bin
     └── src/
-        └── main.rs         # default bin(段階 1 スモーク: バナー + TRNG + P-256 + heartbeat)
+        ├── main.rs         # default bin(段階 1 スモーク: バナー + TRNG + P-256 + heartbeat)
+        ├── lib.rs          # 共有部(EspRng。C6 ポートから移植)
+        ├── ble.rs          # GattPeripheral の TrouBLE 実装(C6 と同一ロジック)
+        ├── kvs.rs          # Kvs trait の esp-storage + sequential-storage 実装
+        ├── net.rs          # UDP trait 群の embassy-net 実装
+        ├── wifi.rs         # WifiDriver trait の esp-radio 実装
+        ├── sensors.rs      # SEN55(sen5x-rs)+ SCD40(libscd)統合タスク
+        └── bin/
+            ├── s3-light.rs     # 段階 2: C6 e5-light の S3 版(dual-transport、LED なし)
+            └── airq-sensor.rs  # 段階 3: AirQ 本番 FW(3 EP 空気質センサ + 実センサ)
 ```
 
 ## ビルド
@@ -71,8 +80,16 @@ ports/esp32s3/
 ```sh
 . ~/export-esp.sh           # xtensa gcc(リンカ)へ PATH を通す
 cd ports/esp32s3
-cargo build --release
+cargo build --release --bins
 ```
+
+フラッシュイメージ実測(espflash save-image、2026-07-09):
+
+| bin | app image |
+|---|---|
+| esp32s3-firmware(スモーク) | 104,928 B |
+| s3-light | 911,600 B |
+| airq-sensor | 952,544 B |
 
 ELF は `target/xtensa-esp32s3-none-elf/release/` に生成される。
 
@@ -85,7 +102,7 @@ AirQ のポートは接続後に `espflash board-info` で確認(esp32s3 / 8MB f
 (espflash board-info もリセットを伴う)。
 
 ```sh
-espflash flash --port <PORT> target/xtensa-esp32s3-none-elf/release/esp32s3-firmware
+espflash flash --port <PORT> target/xtensa-esp32s3-none-elf/release/airq-sensor
 # 観測は stty + cat(espflash monitor --no-reset はチップが止まるため禁止):
 stty -F <PORT> 115200 raw -echo
 cat <PORT>

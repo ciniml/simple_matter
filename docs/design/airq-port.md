@@ -6,7 +6,11 @@ simple-matter ベース(Rust / no_std)へ再実装する検討。本書は調査
 (+フェーズ進捗の記録)。
 
 **進捗**: フェーズ A1(クラスタ実装 + PC シム E2E)**完了(2026-07-09)**。
-記録は §7.1 の表と直下の注記。
+フェーズ A5(ESP32-S3 ポート)は **ツールチェーン + 全ビルド整備まで完了
+(2026-07-09。ports/esp32s3、実機未検証 = AirQ 未接続)**。記録は §7.1、
+実機残作業は §7.3。なお A2-A4(C6 ブリッジ = NanoC6 + 外付けセンサ)は
+機材未手配のため未着手のまま A5 のビルド整備を先行した(センサドライバ統合の
+初検証も AirQ 実機で行うことになる点に注意)。
 
 前提となる現状(2026-07-08 時点):
 
@@ -330,7 +334,7 @@ sensor-hub と同じ「1 計測ドメイン = 1 EP」の分離構成を採る。
 | **A2: ハード選定 / ツールチェーン確認** | C6 ブリッジ機材(NanoC6 + SEN55 5V 供給 + SCD40)手配・配線。espup/S3 の最新状況・esp-hal S3 の coex 実績を再調査(§3.1 の再確認) | I2C スキャンで 0x69/0x62 応答(素の esp-hal bin) | **S** |
 | **A3: センサドライバ統合(C6)** | `sen5x-rs`/`scd4x`(async)を embassy タスクに統合、SCD4x 初期化シーケンス移植(§1.3)、AirQualityEnum 算出ロジック、`airq-c6` bin(e5-light ベース) | シリアルで実測値ログ(既存 FW と同一個体センサの値比較)| **M** |
 | **A4: C6 実機 E2E** | chip-tool `pairing ble-wifi` → 全属性 read / subscribe(30s/10s 周期更新の配信)、リブート後 CASE 再確立(E4 資産) | chip-tool + smctl のフル E2E、フットプリント実測を README に記録 | **S〜M** |
-| **A5: ESP32-S3(AirQ 実機)ポート** | espup 導入、`ports/esp32s3` workspace(rust-toolchain 分離)、E1 相当スモーク(boot/TRNG)→ E2-E5 相当の再検証(S3 radio/coex)→ airq bin 移植 + GPIO10 電源制御 + GPIO46 HOLD | AirQ 実機で chip-tool フル E2E | **L**(Xtensa 未知数を含む) |
+| **A5: ESP32-S3(AirQ 実機)ポート** | espup 導入、`ports/esp32s3` workspace(rust-toolchain 分離)、E1 相当スモーク(boot/TRNG)→ E2-E5 相当の再検証(S3 radio/coex)→ airq bin 移植 + GPIO10 電源制御 + GPIO46 HOLD | AirQ 実機で chip-tool フル E2E | **ビルド整備まで完了(2026-07-09)**。実機ゲートは §7.3(AirQ 未接続のため保留) |
 | **A6(任意): 表示・UX** | e-ink 表示(計測値 + コミッショニング QR)、ボタン/ブザー | 目視 | M |
 | (別トラック) | ICD/バッテリー運用 | — | コアの ICD 実装後 |
 
@@ -365,6 +369,43 @@ A5 が追加で L。
 - ゲート: テスト 518(コア +7)+ 58(smctl +1)、clippy 0、no_std 3 ターゲット
   green、ports/esp32 ビルド green、flash-probe 102259B(増分ゼロ)。
 
+**A5 進捗記録(2026-07-09。ツールチェーン + 全ビルド整備まで。実機未検証 = AirQ 未接続)**:
+
+- **ツールチェーン(段階 1)**: espup 0.16.0 / esp channel(rustc 1.95.0-nightly
+  フォーク、`xtensa-esp32s3-none-elf` built-in)を確認。esp toolchain は xtensa の
+  プリビルド std を含まず **`build-std = ["core", "alloc"]` が必須**(rust-src 同梱)。
+  リンカは target spec 既定の **xtensa-esp32s3-elf-gcc**(esp toolchain 同梱、
+  `. ~/export-esp.sh` で PATH)+ `-nostartfiles` + `-Wl,-Tlinkall.x`。
+  C6(RISC-V)で必須だった `-C force-frame-pointers` は **Xtensa では不要**
+  (esp-backtrace は register window を辿る)。stable への非干渉はコア 518 +
+  smctl 58 テスト green / C6 workspace ビルド green で確認。
+- **`ports/esp32s3` は独立 workspace**(§3.3 の判断どおり)。rust-toolchain.toml
+  (esp channel)がルート(stable)/ ports/esp32(stable + riscv)と両立しない
+  ため分離必須。lock はコミット(C6 と同方針)。
+- **S3 版スタック(段階 2)**: ポート層(ble/kvs/net/wifi)は C6 実装のロジック
+  そのままで chip feature 差し替えのみ(esp-hal 1.x の統一 API が機能)。
+  `esp_rtos::start(timg0.timer0, sw_int.software_interrupt0)` のシグネチャも S3 で
+  同一。差分は AirQ に LED が無いことによる LEDC PWM 削除だけ。
+  esp-radio 0.18 の esp32s3 + ble + wifi + coex はビルド green(実機 coex 挙動は
+  未検証 = R1 残)。
+- **センサ統合(段階 3)**: `sensors.rs` + `airq-sensor` bin。crate 選定は
+  **SEN55 = sen5x-rs 0.4.0**(embedded-hal 1.0。スケーリングが §1.3 の知識と一致
+  することをソース確認。**温度を u16 解釈する癖**があり氷点下で不正 →
+  `fix_sen55_temp` で i16 再解釈補正)、**SCD40 = libscd 0.5.1**(sync + scd4x
+  feature。コマンド実行待ちを内包。SCD41 専用コマンドが feature 分離されており
+  wake_up 誤用を型で防げるため `scd4x` crate より優先)。バス共有は
+  embedded-hal-bus の RefCellDevice(単一センサタスクが順に触る)。
+  初期化は §1.3 踏襲(SCD40: stop→reinit→start、SEN55: GPIO10=LOW→1s→reinit→start)。
+  周期は既存 FW と同じ SEN55 10s / SCD40 30s。温湿度クラスタのソースは
+  **SEN55 側**(A5 タスク指定。既存 FW の SCD4x 採用 = §1.2 とは異なる。SCD40 の
+  温湿度は参考ログ)。データモデルは §5 の 3 EP(A1 example と同一)+ EP0 は
+  C6 e5-light と同じ管理系 5 クラスタ。AirQuality は CO2/PM2.5 worst-of
+  (材料が無い項は Unknown=Ord 最小として max 合成)。VOC/NOx はログのみ(§4.3)。
+- フットプリント(espflash save-image): スモーク 104,928 B / s3-light 911,600 B /
+  airq-sensor 952,544 B(8MB flash に対し 12% 未満)。
+- ゲート: 3 bin ビルド green + clippy 0(esp channel)、コア 518 + smctl 58 green、
+  C6 riscv ビルド green(回帰なし)。**実機ゲート(§7.3)は AirQ 接続後**。
+
 ### 7.2 リスク表
 
 | # | リスク | 影響 | 確認方法 / 回避策 |
@@ -377,6 +418,37 @@ A5 が追加で L。
 | R6 | I2C バス共有(SEN55/SCD40/RTC、50-100kHz)でのタイミング・クロックストレッチ | A3 | 既存 FW 実績(100kHz)に合わせ、問題時 50kHz へ。esp-hal I2C のタイムアウト設定を確認 |
 | R7 | C6 の RAM/flash 予算(e5-light + センサタスク + クラスタ増分) | A3/A4 | E6 の実測ベースに bloat-check で差分監視。クラスタ 7 種追加は数 KB 級の見込み(measurement 系実績より) |
 | R8 | AirQ v1.1(StampS3A)でのピン/挙動差分 | A5 | 着手時に実機リビジョン確認(§2 注記) |
+
+### 7.3 AirQ 接続後の実機チェックリスト(A5 残作業)
+
+前提: AirQ を USB 接続し、`espflash board-info` で **esp32s3 / 8MB flash** を確認
+(他の ESP デバイス同居時はポート取り違えに注意。board-info もリセットを伴う)。
+手元個体のリビジョン(v1.0 = StampS3 / v1.1 = StampS3A)も記録すること(R8)。
+
+1. **段階 1 スモーク**: `esp32s3-firmware` を書き込み → バナー + TRNG サンプル +
+   P-256(SEC1 tag 0x04)+ heartbeat をシリアルで確認(stty+cat。
+   `espflash monitor --no-reset` 禁止)。
+   ※ 2026-07-09 に手違いで別個体の S3(rev v0.2, 8MB)へ書き込んだ際は
+   全チェック green(Xtensa バイナリが実シリコンで動く証明にはなっている)。
+2. **段階 2(s3-light)**: BLE 広告 → chip-tool
+   `pairing ble-wifi 1 <ssid> <pass> 20202021 3840`(--paa-trust-store-path または
+   --bypass-attestation-verifier)でフルコミッショニング → `onoff toggle` →
+   リブート後 CASE 再確立。S3 coex の安定性(R1)・ヒープ(144KiB で足りるか)を
+   ログで確認。
+3. **I2C スキャン相当**: `airq-sensor` 起動ログで SEN55/SCD40 の serial number が
+   出ること(= 0x69/0x62 応答)。NACK が続く場合は 50kHz へ落とす(R6)。
+4. **段階 3(airq-sensor)E2E**:
+   - シリアルで実測値ログ(CO2 400-2000ppm / PM2.5 数-数十 µg/m³ / 温湿度が
+     現実的な室内値)。既存 esp-matter FW と同一個体での値比較(R2)。
+   - chip-tool: pairing ble-wifi → `airquality read air-quality 1 1` /
+     `carbondioxideconcentrationmeasurement read measured-value 1 1` /
+     `pm25concentrationmeasurement read measured-value 1 1` /
+     `temperaturemeasurement read measured-value 1 2` /
+     `relativehumiditymeasurement read measured-value 1 3`。
+   - smctl: OCW 経由 2 fabric 目 + `--names` read + `air-quality subscribe` で
+     時間変動(換気・呼気で CO2 を動かす)のレポート受信。
+   - リブート → fabric/資格情報復元 → 自動 Wi-Fi join → CASE 再確立 → read。
+5. 結果を本書 §7.1 の A5 行・ports/esp32s3/README.md・memory へ反映する。
 
 ## 8. 参考(調査ソース)
 

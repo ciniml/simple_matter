@@ -20,6 +20,7 @@
 pub mod ble;
 pub mod kvs;
 pub mod net;
+pub mod sensors;
 pub mod wifi;
 
 use esp_hal::rng::Trng;

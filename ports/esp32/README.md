@@ -5,6 +5,10 @@
 (esp-hal / esp-println / esp-backtrace)の lock をコアから分離する
 (`docs/design/port-esp32-device.md` §7 / リスク R4)。
 
+> **ESP32-S3(Xtensa)は `ports/esp32s3/`**(さらに別 workspace)。S3 は espup の
+> esp channel(rustc フォーク)を要求し stable 前提の本 workspace と両立しない
+> ため分離している(docs/design/airq-port.md §3.3。M5Stack AirQ 向け)。
+
 現状は **E1(骨格 + TRNG)/ E2(BLE + BTP handshake)/ E3(MatterStack 統合 =
 BLE フルコミッショニング)/ E4(fabric 永続化 = リブート後の CASE 再確立)** まで
 実機確認済み。Wi-Fi join・UDP/mDNS は後続フェーズ(E5 以降)。

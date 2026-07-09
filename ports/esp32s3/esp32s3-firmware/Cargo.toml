@@ -24,6 +24,11 @@ path = "src/main.rs"
 name = "s3-light"
 path = "src/bin/s3-light.rs"
 
+# 段階 3: AirQ 本番 FW(3 EP 空気質センサ + SEN55/SCD40 実センサ)。
+[[bin]]
+name = "airq-sensor"
+path = "src/bin/airq-sensor.rs"
+
 [dependencies]
 esp-hal = { version = "1.1.1", features = ["esp32s3", "unstable"] }
 esp-println = { version = "0.17.0", features = ["esp32s3"] }
@@ -75,6 +80,14 @@ esp-storage = { version = "0.9.0", features = ["esp32s3"] }
 sequential-storage = "7.2"
 embedded-storage = "0.3"
 embedded-storage-async = "0.4"
+
+# --- AirQ 実センサ(SEN55 + SCD40。airq-port.md §2 / sensors.rs の選定メモ)---
+# sen5x-rs: SEN55(0x69)。embedded-hal 1.0、no_std。
+sen5x-rs = "0.4.0"
+# libscd: SCD40(0x62)。sync API + scd4x feature(SCD40/41 共通コマンドのみ)。
+libscd = { version = "0.5.1", features = ["sync", "scd4x"] }
+# 1 本の I2C バス(SDA=11/SCL=12)を 2 ドライバへ分配する RefCellDevice。
+embedded-hal-bus = "0.3"
 
 # --- Wi-Fi 実 join + UDP/mDNS(embassy-net)---
 embassy-net = { version = "0.9", default-features = false, features = [
