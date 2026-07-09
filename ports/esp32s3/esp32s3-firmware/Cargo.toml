@@ -6,10 +6,23 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 # M5Stack AirQ(ESP32-S3FN8 / M5StampS3)向けファームウェア。
-# default bin(src/main.rs)= 段階 1 スモーク(E1 相当: バナー + TRNG + P-256 + heartbeat)。
+# lib(no_std の共有部。C6 ポートから移植)+ 複数 bin 構成。
+# 依存のバージョン・feature 構成は C6 ポート(ports/esp32/esp32c6-firmware)と
+# 同一で、chip feature だけ esp32c6 → esp32s3 に変えている(選定理由・バージョン
+# 制約のコメントは C6 側 Cargo.toml を参照)。
+[lib]
+name = "esp32s3_firmware"
+
+# 段階 1 スモーク(E1 相当: バナー + TRNG + P-256 + heartbeat)。
 [[bin]]
 name = "esp32s3-firmware"
 path = "src/main.rs"
+
+# 段階 2: C6 e5-light の S3 版(BLE+WiFi dual-transport の Dimmable Light。
+# AirQ に LED は無いため OnOff/Level はログ出力のみ)。
+[[bin]]
+name = "s3-light"
+path = "src/bin/s3-light.rs"
 
 [dependencies]
 esp-hal = { version = "1.1.1", features = ["esp32s3", "unstable"] }
@@ -25,4 +38,50 @@ esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
 simple-matter = { path = "../../../crates/simple-matter", default-features = false, features = [
     "rustcrypto",
     "ble",
+] }
+
+# --- BLE + Wi-Fi(esp-radio S3 coex + TrouBLE 0.6 + embassy)---
+# trouble-host 0.6 固定の理由(bt-hci 0.8 系)は C6 側 Cargo.toml のコメント参照。
+esp-radio = { version = "0.18.0", features = [
+    "esp32s3",
+    "ble",
+    "wifi",
+    "coex",
+    "unstable",
+] }
+esp-rtos = { version = "0.3.0", features = [
+    "esp32s3",
+    "embassy",
+    "esp-radio",
+    "esp-alloc",
+] }
+esp-alloc = "0.10.0"
+trouble-host = { version = "0.6.0", default-features = false, features = [
+    "peripheral",
+    "gatt",
+    "derive",
+    "default-packet-pool",
+] }
+bt-hci = "0.8"
+embassy-executor = "0.10.0"
+embassy-time = "0.5.1"
+embassy-futures = "0.1.2"
+embassy-sync = "0.7"
+heapless = "0.9"
+static_cell = "2.1"
+
+# --- fabric 永続化(flash KVS)---
+esp-storage = { version = "0.9.0", features = ["esp32s3"] }
+sequential-storage = "7.2"
+embedded-storage = "0.3"
+embedded-storage-async = "0.4"
+
+# --- Wi-Fi 実 join + UDP/mDNS(embassy-net)---
+embassy-net = { version = "0.9", default-features = false, features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "proto-ipv6",
+    "udp",
+    "dhcpv4",
+    "multicast",
 ] }
