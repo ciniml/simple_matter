@@ -1,0 +1,14 @@
+# ESP32-S3 は Xtensa LX7。ベアメタル target `xtensa-esp32s3-none-elf` は
+# upstream rustc に存在せず(2026-07 時点)、espup が導入する Espressif の
+# rustc フォーク(カスタムツールチェーン名 "esp")が必要(airq-port.md §3.1)。
+#
+#   cargo install espup --locked
+#   espup install        # ~/.rustup/toolchains/esp + ~/export-esp.sh を生成
+#
+# esp toolchain は xtensa target の**プリビルド std を含まない**ため、
+# .cargo/config.toml の `build-std = ["core", "alloc"]`(rust-src 同梱)で
+# core/alloc をソースからビルドする。リンカは GNU gcc
+# (xtensa-esp32s3-elf-gcc、esp toolchain 同梱)なので、ビルド前に
+# `. ~/export-esp.sh` で PATH を通すこと(ports/esp32s3/README.md)。
+[toolchain]
+channel = "esp"

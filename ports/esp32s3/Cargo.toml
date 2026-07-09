@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["esp32s3-firmware"]
+
+# ESP32-S3(Xtensa)は espup の esp channel(rustc フォーク)が必要で、
+# rust-toolchain.toml がルート(stable)とも ports/esp32(stable + riscv)とも
+# 異なる。docs/design/airq-port.md §3.3 のとおり **workspace を分離**し、
+# C6 側の stable 前提・lock を汚染しない(ルートの members には入れない)。
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

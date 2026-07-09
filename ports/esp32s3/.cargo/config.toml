@@ -1,0 +1,28 @@
+# ESP32-S3(Xtensa LX7)。target は esp channel(rustc フォーク)にのみ存在する
+# (rust-toolchain.toml 参照)。
+[build]
+target = "xtensa-esp32s3-none-elf"
+
+# esp toolchain は xtensa の std をプリビルドしないため core/alloc をソースから
+# ビルドする(rust-src は esp toolchain に同梱)。
+[unstable]
+build-std = ["core", "alloc"]
+
+[target.xtensa-esp32s3-none-elf]
+# リンカは target spec 既定の xtensa-esp32s3-elf-gcc(gnu-cc flavor)。
+# gcc の crt0 を外し(-nostartfiles)、esp-hal の rt が OUT_DIR に置く
+# linkall.x(→ memory.x / esp32s3.x / hal-defaults.x を INCLUDE)を -Wl 経由で
+# ld へ渡す。C6(RISC-V)で必須だった -C force-frame-pointers は Xtensa では
+# 不要(esp-backtrace は register window を辿る)。
+rustflags = [
+    "-C", "link-arg=-nostartfiles",
+    "-C", "link-arg=-Wl,-Tlinkall.x",
+]
+# 実機書き込み: `espflash flash --port <AirQ のポート>` を明示する(README 参照。
+# ポートは環境依存のため runner には焼かない)。シリアル観測は stty+cat
+# (`espflash monitor --no-reset` はチップが止まるため禁止。C6 の知見踏襲)。
+runner = "espflash flash"
+
+[env]
+# esp-println / log のデフォルトログレベル。
+ESP_LOG = "info"
