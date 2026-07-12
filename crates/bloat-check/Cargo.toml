@@ -13,6 +13,11 @@ simple-matter = { path = "../simple-matter", default-features = false, features 
     "rustcrypto",
 ] }
 
+# controller ビルドの flash 計測(controller-probe)用。デバイス専用ビルドの計測
+# (flash-probe / ram-report)には影響しない。
+[features]
+controller = ["simple-matter/controller"]
+
 # ホスト実行の RAM 計測バイナリ(std)。
 [[bin]]
 name = "ram-report"
@@ -23,3 +28,12 @@ path = "src/main.rs"
 [[bin]]
 name = "flash-probe"
 path = "src/bin/flash_probe.rs"
+
+# controller(commissioner)経路の flash 計測バイナリ(no_std / no_main)。
+# 既存 flash-probe はデバイス経路のみ参照するため controller コードは GC される。
+# こちらは ControllerStack + Commissioner + MdnsClient + ca-state codec を black_box
+# 参照して .text/.rodata を CI で記録する(docs/design/esp32-controller.md §6.2)。
+[[bin]]
+name = "controller-probe"
+path = "src/bin/controller_probe.rs"
+required-features = ["controller"]

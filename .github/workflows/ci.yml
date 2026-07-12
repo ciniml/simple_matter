@@ -49,6 +49,13 @@ jobs:
       # ハッシュや inliner の文脈に影響するため、バイト単位の一致は保証できない(実測で
       # 共有関数のアウトライン判断が数十バイト揺れる)。閾値 128 バイトで「controller の実コードが
       # デバイスパスへ波及した」事故のみを検知する。
+      # controller(commissioner)経路の flash サイズ記録(esp32-controller.md §6.2 K1)。
+      # デバイス経路のみの flash-probe では controller コードが GC されるため、
+      # ControllerStack/Commissioner/MdnsClient を参照する専用プローブで計測する。
+      - name: Bloat-check controller probe flash size (Cortex-M4F)
+        run: |
+          cargo build -p bloat-check --bin controller-probe --release --target thumbv7em-none-eabihf --features controller
+          size -A target/thumbv7em-none-eabihf/release/controller-probe
       - name: Bloat-check controller-feature footprint invariance
         run: |
           cargo build -p bloat-check --bin flash-probe --release --target thumbv7em-none-eabihf

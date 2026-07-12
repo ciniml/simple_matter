@@ -23,6 +23,7 @@ use crate::cert::{dn_attr, write_matter_cert, DnAttr, MatterCertSpec, NOC_EKU};
 use crate::crypto::{Crypto, P256Keypair, P256PublicKey, P256_PUBLIC_KEY_LEN};
 use crate::error::{Error, Result};
 use crate::fabric::{FabricTable, MAX_CERT_TLV_LEN};
+use crate::tlv::{ContainerType, TlvReader, TlvTag, TlvValue, TlvWriter};
 
 /// コントローラの fabric インデックス(単一 fabric 固定なので常に 1)。
 pub const CONTROLLER_FABRIC_INDEX: NonZeroU8 = match NonZeroU8::new(1) {
@@ -327,4 +328,97 @@ impl<C: Crypto> Ca<C> {
     pub fn next_serial(&self) -> u32 {
         self.next_serial.get()
     }
+
+    // ----------------------------------------------------------------------
+    // CA 状態レコード(v1)の codec(`docs/design/esp32-controller.md` §5.2)
+    // ----------------------------------------------------------------------
+
+    /// CA 鍵素材を v1 TLV レコードへエンコードする(戻りは長さ)。
+    ///
+    /// フォーマットは `simple-matter-ble/examples/ble-commissioner.rs` 由来の
+    /// **ca-state v1**(anonymous struct、cx0=version, cx1=fabric_id,
+    /// cx2=controller_node_id, cx3=vendor_id, cx4=IPK epoch key,
+    /// cx5=root 秘密鍵, cx6=コントローラ運用秘密鍵, cx7=next_serial)。
+    /// smctl の `ca-state.bin` と S3 ハブの `EspKvs` レコード(キー `b"cast"`)が
+    /// 同一バイト列を共有する(PC ↔ S3 の fabric 持ち運びが単純コピーになる)。
+    /// 証明書は保存しない([`Ca::decode_state`] = [`Ca::restore`] が決定的署名で
+    /// 同一バイト列を再生成する)。
+    pub fn encode_state(&self, out: &mut [u8]) -> Result<usize> {
+        let ctrl_key = self.controller_key_bytes()?;
+        let mut w = TlvWriter::new(out);
+        w.start_struct(&TlvTag::Anonymous)?;
+        w.write_u8(&cx(0), CA_STATE_VERSION)?;
+        w.write_u64(&cx(1), self.fabric_id())?;
+        w.write_u64(&cx(2), self.controller_node_id())?;
+        w.write_u16(&cx(3), self.vendor_id())?;
+        w.write_bytes(&cx(4), self.ipk_epoch_key())?;
+        w.write_bytes(&cx(5), &self.root_key_bytes())?;
+        w.write_bytes(&cx(6), &ctrl_key)?;
+        w.write_u32(&cx(7), self.next_serial())?;
+        w.end_container()?;
+        Ok(w.len())
+    }
+
+    /// v1 TLV レコードから CA を復元する([`Ca::encode_state`] の逆、
+    /// [`Ca::restore`] への薄いフロント)。バージョン不一致・欠損は [`Error::Decode`]。
+    pub fn decode_state(crypto: &C, bytes: &[u8], now_epoch_s: u32) -> Result<Self> {
+        let mut r = TlvReader::new(bytes);
+        if r.enter_container()? != ContainerType::Structure {
+            return Err(Error::Decode);
+        }
+        let mut version = 0u8;
+        let mut fabric_id = 0u64;
+        let mut node_id = 0u64;
+        let mut vendor_id = 0u16;
+        let mut ipk = [0u8; 16];
+        let mut root_key = [0u8; crate::crypto::P256_SECRET_KEY_LEN];
+        let mut ctrl_key = [0u8; crate::crypto::P256_SECRET_KEY_LEN];
+        let mut next_serial = 0u32;
+        loop {
+            let e = r.read_next()?.ok_or(Error::Decode)?;
+            match (e.tag, e.value) {
+                (_, TlvValue::ContainerEnd) => break,
+                (TlvTag::ContextSpecific(0), v) => version = v.as_unsigned()? as u8,
+                (TlvTag::ContextSpecific(1), v) => fabric_id = v.as_unsigned()?,
+                (TlvTag::ContextSpecific(2), v) => node_id = v.as_unsigned()?,
+                (TlvTag::ContextSpecific(3), v) => vendor_id = v.as_unsigned()? as u16,
+                (TlvTag::ContextSpecific(4), v) => {
+                    ipk = v.as_bytes()?.try_into().map_err(|_| Error::Decode)?
+                }
+                (TlvTag::ContextSpecific(5), v) => {
+                    root_key = v.as_bytes()?.try_into().map_err(|_| Error::Decode)?
+                }
+                (TlvTag::ContextSpecific(6), v) => {
+                    ctrl_key = v.as_bytes()?.try_into().map_err(|_| Error::Decode)?
+                }
+                (TlvTag::ContextSpecific(7), v) => next_serial = v.as_unsigned()? as u32,
+                _ => r.skip(&e)?,
+            }
+        }
+        if version != CA_STATE_VERSION {
+            return Err(Error::Decode);
+        }
+        Self::restore(
+            crypto,
+            &root_key,
+            &ctrl_key,
+            ipk,
+            fabric_id,
+            node_id,
+            vendor_id,
+            next_serial,
+            now_epoch_s,
+        )
+    }
+}
+
+/// CA 状態レコードの schema version(v1: ble-commissioner / smctl `ca-state.bin` 互換)。
+pub const CA_STATE_VERSION: u8 = 1;
+
+/// [`Ca::encode_state`] の出力上限(v1 レコードは実測 ~130B。余裕込み)。
+pub const CA_STATE_MAX_LEN: usize = 192;
+
+/// context-specific タグの略記。
+fn cx(n: u8) -> TlvTag {
+    TlvTag::ContextSpecific(n)
 }

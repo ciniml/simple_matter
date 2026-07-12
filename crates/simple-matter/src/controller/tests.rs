@@ -188,6 +188,93 @@ fn ca_restore_reproduces_identical_credentials() {
 }
 
 #[test]
+fn ca_state_codec_round_trips() {
+    use super::ca::CA_STATE_MAX_LEN;
+
+    let crypto = crypto();
+    // now_epoch_s = 0 で生成・復元する(RTC なしの S3 ハブ運用。esp32-controller.md R7)。
+    let ca = Ca::<Crb>::generate(
+        &crypto,
+        &mut SeqRng(0x7777),
+        FABRIC_ID,
+        COMM_NODE,
+        VENDOR,
+        0,
+    )
+    .unwrap();
+    // 発行を 1 回進めて serial カウンタが引き継がれることも見る。
+    let dev_kp = crypto.p256_keypair_from_bytes(&[0x33; 32]).unwrap();
+    let dev_pub = dev_kp.public_key().to_bytes();
+    let mut noc = [0u8; 512];
+    ca.issue_noc(&crypto, &dev_pub, DEVICE_NODE, &mut noc)
+        .unwrap();
+
+    // encode → decode(KVS/ファイル保存の代役はバイト列そのもの)。
+    let mut rec = [0u8; CA_STATE_MAX_LEN];
+    let len = ca.encode_state(&mut rec).expect("encode_state");
+    assert!(len <= CA_STATE_MAX_LEN);
+    let restored = Ca::<Crb>::decode_state(&crypto, &rec[..len], 0).expect("decode_state");
+
+    // 決定的署名により資格情報一式が同一バイト列で再生成される。
+    assert_eq!(restored.rcac(), ca.rcac());
+    assert_eq!(restored.ipk_epoch_key(), ca.ipk_epoch_key());
+    assert_eq!(restored.fabric_id(), ca.fabric_id());
+    assert_eq!(restored.controller_node_id(), ca.controller_node_id());
+    assert_eq!(restored.vendor_id(), ca.vendor_id());
+    assert_eq!(restored.next_serial(), ca.next_serial());
+    assert_eq!(
+        restored.compressed_fabric_id_bytes(),
+        ca.compressed_fabric_id_bytes()
+    );
+    let a = ca.creds().iter().next().unwrap();
+    let b = restored.creds().iter().next().unwrap();
+    assert_eq!(a.noc(), b.noc());
+    assert_eq!(a.ipk(), b.ipk());
+
+    // 再 encode も同一レコードになる(冪等性。発行で serial が動く前に見る)。
+    let mut rec2 = [0u8; CA_STATE_MAX_LEN];
+    let len2 = restored.encode_state(&mut rec2).unwrap();
+    assert_eq!(&rec[..len], &rec2[..len2]);
+
+    // 復元 CA が次に発行する NOC は、元 CA の「次の 1 通」と同一バイト列。
+    let mut n_orig = [0u8; 512];
+    let l1 = ca
+        .issue_noc(&crypto, &dev_pub, DEVICE_NODE, &mut n_orig)
+        .unwrap();
+    let mut n_rest = [0u8; 512];
+    let l2 = restored
+        .issue_noc(&crypto, &dev_pub, DEVICE_NODE, &mut n_rest)
+        .unwrap();
+    assert_eq!(&n_orig[..l1], &n_rest[..l2]);
+}
+
+#[test]
+fn ca_state_codec_rejects_bad_version_and_garbage() {
+    use super::ca::CA_STATE_MAX_LEN;
+
+    let crypto = crypto();
+    let ca = Ca::<Crb>::generate(
+        &crypto,
+        &mut SeqRng(0x8888),
+        FABRIC_ID,
+        COMM_NODE,
+        VENDOR,
+        0,
+    )
+    .unwrap();
+    let mut rec = [0u8; CA_STATE_MAX_LEN];
+    let len = ca.encode_state(&mut rec).unwrap();
+
+    // version(cx0 の直後の 1 バイト)を壊す: struct(0x15) + ctrl tag(0x24 0x00) + value。
+    let mut bad = rec;
+    bad[3] = 0x7F;
+    assert!(Ca::<Crb>::decode_state(&crypto, &bad[..len], 0).is_err());
+
+    assert!(Ca::<Crb>::decode_state(&crypto, &[], 0).is_err());
+    assert!(Ca::<Crb>::decode_state(&crypto, &[0x15, 0x18], 0).is_err());
+}
+
+#[test]
 fn parse_csr_round_trips_write_csr() {
     let crypto = crypto();
     let kp = crypto.p256_keypair_from_bytes(&[0x55; 32]).unwrap();
