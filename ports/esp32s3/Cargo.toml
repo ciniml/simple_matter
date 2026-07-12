@@ -2,6 +2,16 @@
 resolver = "2"
 members = ["esp32s3-firmware"]
 
+# trouble-host 0.6.0 の vendored コピー(パッチは vendor/trouble-host/src/gatt.rs の
+# `GattClient::subscribe` 1 箇所のみ)。upstream 0.6 は CCCD write 応答の後に
+# notification subscriber を作るため、subscribe 直後に peripheral が送る最初の
+# indication(Matter BTP の handshake response がまさにこれ)を `task()` が
+# yield なしで連続処理して 100% 取りこぼす。upstream 0.7 は `listen()` で事前登録
+# できるが bt-hci 0.9 を要求し、esp-radio 0.18(bt-hci 0.8)と両立しないため
+# 0.6 へ最小パッチを当てる。詳細は docs/design/esp32-controller.md §7 K3。
+[patch.crates-io]
+trouble-host = { path = "vendor/trouble-host" }
+
 # ESP32-S3(Xtensa)は espup の esp channel(rustc フォーク)が必要で、
 # rust-toolchain.toml がルート(stable)とも ports/esp32(stable + riscv)とも
 # 異なる。docs/design/airq-port.md §3.3 のとおり **workspace を分離**し、

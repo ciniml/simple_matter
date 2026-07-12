@@ -1,23 +1,29 @@
-//! ESP32-S3 スタンドアロンコミッショナ(UDP-only ハブ)— K2。
+//! ESP32-S3 スタンドアロンコミッショナ(ハブ)— K2(UDP-only)+ K3(BLE central)。
 //!
-//! `docs/design/esp32-controller.md` §7 K2。smctl(PC ホスト)の駆動ループを
-//! embassy へ写像し、S3 単独で WiFi 上の commissionable デバイス(PC の
-//! `onoff-light` example / C6 e5 系)をフルコミッショニングして OnOff を操作する:
+//! `docs/design/esp32-controller.md` §7 K2/K3。smctl(PC ホスト)の駆動ループを
+//! embassy へ写像し、S3 単独で commissionable デバイスをフルコミッショニングして
+//! OnOff を操作する:
 //!
 //! 1. **WiFi join**(SSID/パスは定数 or `SM_WIFI_SSID`/`SM_WIFI_PASS` の
 //!    ビルド時環境変数。K2 は簡易投入で可 — doc §8.3)→ DHCPv4。
-//! 2. **mDNS ブラウズ**(`_matterc._udp`、discriminator 絞り込み)。エフェメラル
-//!    ポートから **QU(unicast-response)クエリ**を第一候補とし、応答が無ければ
-//!    5353 bind + マルチキャスト join の **QM フォールバック**(doc §4.2 / R5)。
-//! 3. `Commissioner` フル(PASE → ArmFailSafe → CSR → AddTrustedRoot → AddNOC →
-//!    CASE → CommissioningComplete)→ **OnOff Toggle → on-off Read**。
+//! 2. コミッショニングは 2 トランスポート(ビルド時 `SM_COMMISSION` で選択):
+//!    - **UDP(K2、`SM_COMMISSION=udp`)**: mDNS ブラウズ(`_matterc._udp`、QU 第一
+//!      候補 + QM フォールバック — doc §4.2 / R5)→ `Commissioner` フル(PASE →
+//!      … → AddNOC → CASE → CommissioningComplete)。
+//!    - **BLE(K3、既定)**: TrouBLE central([`TroubleGattCentral`])で scan
+//!      (0xFFF6 service data、discriminator 照合)→ accept-list connect → BTP
+//!      handshake(C1 write → C2 subscribe → indication)→ PASE〜AddNOC を BLE 上で
+//!      実行 → **AddOrUpdateWiFiNetwork / ConnectNetwork**(smctl `pairing ble-wifi`
+//!      と同じ `set_wifi_credentials` + `suspend_before_case`)→ BLE close → 運用
+//!      mDNS 解決 → **CASE over UDP** → CommissioningComplete。
+//! 3. 完走後は **OnOff Toggle → on-off Read** の定常デモ(30 秒周期)。
 //! 4. **CA は初回起動時に生成して `EspKvs`(キー `b"cast"`)へ永続化**
 //!    (smctl `ca-state.bin` v1 互換 = コアの `Ca::encode_state`/`decode_state`)。
 //!    コミッショニング済みノードの記録(node_id / 最終アドレス / CASE resumption
 //!    素材)もポートローカルレコード(キー `b"node"`)で永続化する。
 //! 5. リブート後は CA / ノード記録を復元し、運用 mDNS 解決(`_matter._tcp`)→
-//!    CASE(resumption 素材を import 済みなので可能なら Sigma2_Resume)→ Toggle。
-//! 6. 定常は「30 秒ごとに Toggle」の常駐ハブ最小デモ(K4 の複数ノード管理は別段)。
+//!    CASE(resumption 素材を import 済みなので可能なら Sigma2_Resume)→ Toggle
+//!    (BLE でコミッショニングしたデバイスも運用は常に UDP = dual-transport 前提)。
 //!
 //! # RAM 配分(doc §6.3 / R3)
 //!
@@ -26,7 +32,9 @@
 //! `heap_max`(esp-alloc internal-heap-stats)で最高水位を常時監視する。
 //!
 //! 実行: `cd ports/esp32s3 && cargo build --release --bin s3-controller`
-//! 対向(PC): `SM_STATE_DIR=<dir> cargo run --release --example onoff-light`
+//! 対向(PC、K3): `SM_BLE_ADAPTER=hci1 SM_STATE_DIR=<dir> cargo run --release \
+//!                 -p simple-matter-ble --features device --example ble-onoff-light`
+//! 対向(PC、K2): `SM_STATE_DIR=<dir> cargo run --release --example onoff-light`
 
 #![no_std]
 #![no_main]
@@ -37,7 +45,7 @@ use esp_backtrace as _;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use embassy_executor::Spawner;
-use embassy_futures::join::join3;
+use embassy_futures::join::join5;
 use embassy_futures::select::{select, select3, Either, Either3};
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::StackResources;
@@ -49,6 +57,12 @@ use esp_hal::rng::{Trng, TrngSource};
 use esp_hal::timer::timg::TimerGroup;
 use esp_println::println;
 
+use bt_hci::controller::ExternalController;
+use esp_radio::ble::controller::BleConnector;
+use trouble_host::prelude::{Address, DefaultPacketPool, Host, HostResources};
+
+use simple_matter::btp::gatt::{GattCentral, ScanFilter};
+use simple_matter::btp::{Btp, BtpRole};
 use simple_matter::controller::ca::{Ca, CA_STATE_MAX_LEN};
 use simple_matter::controller::{
     AttestationPolicy, CommissionError, Commissioner, ControllerCreds, ControllerStack, Phase,
@@ -68,10 +82,13 @@ use simple_matter::sc::initiator::{ScEvent, ScInitiator};
 use simple_matter::stack::SendDirective;
 use simple_matter::tlv::TlvValue;
 use simple_matter::transport::net::{
-    PeerAddr, UdpMulticast, UdpReceive, UdpSend, MAX_RX_PACKET_SIZE,
+    BtpConnId, PeerAddr, UdpMulticast, UdpReceive, UdpSend, MAX_RX_PACKET_SIZE,
 };
 use simple_matter::transport::session::SessionId;
 
+use esp32s3_firmware::central::{
+    central_worker, CentralChannels, MatterAdvHandler, TroubleGattCentral,
+};
 use esp32s3_firmware::kvs::EspKvs;
 use esp32s3_firmware::net::{peer_v4, peer_v6, v4_as_mapped, EspUdp};
 use esp32s3_firmware::wifi::{wifi_task, EspWifiDriver};
@@ -91,9 +108,16 @@ const WIFI_PASS: &str = match option_env!("SM_WIFI_PASS") {
     None => "hogeFugapiyo",
 };
 
-// --- 対向デバイス(PC onoff-light example と同値)---
+// --- 対向デバイス(PC onoff-light / ble-onoff-light example と同値)---
 const PASSCODE: u32 = 20202021;
 const DISCRIMINATOR: u16 = 3840;
+
+/// コミッショニングトランスポート(ビルド時選択)。既定 = BLE(K3)。
+/// `SM_COMMISSION=udp` で K2 の UDP-only(mDNS ブラウズ)に戻す。
+const COMMISSION_TRANSPORT: &str = match option_env!("SM_COMMISSION") {
+    Some(s) => s,
+    None => "ble",
+};
 
 // --- コントローラ fabric / ノード識別子(smctl / examples と同値)---
 const FABRIC_ID: u64 = 0xFAB0_0000_0000_0001;
@@ -120,8 +144,19 @@ const MDNS_REQUERY_MS: u64 = 2_000;
 const QM_FALLBACK_MS: u64 = 6_000;
 /// コミッショニング全体のタイムアウト。
 const COMMISSION_TIMEOUT_MS: u64 = 60_000;
+/// BLE 上のコミッショニングフェーズ(handshake + PASE〜ConnectNetwork)のタイムアウト
+/// (BLE は UDP より遅い。smctl と同値)。
+const BLE_COMMISSION_TIMEOUT_MS: u64 = 90_000;
+/// BTP handshake(C1 write → C2 subscribe → 応答 indication)のタイムアウト。
+const BTP_HANDSHAKE_TIMEOUT_MS: u64 = 15_000;
+/// ble-wifi 後の運用 mDNS 解決タイムアウト(デバイスの WiFi join + DHCP を見込む。
+/// 対向がシム(ble-onoff-light)なら即応答するが、実デバイスへの余裕を持たせる)。
+const BLE_RESOLVE_TIMEOUT_MS: u64 = 60_000;
 /// 定常デモ: Toggle の周期。
 const TOGGLE_PERIOD_MS: u64 = 30_000;
+
+/// HCI コマンドの同時実行スロット数(既存 bin と同値)。
+const HCI_SLOTS: usize = 20;
 
 type Backend = RustCrypto<EspRng>;
 /// コントローラスタック(ハブ既定サイジング: コミッショニング 1 + 運用 CASE 数本。
@@ -711,6 +746,286 @@ async fn establish_case(
 }
 
 // ==========================================================================
+// BLE コミッショニング(K3。smctl runner/ble.rs の embassy 版)
+// ==========================================================================
+
+/// BTP が吐く上りフラグメントを尽きるまで C1 write で送出する(smctl `flush_c1`)。
+async fn flush_c1(
+    gatt: &mut TroubleGattCentral<'_>,
+    btp: &mut Btp<6>,
+    conn: BtpConnId,
+    mtu: Option<u16>,
+    now: u64,
+) -> simple_matter::error::Result<()> {
+    let mut out = [0u8; 512];
+    loop {
+        let n = btp.process_outgoing(&mut out, mtu, now)?;
+        if n == 0 {
+            break;
+        }
+        gatt.write_c1(conn, &out[..n]).await?;
+    }
+    Ok(())
+}
+
+/// 再組立済み 1 SDU を `out` にコピーして長さを返す(`Btp::recv` の借用を切るため)。
+fn take_sdu(btp: &mut Btp<6>, out: &mut [u8]) -> Option<usize> {
+    let sdu = btp.recv()?;
+    let n = sdu.len();
+    out[..n].copy_from_slice(sdu);
+    Some(n)
+}
+
+/// 再組立済み Matter メッセージを `stack.handle_rx` へ配り、応答と `poll` の送出を
+/// BTP に載せる(smctl `service_ctrl`)。
+async fn service_ctrl_ble(
+    gatt: &mut TroubleGattCentral<'_>,
+    btp: &mut Btp<6>,
+    stack: &mut Ctrl<'_>,
+    conn: BtpConnId,
+    mtu: Option<u16>,
+    now: u64,
+) -> simple_matter::error::Result<()> {
+    let peer = PeerAddr::Ble(conn);
+    let mut sdu = [0u8; MAX_RX_PACKET_SIZE];
+    let mut txc = [0u8; MAX_RX_PACKET_SIZE];
+    while let Some(slen) = take_sdu(btp, &mut sdu) {
+        if let Some(d) = stack.handle_rx(&mut sdu[..slen], peer, now, &mut txc) {
+            btp.send(&txc[..d.len], now)?;
+            flush_c1(gatt, btp, conn, mtu, now).await?;
+        }
+    }
+    // 閉じた exchange の回収(ble-btp.md §11-4)。BTP では MRP 再送は生じないが poll は必須。
+    while let Some(d) = stack.poll(now, &mut txc) {
+        btp.send(&txc[..d.len], now)?;
+        flush_c1(gatt, btp, conn, mtu, now).await?;
+    }
+    Ok(())
+}
+
+/// BLE 上のコミッショニングフェーズを CASE 保留(`suspend_before_case`)まで駆動する
+/// (smctl `drive_commission_ble` の embassy 版。常に ble-wifi = 運用 UDP 遷移前提)。
+async fn drive_commission_ble(
+    comm: &mut Commissioner<'_, Backend>,
+    stack: &mut Ctrl<'_>,
+    gatt: &mut TroubleGattCentral<'_>,
+    btp: &mut Btp<6>,
+    conn: BtpConnId,
+    mtu: Option<u16>,
+    start: Instant,
+) -> Result<(), CommissionError> {
+    let until = now_ms(start) + BLE_COMMISSION_TIMEOUT_MS;
+    let mut last_phase = Phase::Idle;
+    let mut frag = [0u8; 512];
+    let mut txc = [0u8; MAX_RX_PACKET_SIZE];
+    loop {
+        if now_ms(start) > until {
+            println!("[commission] BLE timed out in phase {:?}", last_phase);
+            return Err(CommissionError::Protocol);
+        }
+
+        // コミッショナを進められるだけ進める(要求を BTP で送る)。
+        loop {
+            let now = now_ms(start);
+            let prev = comm.phase();
+            let out = comm.drive(stack, now, &mut txc);
+            if out.phase != last_phase {
+                report_phase(out.phase);
+                last_phase = out.phase;
+            }
+            if let Some(d) = out.send {
+                if btp.send(&txc[..d.len], now).is_err()
+                    || flush_c1(gatt, btp, conn, mtu, now).await.is_err()
+                {
+                    println!("[btp] send failed (link down?)");
+                    return Err(CommissionError::Protocol);
+                }
+            }
+            match out.phase {
+                Phase::Failed { stage, reason } => {
+                    println!("[commission] FAILED at BLE stage {}: {:?}", stage, reason);
+                    return Err(reason);
+                }
+                // suspend_before_case 前提なので Done には到達しない(防御)。
+                Phase::Done { .. } => return Ok(()),
+                _ => {}
+            }
+            if out.send.is_none() && out.phase == prev {
+                break;
+            }
+        }
+
+        // BLE 上の最終フェーズ完了 = CASE 保留(sigma1 未送出)。ここで BLE を降りる。
+        if matches!(comm.phase(), Phase::Case) {
+            return Ok(());
+        }
+
+        // 既に届いている応答を捌く。
+        let now = now_ms(start);
+        if service_ctrl_ble(gatt, btp, stack, conn, mtu, now)
+            .await
+            .is_err()
+        {
+            return Err(CommissionError::Protocol);
+        }
+
+        // 次の下りフラグメントを待つ(BTP の遅延 ACK 期限まで)。
+        let now = now_ms(start);
+        let sleep = match btp.next_deadline() {
+            Some(t) if t > now => (t - now).min(1_000),
+            Some(_) => 0,
+            None => 1_000,
+        };
+        match select(
+            gatt.next_indication(conn, &mut frag),
+            Timer::after_millis(sleep),
+        )
+        .await
+        {
+            Either::First(Ok(n)) => {
+                let now = now_ms(start);
+                if btp.process_incoming(&frag[..n], mtu, now).is_err() {
+                    println!("[btp] process_incoming error");
+                    return Err(CommissionError::Protocol);
+                }
+                if flush_c1(gatt, btp, conn, mtu, now).await.is_err() {
+                    return Err(CommissionError::Protocol);
+                }
+            }
+            Either::First(Err(e)) => {
+                println!("[ble] indication error (link down?): {:?}", e);
+                return Err(CommissionError::Protocol);
+            }
+            Either::Second(()) => {
+                let now = now_ms(start);
+                if flush_c1(gatt, btp, conn, mtu, now).await.is_err() {
+                    return Err(CommissionError::Protocol);
+                }
+            }
+        }
+        let now = now_ms(start);
+        if service_ctrl_ble(gatt, btp, stack, conn, mtu, now)
+            .await
+            .is_err()
+        {
+            return Err(CommissionError::Protocol);
+        }
+    }
+}
+
+/// BLE コミッショニングの BLE 区間: scan → connect → BTP handshake → PASE〜
+/// ConnectNetwork(CASE 保留)→ BLE close。成功で `comm` は `Phase::Case` 保留状態。
+async fn commission_over_ble(
+    comm: &mut Commissioner<'_, Backend>,
+    stack: &mut Ctrl<'_>,
+    gatt: &mut TroubleGattCentral<'_>,
+    start: Instant,
+) -> Result<(), ()> {
+    // --- scan(0xFFF6 service data、discriminator 照合。タイムアウトはリトライ)---
+    let target = loop {
+        println!(
+            "[ble] scanning for 0xFFF6 commissionable (discriminator={})...",
+            DISCRIMINATOR
+        );
+        match gatt
+            .scan(ScanFilter {
+                discriminator: Some(DISCRIMINATOR),
+                vendor_product: None,
+            })
+            .await
+        {
+            Ok(t) => break t,
+            Err(e) => println!("[ble] scan failed ({:?}); retrying", e),
+        }
+    };
+    println!(
+        "[ble] found device: discriminator={} vid={:#06x} pid={:#06x}",
+        target.discriminator, target.vendor_id, target.product_id
+    );
+
+    // --- connect(accept-list 経由)+ MTU 交換 + C1/C2 discovery ---
+    let (conn, mtu) = match gatt.connect(&target).await {
+        Ok(r) => r,
+        Err(e) => {
+            println!("[ble] connect failed: {:?}", e);
+            return Err(());
+        }
+    };
+    println!("[ble] connected (conn={} att_mtu={:?})", conn.0, mtu);
+
+    // --- BTP handshake(C1 write → C2 subscribe → 応答 indication の順序が必須)---
+    let mut btp = Btp::<6>::new(BtpRole::Central);
+    let mut frag = [0u8; 512];
+    let now = now_ms(start);
+    let hs = async {
+        let n = btp
+            .start_handshake(&mut frag, mtu, now)
+            .map_err(|e| println!("[btp] start_handshake: {:?}", e))?;
+        gatt.write_c1(conn, &frag[..n])
+            .await
+            .map_err(|e| println!("[btp] write_c1(handshake): {:?}", e))?;
+        gatt.subscribe_c2(conn)
+            .await
+            .map_err(|e| println!("[btp] subscribe_c2: {:?}", e))?;
+        while !btp.is_established() {
+            let n = gatt
+                .next_indication(conn, &mut frag)
+                .await
+                .map_err(|e| println!("[btp] next_indication(handshake): {:?}", e))?;
+            btp.process_incoming(&frag[..n], mtu, now_ms(start))
+                .map_err(|e| println!("[btp] process_incoming(handshake): {:?}", e))?;
+        }
+        Ok::<(), ()>(())
+    };
+    match select(hs, Timer::after_millis(BTP_HANDSHAKE_TIMEOUT_MS)).await {
+        Either::First(Ok(())) => {}
+        Either::First(Err(())) | Either::Second(()) => {
+            println!("[btp] handshake failed / timed out");
+            let _ = gatt.disconnect(conn).await;
+            return Err(());
+        }
+    }
+    println!(
+        "[btp] established: fragment={} window={}",
+        btp.fragment_size(),
+        btp.window()
+    );
+
+    // --- コミッショニング(BLE 上、ble-wifi 型: AddNOC 後に WiFi 投入 → CASE 保留)---
+    comm.suspend_before_case();
+    if comm
+        .set_wifi_credentials(WIFI_SSID.as_bytes(), WIFI_PASS.as_bytes())
+        .is_err()
+    {
+        println!("[commission] set_wifi_credentials rejected");
+        let _ = gatt.disconnect(conn).await;
+        return Err(());
+    }
+    if comm
+        .commission(PeerAddr::Ble(conn), PASSCODE, DEVICE_NODE_ID, now_ms(start))
+        .is_err()
+    {
+        println!("[commission] commission() rejected");
+        let _ = gatt.disconnect(conn).await;
+        return Err(());
+    }
+    println!(
+        "[commission] starting over BLE (device node_id={:#x}, wifi ssid=\"{}\")",
+        DEVICE_NODE_ID, WIFI_SSID
+    );
+    let result = drive_commission_ble(comm, stack, gatt, &mut btp, conn, mtu, start).await;
+    // chip 系デバイスは AddNOC 受理後に自ら BLE を閉じることがある。失敗は無視する。
+    let _ = gatt.disconnect(conn).await;
+    match result {
+        Ok(()) => {
+            println!("[commission] BLE phases accepted; switching to operational UDP");
+            Ok(())
+        }
+        Err(_) => Err(()),
+    }
+}
+
+// ==========================================================================
 // 統合層(コントローラ本体のフロー)
 // ==========================================================================
 
@@ -736,6 +1051,7 @@ async fn controller_task(
     matter_udp: &mut EspUdp<'_>,
     qu_udp: &mut EspUdp<'_>,
     qm_udp: &mut EspUdp<'_>,
+    gatt: &mut TroubleGattCentral<'_>,
     node_rec: Option<NodeRecord>,
 ) -> ! {
     let start = Instant::now();
@@ -798,7 +1114,56 @@ async fn controller_task(
         }
     }
 
-    // --- 初回(またはリブート再接続失敗): ブラウズ → フルコミッショニング ---
+    // --- 初回(またはリブート再接続失敗): フルコミッショニング ---
+    // BLE(K3、既定): scan → BTP → PASE〜ConnectNetwork over BLE → BLE close →
+    //                 運用 mDNS 解決 → CASE over UDP → CommissioningComplete。
+    // UDP(K2):       mDNS ブラウズ → 全フェーズ UDP。
+    if session.is_none() && COMMISSION_TRANSPORT == "ble" {
+        if commission_over_ble(comm, stack, gatt, start).await.is_err() {
+            println!("[commission] BLE phase failed; rebooting in 10s");
+            Timer::after_millis(10_000).await;
+            esp_hal::system::software_reset();
+        }
+        // デバイスの WiFi join / DHCP / 運用 mDNS 開始を待って解決する
+        // (対向がシムなら即応答)。
+        let compressed = ca.compressed_fabric_id_bytes();
+        println!(
+            "[dis] resolving _matter._tcp for {:016X}-{:016X} (up to {}s)...",
+            u64::from_be_bytes(compressed),
+            DEVICE_NODE_ID,
+            BLE_RESOLVE_TIMEOUT_MS / 1000
+        );
+        let query = Query::Operational {
+            compressed,
+            node_id: DEVICE_NODE_ID,
+        };
+        let Some(addr) = discover(qu_udp, qm_udp, &query, BLE_RESOLVE_TIMEOUT_MS, start).await
+        else {
+            println!("[dis] operational resolve timed out; rebooting in 10s");
+            Timer::after_millis(10_000).await;
+            esp_hal::system::software_reset();
+        };
+        println!("[dis] operational node resolved at {}", addr);
+        comm.set_peer(PeerAddr::Udp(addr));
+        comm.resume();
+        match run_commissioning(comm, stack, matter_udp, start, &mut rx, &mut tx).await {
+            Ok(s) => {
+                println!(
+                    "[commission] COMPLETE (BLE -> mDNS -> CASE over UDP). session = {:#x}",
+                    s.as_raw()
+                );
+                session = Some(s);
+                peer = Some(addr);
+                save_ca_state(kvs, ca);
+                save_node_record(kvs, stack, addr);
+            }
+            Err(_) => {
+                println!("[commission] giving up; rebooting in 10s");
+                Timer::after_millis(10_000).await;
+                esp_hal::system::software_reset();
+            }
+        }
+    }
     if session.is_none() {
         let addr = loop {
             println!(
@@ -935,7 +1300,7 @@ async fn main(_spawner: Spawner) {
     let _trng_source = TrngSource::new(peripherals.RNG, peripherals.ADC1);
     let mut rng = esp_rng();
 
-    // --- Wi-Fi station(esp-radio。ハブは BLE 不使用 = coex 負荷なし)---
+    // --- Wi-Fi station(esp-radio。K3 から BLE central と coex — R2)---
     let (wifi_controller, wifi_interfaces) = esp_radio::wifi::new(
         peripherals.WIFI,
         esp_radio::wifi::ControllerConfig::default(),
@@ -1007,6 +1372,27 @@ async fn main(_spawner: Spawner) {
     );
     qm_sock.bind(MDNS_PORT).expect("bind 5353");
     let mut qm_udp = EspUdp::new(qm_sock, net_stack);
+
+    // --- BLE controller(esp-radio HCI)→ TrouBLE host(K3: central ロール)---
+    let mut ble_addr = [0u8; 6];
+    rng.fill_bytes(&mut ble_addr).expect("TRNG fill");
+    ble_addr[5] |= 0xC0; // static random address(上位 2 ビット = 0b11 必須)
+    let connector = BleConnector::new(peripherals.BT, esp_radio::ble::Config::default())
+        .expect("BLE controller init");
+    let ble_controller: ExternalController<_, HCI_SLOTS> = ExternalController::new(connector);
+    let mut ble_resources: HostResources<DefaultPacketPool, 1, 1> = HostResources::new();
+    let ble_stack = trouble_host::new(ble_controller, &mut ble_resources)
+        .set_random_address(Address::random(ble_addr));
+    let Host {
+        central,
+        mut runner,
+        ..
+    } = ble_stack.build();
+
+    // GattCentral 実装(channel で central_worker と接続)+ adv report ハンドラ。
+    let channels = CentralChannels::new();
+    let adv_handler = MatterAdvHandler::new(&channels);
+    let mut gatt = TroubleGattCentral::new(&channels);
 
     // --- CA: flash KVS(キー b"cast")から復元、無ければ生成して保存 ---
     let crypto = RustCrypto::new(esp_rng());
@@ -1081,10 +1467,17 @@ async fn main(_spawner: Spawner) {
         core::mem::size_of::<Ctrl<'static>>()
     );
 
-    // wifi_task / embassy-net runner / コントローラ本体を単一 executor 上で並走させる。
-    join3(
+    // wifi_task / embassy-net runner / TrouBLE host runner / central worker /
+    // コントローラ本体を単一 executor 上で並走させる。
+    join5(
         wifi_task(wifi_controller),
         net_runner.run(),
+        async {
+            // runner は HCI イベントループ。落ちたら BLE 全体が止まるので panic で知らせる。
+            let e = runner.run_with_handler(&adv_handler).await;
+            panic!("[ble] host runner exited: {:?}", e);
+        },
+        central_worker(&ble_stack, central, &channels),
         controller_task(
             &mut stack,
             &mut comm,
@@ -1094,6 +1487,7 @@ async fn main(_spawner: Spawner) {
             &mut matter_udp,
             &mut qu_udp,
             &mut qm_udp,
+            &mut gatt,
             node_rec,
         ),
     )

@@ -12,11 +12,11 @@
 組込み(embassy)側でやる話であり、**コアへの新規要求はほぼゼロ**である
 (§2 の監査結果)。唯一の例外は ca-state codec の置き場所(§5.3、コード移動のみ)。
 
-> **状態(2026-07-13)**: **K1 + K2 完了 — AirQ 実機(ESP32-S3、MAC
-> 48:27:e2:e3:0f:b8)で UDP-only コミッショニング E2E green**(§7.1 の完了記録)。
-> ターゲットは §1.2 の素の devkit ではなく手元の AirQ を流用した(devkit 固有の
-> 前提は無し。周辺は未使用なのでコードは同一)。K3(TrouBLE central / ble-wifi)・
-> K4(常駐ハブ化の本格版)は未着手。
+> **状態(2026-07-13)**: **K1 + K2 + K3 完了 — AirQ 実機(ESP32-S3、MAC
+> 48:27:e2:e3:0f:b8)で UDP-only(§7.1)と BLE central 経由 ble-wifi 型
+> (§7.2)のコミッショニング E2E green**。ターゲットは §1.2 の素の devkit では
+> なく手元の AirQ を流用した(devkit 固有の前提は無し。周辺は未使用なのでコードは
+> 同一)。K4(常駐ハブ化の本格版)は未着手。
 
 ---
 
@@ -398,6 +398,58 @@ flash 制約なし)。
   対象デバイスは discriminator 3840 / passcode 20202021 固定の 1 台、
   attestation は `Skip`、mDNS 解決失敗時は記録済みアドレスへフォールバック。
   BLE(TrouBLE central)は一切使わない = K3 スコープのまま。
+
+### 7.2 K3 完了記録(2026-07-13、AirQ 実機 + PC ble-onoff-light)
+
+**冒頭スモークゲート(R1 消し込み)**: trouble-host の features に `central`,`scan` を
+追加し、`s3-scan-smoke` bin(`Runner::run_with_handler` + `EventHandler::on_adv_reports`
+→ `AdStructure::decode` → 0xFFF6 `ServiceData16`)で PC `ble-onoff-light`(bluer、
+hci1)の広告から **discriminator=3840 / VID=0xFFF1 / PID=0x8001 を実測取得**。
+esp-radio 0.18 の S3 で TrouBLE central が型・実機とも成立することを確定させた。
+判明: **非拡張 `Scanner::scan` は FilterDuplicates 有効**(`LeSetScanEnable(true,
+true)`)のため同一デバイスの report はスキャンセッションあたり 1 回。再取得は
+セッション再開始(= `GattCentral::scan` のリトライ)で行う。
+
+**`TroubleGattCentral`(`ports/esp32s3/…/src/central.rs`)**: 設計 §3.2 どおり
+device 側 `ble.rs` の鏡像(worker + channel)。façade は cmd/resp/ind の 3 channel +
+リンク断/強制切断の 2 Signal。非自明点:
+
+- **切断要求は Signal で worker の select に割り込む**(cmd channel だと ATT 応答
+  待ちでブロック中の worker に届かない)。cancel で失われる cmd 応答は pending
+  フラグで検知して補填する(façade の永久待ち防止)。
+- `GattClient::new`(ATT MTU 交換)/ connect / discovery は embassy-time の
+  timeout でラップ(R4 消し込み)。
+- BlueZ は GATT DB 内の characteristic 順序を保証しない(実測で C2 の handle <
+  C1 の handle)。UUID discovery(`characteristic_by_uuid`)なので影響なし。
+
+**trouble-host 0.6 の subscribe 競合(vendored パッチ)**: upstream 0.6 の
+`GattClient::subscribe` は **CCCD write 応答を受けてから** notification subscriber を
+作る。peripheral が subscribe 直後に最初の indication を送ると(Matter BTP の
+handshake response がまさにこれ)、`task()` が Write Response と indication を
+**yield なしで連続処理**し、subscriber 不在の `publish_immediate` で **100%
+取りこぼす**(PC 側に 300ms の送信遅延を仕込むと通ることで確定)。upstream 0.7 は
+`listen()`(CCCD write なしの事前登録)を追加済みだが bt-hci 0.9 要求で esp-radio
+0.18(bt-hci 0.8)と両立しない。→ `ports/esp32s3/vendor/trouble-host` に 0.6.0 を
+vendor し、subscriber 生成を CCCD write の前へ移す **1 関数のみのパッチ**を適用
+(workspace の `[patch.crates-io]`)。
+
+**E2E(SM_STATE_DIR / NVS ともフレッシュ)**: scan→found(disc=3840)→ connect
+(att_mtu=247)→ **BTP established(fragment=244 window=6)** → PASE→…→AddNOC→
+AddOrUpdateWiFiNetwork→ConnectNetwork(対向はシムで即 Success)→ BLE close →
+運用 mDNS 解決(QU 即応答)→ **CASE over UDP** → CommissioningComplete →
+**起動から 16 秒で Toggle OK**、PC 側 `[onoff] light is now ON/OFF` の交互反転を
+確認。リブート後は CA/ノード記録/resumption 復元 → 運用解決 → **CASE
+`resumed=true`** → t=6s で Toggle 再開(運用は常に UDP = K2 パスの流用)。
+
+**coex 所見(R2)**: WiFi association 済みの状態で scan(既定 interval=window=1s)・
+connect・GATT・BTP とも安定して成立し、バックログにあった coex リンク断は本構成
+(S3 central + PC bluer peripheral)では再現しなかった。注意点は S3 リセット直後の
+再接続: S3 側が disconnect せず落ちると peripheral(BlueZ)側に接続が残り、次の
+`Central::connect` が失敗する(supervision timeout まで)。scan リトライ/リブート
+ループで自然回復する。
+
+**リソース**: heap_max **95,388B**(K2 の 52,768B から BLE スタックぶん増、
+112KiB 配分でマージン ~17KB)。スタック起因の PANIC なし(main スタック配置のまま)。
 
 ### リスク表
 

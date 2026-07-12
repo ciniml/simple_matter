@@ -8,6 +8,9 @@
 //! - [`ble`]: コアの `GattPeripheral` trait を TrouBLE(trouble-host)で実装する
 //!   [`ble::TroubleGattPeripheral`] と、その裏で GATT 接続を駆動するワーカー
 //!   [`ble::gatt_worker`]。
+//! - [`central`]: コアの `GattCentral` trait の TrouBLE 実装
+//!   [`central::TroubleGattCentral`](K3、s3-controller の BLE コミッショニング)と
+//!   ワーカー [`central::central_worker`](ble の鏡像)。
 //! - [`kvs`]: コアの `Kvs` trait を内蔵 flash(esp-storage + sequential-storage)で
 //!   実装する [`kvs::EspKvs`](E4 の fabric 永続化バックエンド)。
 //! - [`net`]: コアの UDP trait 群(`UdpSend`/`UdpReceive`/`UdpMulticast`)の
@@ -18,6 +21,7 @@
 #![no_std]
 
 pub mod ble;
+pub mod central;
 pub mod display;
 pub mod kvs;
 pub mod net;
