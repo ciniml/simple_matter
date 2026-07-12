@@ -29,6 +29,13 @@ path = "src/bin/s3-light.rs"
 name = "airq-sensor"
 path = "src/bin/airq-sensor.rs"
 
+# K2: S3 スタンドアロンコミッショナ(UDP-only ハブ、docs/design/esp32-controller.md)。
+# WiFi join → mDNS ブラウズ(QU + QM フォールバック)→ フルコミッショニング →
+# CASE → OnOff Toggle。CA は EspKvs(キー b"cast"、smctl v1 互換)へ永続化。
+[[bin]]
+name = "s3-controller"
+path = "src/bin/s3-controller.rs"
+
 [dependencies]
 esp-hal = { version = "1.1.1", features = ["esp32s3", "unstable"] }
 esp-println = { version = "0.17.0", features = ["esp32s3"] }
@@ -39,10 +46,13 @@ esp-backtrace = { version = "0.19.0", features = [
 ] }
 esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
 
-# コア。デバイス(responder)向けの最小構成(C6 ポートと同じ)。
+# コア。デバイス(responder)構成 + controller(s3-controller 用。feature は
+# workspace で合成されるが、controller はデバイス bin の flash に波及しないことを
+# CI の bloat-check footprint-invariance が機械検証している)。
 simple-matter = { path = "../../../crates/simple-matter", default-features = false, features = [
     "rustcrypto",
     "ble",
+    "controller",
 ] }
 
 # --- BLE + Wi-Fi(esp-radio S3 coex + TrouBLE 0.6 + embassy)---
