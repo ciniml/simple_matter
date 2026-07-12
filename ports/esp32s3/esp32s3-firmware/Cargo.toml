@@ -2,7 +2,7 @@
 name = "esp32s3-firmware"
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "BSL-1.0"
 publish = false
 
 # M5Stack AirQ(ESP32-S3FN8 / M5StampS3)向けファームウェア。

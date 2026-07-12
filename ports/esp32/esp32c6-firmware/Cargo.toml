@@ -2,7 +2,7 @@
 name = "esp32c6-firmware"
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "BSL-1.0"
 publish = false
 
 # lib(no_std の共有部: EspRng / TroubleGattPeripheral)+ 複数 bin 構成。
