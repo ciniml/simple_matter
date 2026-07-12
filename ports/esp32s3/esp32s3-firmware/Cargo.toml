@@ -36,6 +36,12 @@ path = "src/bin/airq-sensor.rs"
 name = "s3-controller"
 path = "src/bin/s3-controller.rs"
 
+# K3 冒頭スモークゲート(esp32-controller.md §7 K3 / リスク R1): TrouBLE central の
+# scan 適合検証。0xFFF6 service data から discriminator/VID/PID を読めることだけを見る。
+[[bin]]
+name = "s3-scan-smoke"
+path = "src/bin/s3-scan-smoke.rs"
+
 [dependencies]
 esp-hal = { version = "1.1.1", features = ["esp32s3", "unstable"] }
 esp-println = { version = "0.17.0", features = ["esp32s3"] }
@@ -78,6 +84,11 @@ trouble-host = { version = "0.6.0", default-features = false, features = [
     "gatt",
     "derive",
     "default-packet-pool",
+    # K3(s3-controller の BLE central、docs/design/esp32-controller.md §3): scan は
+    # central を連動有効化する。feature はワークスペースで合成されるためデバイス bin にも
+    # 付くが、未使用コードはリンカが落とす(bloat-check の不変条件はコア側の話で無関係)。
+    "central",
+    "scan",
 ] }
 bt-hci = "0.8"
 embassy-executor = "0.10.0"
