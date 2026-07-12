@@ -369,9 +369,17 @@ done
   Matter UDP は 5540(v4/v6 両受け)。
 - **mDNS**: DHCP で IPv4 取得後に 5353 + 224.0.0.251(IGMP join)**および ff02::fb
   (MLD join)**で、コアの sans-IO `MdnsResponder` を駆動。A に DHCP v4、AAAA に fe80 を
-  載せる(`docs/design/mdns-ipv6.md` §4)。operational レコードのみ広告
-  (commissionable は BLE 広告が担う)。QU クエリにはユニキャスト応答、QM は受信
-  ファミリ側のマルチキャストへ返す。
+  載せる(`docs/design/mdns-ipv6.md` §4)。平常時は operational レコードを広告
+  (初回 commissionable は BLE 広告が担う)し、**OCW 開窓中のみ commissionable
+  (CM=2、動的 discriminator)も広告**する。QU クエリにはユニキャスト応答、QM は
+  受信ファミリ側のマルチキャストへ返す。
+- **AdminCommissioning(0x003C、2026-07-13 追加)**: EP0 に搭載。窓状態は外部所有
+  `RefCell<CommissioningWindow>` を pump と共有し、`WindowEvent` で PASE 動的注入
+  (`set_pase_config`/`set_pase_enabled`)+ mDNS CM=2 再広告を行う
+  (docs/design/admin-commissioning.md、airq-port.md §7.4.1)。**fabric >0 で起動
+  すると焼き込みパスコードの PASE は無効**(管理者追加は OCW 経由のみ。閉窓中の
+  PBKDFParamRequest は Busy 拒否)。S3 の airq-sensor で実機 E2E 済み(C6 は
+  ビルド回帰のみ)。
 - ConnectNetworkResponse は**即 Success + バックグラウンド join**
   (シムで chip-tool 相互運用実証済みのフロー。遅延応答は将来課題、doc §E5.2)。
 - ヒープは 144KiB(E4 の 72KiB → E5 の 112KiB から再増量)。IPv6(proto-ipv6)追加後、

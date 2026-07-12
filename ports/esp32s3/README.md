@@ -9,13 +9,17 @@ workspace**。S3 は espup の esp channel(rustc フォーク)を要求し、
 `rust-toolchain.toml` が stable 前提の両者と衝突するため、workspace 分離が
 必須(airq-port.md §3.3)。
 
-> **状態(2026-07-12)**: **A5 完了 — AirQ 実機(esp32s3 rev v0.2 / 8MB /
-> MAC 48:27:e2:e3:0f:b8)で §7.3 チェックリスト全項目 green**。
-> SEN55/SCD40 実測値取得、chip-tool `pairing ble-wifi` フル E2E
+> **状態(2026-07-13)**: **A5 完了 + 残改善バッチ 1 完了 — AirQ 実機
+> (esp32s3 rev v0.2 / 8MB / MAC 48:27:e2:e3:0f:b8)で §7.3 チェックリスト
+> 全項目 green**。SEN55/SCD40 実測値取得、chip-tool `pairing ble-wifi` フル E2E
 > (--paa-trust-store-path、attestation 実検証)、smctl 2 fabric 目 +
 > subscribe、リブート永続化まで確認。実機で発見した S3 固有バグ
-> (main スタック逼迫 → ヒープ 112KiB 化)と検証記録は
-> airq-port.md §7.3.1 を参照。
+> (main スタック逼迫 → ヒープ 112KiB 化)と検証記録は airq-port.md §7.3.1 を参照。
+> **残改善バッチ 1(airq-port.md §7.4)**: EP0 に AdminCommissioning(0x003C)
+> 搭載(OCW → mDNS CM=2 → smctl manual code 経由 2 fabric 目を実機 E2E 済み。
+> 以降、閉窓中の直接 PASE は仕様どおり拒否される)、SEN55 温度の自己発熱補正
+> -3.0°C(補正前後をログ並記)、VOC/NOx index の AirQuality worst-of 活用
+> (閾値根拠は §4.3b。濃度クラスタには載せない方針は不変)。
 
 ## ツールチェーン(C6 との最大の違い)
 
@@ -87,13 +91,13 @@ cd ports/esp32s3
 cargo build --release --bins
 ```
 
-フラッシュイメージ実測(espflash save-image、2026-07-12):
+フラッシュイメージ実測(2026-07-13、残改善バッチ 1 = OCW 搭載後):
 
 | bin | app image |
 |---|---|
 | esp32s3-firmware(スモーク) | 104,928 B |
-| s3-light | 906,800 B |
-| airq-sensor | 953,168 B |
+| s3-light | 912,016 B |
+| airq-sensor | 959,408 B |
 
 **RAM 配分の注意(S3 固有、実機で顕在化)**: S3 の DRAM リンカ領域は約 340KiB
 (C6 より狭い)で、main スタック(`.stack`)は「.data/.bss の残り」になる。

@@ -64,11 +64,13 @@ use simple_matter::btp::{Btp, BtpRole};
 use simple_matter::crypto::rustcrypto::RustCrypto;
 use simple_matter::crypto::Rng;
 use simple_matter::discovery::{
-    MdnsResponder, Operational, MATTER_PORT, MDNS_IPV4, MDNS_IPV6, MDNS_PORT,
+    Commissionable, CommissioningMode, MdnsResponder, Operational, MATTER_PORT, MDNS_IPV4,
+    MDNS_IPV6, MDNS_PORT,
 };
 use simple_matter::dm::clusters::{
-    BasicInfoConfig, BasicInformationCluster, DescriptorCluster, GeneralCommissioning,
-    LevelControlCluster, NetworkCommissioningWifi, OnOffCluster, OpCredsCluster, TestDacProvider,
+    AdminCommissioningCluster, BasicInfoConfig, BasicInformationCluster, CommissioningWindow,
+    DescriptorCluster, GeneralCommissioning, LevelControlCluster, NetworkCommissioningWifi,
+    OnOffCluster, OpCredsCluster, TestDacProvider, WindowEvent,
 };
 use simple_matter::dm::meta::{ClusterId, DeviceType, EndpointId, EndpointMeta};
 use simple_matter::dm::{tick_clusters, DataModel, ServerCluster};
@@ -141,6 +143,7 @@ static EP0_SERVERS: &[ClusterId] = &[
     ClusterId(0x0028),
     ClusterId(0x0030),
     ClusterId(0x0031),
+    ClusterId(0x003C),
     ClusterId(0x003E),
     ClusterId(0x001D),
 ];
@@ -159,6 +162,7 @@ struct Light<'s> {
     basic: BasicInformationCluster,
     gc: GeneralCommissioning,
     net: NetworkCommissioningWifi<EspWifiDriver>,
+    admin: AdminCommissioningCluster<'s>,
     opcreds: OpCreds<'s>,
     desc0: DescriptorCluster,
     onoff: OnOffCluster,
@@ -188,6 +192,7 @@ impl DataModel for Light<'_> {
             (0, 0x0028) => Some(&self.basic),
             (0, 0x0030) => Some(&self.gc),
             (0, 0x0031) => Some(&self.net),
+            (0, 0x003C) => Some(&self.admin),
             (0, 0x003E) => Some(&self.opcreds),
             (0, 0x001D) => Some(&self.desc0),
             (1, 0x0006) => Some(&self.onoff),
@@ -201,6 +206,7 @@ impl DataModel for Light<'_> {
             (0, 0x0028) => Some(&mut self.basic),
             (0, 0x0030) => Some(&mut self.gc),
             (0, 0x0031) => Some(&mut self.net),
+            (0, 0x003C) => Some(&mut self.admin),
             (0, 0x003E) => Some(&mut self.opcreds),
             (0, 0x001D) => Some(&mut self.desc0),
             (1, 0x0006) => Some(&mut self.onoff),
@@ -216,6 +222,8 @@ impl DataModel for Light<'_> {
                 self.removed_fabric = Some(idx);
             }
         }
+        // コミッショニング窓のタイムアウト自動クローズ(WindowEvent は pump が拾う)。
+        let _ = self.admin.on_tick(now_ms);
         // on_tick を手書きで上書きしているため、クラスタ tick(Level Control の時間遷移)は
         // tick_clusters を明示的に呼ぶ(設計 §15.1)。
         let next = tick_clusters(self, now_ms);
@@ -242,13 +250,17 @@ impl DataModel for Light<'_> {
     }
 }
 
-fn build_light(fabrics: &RefCell<FabricTable<Backend, NF>>) -> Light<'_> {
+fn build_light<'s>(
+    fabrics: &'s RefCell<FabricTable<Backend, NF>>,
+    window: &'s RefCell<CommissioningWindow>,
+) -> Light<'s> {
     let dac_crypto = RustCrypto::new(esp_rng());
     let dac = TestDacProvider::new(&dac_crypto).expect("test DAC");
     Light {
         basic: BasicInformationCluster::new(&CFG),
         gc: GeneralCommissioning::default_config(),
         net: NetworkCommissioningWifi::with_driver(EspWifiDriver),
+        admin: AdminCommissioningCluster::new(window),
         opcreds: OpCredsCluster::new_shared(fabrics, RustCrypto::new(esp_rng()), dac),
         desc0: DescriptorCluster::new(EndpointId(0), EP0_DT, EP0_SERVERS, &[], EP0_PARTS),
         onoff: OnOffCluster::new().with_listener(|on| {
@@ -409,6 +421,23 @@ async fn route_send(
     }
 }
 
+/// commissionable 広告(`_matterc._udp`)の材料を作る(instance id は MAC 由来)。
+fn commissionable(mac: &[u8; 6], discriminator: u16, mode: CommissioningMode) -> Commissionable {
+    let mut id = [0u8; 8];
+    id[2..].copy_from_slice(mac);
+    Commissionable {
+        device_type: Some(0x0101),
+        device_name: Some(CFG.product_name),
+        ..Commissionable::new(
+            u64::from_be_bytes(id),
+            discriminator,
+            CFG.vendor_id,
+            CFG.product_id,
+            mode,
+        )
+    }
+}
+
 // ==========================================================================
 // 統合層(pump): BTP + UDP + mDNS ⇔ MatterStack
 // ==========================================================================
@@ -425,6 +454,7 @@ async fn pump(
     gatt: &mut TroubleGattPeripheral<'_>,
     stack: &mut LightStack<'_>,
     fabrics: &RefCell<FabricTable<Backend, NF>>,
+    window: &RefCell<CommissioningWindow>,
     kvs: &mut EspKvs,
     net_stack: embassy_net::Stack<'_>,
     matter_udp: &mut EspUdp<'_>,
@@ -447,6 +477,9 @@ async fn pump(
     let mut saved_resumption_gen = stack.resumption_generation();
     // 運用 mDNS レスポンダ(DHCP で IPv4 を取得してから構築する)。
     let mut mdns: Option<MdnsResponder<NF>> = None;
+    // 初回コミッショニング窓(fabric 0 個で起動 = 焼き込みパスコードの PASE が有効)。
+    let mut boot_window_open = fabrics.borrow().is_empty();
+    let mut last_fabric_count = fabrics.borrow().len();
 
     let start = Instant::now();
     let mut buf = [0u8; 512];
@@ -742,6 +775,87 @@ async fn pump(
                     r.operational_len()
                 );
             }
+            // 窓経由のコミッショニング成功(fabric 増加)で窓を閉じる(§11.19.5)。
+            // Closed イベントが積まれ、次周の窓イベント処理で PASE/広告が畳まれる。
+            let fabric_count = fabrics.borrow().len();
+            if fabric_count > last_fabric_count && window.borrow().is_open() {
+                window.borrow_mut().close_window();
+                println!("[window] commissioning succeeded; closing window");
+            }
+            if boot_window_open && fabric_count > 0 && !window.borrow().is_open() {
+                // 初回コミッショニング完了: 焼き込みパスコードの PASE を閉じる。
+                // 以降の管理者追加は OCW(AdminCommissioning)経由のみ。
+                boot_window_open = false;
+                stack.set_pase_enabled(false);
+                println!("[window] initial commissioning done; PASE disabled");
+            } else if !boot_window_open && fabric_count == 0 && !window.borrow().is_open() {
+                // 全 fabric 削除: 初期状態(焼き込みパスコード)へ戻す。
+                boot_window_open = true;
+                let cfg = PaseConfig::from_passcode_default(PASSCODE, &SALT).expect("PASE config");
+                stack.set_pase_config(cfg);
+                stack.set_pase_enabled(true);
+                println!("[window] all fabrics removed; reopening initial commissioning window");
+            }
+            last_fabric_count = fabric_count;
+        }
+
+        // --- コミッショニング窓イベントを PASE 設定と mDNS 広告へ反映する(設計 §4/§5)---
+        // borrow を窓イベント取り出しとネスト利用で分ける(borrow がボディ全体で生存する罠)。
+        let window_event = window.borrow_mut().take_event();
+        if let Some(ev) = window_event {
+            let now = now_ms(start);
+            match ev {
+                WindowEvent::OpenedEnhanced { discriminator } => {
+                    if let Some(cfg) = window.borrow().pase_config() {
+                        stack.set_pase_config(cfg);
+                        stack.set_pase_enabled(true);
+                        if let Some(r) = mdns.as_mut() {
+                            r.set_commissionable(Some(commissionable(
+                                &mac,
+                                discriminator,
+                                CommissioningMode::Enhanced,
+                            )));
+                            r.notify_change(now);
+                        }
+                        println!(
+                            "[window] enhanced commissioning window open (CM=2, discriminator {})",
+                            discriminator
+                        );
+                    }
+                }
+                WindowEvent::OpenedBasic => {
+                    // 焼き込みパスコードへ戻す(PBKDF2 数百 ms、低頻度なので pump 停止は許容)。
+                    let cfg =
+                        PaseConfig::from_passcode_default(PASSCODE, &SALT).expect("PASE config");
+                    stack.set_pase_config(cfg);
+                    stack.set_pase_enabled(true);
+                    if let Some(r) = mdns.as_mut() {
+                        r.set_commissionable(Some(commissionable(
+                            &mac,
+                            DISCRIMINATOR,
+                            CommissioningMode::Standard,
+                        )));
+                        r.notify_change(now);
+                    }
+                    println!("[window] basic commissioning window open (CM=1)");
+                }
+                WindowEvent::Closed => {
+                    stack.set_pase_enabled(false);
+                    if let Some(r) = mdns.as_mut() {
+                        r.set_commissionable(None);
+                        r.notify_change(now);
+                    }
+                    println!("[window] commissioning window closed");
+                }
+            }
+            // AdminVendorId は fabric テーブルから解決して書き戻す(設計 §7)。
+            let admin_idx = window.borrow().admin_fabric_index();
+            if let Some(idx) = admin_idx {
+                let vid = fabrics.borrow().get(idx).map(|f| f.vendor_id());
+                if let Some(vid) = vid {
+                    window.borrow_mut().set_admin_vendor_id(vid);
+                }
+            }
         }
 
         // --- CASE resumption ストアの世代変化を検知して flash 保存(§7.4)---
@@ -891,6 +1005,8 @@ async fn main(_spawner: Spawner) {
     // --- MatterStack 構築(E4 と同じ。乱数は全て TRNG)---
     let crypto = RustCrypto::new(esp_rng());
     let fabrics: RefCell<FabricTable<Backend, NF>> = RefCell::new(FabricTable::new());
+    // コミッショニング窓(AdminCommissioning 0x003C と pump が共有)。
+    let window: RefCell<CommissioningWindow> = RefCell::new(CommissioningWindow::new());
 
     // flash KVS から fabric テーブルを復元する(E4、doc §E4.4 / §E4.5)。
     let mut kvs = EspKvs::new(peripherals.FLASH);
@@ -913,8 +1029,14 @@ async fn main(_spawner: Spawner) {
 
     let creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
     let sc = SecureChannel::new(&crypto, esp_rng(), pase, creds);
-    let im = InteractionModel::new(build_light(&fabrics));
+    let im = InteractionModel::new(build_light(&fabrics, &window));
     let mut stack: LightStack<'_> = MatterStack::new(&crypto, sc, im);
+    // コミッショニング済みで起動した場合、焼き込みパスコードの PASE は閉じる
+    // (管理者追加は OCW 経由のみ。PC example と同じ窓ゲート)。
+    if !fabrics.borrow().is_empty() {
+        stack.set_pase_enabled(false);
+        println!("[pase] disabled at boot (already commissioned; use OCW to add admins)");
+    }
     // 起動イベント(BasicInformation StartUp、CRITICAL、{ softwareVersion })を積む。
     let _ = stack.post_startup_event(CFG.software_version, 0);
     println!(
@@ -1005,6 +1127,7 @@ async fn main(_spawner: Spawner) {
             &mut gatt,
             &mut stack,
             &fabrics,
+            &window,
             &mut kvs,
             net_stack,
             &mut matter_udp,

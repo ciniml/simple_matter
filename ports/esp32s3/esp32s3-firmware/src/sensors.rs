@@ -57,6 +57,17 @@ const SEN55_PERIOD_S: u64 = 10;
 const SCD40_PERIOD_S: u64 = 30;
 /// SEN55 電源 ON(GPIO10 = LOW)後の起動待ち(ms)。1 秒必須(§1.3)。
 const SEN55_POWER_ON_WAIT_MS: u64 = 1000;
+/// SEN55 温度の自己発熱補正オフセット(°C、読み値から減算)。
+///
+/// 根拠(airq-port.md §7.4): AirQ 同一筐体の ESPHome コミュニティ設定が
+/// `temperature_compensation: offset: -3.0`(devices.esphome.io/devices/m5stack-airq)。
+/// M5Stack 公式 FW(AirQUserDemo)は補正 0 で、公式サンプルデータでも SEN55 36°C 級の
+/// 自己発熱を記録している。Sensirion 公式は「筐体ごとに実測して決める」立場
+/// (SEN5x Temperature Acceleration and Compensation Instructions)。既存 esp-matter FW
+/// の 9°C(Kconfig 既定)は **SCD4x 側** のオフセットで SEN55 には流用できない。
+/// センサ内蔵の 0x60B2 補正(湿度も連動補正される)は sen5x-rs 0.4 が未対応のため
+/// ソフト減算とする(湿度の連動補正は将来課題)。
+pub const SEN55_TEMP_OFFSET_C: f32 = 3.0;
 /// SEN55 reinit 後の待ち(ms)。データシートのリセット完了 100ms + 余裕。
 const SEN55_REINIT_WAIT_MS: u64 = 200;
 
@@ -73,7 +84,7 @@ pub struct SensorSnapshot {
     pub pm25: Option<f32>,
     /// PM10 µg/m³(SEN55)。
     pub pm10: Option<f32>,
-    /// 温度 ℃(SEN55。タスク指定によりソースは SEN55 側)。
+    /// 温度 ℃(SEN55、[`SEN55_TEMP_OFFSET_C`] の自己発熱補正適用済み)。
     pub temp_c: Option<f32>,
     /// 相対湿度 %RH(SEN55)。
     pub rh: Option<f32>,
@@ -181,12 +192,10 @@ pub async fn sensor_task(i2c: I2c<'static, Blocking>, mut sen55_power: Output<'s
             continue;
         }
         Timer::after_millis(SEN55_REINIT_WAIT_MS).await;
-        match sen55
-            .serial_number()
-            .and_then(|serial| {
-                println!("[sensors] SEN55 serial={:012x}", serial);
-                sen55.start_measurement()
-            }) {
+        match sen55.serial_number().and_then(|serial| {
+            println!("[sensors] SEN55 serial={:012x}", serial);
+            sen55.start_measurement()
+        }) {
             Ok(()) => {
                 println!("[sensors] SEN55 measurement started (fan spin-up)");
                 break;
@@ -209,7 +218,10 @@ pub async fn sensor_task(i2c: I2c<'static, Blocking>, mut sen55_power: Output<'s
             match sen55.data_ready_status() {
                 Ok(true) => match sen55.measurement() {
                     Ok(d) => {
-                        let temp = fix_sen55_temp(d.temperature);
+                        // 自己発熱補正: 生値(raw)から固定オフセットを減算する。
+                        // 補正前後をログに並記する(補正値の妥当性検証のため)。
+                        let raw_temp = fix_sen55_temp(d.temperature);
+                        let temp = raw_temp - SEN55_TEMP_OFFSET_C;
                         publish(|s| {
                             s.pm1 = Some(d.pm1_0);
                             s.pm25 = Some(d.pm2_5);
@@ -220,8 +232,16 @@ pub async fn sensor_task(i2c: I2c<'static, Blocking>, mut sen55_power: Output<'s
                             s.nox_index = Some(d.nox_index);
                         });
                         println!(
-                            "[sensors] SEN55 pm1={} pm2.5={} pm10={} T={}C RH={}% voc={} nox={}",
-                            d.pm1_0, d.pm2_5, d.pm10_0, temp, d.humidity, d.voc_index, d.nox_index
+                            "[sensors] SEN55 pm1={} pm2.5={} pm10={} T={}C (raw={}C offset=-{}C) RH={}% voc={} nox={}",
+                            d.pm1_0,
+                            d.pm2_5,
+                            d.pm10_0,
+                            temp,
+                            raw_temp,
+                            SEN55_TEMP_OFFSET_C,
+                            d.humidity,
+                            d.voc_index,
+                            d.nox_index
                         );
                     }
                     Err(e) => println!("[sensors] SEN55 read failed: {:?}", e),

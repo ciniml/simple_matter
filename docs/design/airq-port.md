@@ -279,6 +279,36 @@ Matter の TVOC/NO2 Concentration クラスタに ppm/ppb として入れるの�
 **搭載しない**(上記方針どおり。既存 FW のバグ 2 の是正)。dead-code 除去により
 未使用クラスタのフットプリント影響はゼロ(flash-probe 実測 102259B、増分なし)。
 
+### 4.3b VOC/NOx index → AirQualityEnum の閾値(残改善バッチ 1、2026-07-13)
+
+§4.3 の「VOC index は AirQualityEnum 算出材料として活用」を実装した。閾値の根拠
+(Sensirion 公式ドキュメント調査。詳細な出典は各 Info Note / Engineering
+Guidelines / SEN5x データシート / 公式ウェビナー資料):
+
+- **VOC index**(1-500、100 = 過去 24h の平常。アルゴリズムが 24h で 100 へ
+  再基準化するため定常値は常に 100 近傍、リップル ±5):
+
+  | AirQualityEnum | VOC index | 根拠 |
+  |---|---|---|
+  | Good | ≤ 150 | 100 = 平常(Info Note: VOC Index)+ >150 = 清浄機作動例(同)を最初の劣化境界に採用。**100 を境界にすると平常時にフラップする**(AirQ 実機で 100↔101 の振動を実測)ため 100-150 は Good に含める |
+  | Fair | ≤ 200 | 公式ウェビナーの緑/黄境界 200 |
+  | Moderate | ≤ 300 | 黄帯 200-400 の補間(公式のイベントゲーティング閾値 230 を含む) |
+  | Poor | ≤ 400 | 公式の黄/赤境界 400 |
+  | VeryPoor | > 400 | 公式赤帯("ventilate intensely")。**相対指標のため単一チャネル寄与は VeryPoor 上限**(ExtremelyPoor は絶対量ベースの CO2/PM に予約) |
+
+- **NOx index**(1-500、**1 = クリーンが定常**。公式アンカーは「1 = クリーン」
+  「>20 = 清浄機作動例」の 2 点のみで、個体差 ±50 point / ±50%(データシート
+  Table 5)と大きい): 粗い 3 段階 + Poor 上限に制限 —
+  **≤20 Good / ≤100 Moderate / >100 Poor**。
+- **無効値ガード**: 有効範囲(1.0..=500.0)外 — 未較正マーカー 0x7FFF/10 =
+  3276.7、ウォームアップ中の 0 — は Unknown として worst-of から除外
+  (実機でウォームアップ直後の voc=0 / nox=3276.7 が Unknown 扱いになることを確認)。
+- ウォームアップ: VOC はスペック到達 <1h、**NOx は <6h**(データシート)。
+  無効値ガードで安全側だが、NOx の初期数時間は 1 に張り付くのが正常。
+- worst-of 合成は従来どおり `AirQualityEnum: Ord` の max(Unknown = 最小)。
+  実装は airq-sensor.rs の `classify_voc` / `classify_nox`。
+  **濃度クラスタ(TVOC/NO2)には引き続き載せない**(§4.3 の方針は不変)。
+
 ### 4.4 smctl / example
 
 - smctl: `air-quality` + concentration 族 6 種の `cluster_def!` 追加(read/subscribe 確認用)。
@@ -511,9 +541,75 @@ chip-tool kvs のフレッシュ化(`rm ~/snap/chip-tool/common/chip_tool_kvs`)�
 モードへ落ちることがある(USB-Serial-JTAG のストラップ干渉)— reset 単独実行
 → 直後に stty+cat の順なら正常起動を捕捉できる。
 
-残課題(A5 スコープ外): AdminCommissioning(OCW)を S3 bin へ搭載
-(PC example の写しで可能)、SEN55 温度の自己発熱補正、既存 esp-matter FW との
-同一個体値比較(R2 の完全クローズ)、s3-light 単独の onoff E2E。
+残課題(A5 スコープ外): ~~AdminCommissioning(OCW)を S3 bin へ搭載~~、
+~~SEN55 温度の自己発熱補正~~(いずれも §7.4 の残改善バッチ 1 で完了、2026-07-13)、
+既存 esp-matter FW との同一個体値比較(R2 の完全クローズ)、s3-light 単独の
+onoff E2E。
+
+## 7.4 残改善バッチ 1(2026-07-13): OCW 搭載 + 温度補正 + VOC/NOx 活用
+
+### 7.4.1 AdminCommissioning(0x003C)の ESP32 bin 搭載
+
+`airq-sensor` / `s3-light`(S3)+ `e5-light`(C6)の EP0 に AdminCommissioning を
+搭載し、PC example(air-quality-sensor.rs)の窓管理配線を pump へ移植した
+(docs/design/admin-commissioning.md の設計どおり):
+
+- 外部所有 `RefCell<CommissioningWindow>` を クラスタ / pump で共有、
+  `DataModel::on_tick` で窓タイムアウト自動クローズ。
+- pump が `take_event()` をポーリング: OpenedEnhanced → `set_pase_config`(動的
+  verifier)+ `set_pase_enabled(true)` + **mDNS commissionable(CM=2、動的
+  discriminator)広告**(ESP32 bin で commissionable 広告を出すのは初。instance id
+  は MAC 由来)。Closed → PASE 無効化 + 広告停止。
+- **PASE 窓ゲート**: fabric >0 で起動したら焼き込みパスコードの PASE を無効化
+  (`[pase] disabled at boot`)。初回コミッショニング完了(fabric 0→1)でも無効化。
+  全 fabric 削除で焼き込みパスコードへ戻す。fabric 増加で開窓中の窓を自動クローズ
+  (§11.19.5)。
+- 挙動変更: 従来可能だった「コミッショニング済みデバイスへの `pairing address`
+  直接 PASE」は **窓が開いていない限り StatusReport(4) で拒否**される(仕様準拠。
+  実機で確認)。
+
+### 7.4.2 SEN55 温度の自己発熱補正(-3.0°C 固定オフセット)
+
+`sensors::SEN55_TEMP_OFFSET_C = 3.0`(読み値から減算)。調査結果:
+
+| ソース | 値 |
+|---|---|
+| ESPHome M5Stack AirQ コミュニティ設定(devices.esphome.io/devices/m5stack-airq) | **sen5x temperature_compensation offset=-3.0**(time_constant 1200s)← 採用 |
+| M5Stack 公式 FW(AirQUserDemo) | 0.0(無補正。公式サンプルデータでも SEN55 36°C 級) |
+| 既存 esp-matter FW(Kconfig 既定) | 9.0°C だが **SCD4x 側**(SEN55 には流用不可) |
+| Sensirion 公式(SEN5x 補償ガイド) | 「筐体ごとに実測して決める」(万能推奨値なし) |
+
+センサ内蔵の 0x60B2 補正(湿度も連動補正)は sen5x-rs 0.4 が未対応のためソフト
+減算とし、**補正前後をログに並記**(`T=30.5C (raw=33.5C offset=-3C)`)。
+実測: 起動直後 raw 38.7°C(ファン起動過渡)→ 定常 raw 33.5°C / 補正後 30.5°C。
+湿度の連動補正(絶対湿度不変での RH 再計算)は将来課題。
+
+### 7.4.3 実機 E2E 記録(AirQ、NVS erase から)
+
+1. chip-tool `pairing ble-wifi 1 iotap … 20202021 3840 --paa-trust-store-path …`
+   (attestation 実検証)フル完走 → 全属性 read(AQ=2 / CO2=817.0 / PM2.5=2.5 /
+   温度=3129(補正後)/ 湿度=3530)。
+2. **OCW E2E**: chip-tool `pairing open-commissioning-window 1 1 300 1000 3841`
+   → デバイス `[window] enhanced commissioning window open (CM=2, discriminator
+   3841)` → manual code 36164605764 から passcode 復元(chunk2 下位 14bit |
+   chunk3<<14 = 9449678)→ 別 state-dir の smctl `pairing onnetwork-long 2
+   9449678 3841` で **2 fabric 目完走** → `[window] commissioning succeeded;
+   closing window`(自動クローズ)。revoke-commissioning も確認。
+3. smctl read(--names で 0x002c 表示)+ `carbon-dioxide-concentration subscribe`
+   (Sigma2Resume 再開 + 周期レポート +25s/+55s)。
+4. 閉窓中の `pairing address`(3 人目)= `Sc(StatusReport(4))` 拒否(窓ゲート実証)。
+5. リブート: restored 2 fabrics / 2 resumptions / wifi credentials → PASE
+   disabled at boot → auto-join → chip-tool(fabric 1)/ smctl(fabric 2)とも
+   CASE 再確立 + read 成功。
+6. AirQuality worst-of のライブ遷移: ブート時のファン起動で PM2.5 が 62→32µg/m³
+   と変動し Poor→Moderate→Fair の遷移をログ + chip-tool read(=4)で観測。
+   VOC/NOx は定常(voc≈100 / nox=1)のため Good 寄与(専用の VOC イベント起因の
+   遷移は未観測 — 平常時は発生しないのが正しい挙動)。
+
+ゲート: コア 519 + smctl 58 テスト green、clippy 0(root/S3/C6)、
+riscv/thumbv6m/no-default-features check green、S3 3 bin + C6 ビルド green。
+フットプリント: airq-sensor 959,408 B(前回 953,168 B から +6.2KB =
+AdminCommissioning + 窓配線 + mDNS commissionable)。
 
 ## 8. 参考(調査ソース)
 

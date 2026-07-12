@@ -13,12 +13,14 @@
 //! | 2 | Temperature Sensor 0x0302 | Identify + TemperatureMeasurement | SEN55 |
 //! | 3 | Humidity Sensor 0x0307 | Identify + RelativeHumidityMeasurement | SEN55 |
 //!
-//! - **AirQuality(0x005B)は CO2/PM2.5 の worst-of で常時更新**(既存 esp-matter
-//!   FW のバグ 1 是正。閾値 = 屋内 IAQ / US EPA AQI 相当のデバイスポリシー)。
-//! - **VOC/NOx index はクラスタに載せない**(無次元 index は濃度ではない。
-//!   airq-port.md §4.3。ログには出す)。
+//! - **AirQuality(0x005B)は CO2/PM2.5/VOC index/NOx index の worst-of で常時更新**
+//!   (既存 esp-matter FW のバグ 1 是正。閾値 = 屋内 IAQ / US EPA AQI 相当 +
+//!   Sensirion 公式アンカー。airq-port.md §4.2/§4.3b)。
+//! - **VOC/NOx index は濃度クラスタに載せない**(無次元 index は濃度ではない。
+//!   airq-port.md §4.3。AirQuality 算出材料 + ログにのみ使う)。
 //! - 温湿度ソースは SEN55(A5 タスク指定。既存 FW は SCD4x 側を採用していた —
-//!   airq-port.md §1.2。SCD40 側の値は参考としてログに出す)。
+//!   airq-port.md §1.2。SCD40 側の値は参考としてログに出す)。温度には自己発熱
+//!   補正 -3.0°C を適用(`sensors::SEN55_TEMP_OFFSET_C`、airq-port.md §7.4)。
 //! - AirQ 固有のハード制御: **GPIO46 = HIGH(電源 HOLD)** を起動直後に固定、
 //!   **GPIO10 = LOW(SEN55 電源 ON)+ 1 秒待ち**は [`sensor_task`] が行う。
 //!
@@ -66,14 +68,16 @@ use simple_matter::btp::{Btp, BtpRole};
 use simple_matter::crypto::rustcrypto::RustCrypto;
 use simple_matter::crypto::Rng;
 use simple_matter::discovery::{
-    MdnsResponder, Operational, MATTER_PORT, MDNS_IPV4, MDNS_IPV6, MDNS_PORT,
+    Commissionable, CommissioningMode, MdnsResponder, Operational, MATTER_PORT, MDNS_IPV4,
+    MDNS_IPV6, MDNS_PORT,
 };
 use simple_matter::dm::clusters::{
-    AirQualityCluster, AirQualityEnum, BasicInfoConfig, BasicInformationCluster,
-    CarbonDioxideConcentrationCluster, DescriptorCluster, GeneralCommissioning, IdentifyCluster,
-    NetworkCommissioningWifi, OpCredsCluster, Pm10ConcentrationCluster, Pm1ConcentrationCluster,
-    Pm25ConcentrationCluster, RelativeHumidityMeasurementCluster, TemperatureMeasurementCluster,
-    TestDacProvider,
+    AdminCommissioningCluster, AirQualityCluster, AirQualityEnum, BasicInfoConfig,
+    BasicInformationCluster, CarbonDioxideConcentrationCluster, CommissioningWindow,
+    DescriptorCluster, GeneralCommissioning, IdentifyCluster, NetworkCommissioningWifi,
+    OpCredsCluster, Pm10ConcentrationCluster, Pm1ConcentrationCluster, Pm25ConcentrationCluster,
+    RelativeHumidityMeasurementCluster, TemperatureMeasurementCluster, TestDacProvider,
+    WindowEvent,
 };
 use simple_matter::dm::meta::{ClusterId, DeviceType, EndpointId, EndpointMeta};
 use simple_matter::dm::{tick_clusters, DataModel, ServerCluster};
@@ -144,11 +148,12 @@ static CFG: BasicInfoConfig = BasicInfoConfig {
     serial_number: "SM-AIRQ-S3-1",
 };
 
-// EP0 = Root Node(0x0016)。C6 e5-light と同じ管理系 5 クラスタ。
+// EP0 = Root Node(0x0016)。管理系 5 クラスタ + AdminCommissioning(0x003C、OCW)。
 static EP0_SERVERS: &[ClusterId] = &[
     ClusterId(0x0028),
     ClusterId(0x0030),
     ClusterId(0x0031),
+    ClusterId(0x003C),
     ClusterId(0x003E),
     ClusterId(0x001D),
 ];
@@ -201,11 +206,49 @@ fn classify_pm25(ugm3: f32) -> AirQualityEnum {
     }
 }
 
+/// Sensirion VOC index(1-500、100 = 過去 24h の平常)→ AirQualityEnum。
+///
+/// 帯域は Sensirion 公式のアンカーに基づく(根拠は airq-port.md §4.3b):
+/// 100 = 平常(Info Note: VOC Index。アルゴリズムが 24h で 100 へ再基準化するため
+/// 定常値。リップル ±5 があるので 100 を境界にすると平常時にフラップする —
+/// AirQ 実機で 100↔101 の振動を実測)、>150 = 清浄機作動例(同 Info Note)を
+/// 最初の劣化レベル境界に採用、200/400 = 公式ウェビナーの緑/黄/赤境界、
+/// 300 のみ黄帯の補間。相対指標のため単一チャネルの寄与は VeryPoor を上限とする
+/// (ExtremelyPoor は絶対量ベースの CO2/PM に予約)。
+/// 有効範囲外(未較正マーカー 0x7FFF/10 = 3276.7、ウォームアップ中の 0)は Unknown
+/// (worst-of 合成に影響しない)。
+fn classify_voc(index: f32) -> AirQualityEnum {
+    match index {
+        v if !(1.0..=500.0).contains(&v) => AirQualityEnum::Unknown,
+        v if v <= 150.0 => AirQualityEnum::Good,
+        v if v <= 200.0 => AirQualityEnum::Fair,
+        v if v <= 300.0 => AirQualityEnum::Moderate,
+        v if v <= 400.0 => AirQualityEnum::Poor,
+        _ => AirQualityEnum::VeryPoor,
+    }
+}
+
+/// Sensirion NOx index(1-500、1 = クリーンが定常)→ AirQualityEnum。
+///
+/// 公式アンカーは「1 = クリーン」「>20 = 清浄機作動例」の 2 点のみで、
+/// SEN55 の NOx index 個体差は ±50 point / ±50%(データシート Table 5)と大きい。
+/// このため寄与は粗い 3 段階に落とし、上限 Poor に制限する(単一チャネルのノイズで
+/// ExtremelyPoor まで振れないように。根拠は airq-port.md §4.3b)。
+fn classify_nox(index: f32) -> AirQualityEnum {
+    match index {
+        v if !(1.0..=500.0).contains(&v) => AirQualityEnum::Unknown,
+        v if v <= 20.0 => AirQualityEnum::Good,
+        v if v <= 100.0 => AirQualityEnum::Moderate,
+        _ => AirQualityEnum::Poor,
+    }
+}
+
 /// AirQ デバイス(EP0 = ルート、EP1 = 空気質、EP2/3 = 温湿度)。
 struct AirQualityDevice<'s> {
     basic: BasicInformationCluster,
     gc: GeneralCommissioning,
     net: NetworkCommissioningWifi<EspWifiDriver>,
+    admin: AdminCommissioningCluster<'s>,
     opcreds: OpCreds<'s>,
     desc0: DescriptorCluster,
     // EP1-3 の Identify(各 EP 独立の IdentifyTime を持つ)。
@@ -253,23 +296,25 @@ impl AirQualityDevice<'_> {
         if let Some(h) = snap.rh {
             self.humidity.set_measured(Some((h * 100.0) as u16));
         }
-        // 総合評価 = worst-of(CO2, PM2.5)。Unknown(=0)は Ord の最小値なので
-        // 「揃っていない材料は評価に影響しない」max 合成が成立する。
-        let aq = snap
-            .co2_ppm
-            .map(classify_co2)
-            .unwrap_or(AirQualityEnum::Unknown)
-            .max(
-                snap.pm25
-                    .map(classify_pm25)
-                    .unwrap_or(AirQualityEnum::Unknown),
-            );
+        // 総合評価 = worst-of(CO2, PM2.5, VOC index, NOx index)。Unknown(=0)は
+        // Ord の最小値なので「揃っていない/無効な材料は評価に影響しない」max 合成が
+        // 成立する。VOC/NOx は濃度クラスタには載せず(§4.3)、ここでの合成にのみ使う。
+        let aq = [
+            snap.co2_ppm.map(classify_co2),
+            snap.pm25.map(classify_pm25),
+            snap.voc_index.map(classify_voc),
+            snap.nox_index.map(classify_nox),
+        ]
+        .into_iter()
+        .flatten()
+        .max()
+        .unwrap_or(AirQualityEnum::Unknown);
         let prev = self.air_quality.air_quality();
         self.air_quality.set_air_quality(aq);
         if prev != aq {
             println!(
-                "[airq] AirQuality {:?} -> {:?} (co2={:?}ppm pm2.5={:?}ug/m3)",
-                prev, aq, snap.co2_ppm, snap.pm25
+                "[airq] AirQuality {:?} -> {:?} (co2={:?}ppm pm2.5={:?}ug/m3 voc={:?} nox={:?})",
+                prev, aq, snap.co2_ppm, snap.pm25, snap.voc_index, snap.nox_index
             );
         }
     }
@@ -299,6 +344,7 @@ impl DataModel for AirQualityDevice<'_> {
             (0, 0x0028) => Some(&self.basic),
             (0, 0x0030) => Some(&self.gc),
             (0, 0x0031) => Some(&self.net),
+            (0, 0x003C) => Some(&self.admin),
             (0, 0x003E) => Some(&self.opcreds),
             (0, 0x001D) => Some(&self.desc0),
             (1, 0x0003) => Some(&self.identify1),
@@ -322,6 +368,7 @@ impl DataModel for AirQualityDevice<'_> {
             (0, 0x0028) => Some(&mut self.basic),
             (0, 0x0030) => Some(&mut self.gc),
             (0, 0x0031) => Some(&mut self.net),
+            (0, 0x003C) => Some(&mut self.admin),
             (0, 0x003E) => Some(&mut self.opcreds),
             (0, 0x001D) => Some(&mut self.desc0),
             (1, 0x0003) => Some(&mut self.identify1),
@@ -347,6 +394,8 @@ impl DataModel for AirQualityDevice<'_> {
                 self.removed_fabric = Some(idx);
             }
         }
+        // コミッショニング窓のタイムアウト自動クローズ(WindowEvent は pump が拾う)。
+        let _ = self.admin.on_tick(now_ms);
         // クラスタ tick(Identify の IdentifyTime 減衰)を回す。
         tick_clusters(self, now_ms)
     }
@@ -371,13 +420,17 @@ fn ident_state(on: bool) -> &'static str {
     }
 }
 
-fn build_device(fabrics: &RefCell<FabricTable<Backend, NF>>) -> AirQualityDevice<'_> {
+fn build_device<'s>(
+    fabrics: &'s RefCell<FabricTable<Backend, NF>>,
+    window: &'s RefCell<CommissioningWindow>,
+) -> AirQualityDevice<'s> {
     let dac_crypto = RustCrypto::new(esp_rng());
     let dac = TestDacProvider::new(&dac_crypto).expect("test DAC");
     AirQualityDevice {
         basic: BasicInformationCluster::new(&CFG),
         gc: GeneralCommissioning::default_config(),
         net: NetworkCommissioningWifi::with_driver(EspWifiDriver),
+        admin: AdminCommissioningCluster::new(window),
         opcreds: OpCredsCluster::new_shared(fabrics, RustCrypto::new(esp_rng()), dac),
         desc0: DescriptorCluster::new(EndpointId(0), EP0_DT, EP0_SERVERS, &[], EP0_PARTS),
         identify1: IdentifyCluster::new()
@@ -517,6 +570,23 @@ fn take_sdu(btp: &mut Btp<6>, out: &mut [u8]) -> Option<usize> {
     Some(n)
 }
 
+/// commissionable 広告(`_matterc._udp`)の材料を作る(instance id は MAC 由来)。
+fn commissionable(mac: &[u8; 6], discriminator: u16, mode: CommissioningMode) -> Commissionable {
+    let mut id = [0u8; 8];
+    id[2..].copy_from_slice(mac);
+    Commissionable {
+        device_type: Some(0x002C),
+        device_name: Some(CFG.product_name),
+        ..Commissionable::new(
+            u64::from_be_bytes(id),
+            discriminator,
+            CFG.vendor_id,
+            CFG.product_id,
+            mode,
+        )
+    }
+}
+
 /// スタックの送信指示を宛先トランスポートへ振り分ける。
 #[allow(clippy::too_many_arguments)]
 async fn route_send(
@@ -554,6 +624,7 @@ async fn pump(
     gatt: &mut TroubleGattPeripheral<'_>,
     stack: &mut AirqStack<'_>,
     fabrics: &RefCell<FabricTable<Backend, NF>>,
+    window: &RefCell<CommissioningWindow>,
     kvs: &mut EspKvs,
     net_stack: embassy_net::Stack<'_>,
     matter_udp: &mut EspUdp<'_>,
@@ -575,6 +646,9 @@ async fn pump(
     let mut mdns: Option<MdnsResponder<NF>> = None;
     // センサスナップショットの反映済み世代。
     let mut sensor_gen: u32 = 0;
+    // 初回コミッショニング窓(fabric 0 個で起動 = 焼き込みパスコードの PASE が有効)。
+    let mut boot_window_open = fabrics.borrow().is_empty();
+    let mut last_fabric_count = fabrics.borrow().len();
 
     let start = Instant::now();
     let mut buf = [0u8; 512];
@@ -863,6 +937,87 @@ async fn pump(
                     r.operational_len()
                 );
             }
+            // 窓経由のコミッショニング成功(fabric 増加)で窓を閉じる(§11.19.5)。
+            // Closed イベントが積まれ、次周の窓イベント処理で PASE/広告が畳まれる。
+            let fabric_count = fabrics.borrow().len();
+            if fabric_count > last_fabric_count && window.borrow().is_open() {
+                window.borrow_mut().close_window();
+                println!("[window] commissioning succeeded; closing window");
+            }
+            if boot_window_open && fabric_count > 0 && !window.borrow().is_open() {
+                // 初回コミッショニング完了: 焼き込みパスコードの PASE を閉じる。
+                // 以降の管理者追加は OCW(AdminCommissioning)経由のみ。
+                boot_window_open = false;
+                stack.set_pase_enabled(false);
+                println!("[window] initial commissioning done; PASE disabled");
+            } else if !boot_window_open && fabric_count == 0 && !window.borrow().is_open() {
+                // 全 fabric 削除: 初期状態(焼き込みパスコード)へ戻す。
+                boot_window_open = true;
+                let cfg = PaseConfig::from_passcode_default(PASSCODE, &SALT).expect("PASE config");
+                stack.set_pase_config(cfg);
+                stack.set_pase_enabled(true);
+                println!("[window] all fabrics removed; reopening initial commissioning window");
+            }
+            last_fabric_count = fabric_count;
+        }
+
+        // --- コミッショニング窓イベントを PASE 設定と mDNS 広告へ反映する(設計 §4/§5)---
+        // borrow を窓イベント取り出しとネスト利用で分ける(borrow がボディ全体で生存する罠)。
+        let window_event = window.borrow_mut().take_event();
+        if let Some(ev) = window_event {
+            let now = now_ms(start);
+            match ev {
+                WindowEvent::OpenedEnhanced { discriminator } => {
+                    if let Some(cfg) = window.borrow().pase_config() {
+                        stack.set_pase_config(cfg);
+                        stack.set_pase_enabled(true);
+                        if let Some(r) = mdns.as_mut() {
+                            r.set_commissionable(Some(commissionable(
+                                &mac,
+                                discriminator,
+                                CommissioningMode::Enhanced,
+                            )));
+                            r.notify_change(now);
+                        }
+                        println!(
+                            "[window] enhanced commissioning window open (CM=2, discriminator {})",
+                            discriminator
+                        );
+                    }
+                }
+                WindowEvent::OpenedBasic => {
+                    // 焼き込みパスコードへ戻す(PBKDF2 数百 ms、低頻度なので pump 停止は許容)。
+                    let cfg =
+                        PaseConfig::from_passcode_default(PASSCODE, &SALT).expect("PASE config");
+                    stack.set_pase_config(cfg);
+                    stack.set_pase_enabled(true);
+                    if let Some(r) = mdns.as_mut() {
+                        r.set_commissionable(Some(commissionable(
+                            &mac,
+                            DISCRIMINATOR,
+                            CommissioningMode::Standard,
+                        )));
+                        r.notify_change(now);
+                    }
+                    println!("[window] basic commissioning window open (CM=1)");
+                }
+                WindowEvent::Closed => {
+                    stack.set_pase_enabled(false);
+                    if let Some(r) = mdns.as_mut() {
+                        r.set_commissionable(None);
+                        r.notify_change(now);
+                    }
+                    println!("[window] commissioning window closed");
+                }
+            }
+            // AdminVendorId は fabric テーブルから解決して書き戻す(設計 §7)。
+            let admin_idx = window.borrow().admin_fabric_index();
+            if let Some(idx) = admin_idx {
+                let vid = fabrics.borrow().get(idx).map(|f| f.vendor_id());
+                if let Some(vid) = vid {
+                    window.borrow_mut().set_admin_vendor_id(vid);
+                }
+            }
         }
 
         // --- CASE resumption ストアの世代変化を検知して flash 保存(§7.4)---
@@ -1024,6 +1179,8 @@ async fn main(_spawner: Spawner) {
     // --- MatterStack 構築(乱数は全て TRNG)---
     let crypto = RustCrypto::new(esp_rng());
     let fabrics: RefCell<FabricTable<Backend, NF>> = RefCell::new(FabricTable::new());
+    // コミッショニング窓(AdminCommissioning 0x003C とpump が共有)。
+    let window: RefCell<CommissioningWindow> = RefCell::new(CommissioningWindow::new());
 
     // flash KVS から fabric テーブルを復元する。
     let mut kvs = EspKvs::new(peripherals.FLASH);
@@ -1046,8 +1203,14 @@ async fn main(_spawner: Spawner) {
 
     let creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
     let sc = SecureChannel::new(&crypto, esp_rng(), pase, creds);
-    let im = InteractionModel::new(build_device(&fabrics));
+    let im = InteractionModel::new(build_device(&fabrics, &window));
     let mut stack: AirqStack<'_> = MatterStack::new(&crypto, sc, im);
+    // コミッショニング済みで起動した場合、焼き込みパスコードの PASE は閉じる
+    // (管理者追加は OCW 経由のみ。PC example と同じ窓ゲート)。
+    if !fabrics.borrow().is_empty() {
+        stack.set_pase_enabled(false);
+        println!("[pase] disabled at boot (already commissioned; use OCW to add admins)");
+    }
     // 起動イベント(BasicInformation StartUp、CRITICAL、{ softwareVersion })を積む。
     let _ = stack.post_startup_event(CFG.software_version, 0);
     println!(
@@ -1136,6 +1299,7 @@ async fn main(_spawner: Spawner) {
                 &mut gatt,
                 &mut stack,
                 &fabrics,
+                &window,
                 &mut kvs,
                 net_stack,
                 &mut matter_udp,
