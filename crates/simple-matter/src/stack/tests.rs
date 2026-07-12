@@ -2738,6 +2738,64 @@ mod controller_e2e {
             "全メッセージが単一フラグメントに収まった(セグメント化経路を踏んでいない)"
         );
     }
+
+    /// `start_case` の第 1 メッセージ送信失敗(tx バッファ不足で再現)が initiator
+    /// 状態を完全に巻き戻すこと(K4 実機で顕在化したリークの回帰テスト)。
+    ///
+    /// 巻き戻しが無いと: (a) initiator 単一スロットが占有されたままになり後続
+    /// `start_case` が `NoSpace`、(b) HANDSHAKE_TIMEOUT 経過で stale な
+    /// `Failed { Timeout }` イベントが積まれ、後続ハンドシェイクの待ち手が誤って
+    /// 失敗を拾う。
+    #[test]
+    fn start_case_send_failure_rolls_back_initiator() {
+        let crypto: Crb = RustCrypto::new(SeqRng(0xC0DE_0002));
+        let ca = Ca::<Crb>::generate(
+            &crypto,
+            &mut SeqRng(0xCA00_0002),
+            FABRIC_ID,
+            COMM_NODE,
+            0xFFF1,
+            0,
+        )
+        .expect("Ca::generate");
+        let ctrl_creds = ControllerCreds::new(&ca, &crypto, 0);
+        let sc_init = ScInitiator::new(&crypto, SeqRng(0x1C00_0002), ctrl_creds);
+        let mut ctrl: Ctrl = ControllerStack::new(&crypto, sc_init, ImClient::new());
+
+        // tx バッファをヘッダ分すら無い長さにして送信段で失敗させる。
+        let mut tiny = [0u8; 8];
+        let err = ctrl
+            .start_case(
+                peer(),
+                crate::controller::CONTROLLER_FABRIC_INDEX,
+                DEVICE_NODE,
+                NOW,
+                &mut tiny,
+            )
+            .expect_err("tiny tx buffer must fail");
+        assert_eq!(err, crate::error::Error::NoSpace);
+        // 同期エラーであってイベントではない(stale Failed を残さない)。
+        assert!(ctrl.sc_take_event().is_none());
+
+        // リトライは即座に成功する(initiator スロットが解放されている)。
+        let mut tx = [0u8; 1700];
+        ctrl.start_case(
+            peer(),
+            crate::controller::CONTROLLER_FABRIC_INDEX,
+            DEVICE_NODE,
+            NOW,
+            &mut tx,
+        )
+        .expect("retry after rollback");
+        assert!(ctrl.sc_take_event().is_none());
+
+        // HANDSHAKE_TIMEOUT を跨いでも、失敗イベントは(進行中の 2 回目の
+        // ハンドシェイクのタイムアウト以外)積まれない = 1 回目の残骸が無い。
+        // ここでは 2 回目が生きていることだけ確認する(poll でタイムアウトを進める)。
+        let mut out = [0u8; 1700];
+        let _ = ctrl.poll(NOW + 1, &mut out);
+        assert!(ctrl.sc_take_event().is_none());
+    }
 }
 
 // ==========================================================================

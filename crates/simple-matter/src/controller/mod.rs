@@ -26,6 +26,7 @@
 
 pub mod ca;
 pub mod commissioner;
+pub mod nodes;
 
 use core::num::NonZeroU8;
 
@@ -450,6 +451,15 @@ impl<
             now_ms,
             tx_out,
         )
+        .inspect_err(|_| {
+            // 送信失敗時はハンドシェイク一式を巻き戻す(initiator 単一スロットの
+            // 占有・予約セッション・exchange のリーク防止。放置すると次の
+            // start_pase が NoSpace になり、HANDSHAKE_TIMEOUT 経過時に stale な
+            // Failed イベントが積まれて後続の待ち手を誤らせる)。
+            self.mgr.handler_mut().sc.cancel_handshake();
+            self.sessions.remove(reserved);
+            let _ = self.mgr.close(ex);
+        })
     }
 
     /// `fabric_idx` の fabric で peer と CASE を開始する(§7.2)。
@@ -499,6 +509,12 @@ impl<
             now_ms,
             tx_out,
         )
+        .inspect_err(|_| {
+            // start_pase と同じ巻き戻し(コメント参照)。
+            self.mgr.handler_mut().sc.cancel_handshake();
+            self.sessions.remove(reserved);
+            let _ = self.mgr.close(ex);
+        })
     }
 
     /// 確立済み `session` 上で Invoke を開始する(§7.2)。

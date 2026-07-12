@@ -110,6 +110,10 @@ ESP32 実機への書き込み・BLE/WiFi コミッショニング手順は各�
   On/Off+PWM 調光(Dimmable Light)、リブート永続化
 - **M5Stack AirQ**(ESP32-S3): `airq-sensor` で SEN55/SCD40 実測値の
   Air Quality+濃度計測クラスタ配信、e-ink 表示、OCW によるマルチ fabric
+- **スタンドアロンハブ**(ESP32-S3、`s3-controller`): S3 単独で UDP(mDNS
+  ブラウズ)と BLE(TrouBLE central + BTP)の両トランスポートから複数デバイスを
+  コミッショニングし、常駐で交互 Toggle・切断回復・リブート後の CASE resumption
+  再接続まで(PC 不要の常駐コントローラ)
 - **Windows**: `smctl.exe` / BLE コミッショナを cargo-xwin で Linux からクロスビルドし、
   Windows 実機から BLE/mDNS/UDP コミッショニングを完走
 

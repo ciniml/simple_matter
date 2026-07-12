@@ -1,28 +1,33 @@
-//! ESP32-S3 スタンドアロンコミッショナ(ハブ)— K2(UDP-only)+ K3(BLE central)。
+//! ESP32-S3 スタンドアロンコミッショナ(常駐ハブ)— K2(UDP)+ K3(BLE central)+
+//! K4(複数ノード常駐)。
 //!
-//! `docs/design/esp32-controller.md` §7 K2/K3。smctl(PC ホスト)の駆動ループを
-//! embassy へ写像し、S3 単独で commissionable デバイスをフルコミッショニングして
-//! OnOff を操作する:
+//! `docs/design/esp32-controller.md` §7。smctl(PC ホスト)の駆動ループを embassy へ
+//! 写像し、S3 単独で [`NODE_PLAN`] の各デバイスをフルコミッショニングして常駐管理する:
 //!
 //! 1. **WiFi join**(SSID/パスは定数 or `SM_WIFI_SSID`/`SM_WIFI_PASS` の
-//!    ビルド時環境変数。K2 は簡易投入で可 — doc §8.3)→ DHCPv4。
-//! 2. コミッショニングは 2 トランスポート(ビルド時 `SM_COMMISSION` で選択):
-//!    - **UDP(K2、`SM_COMMISSION=udp`)**: mDNS ブラウズ(`_matterc._udp`、QU 第一
-//!      候補 + QM フォールバック — doc §4.2 / R5)→ `Commissioner` フル(PASE →
-//!      … → AddNOC → CASE → CommissioningComplete)。
-//!    - **BLE(K3、既定)**: TrouBLE central([`TroubleGattCentral`])で scan
-//!      (0xFFF6 service data、discriminator 照合)→ accept-list connect → BTP
-//!      handshake(C1 write → C2 subscribe → indication)→ PASE〜AddNOC を BLE 上で
-//!      実行 → **AddOrUpdateWiFiNetwork / ConnectNetwork**(smctl `pairing ble-wifi`
-//!      と同じ `set_wifi_credentials` + `suspend_before_case`)→ BLE close → 運用
-//!      mDNS 解決 → **CASE over UDP** → CommissioningComplete。
-//! 3. 完走後は **OnOff Toggle → on-off Read** の定常デモ(30 秒周期)。
-//! 4. **CA は初回起動時に生成して `EspKvs`(キー `b"cast"`)へ永続化**
-//!    (smctl `ca-state.bin` v1 互換 = コアの `Ca::encode_state`/`decode_state`)。
-//!    コミッショニング済みノードの記録(node_id / 最終アドレス / CASE resumption
-//!    素材)もポートローカルレコード(キー `b"node"`)で永続化する。
-//! 5. リブート後は CA / ノード記録を復元し、運用 mDNS 解決(`_matter._tcp`)→
-//!    CASE(resumption 素材を import 済みなので可能なら Sigma2_Resume)→ Toggle
+//!    ビルド時環境変数)→ DHCPv4。
+//! 2. ノードごとの計画([`NODE_PLAN`])に従いコミッショニング:
+//!    - **UDP**: mDNS ブラウズ(`_matterc._udp` discriminator subtype、QU 第一候補 +
+//!      QM フォールバック — doc §4.2 / R5)→ `Commissioner` フル(PASE → … →
+//!      AddNOC → CASE → CommissioningComplete)。
+//!    - **BLE**: TrouBLE central([`TroubleGattCentral`])で scan(0xFFF6 service
+//!      data、discriminator 照合)→ accept-list connect → BTP handshake → PASE〜
+//!      AddNOC を BLE 上で実行 → **AddOrUpdateWiFiNetwork / ConnectNetwork**
+//!      (smctl `pairing ble-wifi` と同じ `set_wifi_credentials` +
+//!      `suspend_before_case`)→ BLE close → 運用 mDNS 解決 → **CASE over UDP** →
+//!      CommissioningComplete。
+//! 3. 定常は **30 秒ごとに全ノードをラウンドロビンで OnOff Toggle → Read**。失敗した
+//!    ノードは mDNS 再解決 → CASE 再確立(resumption)で回復し、全ノードが連続失敗
+//!    したときのみリブートする。
+//! 4. 永続化(すべて `EspKvs`):
+//!    - CA 鍵素材: キー `b"cast"`(smctl `ca-state.bin` v1 互換 =
+//!      `Ca::encode_state`/`decode_state`)。
+//!    - ノード帳: キー `b"nods"`(**smctl `nodes.tlv` v1 互換** = コアの
+//!      `controller::nodes` codec。K2 のポートローカル 64B レコードを置き換え)。
+//!    - CASE resumption 素材: ノードごとにキー `b"rsm<i>"`(ポートローカル 49B。
+//!      smctl は `resume/<node>.tlv` に相当)。
+//! 5. リブート後は CA / ノード帳 / resumption を復元し、各ノードを運用 mDNS 解決
+//!    (`_matter._tcp`)→ CASE(可能なら Sigma2_Resume)で自動再接続する
 //!    (BLE でコミッショニングしたデバイスも運用は常に UDP = dual-transport 前提)。
 //!
 //! # RAM 配分(doc §6.3 / R3)
@@ -32,9 +37,11 @@
 //! `heap_max`(esp-alloc internal-heap-stats)で最高水位を常時監視する。
 //!
 //! 実行: `cd ports/esp32s3 && cargo build --release --bin s3-controller`
-//! 対向(PC、K3): `SM_BLE_ADAPTER=hci1 SM_STATE_DIR=<dir> cargo run --release \
-//!                 -p simple-matter-ble --features device --example ble-onoff-light`
-//! 対向(PC、K2): `SM_STATE_DIR=<dir> cargo run --release --example onoff-light`
+//! 対向(PC、両ノードを同一ホストで同時起動できる):
+//! - node1: `SM_DISCRIMINATOR=3841 SM_MATTER_PORT=5541 SM_STATE_DIR=<dir1> \
+//!   cargo run --release --example onoff-light`
+//! - node2: `SM_BLE_ADAPTER=hci1 SM_STATE_DIR=<dir2> cargo run --release \
+//!   -p simple-matter-ble --features device --example ble-onoff-light`
 
 #![no_std]
 #![no_main]
@@ -64,6 +71,7 @@ use trouble_host::prelude::{Address, DefaultPacketPool, Host, HostResources};
 use simple_matter::btp::gatt::{GattCentral, ScanFilter};
 use simple_matter::btp::{Btp, BtpRole};
 use simple_matter::controller::ca::{Ca, CA_STATE_MAX_LEN};
+use simple_matter::controller::nodes as nodes_codec;
 use simple_matter::controller::{
     AttestationPolicy, CommissionError, Commissioner, ControllerCreds, ControllerStack, Phase,
     CONTROLLER_FABRIC_INDEX,
@@ -110,20 +118,54 @@ const WIFI_PASS: &str = match option_env!("SM_WIFI_PASS") {
 
 // --- 対向デバイス(PC onoff-light / ble-onoff-light example と同値)---
 const PASSCODE: u32 = 20202021;
-const DISCRIMINATOR: u16 = 3840;
-
-/// コミッショニングトランスポート(ビルド時選択)。既定 = BLE(K3)。
-/// `SM_COMMISSION=udp` で K2 の UDP-only(mDNS ブラウズ)に戻す。
-const COMMISSION_TRANSPORT: &str = match option_env!("SM_COMMISSION") {
-    Some(s) => s,
-    None => "ble",
-};
 
 // --- コントローラ fabric / ノード識別子(smctl / examples と同値)---
 const FABRIC_ID: u64 = 0xFAB0_0000_0000_0001;
 const CONTROLLER_NODE_ID: u64 = 0x0000_0000_1122_3344;
-const DEVICE_NODE_ID: u64 = 0x0000_0000_AABB_CCDD;
 const VENDOR_ID: u16 = 0xFFF1;
+
+// --- ノード計画(K4: 常駐ハブが管理するデバイスの静的テーブル)---
+
+/// コミッショニングに使うトランスポート。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    /// mDNS ブラウズ → 全フェーズ UDP(K2)。
+    Udp,
+    /// BLE scan → BTP → PASE〜ConnectNetwork → 運用 UDP へハンドオフ(K3)。
+    Ble,
+}
+
+/// 管理対象ノード 1 台の計画(discriminator / passcode は永続化しない —
+/// nodes.tlv v1 の方針。再コミッショニングに必要な値はここに持つ)。
+struct NodePlan {
+    node_id: u64,
+    transport: Transport,
+    discriminator: u16,
+    passcode: u32,
+    label: &'static str,
+}
+
+/// 常駐ハブの管理ノード。node1 = PC `onoff-light`(UDP、`SM_DISCRIMINATOR=3841
+/// SM_MATTER_PORT=5541` で起動)、node2 = PC `ble-onoff-light`(BLE、既定 3840)。
+static NODE_PLAN: &[NodePlan] = &[
+    NodePlan {
+        node_id: 0x0000_0000_AABB_CCDD,
+        transport: Transport::Udp,
+        discriminator: 3841,
+        passcode: PASSCODE,
+        label: "onoff-light",
+    },
+    NodePlan {
+        node_id: 0x0000_0000_AABB_CCEE,
+        transport: Transport::Ble,
+        discriminator: 3840,
+        passcode: PASSCODE,
+        label: "ble-onoff-light",
+    },
+];
+
+/// [`NODE_PLAN`] の上限(ノード帳バッファ・resumption キーのサイジング)。
+const MAX_NODES: usize = 4;
 
 // --- OnOff クラスタ(EP1 / 0x0006)---
 const ONOFF_EP: EndpointId = EndpointId(1);
@@ -134,8 +176,15 @@ const ONOFF_CMD_TOGGLE: CommandId = CommandId(0x02);
 // --- KVS キー(pack_key の 7B 制限内)---
 /// CA 鍵素材(smctl ca-state.bin v1 と同一バイト列。doc §5.2)。
 const CA_STATE_KEY: &[u8] = b"cast";
-/// コミッショニング済みノード記録(ポートローカル v1 フォーマット)。
-const NODE_KEY: &[u8] = b"node";
+/// ノード帳(smctl `nodes.tlv` v1 と同一バイト列 = コア `controller::nodes` codec)。
+const NODES_KEY: &[u8] = b"nods";
+
+/// ノードごとの CASE resumption 素材のキー(`b"rsm0"`..)。index は [`NODE_PLAN`] 順。
+fn resumption_key(index: usize) -> [u8; 4] {
+    let mut k = *b"rsm0";
+    k[3] = b'0' + (index as u8);
+    k
+}
 
 // --- タイミング ---
 /// mDNS 再クエリ間隔(smctl と同値)。
@@ -152,16 +201,21 @@ const BTP_HANDSHAKE_TIMEOUT_MS: u64 = 15_000;
 /// ble-wifi 後の運用 mDNS 解決タイムアウト(デバイスの WiFi join + DHCP を見込む。
 /// 対向がシム(ble-onoff-light)なら即応答するが、実デバイスへの余裕を持たせる)。
 const BLE_RESOLVE_TIMEOUT_MS: u64 = 60_000;
-/// 定常デモ: Toggle の周期。
+/// 定常デモ: Toggle の周期(この周期でラウンドロビンに 1 ノードずつ回す)。
 const TOGGLE_PERIOD_MS: u64 = 30_000;
+/// 全ノードがこの回数連続で失敗したらリブートする。
+const FAILURES_BEFORE_REBOOT: u32 = 5;
 
 /// HCI コマンドの同時実行スロット数(既存 bin と同値)。
 const HCI_SLOTS: usize = 20;
 
 type Backend = RustCrypto<EspRng>;
-/// コントローラスタック(ハブ既定サイジング: コミッショニング 1 + 運用 CASE 数本。
-/// doc §6.1。RESULT=1280 は単一属性 Read には十分 — wildcard は使わない)。
-type Ctrl<'s> = ControllerStack<'s, Backend, EspRng, ControllerCreds<'s, Backend>, 4, 6, 3, 1280>;
+/// コントローラスタック(K4 サイジング: 運用 CASE ×ノード数 + コミッショニング時の
+/// PASE/unsecured + 再確立の揺らぎ。SS=4 では 2 ノード目のコミッショニング中に
+/// 1 ノード目の運用セッションが LRU 退避される(実測)ため 6 へ。EX も連続
+/// コミッショニング直後の未回収 exchange を見込んで 8 へ。RESULT=1280 は単一属性
+/// Read には十分 — wildcard は使わない)。
+type Ctrl<'s> = ControllerStack<'s, Backend, EspRng, ControllerCreds<'s, Backend>, 6, 8, 3, 1280>;
 
 /// TRNG ハンドルを 1 つ生成する([`TrngSource`] が有効な間だけ成功する)。
 fn esp_rng() -> EspRng {
@@ -198,85 +252,125 @@ fn link_local_from_mac(mac: &[u8; 6]) -> core::net::Ipv6Addr {
 }
 
 // ==========================================================================
-// ノード記録(ポートローカル v1。node_id + 最終アドレス + CASE resumption 素材)
+// ノード帳(smctl nodes.tlv v1 互換 = コア codec)+ resumption 素材の永続化
 // ==========================================================================
 
-/// ノード記録レコードのフォーマットバージョン。
-const NODE_RECORD_VERSION: u8 = 1;
-/// 固定長レイアウト:
-/// [version(1)][node_id(8 LE)][ipv4(4)][port(2 LE)][has_resumption(1)]
-/// [resumption_id(16)][shared_secret(32)] = 64 B。
-const NODE_RECORD_LEN: usize = 1 + 8 + 4 + 2 + 1 + CASE_RESUMPTION_ID_LEN + SHARED_SECRET_LEN;
-
-/// コミッショニング済みノードの記録(リブート後の再接続用)。
-struct NodeRecord {
-    node_id: u64,
+/// ノードごとの実行時状態([`NODE_PLAN`] と同順)。
+struct NodeRt {
     /// 最後に確認した運用アドレス(mDNS 解決が空振りしたときのフォールバック)。
-    addr: SocketAddr,
-    /// CASE resumption 素材(`ScInitiator::resumption_export`)。
-    resumption: Option<([u8; CASE_RESUMPTION_ID_LEN], [u8; SHARED_SECRET_LEN])>,
+    addr: Option<SocketAddr>,
+    /// 確立済みの運用 CASE セッション。
+    session: Option<SessionId>,
+    /// 連続 Toggle 失敗回数(成功でリセット。全ノード同時に閾値超えでリブート)。
+    failures: u32,
 }
 
-fn encode_node_record(rec: &NodeRecord) -> Option<[u8; NODE_RECORD_LEN]> {
-    let SocketAddr::V4(v4) = rec.addr else {
-        // v6 運用アドレスは保存しない(次回は mDNS 解決に任せる)。呼び出し側で
-        // None を「保存スキップ」として扱う。
-        return None;
-    };
-    let mut out = [0u8; NODE_RECORD_LEN];
-    out[0] = NODE_RECORD_VERSION;
-    out[1..9].copy_from_slice(&rec.node_id.to_le_bytes());
-    out[9..13].copy_from_slice(&v4.ip().octets());
-    out[13..15].copy_from_slice(&v4.port().to_le_bytes());
-    if let Some((rid, ss)) = &rec.resumption {
-        out[15] = 1;
-        out[16..16 + CASE_RESUMPTION_ID_LEN].copy_from_slice(rid);
-        out[16 + CASE_RESUMPTION_ID_LEN..].copy_from_slice(ss);
+impl NodeRt {
+    const fn new() -> Self {
+        Self {
+            addr: None,
+            session: None,
+            failures: 0,
+        }
     }
-    Some(out)
 }
 
-fn decode_node_record(rec: &[u8]) -> Option<NodeRecord> {
-    if rec.len() != NODE_RECORD_LEN || rec[0] != NODE_RECORD_VERSION {
-        return None;
+/// ノード帳(`b"nods"`)を読み、[`NODE_PLAN`] の node_id 一致エントリのアドレスを
+/// 返す(帳面にあるが計画に無いノードは無視 = 帳面が真、計画がフィルタ)。
+fn load_node_ledger(kvs: &mut EspKvs) -> [Option<SocketAddr>; MAX_NODES] {
+    let mut addrs = [None; MAX_NODES];
+    let mut buf = [0u8; nodes_codec::nodes_max_len(MAX_NODES)];
+    match kvs.get(NODES_KEY, &mut buf) {
+        Ok(Some(len)) => {
+            let res = nodes_codec::decode_nodes(&buf[..len], |rec| {
+                if let Some(i) = NODE_PLAN.iter().position(|p| p.node_id == rec.node_id) {
+                    addrs[i] = Some(rec.last_addr);
+                }
+            });
+            match res {
+                Ok(n) => println!("[kvs] node ledger restored ({} entries)", n),
+                Err(e) => println!("[kvs] node ledger decode error: {:?}", e),
+            }
+        }
+        Ok(None) => {}
+        Err(e) => println!("[kvs] node ledger read error: {:?}", e),
     }
-    let node_id = u64::from_le_bytes(rec[1..9].try_into().ok()?);
-    let ip = Ipv4Addr::new(rec[9], rec[10], rec[11], rec[12]);
-    let port = u16::from_le_bytes(rec[13..15].try_into().ok()?);
-    let resumption = if rec[15] == 1 {
-        let rid: [u8; CASE_RESUMPTION_ID_LEN] =
-            rec[16..16 + CASE_RESUMPTION_ID_LEN].try_into().ok()?;
-        let ss: [u8; SHARED_SECRET_LEN] = rec[16 + CASE_RESUMPTION_ID_LEN..].try_into().ok()?;
-        Some((rid, ss))
-    } else {
-        None
-    };
-    Some(NodeRecord {
-        node_id,
-        addr: SocketAddr::new(IpAddr::V4(ip), port),
-        resumption,
-    })
+    addrs
 }
 
-/// ノード記録(最新アドレス + resumption 素材)を KVS へ保存する。
-fn save_node_record(kvs: &mut EspKvs, stack: &Ctrl<'_>, addr: SocketAddr) {
-    let rec = NodeRecord {
-        node_id: DEVICE_NODE_ID,
-        addr,
-        resumption: stack.resumption_export(CONTROLLER_FABRIC_INDEX, DEVICE_NODE_ID),
-    };
-    let Some(bytes) = encode_node_record(&rec) else {
-        println!("[kvs] node record skipped (non-IPv4 operational address)");
-        return;
-    };
-    match kvs.set(NODE_KEY, &bytes) {
-        Ok(()) => println!(
-            "[kvs] node record saved (node_id={:#x} addr={} resumption={})",
-            rec.node_id,
-            rec.addr,
-            rec.resumption.is_some()
-        ),
-        Err(e) => println!("[kvs] node record save error: {:?}", e),
+/// ノード帳(アドレスが判明している全ノード)を `b"nods"` へ保存する
+/// (smctl `nodes.tlv` v1 と同一バイト列。全量書き換え)。
+fn save_node_ledger(kvs: &mut EspKvs, rt: &[NodeRt]) {
+    // NodeRecord は Copy なのでダミー埋めの固定長配列に先頭詰めする。
+    let dummy =
+        nodes_codec::NodeRecord::new(0, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0), "")
+            .unwrap();
+    let mut flat = [dummy; MAX_NODES];
+    let mut n = 0;
+    for (plan, node) in NODE_PLAN.iter().zip(rt) {
+        if let Some(addr) = node.addr {
+            match nodes_codec::NodeRecord::new(plan.node_id, addr, plan.label) {
+                Ok(rec) => {
+                    flat[n] = rec;
+                    n += 1;
+                }
+                Err(e) => println!("[kvs] node record build error: {:?}", e),
+            }
+        }
+    }
+    let mut buf = [0u8; nodes_codec::nodes_max_len(MAX_NODES)];
+    match nodes_codec::encode_nodes(&mut buf, &flat[..n]) {
+        Ok(len) => match kvs.set(NODES_KEY, &buf[..len]) {
+            Ok(()) => println!("[kvs] node ledger saved ({} nodes, {}B)", n, len),
+            Err(e) => println!("[kvs] node ledger save error: {:?}", e),
+        },
+        Err(e) => println!("[kvs] node ledger encode error: {:?}", e),
+    }
+}
+
+/// resumption 素材レコード(ポートローカル): [version(1)][rid(16)][ss(32)] = 49B。
+const RESUMPTION_RECORD_VERSION: u8 = 1;
+const RESUMPTION_RECORD_LEN: usize = 1 + CASE_RESUMPTION_ID_LEN + SHARED_SECRET_LEN;
+
+/// ノード `index` の CASE resumption 素材を KVS(`b"rsm<i>"`)へ保存する
+/// (CASE 確立のたびに rid が回るので、確立ごとに呼ぶ)。
+fn save_resumption(kvs: &mut EspKvs, stack: &Ctrl<'_>, index: usize, node_id: u64) {
+    let key = resumption_key(index);
+    match stack.resumption_export(CONTROLLER_FABRIC_INDEX, node_id) {
+        Some((rid, ss)) => {
+            let mut rec = [0u8; RESUMPTION_RECORD_LEN];
+            rec[0] = RESUMPTION_RECORD_VERSION;
+            rec[1..1 + CASE_RESUMPTION_ID_LEN].copy_from_slice(&rid);
+            rec[1 + CASE_RESUMPTION_ID_LEN..].copy_from_slice(&ss);
+            if let Err(e) = kvs.set(&key, &rec) {
+                println!("[kvs] resumption save error (node{}): {:?}", index, e);
+            }
+        }
+        None => {
+            // セッションが張れていない(素材なし)。古い素材は消しておく。
+            let _ = kvs.remove(&key);
+        }
+    }
+}
+
+/// ノード `index` の resumption 素材を KVS から stack へ import する。
+fn restore_resumption(kvs: &mut EspKvs, stack: &mut Ctrl<'_>, index: usize, node_id: u64) {
+    let key = resumption_key(index);
+    let mut rec = [0u8; RESUMPTION_RECORD_LEN];
+    match kvs.get(&key, &mut rec) {
+        Ok(Some(len)) if len == RESUMPTION_RECORD_LEN && rec[0] == RESUMPTION_RECORD_VERSION => {
+            let rid: [u8; CASE_RESUMPTION_ID_LEN] =
+                rec[1..1 + CASE_RESUMPTION_ID_LEN].try_into().unwrap();
+            let ss: [u8; SHARED_SECRET_LEN] = rec[1 + CASE_RESUMPTION_ID_LEN..].try_into().unwrap();
+            stack.resumption_import(CONTROLLER_FABRIC_INDEX, node_id, &rid, &ss);
+            println!(
+                "[case] resumption material imported (node_id={:#x})",
+                node_id
+            );
+        }
+        Ok(Some(_)) => println!("[kvs] resumption record invalid (node{}); ignoring", index),
+        Ok(None) => {}
+        Err(e) => println!("[kvs] resumption read error (node{}): {:?}", index, e),
     }
 }
 
@@ -711,18 +805,20 @@ fn read_onoff_value(stack: &Ctrl<'_>) -> Option<bool> {
 }
 
 /// CASE を張り、確立したセッションと resumed フラグを返す。
+#[allow(clippy::too_many_arguments)]
 async fn establish_case(
     stack: &mut Ctrl<'_>,
     udp: &mut EspUdp<'_>,
     start: Instant,
     peer: SocketAddr,
+    node_id: u64,
     rx: &mut [u8],
     tx: &mut [u8],
 ) -> Option<(SessionId, bool)> {
     let dir = match stack.start_case(
         PeerAddr::Udp(peer),
         CONTROLLER_FABRIC_INDEX,
-        DEVICE_NODE_ID,
+        node_id,
         now_ms(start),
         tx,
     ) {
@@ -920,22 +1016,30 @@ async fn commission_over_ble(
     stack: &mut Ctrl<'_>,
     gatt: &mut TroubleGattCentral<'_>,
     start: Instant,
+    plan: &NodePlan,
 ) -> Result<(), ()> {
-    // --- scan(0xFFF6 service data、discriminator 照合。タイムアウトはリトライ)---
+    // --- scan(0xFFF6 service data、discriminator 照合。2 セッションまで)---
+    let mut attempts = 0;
     let target = loop {
         println!(
             "[ble] scanning for 0xFFF6 commissionable (discriminator={})...",
-            DISCRIMINATOR
+            plan.discriminator
         );
         match gatt
             .scan(ScanFilter {
-                discriminator: Some(DISCRIMINATOR),
+                discriminator: Some(plan.discriminator),
                 vendor_product: None,
             })
             .await
         {
             Ok(t) => break t,
-            Err(e) => println!("[ble] scan failed ({:?}); retrying", e),
+            Err(e) => {
+                attempts += 1;
+                println!("[ble] scan failed ({:?}); attempt {}/2", e, attempts);
+                if attempts >= 2 {
+                    return Err(());
+                }
+            }
         }
     };
     println!(
@@ -1002,7 +1106,12 @@ async fn commission_over_ble(
         return Err(());
     }
     if comm
-        .commission(PeerAddr::Ble(conn), PASSCODE, DEVICE_NODE_ID, now_ms(start))
+        .commission(
+            PeerAddr::Ble(conn),
+            plan.passcode,
+            plan.node_id,
+            now_ms(start),
+        )
         .is_err()
     {
         println!("[commission] commission() rejected");
@@ -1011,7 +1120,7 @@ async fn commission_over_ble(
     }
     println!(
         "[commission] starting over BLE (device node_id={:#x}, wifi ssid=\"{}\")",
-        DEVICE_NODE_ID, WIFI_SSID
+        plan.node_id, WIFI_SSID
     );
     let result = drive_commission_ble(comm, stack, gatt, &mut btp, conn, mtu, start).await;
     // chip 系デバイスは AddNOC 受理後に自ら BLE を閉じることがある。失敗は無視する。
@@ -1040,19 +1149,161 @@ async fn wait_dhcp(net_stack: embassy_net::Stack<'_>) -> Ipv4Addr {
     }
 }
 
+/// ノード 1 台のトランスポート別フルコミッショニング。成功で運用 CASE セッションと
+/// 運用アドレスを返す(`Commissioner` はノードごとに使い捨て — `commission()` は
+/// Idle からしか開始できないため)。
+#[allow(clippy::too_many_arguments)]
+async fn commission_node(
+    plan: &NodePlan,
+    stack: &mut Ctrl<'_>,
+    ca: &Ca<Backend>,
+    crypto: &Backend,
+    gatt: &mut TroubleGattCentral<'_>,
+    matter_udp: &mut EspUdp<'_>,
+    qu_udp: &mut EspUdp<'_>,
+    qm_udp: &mut EspUdp<'_>,
+    start: Instant,
+    rx: &mut [u8],
+    tx: &mut [u8],
+) -> Result<(SessionId, SocketAddr), ()> {
+    let mut comm = Commissioner::new(ca, crypto, AttestationPolicy::Skip);
+    match plan.transport {
+        Transport::Udp => {
+            // --- K2 パス: ブラウズ(discriminator subtype)→ 全フェーズ UDP ---
+            println!(
+                "[dis] browsing _matterc._udp (discriminator={}) via QU...",
+                plan.discriminator
+            );
+            let query = Query::Browse {
+                discriminator: plan.discriminator,
+            };
+            let Some(addr) = discover(qu_udp, qm_udp, &query, 30_000, start).await else {
+                println!(
+                    "[dis] no commissionable device found (disc={})",
+                    plan.discriminator
+                );
+                return Err(());
+            };
+            println!("[dis] found commissionable node at {}", addr);
+            comm.commission(
+                PeerAddr::Udp(addr),
+                plan.passcode,
+                plan.node_id,
+                now_ms(start),
+            )
+            .map_err(|e| println!("[commission] commission() rejected: {:?}", e))?;
+            println!(
+                "[commission] starting to {} (device node_id={:#x})",
+                addr, plan.node_id
+            );
+            let session = run_commissioning(&mut comm, stack, matter_udp, start, rx, tx)
+                .await
+                .map_err(|_| ())?;
+            // Done 直後の残 ACK/exchange を流し切る(次ノードのコミッショニングや
+            // 直後の Invoke が exchange プール枯渇(NoSpace)にならないように)。
+            let _ = settle(stack, matter_udp, start, rx, tx, 10_000).await;
+            println!(
+                "[commission] COMPLETE. operational CASE session = {:#x}",
+                session.as_raw()
+            );
+            Ok((session, addr))
+        }
+        Transport::Ble => {
+            // --- K3 パス: BLE 区間 → BLE close → 運用解決 → CASE over UDP ---
+            commission_over_ble(&mut comm, stack, gatt, start, plan).await?;
+            let compressed = ca.compressed_fabric_id_bytes();
+            println!(
+                "[dis] resolving _matter._tcp for {:016X}-{:016X} (up to {}s)...",
+                u64::from_be_bytes(compressed),
+                plan.node_id,
+                BLE_RESOLVE_TIMEOUT_MS / 1000
+            );
+            let query = Query::Operational {
+                compressed,
+                node_id: plan.node_id,
+            };
+            let Some(addr) = discover(qu_udp, qm_udp, &query, BLE_RESOLVE_TIMEOUT_MS, start).await
+            else {
+                println!("[dis] operational resolve timed out after BLE phases");
+                return Err(());
+            };
+            println!("[dis] operational node resolved at {}", addr);
+            comm.set_peer(PeerAddr::Udp(addr));
+            comm.resume();
+            let session = run_commissioning(&mut comm, stack, matter_udp, start, rx, tx)
+                .await
+                .map_err(|_| ())?;
+            let _ = settle(stack, matter_udp, start, rx, tx, 10_000).await;
+            println!(
+                "[commission] COMPLETE (BLE -> mDNS -> CASE over UDP). session = {:#x}",
+                session.as_raw()
+            );
+            Ok((session, addr))
+        }
+    }
+}
+
+/// コミッショニング済みノードへ再接続する: 運用 mDNS 解決(空振りは記録アドレスへ
+/// フォールバック)→ CASE(resumption 素材があれば Sigma2_Resume)。
+#[allow(clippy::too_many_arguments)]
+async fn reconnect_node(
+    plan: &NodePlan,
+    last_addr: Option<SocketAddr>,
+    stack: &mut Ctrl<'_>,
+    ca: &Ca<Backend>,
+    matter_udp: &mut EspUdp<'_>,
+    qu_udp: &mut EspUdp<'_>,
+    qm_udp: &mut EspUdp<'_>,
+    start: Instant,
+    resolve_timeout_ms: u64,
+    rx: &mut [u8],
+    tx: &mut [u8],
+) -> Option<(SessionId, SocketAddr, bool)> {
+    let compressed = ca.compressed_fabric_id_bytes();
+    println!(
+        "[dis] resolving _matter._tcp for {:016X}-{:016X}...",
+        u64::from_be_bytes(compressed),
+        plan.node_id
+    );
+    let query = Query::Operational {
+        compressed,
+        node_id: plan.node_id,
+    };
+    let addr = match discover(qu_udp, qm_udp, &query, resolve_timeout_ms, start).await {
+        Some(a) => {
+            println!("[dis] operational node resolved at {}", a);
+            a
+        }
+        None => {
+            let Some(a) = last_addr else {
+                println!("[dis] operational resolve timed out (no cached addr)");
+                return None;
+            };
+            println!(
+                "[dis] operational resolve timed out; falling back to last addr {}",
+                a
+            );
+            a
+        }
+    };
+    let (session, resumed) =
+        establish_case(stack, matter_udp, start, addr, plan.node_id, rx, tx).await?;
+    Some((session, addr, resumed))
+}
+
 /// コントローラのメインフロー(常駐)。
 #[allow(clippy::too_many_arguments)]
 async fn controller_task(
     stack: &mut Ctrl<'_>,
-    comm: &mut Commissioner<'_, Backend>,
     ca: &Ca<Backend>,
+    crypto: &Backend,
     kvs: &mut EspKvs,
     net_stack: embassy_net::Stack<'_>,
     matter_udp: &mut EspUdp<'_>,
     qu_udp: &mut EspUdp<'_>,
     qm_udp: &mut EspUdp<'_>,
     gatt: &mut TroubleGattCentral<'_>,
-    node_rec: Option<NodeRecord>,
+    known_addrs: [Option<SocketAddr>; MAX_NODES],
 ) -> ! {
     let start = Instant::now();
     let mut rx = [0u8; MAX_RX_PACKET_SIZE];
@@ -1063,193 +1314,160 @@ async fn controller_task(
     EspWifiDriver.connect(WIFI_SSID.as_bytes(), WIFI_PASS.as_bytes());
     let _ip = wait_dhcp(net_stack).await;
 
-    let mut session: Option<SessionId> = None;
-    let mut peer: Option<SocketAddr> = None;
+    let mut rt: [NodeRt; MAX_NODES] = core::array::from_fn(|_| NodeRt::new());
+    for (node, addr) in rt.iter_mut().zip(known_addrs) {
+        node.addr = addr;
+    }
 
-    // --- リブート後: ノード記録があれば運用解決 → CASE(resumption 素材 import 済み)---
-    if let Some(rec) = &node_rec {
-        println!(
-            "[boot] node record found (node_id={:#x} last_addr={} resumption={}); reconnecting",
-            rec.node_id,
-            rec.addr,
-            rec.resumption.is_some()
-        );
-        let compressed = ca.compressed_fabric_id_bytes();
-        println!(
-            "[dis] resolving _matter._tcp for {:016X}-{:016X}...",
-            u64::from_be_bytes(compressed),
-            rec.node_id
-        );
-        let query = Query::Operational {
-            compressed,
-            node_id: rec.node_id,
-        };
-        let addr = match discover(qu_udp, qm_udp, &query, 30_000, start).await {
-            Some(a) => {
-                println!("[dis] operational node resolved at {}", a);
-                a
-            }
-            None => {
-                println!(
-                    "[dis] operational resolve timed out; falling back to last addr {}",
-                    rec.addr
-                );
-                rec.addr
-            }
-        };
-        if let Some((s, resumed)) =
-            establish_case(stack, matter_udp, start, addr, &mut rx, &mut tx).await
-        {
+    // --- 各ノードへ接続(帳面に記録があれば再接続、なければコミッショニング)---
+    for (i, plan) in NODE_PLAN.iter().enumerate() {
+        // リブート後の再接続(resumption 素材は main で import 済み)。
+        if rt[i].addr.is_some() {
             println!(
-                "[case] operational session re-established (session={:#x}, resumed={})",
-                s.as_raw(),
-                resumed
+                "[boot] node{} ({}, node_id={:#x}) found in ledger; reconnecting",
+                i, plan.label, plan.node_id
             );
-            session = Some(s);
-            peer = Some(addr);
-            // resumption id は CASE のたびに回る。最新素材で記録を更新する。
-            save_node_record(kvs, stack, addr);
-        } else {
-            println!("[case] reconnect failed; falling back to fresh commissioning");
-        }
-    }
-
-    // --- 初回(またはリブート再接続失敗): フルコミッショニング ---
-    // BLE(K3、既定): scan → BTP → PASE〜ConnectNetwork over BLE → BLE close →
-    //                 運用 mDNS 解決 → CASE over UDP → CommissioningComplete。
-    // UDP(K2):       mDNS ブラウズ → 全フェーズ UDP。
-    if session.is_none() && COMMISSION_TRANSPORT == "ble" {
-        if commission_over_ble(comm, stack, gatt, start).await.is_err() {
-            println!("[commission] BLE phase failed; rebooting in 10s");
-            Timer::after_millis(10_000).await;
-            esp_hal::system::software_reset();
-        }
-        // デバイスの WiFi join / DHCP / 運用 mDNS 開始を待って解決する
-        // (対向がシムなら即応答)。
-        let compressed = ca.compressed_fabric_id_bytes();
-        println!(
-            "[dis] resolving _matter._tcp for {:016X}-{:016X} (up to {}s)...",
-            u64::from_be_bytes(compressed),
-            DEVICE_NODE_ID,
-            BLE_RESOLVE_TIMEOUT_MS / 1000
-        );
-        let query = Query::Operational {
-            compressed,
-            node_id: DEVICE_NODE_ID,
-        };
-        let Some(addr) = discover(qu_udp, qm_udp, &query, BLE_RESOLVE_TIMEOUT_MS, start).await
-        else {
-            println!("[dis] operational resolve timed out; rebooting in 10s");
-            Timer::after_millis(10_000).await;
-            esp_hal::system::software_reset();
-        };
-        println!("[dis] operational node resolved at {}", addr);
-        comm.set_peer(PeerAddr::Udp(addr));
-        comm.resume();
-        match run_commissioning(comm, stack, matter_udp, start, &mut rx, &mut tx).await {
-            Ok(s) => {
+            if let Some((session, addr, resumed)) = reconnect_node(
+                plan, rt[i].addr, stack, ca, matter_udp, qu_udp, qm_udp, start, 30_000, &mut rx,
+                &mut tx,
+            )
+            .await
+            {
                 println!(
-                    "[commission] COMPLETE (BLE -> mDNS -> CASE over UDP). session = {:#x}",
-                    s.as_raw()
+                    "[case] node{} session re-established (session={:#x}, resumed={})",
+                    i,
+                    session.as_raw(),
+                    resumed
                 );
-                session = Some(s);
-                peer = Some(addr);
-                save_ca_state(kvs, ca);
-                save_node_record(kvs, stack, addr);
+                rt[i].session = Some(session);
+                rt[i].addr = Some(addr);
+                save_node_ledger(kvs, &rt);
+                save_resumption(kvs, stack, i, plan.node_id);
+                continue;
             }
-            Err(_) => {
-                println!("[commission] giving up; rebooting in 10s");
-                Timer::after_millis(10_000).await;
-                esp_hal::system::software_reset();
-            }
-        }
-    }
-    if session.is_none() {
-        let addr = loop {
             println!(
-                "[dis] browsing _matterc._udp (discriminator={}) via QU...",
-                DISCRIMINATOR
+                "[case] node{} reconnect failed; falling back to fresh commissioning",
+                i
             );
-            let query = Query::Browse {
-                discriminator: DISCRIMINATOR,
-            };
-            if let Some(a) = discover(qu_udp, qm_udp, &query, 30_000, start).await {
-                println!("[dis] found commissionable node at {}", a);
-                break a;
-            }
-            println!("[dis] no commissionable device found; retrying...");
-        };
-
-        comm.commission(PeerAddr::Udp(addr), PASSCODE, DEVICE_NODE_ID, now_ms(start))
-            .expect("commission() rejected");
-        println!(
-            "[commission] starting to {} (device node_id={:#x})",
-            addr, DEVICE_NODE_ID
-        );
-        match run_commissioning(comm, stack, matter_udp, start, &mut rx, &mut tx).await {
-            Ok(s) => {
-                println!(
-                    "[commission] COMPLETE. operational CASE session = {:#x}",
-                    s.as_raw()
-                );
-                session = Some(s);
-                peer = Some(addr);
-                // issue_noc で next_serial が進んだ CA 状態と、ノード記録
-                // (アドレス + resumption 素材)を永続化する(doc §5.2)。
+        }
+        // フレッシュコミッショニング(2 回まで。失敗したノードは残して先へ進む —
+        // 定常ループの全滅判定 or 次リブートで再試行される)。
+        let mut ok = false;
+        for attempt in 1..=2 {
+            println!(
+                "[commission] node{} ({}, {:?}) attempt {}/2",
+                i,
+                plan.label,
+                match plan.transport {
+                    Transport::Udp => "udp",
+                    Transport::Ble => "ble",
+                },
+                attempt
+            );
+            if let Ok((session, addr)) = commission_node(
+                plan, stack, ca, crypto, gatt, matter_udp, qu_udp, qm_udp, start, &mut rx, &mut tx,
+            )
+            .await
+            {
+                rt[i].session = Some(session);
+                rt[i].addr = Some(addr);
+                // issue_noc で next_serial が進んだ CA 状態と、ノード帳 + resumption
+                // 素材を永続化する(doc §5.2)。
                 save_ca_state(kvs, ca);
-                save_node_record(kvs, stack, addr);
-            }
-            Err(_) => {
-                println!("[commission] giving up; rebooting in 10s");
-                Timer::after_millis(10_000).await;
-                esp_hal::system::software_reset();
+                save_node_ledger(kvs, &rt);
+                save_resumption(kvs, stack, i, plan.node_id);
+                ok = true;
+                break;
             }
         }
+        if !ok {
+            println!(
+                "[commission] node{} ({}) FAILED; continuing without it",
+                i, plan.label
+            );
+            rt[i].failures = FAILURES_BEFORE_REBOOT;
+        }
+    }
+    if rt.iter().take(NODE_PLAN.len()).all(|n| n.session.is_none()) {
+        println!("[boot] no node reachable; rebooting in 10s");
+        Timer::after_millis(10_000).await;
+        esp_hal::system::software_reset();
     }
 
-    let mut session = session.expect("session established");
-    let peer = peer.expect("peer known");
-
-    // --- 定常デモ: 30 秒ごとに Toggle → Read(常駐ハブの最小形)---
-    let mut consecutive_failures = 0u32;
+    // --- 定常: 30 秒ごとに全ノードをラウンドロビンで Toggle → Read ---
+    let mut turn = 0usize;
     loop {
-        match toggle_and_read(stack, matter_udp, start, session, &mut rx, &mut tx).await {
-            Ok(v) => {
-                consecutive_failures = 0;
-                let heap = esp_alloc::HEAP.stats();
+        let i = turn % NODE_PLAN.len();
+        turn += 1;
+        let plan = &NODE_PLAN[i];
+
+        // セッションが無ければ再接続を試みる(mDNS 再解決 + resumption CASE)。
+        if rt[i].session.is_none() && rt[i].addr.is_some() {
+            if let Some((session, addr, resumed)) = reconnect_node(
+                plan, rt[i].addr, stack, ca, matter_udp, qu_udp, qm_udp, start, 10_000, &mut rx,
+                &mut tx,
+            )
+            .await
+            {
                 println!(
-                    "[onoff] Toggle OK (light={}) t={}s heap_max={}",
-                    match v {
-                        Some(true) => "ON",
-                        Some(false) => "OFF",
-                        None => "?",
-                    },
-                    now_ms(start) / 1000,
-                    heap.max_usage
+                    "[case] node{} session re-established (session={:#x}, resumed={})",
+                    i,
+                    session.as_raw(),
+                    resumed
                 );
+                rt[i].session = Some(session);
+                rt[i].addr = Some(addr);
+                save_node_ledger(kvs, &rt);
+                save_resumption(kvs, stack, i, plan.node_id);
             }
-            Err(()) => {
-                consecutive_failures += 1;
-                println!(
-                    "[onoff] Toggle failed ({} consecutive); re-establishing CASE",
-                    consecutive_failures
-                );
-                if let Some((s, resumed)) =
-                    establish_case(stack, matter_udp, start, peer, &mut rx, &mut tx).await
-                {
-                    println!(
-                        "[case] session re-established (session={:#x}, resumed={})",
-                        s.as_raw(),
-                        resumed
-                    );
-                    session = s;
-                    save_node_record(kvs, stack, peer);
-                    consecutive_failures = 0;
-                } else if consecutive_failures >= 5 {
-                    println!("[onoff] device unreachable; rebooting");
-                    esp_hal::system::software_reset();
+        }
+
+        match rt[i].session {
+            Some(session) => {
+                match toggle_and_read(stack, matter_udp, start, session, &mut rx, &mut tx).await {
+                    Ok(v) => {
+                        rt[i].failures = 0;
+                        let heap = esp_alloc::HEAP.stats();
+                        println!(
+                            "[onoff] node{} ({}) Toggle OK (light={}) t={}s heap_max={}",
+                            i,
+                            plan.label,
+                            match v {
+                                Some(true) => "ON",
+                                Some(false) => "OFF",
+                                None => "?",
+                            },
+                            now_ms(start) / 1000,
+                            heap.max_usage
+                        );
+                    }
+                    Err(()) => {
+                        rt[i].failures += 1;
+                        rt[i].session = None;
+                        println!(
+                            "[onoff] node{} Toggle failed ({} consecutive); will re-establish",
+                            i, rt[i].failures
+                        );
+                    }
                 }
             }
+            None => {
+                rt[i].failures += 1;
+                println!(
+                    "[onoff] node{} unreachable ({} consecutive)",
+                    i, rt[i].failures
+                );
+            }
+        }
+
+        // 全ノードが閾値を超えて連続失敗 → ネットワーク側の問題とみなしてリブート。
+        if rt
+            .iter()
+            .take(NODE_PLAN.len())
+            .all(|n| n.failures >= FAILURES_BEFORE_REBOOT)
+        {
+            println!("[onoff] all nodes unreachable; rebooting");
+            esp_hal::system::software_reset();
         }
 
         // 次の Toggle まで受信 + poll を回しながら待つ。
@@ -1283,9 +1501,12 @@ async fn main(_spawner: Spawner) {
 
     println!();
     println!("======================================================");
-    println!(" simple-matter :: ESP32-S3 controller (K2: s3-controller)");
-    println!(" hal      : esp-hal 1.1.1 + esp-radio 0.18 + embassy-net 0.9");
-    println!(" scope    : standalone commissioner (UDP-only hub)");
+    println!(" simple-matter :: ESP32-S3 controller (K4: s3-controller)");
+    println!(" hal      : esp-hal 1.1.1 + esp-radio 0.18 (coex) + embassy-net 0.9");
+    println!(
+        " scope    : resident hub ({} nodes, UDP + BLE commissioning)",
+        NODE_PLAN.len()
+    );
     println!("======================================================");
 
     // デバイス bin と同じ heap 112KiB / .stack ≈69KiB 配分(doc §6.3 / R3)。
@@ -1443,25 +1664,18 @@ async fn main(_spawner: Spawner) {
         u64::from_be_bytes(ca.compressed_fabric_id_bytes())
     );
 
-    // --- ノード記録の復元(リブート後の再接続用)---
-    let mut node_buf = [0u8; NODE_RECORD_LEN];
-    let node_rec = match kvs.get(NODE_KEY, &mut node_buf) {
-        Ok(Some(len)) => decode_node_record(&node_buf[..len]),
-        _ => None,
-    };
+    // --- ノード帳(smctl nodes.tlv v1 互換)の復元(リブート後の再接続用)---
+    let known_addrs = load_node_ledger(&mut kvs);
 
-    // --- ControllerStack + Commissioner(now_epoch_s=0 運用。R7 は K1 で実証済み)---
+    // --- ControllerStack(now_epoch_s=0 運用。R7 は K1 で実証済み)---
     let ctrl_creds = ControllerCreds::new(&ca, &crypto, 0);
     let sc_init = ScInitiator::new(&crypto, esp_rng(), ctrl_creds);
     let im_client = ImClient::new();
     let mut stack: Ctrl = ControllerStack::new(&crypto, sc_init, im_client);
-    if let Some(rec) = &node_rec {
-        if let Some((rid, ss)) = &rec.resumption {
-            stack.resumption_import(CONTROLLER_FABRIC_INDEX, rec.node_id, rid, ss);
-            println!("[case] resumption material imported from flash");
-        }
+    // resumption 素材(ノードごとの b"rsm<i>")を import する。
+    for (i, plan) in NODE_PLAN.iter().enumerate() {
+        restore_resumption(&mut kvs, &mut stack, i, plan.node_id);
     }
-    let mut comm = Commissioner::new(&ca, &crypto, AttestationPolicy::Skip);
     println!(
         "[stack] ControllerStack ready ({} bytes, on main stack)",
         core::mem::size_of::<Ctrl<'static>>()
@@ -1480,15 +1694,15 @@ async fn main(_spawner: Spawner) {
         central_worker(&ble_stack, central, &channels),
         controller_task(
             &mut stack,
-            &mut comm,
             &ca,
+            &crypto,
             &mut kvs,
             net_stack,
             &mut matter_udp,
             &mut qu_udp,
             &mut qm_udp,
             &mut gatt,
-            node_rec,
+            known_addrs,
         ),
     )
     .await;

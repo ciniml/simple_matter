@@ -1,41 +1,26 @@
 //! ノードアドレス帳 `nodes.tlv`(設計 doc §4.2)。
 //!
-//! versioned TLV(手書きエンコーダで依存追加なし):
-//!
-//! ```text
-//! struct(anonymous) {
-//!   0: u8   version (=1)
-//!   1: array of struct {
-//!        0: u64   node_id
-//!        1: utf8  label(空文字可)
-//!        2: bytes last_addr の IP(4 バイト = IPv4 / 16 バイト = IPv6)
-//!        3: u16   last_addr のポート
-//!      }
-//! }
-//! ```
+//! codec は **コアの共有実装**(`simple_matter::controller::nodes`、v1 TLV)へ
+//! 委譲する(esp32-controller.md K4 で S3 ハブと記録フォーマットを共有するため、
+//! ca-state v1 と同じくコアへ移動した)。本モジュールはファイル I/O と
+//! `Vec<NodeEntry>` への詰め替えの皮のみ。
 //!
 //! discriminator / passcode は保存しない(再コミッショニングに必要な秘密を残さない)。
 //! CASE resumption 素材もここには混ぜない(§4.3、`resume/<node>.tlv` は C4)。
+//!
+//! 制約: ラベルは共有 codec の上限(`MAX_NODE_LABEL_LEN` = 64 バイト)まで。
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::Path;
 
-use simple_matter::error::Result as MResult;
-use simple_matter::tlv::{ContainerType, TlvReader, TlvTag, TlvValue, TlvWriter};
-
-/// アドレス帳レコードの schema version。
-const NODES_VERSION: u8 = 1;
-
-fn cx(n: u8) -> TlvTag {
-    TlvTag::ContextSpecific(n)
-}
+use simple_matter::controller::nodes as codec;
 
 /// アドレス帳の 1 エントリ。
 #[derive(Clone, Debug)]
 pub struct NodeEntry {
     /// デバイスの運用 NodeId(`pairing` の引数で指定)。
     pub node_id: u64,
-    /// 任意ラベル(`--label`)。
+    /// 任意ラベル(`--label`。共有 codec の上限 64 バイトまで)。
     pub label: String,
     /// 最後に疎通したアドレス(キャッシュ。CASE 失敗時に mDNS 再解決で上書き)。
     pub last_addr: SocketAddr,
@@ -48,17 +33,35 @@ pub fn load(path: &Path) -> Result<Vec<NodeEntry>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(format!("read {}: {e}", path.display())),
     };
-    decode(&bytes).map_err(|e| format!("decode {}: {e:?}", path.display()))
+    let mut out = Vec::new();
+    codec::decode_nodes(&bytes, |r| {
+        out.push(NodeEntry {
+            node_id: r.node_id,
+            label: r.label().to_string(),
+            last_addr: r.last_addr,
+        });
+    })
+    .map_err(|e| format!("decode {}: {e:?}", path.display()))?;
+    Ok(out)
 }
 
 /// アドレス帳を書く(全量書き換え)。
 pub fn save(path: &Path, entries: &[NodeEntry]) -> Result<(), String> {
-    let mut buf = vec![0u8; 64 + entries.len() * 96];
-    let len = {
-        let mut w = TlvWriter::new(&mut buf);
-        encode(&mut w, entries).map_err(|e| format!("encode nodes: {e:?}"))?;
-        w.len()
-    };
+    let records: Vec<codec::NodeRecord> = entries
+        .iter()
+        .map(|e| {
+            codec::NodeRecord::new(e.node_id, e.last_addr, &e.label).map_err(|_| {
+                format!(
+                    "node {} label too long (max {} bytes)",
+                    e.node_id,
+                    codec::MAX_NODE_LABEL_LEN
+                )
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    let mut buf = vec![0u8; codec::nodes_max_len(records.len())];
+    let len =
+        codec::encode_nodes(&mut buf, &records).map_err(|e| format!("encode nodes: {e:?}"))?;
     std::fs::write(path, &buf[..len]).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
@@ -93,92 +96,6 @@ pub fn update_addr(path: &Path, node_id: u64, addr: SocketAddr) -> Result<(), St
         save(path, &entries)?;
     }
     Ok(())
-}
-
-fn encode(w: &mut TlvWriter, entries: &[NodeEntry]) -> MResult<()> {
-    w.start_struct(&TlvTag::Anonymous)?;
-    w.write_u8(&cx(0), NODES_VERSION)?;
-    w.start_array(&cx(1))?;
-    for e in entries {
-        w.start_struct(&TlvTag::Anonymous)?;
-        w.write_u64(&cx(0), e.node_id)?;
-        w.write_utf8(&cx(1), &e.label)?;
-        match e.last_addr.ip() {
-            IpAddr::V4(ip) => w.write_bytes(&cx(2), &ip.octets())?,
-            IpAddr::V6(ip) => w.write_bytes(&cx(2), &ip.octets())?,
-        }
-        w.write_u16(&cx(3), e.last_addr.port())?;
-        w.end_container()?;
-    }
-    w.end_container()?;
-    w.end_container()
-}
-
-fn decode(bytes: &[u8]) -> MResult<Vec<NodeEntry>> {
-    let mut r = TlvReader::new(bytes);
-    if r.enter_container()? != ContainerType::Structure {
-        return Err(simple_matter::Error::Decode);
-    }
-    let mut version = 0u8;
-    let mut out = Vec::new();
-    loop {
-        let e = r.read_next()?.ok_or(simple_matter::Error::Decode)?;
-        match (e.tag, e.value) {
-            (_, TlvValue::ContainerEnd) => break,
-            (TlvTag::ContextSpecific(0), v) => version = v.as_unsigned()? as u8,
-            (TlvTag::ContextSpecific(1), TlvValue::ContainerStart(ContainerType::Array)) => loop {
-                let item = r.read_next()?.ok_or(simple_matter::Error::Decode)?;
-                match item.value {
-                    TlvValue::ContainerEnd => break,
-                    TlvValue::ContainerStart(ContainerType::Structure) => {
-                        out.push(decode_entry(&mut r)?);
-                    }
-                    _ => r.skip(&item)?,
-                }
-            },
-            _ => r.skip(&e)?,
-        }
-    }
-    if version != NODES_VERSION {
-        return Err(simple_matter::Error::Decode);
-    }
-    Ok(out)
-}
-
-/// struct 開始を消費済みの状態から 1 エントリを読む。
-fn decode_entry(r: &mut TlvReader) -> MResult<NodeEntry> {
-    let mut node_id = 0u64;
-    let mut label = String::new();
-    let mut ip: Option<IpAddr> = None;
-    let mut port = 0u16;
-    loop {
-        let e = r.read_next()?.ok_or(simple_matter::Error::Decode)?;
-        match (e.tag, e.value) {
-            (_, TlvValue::ContainerEnd) => break,
-            (TlvTag::ContextSpecific(0), v) => node_id = v.as_unsigned()?,
-            (TlvTag::ContextSpecific(1), v) => label = v.as_str()?.to_string(),
-            (TlvTag::ContextSpecific(2), v) => {
-                let b = v.as_bytes()?;
-                ip = Some(match b.len() {
-                    4 => IpAddr::V4(Ipv4Addr::from(
-                        <[u8; 4]>::try_from(b).map_err(|_| simple_matter::Error::Decode)?,
-                    )),
-                    16 => IpAddr::V6(Ipv6Addr::from(
-                        <[u8; 16]>::try_from(b).map_err(|_| simple_matter::Error::Decode)?,
-                    )),
-                    _ => return Err(simple_matter::Error::Decode),
-                });
-            }
-            (TlvTag::ContextSpecific(3), v) => port = v.as_unsigned()? as u16,
-            _ => r.skip(&e)?,
-        }
-    }
-    let ip = ip.ok_or(simple_matter::Error::Decode)?;
-    Ok(NodeEntry {
-        node_id,
-        label,
-        last_addr: SocketAddr::new(ip, port),
-    })
 }
 
 #[cfg(test)]
@@ -218,6 +135,24 @@ mod tests {
         // 最後の 1 件も消せる。
         assert!(remove(&path, 2).unwrap());
         assert!(load(&path).unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v6_and_long_label_edge_cases() {
+        let dir = std::env::temp_dir().join(format!("smctl-nodes-v6-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nodes.tlv");
+
+        // IPv6 アドレスも往復する。
+        upsert(&path, entry(3, "v6", "[fe80::1]:5540")).unwrap();
+        let got = load(&path).unwrap();
+        assert_eq!(got[0].last_addr, "[fe80::1]:5540".parse().unwrap());
+
+        // 共有 codec の上限(64 バイト)超のラベルは保存時に明示エラー。
+        let long = "x".repeat(65);
+        assert!(upsert(&path, entry(4, &long, "10.0.0.4:5540")).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

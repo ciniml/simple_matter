@@ -82,8 +82,8 @@ ports/esp32s3/
         └── bin/
             ├── s3-light.rs      # 段階 2: C6 e5-light の S3 版(dual-transport、LED なし)
             ├── airq-sensor.rs   # 段階 3: AirQ 本番 FW(3 EP 空気質センサ + 実センサ)
-            ├── s3-controller.rs # K2/K3: スタンドアロンコミッショナ(UDP + BLE
-            │                    #     central、docs/design/esp32-controller.md)
+            ├── s3-controller.rs # K2-K4: スタンドアロン常駐ハブ(UDP + BLE central、
+            │                    #     複数ノード。docs/design/esp32-controller.md)
             └── s3-scan-smoke.rs # K3 冒頭ゲート: TrouBLE central の scan スモーク
 ```
 
@@ -115,27 +115,31 @@ stack guard 破壊 PANIC** を実機で確認(2026-07-12)。両 Matter bin と�
 
 ELF は `target/xtensa-esp32s3-none-elf/release/` に生成される。
 
-## s3-controller(K2/K3: スタンドアロンコミッショナ)
+## s3-controller(K2〜K4: スタンドアロン常駐ハブ)
 
-`docs/design/esp32-controller.md` K2/K3 のハブ。S3 単独で commissionable
-デバイス(discriminator 3840 / passcode 20202021)をフルコミッショニング →
-CASE → 30 秒ごと OnOff Toggle する。コミッショニングのトランスポートは
-ビルド時 `SM_COMMISSION` で選択:
+`docs/design/esp32-controller.md` K2〜K4 のハブ。S3 単独で bin 内の静的
+`NODE_PLAN`(既定 2 ノード)を管理する: 未コミッショニングのノードを
+トランスポート別にフルコミッショニング → 全ノードへ CASE → **30 秒ごとに
+ラウンドロビンで OnOff Toggle → Read**。失敗ノードは mDNS 再解決 + CASE
+再確立(resumption)で回復する。
 
-- **BLE(既定、K3)**: TrouBLE central で scan → BTP handshake → PASE〜AddNOC →
-  AddOrUpdateWiFiNetwork/ConnectNetwork(smctl `pairing ble-wifi` 相当)→
-  BLE close → 運用 mDNS 解決 → CASE over UDP → CommissioningComplete。
-  対向(PC): `SM_BLE_ADAPTER=hci1 SM_STATE_DIR=<dir> cargo run --release \
+- **node1(UDP、K2 パス)**: mDNS ブラウズ(discriminator subtype、QU 第一候補 +
+  QM フォールバック)→ 全フェーズ UDP。対向(PC、ポート/識別子は同居用に変更):
+  `SM_DISCRIMINATOR=3841 SM_MATTER_PORT=5541 SM_STATE_DIR=<dir1> \
+  cargo run --release --example onoff-light`
+- **node2(BLE、K3 パス)**: TrouBLE central で scan → BTP handshake →
+  PASE〜AddNOC → AddOrUpdateWiFiNetwork/ConnectNetwork(smctl `pairing ble-wifi`
+  相当)→ BLE close → 運用 mDNS 解決 → CASE over UDP → CommissioningComplete。
+  対向(PC): `SM_BLE_ADAPTER=hci1 SM_STATE_DIR=<dir2> cargo run --release \
   -p simple-matter-ble --features device --example ble-onoff-light`
-- **UDP(`SM_COMMISSION=udp` でビルド、K2)**: mDNS ブラウズ(QU 第一候補 +
-  QM フォールバック)→ 全フェーズ UDP。
-  対向(PC): `SM_STATE_DIR=<dir> cargo run --release --example onoff-light`
 
 - WiFi 資格情報はコンパイル時定数(既定 iotap)。ビルド時に
   `SM_WIFI_SSID=... SM_WIFI_PASS=... cargo build ...` で差し替え可(`option_env!`)。
-- CA は flash KVS キー `b"cast"`(smctl `ca-state.bin` v1 と同一バイト列)、
-  ノード記録(node_id / 最終アドレス / CASE resumption 素材)はキー `b"node"`。
-  リブート後は復元 → 運用 mDNS 解決 → CASE(resumption)→ Toggle 再開。
+- 永続化(flash KVS): CA = キー `b"cast"`(smctl `ca-state.bin` v1 互換)、
+  ノード帳 = キー `b"nods"`(**smctl `nodes.tlv` v1 互換** = コアの
+  `controller::nodes` codec)、CASE resumption 素材 = ノードごとの `b"rsm<i>"`。
+  リブート後は全ノードを復元 → 運用 mDNS 解決 → CASE(Sigma2_Resume)→
+  Toggle 再開。
 - **vendored trouble-host**: `vendor/trouble-host`(0.6.0 + `GattClient::subscribe`
   の 1 関数パッチ、workspace `[patch.crates-io]`)。upstream 0.6 は CCCD write
   応答後に subscriber を作るため、subscribe 直後の最初の indication(BTP handshake

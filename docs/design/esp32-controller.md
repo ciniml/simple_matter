@@ -12,11 +12,12 @@
 組込み(embassy)側でやる話であり、**コアへの新規要求はほぼゼロ**である
 (§2 の監査結果)。唯一の例外は ca-state codec の置き場所(§5.3、コード移動のみ)。
 
-> **状態(2026-07-13)**: **K1 + K2 + K3 完了 — AirQ 実機(ESP32-S3、MAC
-> 48:27:e2:e3:0f:b8)で UDP-only(§7.1)と BLE central 経由 ble-wifi 型
-> (§7.2)のコミッショニング E2E green**。ターゲットは §1.2 の素の devkit では
-> なく手元の AirQ を流用した(devkit 固有の前提は無し。周辺は未使用なのでコードは
-> 同一)。K4(常駐ハブ化の本格版)は未着手。
+> **状態(2026-07-13)**: **K1〜K4 全フェーズ完了 — AirQ 実機(ESP32-S3、MAC
+> 48:27:e2:e3:0f:b8)で UDP-only(§7.1)・BLE central 経由 ble-wifi 型(§7.2)の
+> コミッショニングと、2 ノード常駐ハブ(§7.3: UDP+BLE 混在コミッショニング・
+> 交互 Toggle・リブート後の全ノード resumption 再接続)の E2E green**。
+> ターゲットは §1.2 の素の devkit ではなく手元の AirQ を流用した(devkit 固有の
+> 前提は無し。周辺は未使用なのでコードは同一)。
 
 ---
 
@@ -451,6 +452,53 @@ connect・GATT・BTP とも安定して成立し、バックログにあった c
 **リソース**: heap_max **95,388B**(K2 の 52,768B から BLE スタックぶん増、
 112KiB 配分でマージン ~17KB)。スタック起因の PANIC なし(main スタック配置のまま)。
 
+### 7.3 K4 完了記録(2026-07-13、AirQ 実機 + PC 2 デバイス同時)
+
+**ノード帳の共有 codec 化(K2 の割り切り解消)**: smctl `nodes.tlv` v1 の
+encode/decode を **コアへ移動**(`controller::nodes`、no_std・ヒープレス。
+`NodeRecord` 固定長 + callback デコード)。smctl `state/nodes.rs` は I/O の皮に
+縮退し、S3 は同一バイト列を `EspKvs` キー `b"nods"` に置く(§8.4 の「PC と S3 の
+記録互換」はこれで単純コピー可能になった)。制約の明文化: ラベルは 64 バイトまで。
+CASE resumption 素材はノードごとにポートローカルの `b"rsm<i>"`(49B 固定長)。
+K2 のポートローカル単一ノードレコード(`b"node"`)は廃止。
+
+**2 ノード管理**: 静的な `NODE_PLAN`(node1 = PC `onoff-light` を UDP/disc 3841、
+node2 = PC `ble-onoff-light` を BLE/disc 3840)に従い、起動時に「帳面にあれば
+mDNS 解決 → resumption CASE 再接続 / なければトランスポート別コミッショニング
+(2 回まで)」。定常は 30 秒周期のラウンドロビン Toggle → Read。失敗ノードは
+mDNS 再解決 → CASE 再確立(resumption)で回復し、全ノードが 5 回連続失敗した
+ときのみリブート。PC example 側は同一ホスト同居のため `SM_MATTER_PORT` /
+`SM_DISCRIMINATOR`(onoff-light)を追加した(5540/discriminator の衝突回避。
+mDNS ブラウズは discriminator subtype クエリなので同居しても混線しない)。
+
+**コアのバグ修正(K4 実機で顕在化)**: `ControllerStack::start_pase/start_case` の
+第 1 メッセージ**送信**失敗(セッションテーブル逼迫で unsecured セッションが
+LRU 退避された場合など)で、ScInitiator の単一ハンドシェイクスロット・予約
+セッション・exchange がリークしていた。放置すると後続 start_case が `NoSpace` に
+なり、さらに HANDSHAKE_TIMEOUT 経過時に stale な `Failed { Timeout }` イベントが
+積まれて**後続ハンドシェイクの待ち手が誤って失敗を拾う**(実機で node1 の再接続が
+これで空振りした)。→ 送信失敗時に `cancel_handshake`(イベントを積まない静かな
+巻き戻し)+ 予約解放 + exchange close。回帰テスト
+`start_case_send_failure_rolls_back_initiator` を追加。
+
+**サイジングの知見**: `ControllerStack` の SS=4 では **2 ノード目の
+コミッショニング中(PASE + unsecured + CASE が並ぶ)に 1 ノード目の運用 CASE
+セッションが LRU 退避**され、直後の Invoke が `NotFound` になる(実測)。ハブは
+SS=6 / EX=8 へ(EX は連続コミッショニング直後の未回収 exchange 対策。加えて
+`run_commissioning` 完走直後に `settle` を 1 回入れて ACK/exchange を回収する)。
+
+**E2E(NVS・両 PC デバイスの状態ともフレッシュ)**:
+
+- 初回: CA 生成 → node0 を UDP(ブラウズ disc=3841 → PASE→…→Done、t≈10s)→
+  node1 を BLE(scan→BTP→…→ConnectNetwork→BLE close→運用解決→CASE over UDP→Done、
+  t≈35s)→ 以降 30 秒ごとに node0/node1 交互 Toggle(両 PC ログで反転確認)。
+- リブート: CA + ノード帳(2 エントリ)+ resumption ×2 復元 → 両ノード運用解決 →
+  **CASE `resumed=true` ×2**(node0 t=4s、node1 t=6s)→ t=7s から交互 Toggle 再開。
+- リソース: heap_max **92,028B**(2 ノード定常。112KiB 配分でマージン ~20KB)、
+  スタック起因 PANIC なし。
+- 既知の揺らぎ: S3 リセット直後の BLE connect は peripheral(BlueZ)側に残った
+  旧接続で 1 回失敗することがある(§7.2 の coex 所見と同じ。2 回目の試行で回復)。
+
 ### リスク表
 
 | # | リスク | 影響フェーズ | 緩和 |
@@ -480,4 +528,5 @@ connect・GATT・BTP とも安定して成立し、バックログにあった c
    コア設計に影響しないためユースケース (b) と併せて検討。
 4. **smctl との fabric 共有**: ca-state フォーマットを揃える(§5.2)ことで
    「PC でコミッショニングした fabric を S3 ハブが引き継ぐ」運用が可能になる。
-   ノード帳(`nodes.tlv`)側の互換もそのとき決める。
+   ノード帳(`nodes.tlv`)側の互換は K4 で解消済み(コアの `controller::nodes`
+   codec を両者で共有。§7.3)。

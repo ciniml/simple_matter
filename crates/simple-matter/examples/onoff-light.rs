@@ -59,6 +59,25 @@ const NACL: usize = 20;
 
 /// コミッショニング discriminator(12 ビット)。chip-tool の既定テスト値。
 const DISCRIMINATOR: u16 = 3840;
+
+/// 実効 discriminator(`SM_DISCRIMINATOR` で上書き可)。同一ホストで複数の
+/// example デバイスを同居させるとき(esp32-controller.md K4 の 2 ノードハブ E2E)に
+/// ブラウズの照合が衝突しないようにする。
+fn discriminator() -> u16 {
+    std::env::var("SM_DISCRIMINATOR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DISCRIMINATOR)
+}
+
+/// 実効 Matter UDP ポート(`SM_MATTER_PORT` で上書き可)。用途は同上
+/// (5540 は同一ホストで 1 プロセスしか bind できない)。
+fn matter_port() -> u16 {
+    std::env::var("SM_MATTER_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MATTER_PORT)
+}
 /// mDNS インスタンス識別子(hostname / commissionable インスタンス名の素)。
 const MDNS_INSTANCE_ID: u64 = 0x0011_2233_4455_6677;
 
@@ -426,7 +445,7 @@ fn main() -> std::io::Result<()> {
     let local_ipv6 = discover_local_ipv6();
     let mac = MDNS_INSTANCE_ID.to_be_bytes(); // 下位 6 バイトをホスト名(MAC 相当)に使う
     let host = Host::from_mac(&mac[2..8], local_ipv6.map(|(ip, _)| ip), Some(local_ipv4));
-    let mut mdns: MdnsResponder<NF> = MdnsResponder::new(host, MATTER_PORT);
+    let mut mdns: MdnsResponder<NF> = MdnsResponder::new(host, matter_port());
     // VPN 運用ガイド(matter-over-vpn.md V2): SM_MDNS_SII_MS / SM_MDNS_SAI_MS を
     // TXT の SII/SAI として広告する。DERP リレー経由等で RTT が伸びる環境では
     // SAI を大きめ(≥500ms 目安)に広告すると MRP の偽再送を抑えられる。
@@ -451,7 +470,7 @@ fn main() -> std::io::Result<()> {
     // 復元済み(fabric>0)なら commissionable は出さず operational のみ広告する。
     if restored_fabric_count == 0 {
         mdns.set_commissionable(Some(commissionable(
-            DISCRIMINATOR,
+            discriminator(),
             CommissioningMode::Standard,
         )));
     } else {
@@ -474,8 +493,11 @@ fn main() -> std::io::Result<()> {
     let mdns_v6_dst: Option<SocketAddr> = local_ipv6
         .map(|(_, scope)| SocketAddr::V6(SocketAddrV6::new(MDNS_IPV6, MDNS_PORT, 0, scope)));
 
-    println!("simple-matter On/Off light listening on UDP/5540 (dual-stack)");
-    println!("  passcode: {PASSCODE}  discriminator: {DISCRIMINATOR}");
+    println!(
+        "simple-matter On/Off light listening on UDP/{} (dual-stack)",
+        matter_port()
+    );
+    println!("  passcode: {PASSCODE}  discriminator: {}", discriminator());
     match &mdns_socket {
         Some(_) => println!("  mDNS advertising on 224.0.0.251:5353 (A record: {local_ipv4})"),
         None => println!("  (mDNS socket unavailable; point a commissioner at this UDP port.)"),
@@ -617,7 +639,7 @@ fn main() -> std::io::Result<()> {
                 stack.set_pase_config(cfg);
                 stack.set_pase_enabled(true);
                 mdns.set_commissionable(Some(commissionable(
-                    DISCRIMINATOR,
+                    discriminator(),
                     CommissioningMode::Standard,
                 )));
                 mdns.notify_change(now_ms(&start));
@@ -679,7 +701,7 @@ fn main() -> std::io::Result<()> {
                     stack.set_pase_config(cfg);
                     stack.set_pase_enabled(true);
                     mdns.set_commissionable(Some(commissionable(
-                        DISCRIMINATOR,
+                        discriminator(),
                         CommissioningMode::Standard,
                     )));
                     mdns.notify_change(now);
@@ -828,7 +850,8 @@ fn sync_group_joins(
     }
 }
 
-/// Matter 運用 UDP(5540)をデュアルスタック(v6only=false)で bind する。
+/// Matter 運用 UDP(既定 5540、`SM_MATTER_PORT` で上書き可)をデュアルスタック
+/// (v6only=false)で bind する。
 fn open_matter_udp() -> std::io::Result<UdpSocket> {
     let s = socket2::Socket::new(
         socket2::Domain::IPV6,
@@ -836,7 +859,7 @@ fn open_matter_udp() -> std::io::Result<UdpSocket> {
         Some(socket2::Protocol::UDP),
     )?;
     s.set_only_v6(false)?;
-    s.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, MATTER_PORT)).into())?;
+    s.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, matter_port())).into())?;
     Ok(s.into())
 }
 

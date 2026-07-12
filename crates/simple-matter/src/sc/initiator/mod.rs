@@ -312,6 +312,17 @@ impl<'c, C: Crypto, R: Rng, F> ScInitiator<'c, C, R, F> {
         Ok(len)
     }
 
+    /// 開始直後のハンドシェイクを**静かに**取り消す(`start_pase`/`start_case` の
+    /// 第 1 メッセージ送信に失敗したときの巻き戻し用)。
+    ///
+    /// [`abort`](Self::abort) と違い `Failed` イベントは積まない(呼び出し元が同期
+    /// エラーを受け取るため。イベントを積むと後続ハンドシェイクの待ち手が stale な
+    /// Failed を拾って誤判定する — K4 実機で顕在化)。予約セッション・exchange の
+    /// 解放は呼び出し元(controller 層)が行う。
+    pub(crate) fn cancel_handshake(&mut self) {
+        self.hs = None;
+    }
+
     /// 進行中ハンドシェイクを破棄し、予約セッションを解放して `Failed` を積む。
     fn abort<const S: usize>(
         &mut self,
