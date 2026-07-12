@@ -80,8 +80,10 @@ ports/esp32s3/
         ├── sensors.rs      # SEN55(sen5x-rs)+ SCD40(libscd)統合タスク
         ├── display.rs      # e-ink(GDEW0154D67=SSD1681、epd-waveshare)表示タスク
         └── bin/
-            ├── s3-light.rs     # 段階 2: C6 e5-light の S3 版(dual-transport、LED なし)
-            └── airq-sensor.rs  # 段階 3: AirQ 本番 FW(3 EP 空気質センサ + 実センサ)
+            ├── s3-light.rs      # 段階 2: C6 e5-light の S3 版(dual-transport、LED なし)
+            ├── airq-sensor.rs   # 段階 3: AirQ 本番 FW(3 EP 空気質センサ + 実センサ)
+            └── s3-controller.rs # K2: スタンドアロンコミッショナ(UDP-only ハブ、
+                                 #     docs/design/esp32-controller.md)
 ```
 
 ## ビルド
@@ -99,6 +101,7 @@ cargo build --release --bins
 | esp32s3-firmware(スモーク) | 104,928 B |
 | s3-light | 912,016 B(OCW 搭載後。e-ink なし) |
 | airq-sensor | 981,184 B(OCW + e-ink 表示) |
+| s3-controller | 690,656 B(コントローラ。BLE/センサ/e-ink なし) |
 
 **RAM 配分の注意(S3 固有、実機で顕在化)**: S3 の DRAM リンカ領域は約 340KiB
 (C6 より狭い)で、main スタック(`.stack`)は「.data/.bss の残り」になる。
@@ -110,6 +113,20 @@ stack guard 破壊 PANIC** を実機で確認(2026-07-12)。両 Matter bin と�
 常時監視できる(E2E ピーク実測 90,160B / 114,688B — マージン約 24KiB)。
 
 ELF は `target/xtensa-esp32s3-none-elf/release/` に生成される。
+
+## s3-controller(K2: スタンドアロンコミッショナ)
+
+`docs/design/esp32-controller.md` K2 の UDP-only ハブ。S3 単独で WiFi 上の
+commissionable デバイス(PC の `onoff-light` example 等、discriminator 3840 /
+passcode 20202021)を mDNS ブラウズ(QU 第一候補 + QM フォールバック)→
+フルコミッショニング → CASE → 30 秒ごと OnOff Toggle する。
+
+- WiFi 資格情報はコンパイル時定数(既定 iotap)。ビルド時に
+  `SM_WIFI_SSID=... SM_WIFI_PASS=... cargo build ...` で差し替え可(`option_env!`)。
+- CA は flash KVS キー `b"cast"`(smctl `ca-state.bin` v1 と同一バイト列)、
+  ノード記録(node_id / 最終アドレス / CASE resumption 素材)はキー `b"node"`。
+  リブート後は復元 → 運用 mDNS 解決 → CASE(resumption)→ Toggle 再開。
+- 対向(PC): `SM_STATE_DIR=<dir> cargo run --release --example onoff-light`
 
 ## 実機への書き込み・観測(AirQ 接続後)
 

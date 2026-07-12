@@ -12,6 +12,12 @@
 組込み(embassy)側でやる話であり、**コアへの新規要求はほぼゼロ**である
 (§2 の監査結果)。唯一の例外は ca-state codec の置き場所(§5.3、コード移動のみ)。
 
+> **状態(2026-07-13)**: **K1 + K2 完了 — AirQ 実機(ESP32-S3、MAC
+> 48:27:e2:e3:0f:b8)で UDP-only コミッショニング E2E green**(§7.1 の完了記録)。
+> ターゲットは §1.2 の素の devkit ではなく手元の AirQ を流用した(devkit 固有の
+> 前提は無し。周辺は未使用なのでコードは同一)。K3(TrouBLE central / ble-wifi)・
+> K4(常駐ハブ化の本格版)は未着手。
+
 ---
 
 ## 0. サマリ(調査結果と主要な設計判断)
@@ -272,7 +278,8 @@ loop {
   192B を大きく上回るため追加変更なし。フォーマットを smctl と揃えておくと、
   PC で作った fabric を S3 ハブへ移す(またはその逆)ことが将来単純コピーで
   できる。
-- **コード配置の提案(唯一のコア変更、K2 で実施)**: `state/ca.rs` の
+- **コード配置の提案(唯一のコア変更。K1 で実施済み = `Ca::encode_state` /
+  `Ca::decode_state`)**: `state/ca.rs` の
   encode/decode は純 TLV で I/O を含まないため、
   `simple_matter::controller::ca` 配下(feature 内)へ移して smctl と S3 で
   共有する。移動のみで挙動不変、bloat-check の不変条件にも影響しない
@@ -352,6 +359,45 @@ initiator 状態機械 + codec + CA 分(実装 ~5.7k LoC)に留まる見込み�
 | **K2: S3 UDP-only コミッショニング** | `ports/esp32s3` に `s3-controller` bin 追加(devkit b4:3a:45:bc:a8:00)。`EspUdp` + mDNS ブラウズ(QU、QM フォールバック)→ `Commissioner` フル(onnetwork)→ Toggle。ca-state を `EspKvs`(`b"cast"`)へ、codec は `state/ca.rs` からコアの controller feature 内へ移動(§5.2)。stack watermark 計測(R3) | S3 devkit 単独で、WiFi 上のデバイス(C6 e5 系 or AirQ)をコミッショニングし OnOff Toggle。**リブート後に `Ca::restore` → 運用解決 → CASE 再確立**まで | **M**(3-5 日) |
 | **K3: BLE central → ble-wifi 相当** | trouble-host features に `central`,`scan` 追加。冒頭ゲート: スキャンスモーク(`on_adv_reports` で 0xFFF6 service data と discriminator が読めること = R1 消し込み)。`TroubleGattCentral`(worker+channel、§3.2)→ BTP central handshake → BLE 上 PASE→AddNOC、`set_wifi_credentials` + `suspend_before_case`/`set_peer`/`resume` による **ble-wifi**(AddWifiNetwork→ConnectNetwork→BLE close→運用解決→CASE over UDP) | S3 devkit から BLE デバイス(C6 `e2-ble` / S3 `s3-light`)を ble-wifi コミッショニングし、運用 UDP で Toggle | **M-L**(4-7 日) |
 | **K4: 常駐ハブ化** | ノード帳(smctl `nodes` 相当: node_id / last_addr / resumption 素材)を `EspKvs` 化。CASE resumption(コア実装済み、`export/import` API)で跨リブート再接続。複数ノードの定常管理(定期 Read or Subscribe)。(オプション)CoreS3 表示 UI | 2 ノード以上を管理し、ハブ再起動後に resumption で CASE 再確立 → 操作継続 | **L**(5 日+) |
+
+### 7.1 K1 / K2 完了記録(2026-07-13、AirQ 実機)
+
+**K1(監査固定 + ホストシム)**: ホストシムの大半は既存資産で固定済みと判断し、
+残差分のみ実施した。(a) sans-IO 駆動ループは in-memory の `controller_end_to_end`
+系(stack/tests.rs)+ `examples/commissioner.rs` + smctl が既に「S3 と同形状」
+(同期 pump / `now_ms` 引数 / QU mDNS / **now_epoch_s=0**)で通しており、R7
+(now_epoch_s=0 での `verify_peer_noc`)はテストが常時検証している。
+(b) 追加した差分: **ca-state v1 codec をコアへ移動**(`Ca::encode_state` /
+`Ca::decode_state`、§5.2 のとおり smctl `state/ca.rs` は I/O の皮に縮退)+
+codec 往復テスト(now_epoch_s=0 生成・復元・再 encode 冪等・next_serial
+引き継ぎ = 「KVS 保存 CA の再現性」ゲート)。(c) bloat-check に
+**controller-probe** bin を追加し CI で記録開始(Cortex-M4F 実測:
+.text 82,504B + .rodata 2,276B ≈ 83KiB — §6.2 の見込みどおり共有基盤込みでも
+flash 制約なし)。
+
+**K2(S3 UDP-only コミッショニング)**: `ports/esp32s3` に `s3-controller` bin を
+追加(コミット 83c1858)。実機 E2E(対向 = PC `onoff-light` example
+@192.168.2.14:5540、`SM_STATE_DIR` フレッシュ / AirQ は NVS erase から):
+
+- 初回起動: WiFi join(iotap)→ DHCP → **QU ブラウズ即応答**
+  (`[dis] found commissionable node at 192.168.2.14:5540`)→ PASE→…→
+  CommissioningComplete → **Toggle OK(起動から ~25 秒)**。ホスト側で
+  `[onoff] light is now ON` を確認。QM フォールバック(R5)は発動せず
+  (自デバイスは `query_wants_unicast` 対応のため。コードパスは実装済み)。
+- リブート: `[ca] restored from flash (next_serial=4)` → resumption import →
+  運用解決(`_matter._tcp` QU)→ **CASE `resumed=true`(Sigma2_Resume)** →
+  t=11s で Toggle OK。30 秒ごとの Toggle デモ(常駐ハブ最小形)でホスト側
+  ON/OFF が交互に反転することを確認。
+- リソース(R3): heap 112KiB / .stack ≈69KiB 配分の踏襲で **heap_max 52,768B**
+  (マージン ~58KiB)、`ControllerStack`(4,6,3,1280)= 12,424B を main スタックに
+  置いてスタック起因の PANIC なし。専用スタックタスクへの切り出しは不要だった。
+- 永続化: CA = `EspKvs` キー `b"cast"`(117B、smctl v1 互換)。ノード記録
+  (node_id / 最終 IPv4 アドレス / resumption 素材)はポートローカル 64B 固定長の
+  キー `b"node"`(K4 で smctl `nodes.tlv` 互換に置き換える候補)。
+- 割り切り(K2 スコープ): WiFi 資格情報はコンパイル時定数(`option_env!`)、
+  対象デバイスは discriminator 3840 / passcode 20202021 固定の 1 台、
+  attestation は `Skip`、mDNS 解決失敗時は記録済みアドレスへフォールバック。
+  BLE(TrouBLE central)は一切使わない = K3 スコープのまま。
 
 ### リスク表
 
