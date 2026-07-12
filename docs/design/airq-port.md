@@ -666,6 +666,7 @@ AdminCommissioning + 窓配線 + mDNS commissionable)。
   戦略で MRP/購読への影響なし。heap_max 91,908B / 114,688B(マージン維持)。
   .stack は 65,284B(フレームバッファ 5KB が main future に載った分減、余裕あり)。
 - 表示内容の目視確認はユーザに依頼(ログの update #N の値と画面表示の一致)。
+- **2026-07-13 ユーザ目視確認済み: 表示問題なし** — A5+残改善の全項目クローズ。
 - フットプリント: airq-sensor 981,184B(バッチ 1 の 959,408B から +21.8KB =
   epd-waveshare + embedded-graphics + フォント)。
 
