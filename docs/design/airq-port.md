@@ -6,11 +6,11 @@ simple-matter ベース(Rust / no_std)へ再実装する検討。本書は調査
 (+フェーズ進捗の記録)。
 
 **進捗**: フェーズ A1(クラスタ実装 + PC シム E2E)**完了(2026-07-09)**。
-フェーズ A5(ESP32-S3 ポート)は **ツールチェーン + 全ビルド整備まで完了
-(2026-07-09。ports/esp32s3、実機未検証 = AirQ 未接続)**。記録は §7.1、
-実機残作業は §7.3。なお A2-A4(C6 ブリッジ = NanoC6 + 外付けセンサ)は
-機材未手配のため未着手のまま A5 のビルド整備を先行した(センサドライバ統合の
-初検証も AirQ 実機で行うことになる点に注意)。
+フェーズ A5(ESP32-S3 ポート)**完了(2026-07-12。AirQ 実機で §7.3 チェック
+リスト全項目 green = chip-tool フル E2E + smctl 2 fabric 目 + リブート永続化)**。
+記録は §7.1 と §7.3 の実機検証記録。なお A2-A4(C6 ブリッジ = NanoC6 +
+外付けセンサ)は機材未手配のためスキップし、センサドライバ統合の初検証も
+AirQ 実機で行った(SEN55/SCD40 とも初回起動から実測値取得に成功)。
 
 前提となる現状(2026-07-08 時点):
 
@@ -334,7 +334,7 @@ sensor-hub と同じ「1 計測ドメイン = 1 EP」の分離構成を採る。
 | **A2: ハード選定 / ツールチェーン確認** | C6 ブリッジ機材(NanoC6 + SEN55 5V 供給 + SCD40)手配・配線。espup/S3 の最新状況・esp-hal S3 の coex 実績を再調査(§3.1 の再確認) | I2C スキャンで 0x69/0x62 応答(素の esp-hal bin) | **S** |
 | **A3: センサドライバ統合(C6)** | `sen5x-rs`/`scd4x`(async)を embassy タスクに統合、SCD4x 初期化シーケンス移植(§1.3)、AirQualityEnum 算出ロジック、`airq-c6` bin(e5-light ベース) | シリアルで実測値ログ(既存 FW と同一個体センサの値比較)| **M** |
 | **A4: C6 実機 E2E** | chip-tool `pairing ble-wifi` → 全属性 read / subscribe(30s/10s 周期更新の配信)、リブート後 CASE 再確立(E4 資産) | chip-tool + smctl のフル E2E、フットプリント実測を README に記録 | **S〜M** |
-| **A5: ESP32-S3(AirQ 実機)ポート** | espup 導入、`ports/esp32s3` workspace(rust-toolchain 分離)、E1 相当スモーク(boot/TRNG)→ E2-E5 相当の再検証(S3 radio/coex)→ airq bin 移植 + GPIO10 電源制御 + GPIO46 HOLD | AirQ 実機で chip-tool フル E2E | **ビルド整備まで完了(2026-07-09)**。実機ゲートは §7.3(AirQ 未接続のため保留) |
+| **A5: ESP32-S3(AirQ 実機)ポート** | espup 導入、`ports/esp32s3` workspace(rust-toolchain 分離)、E1 相当スモーク(boot/TRNG)→ E2-E5 相当の再検証(S3 radio/coex)→ airq bin 移植 + GPIO10 電源制御 + GPIO46 HOLD | AirQ 実機で chip-tool フル E2E | **✅ 完了(2026-07-12、AirQ 実機で §7.3 全項目 green。S3 固有のスタック逼迫バグ 1 件を発見・修正 = §7.3 実機検証記録)** |
 | **A6(任意): 表示・UX** | e-ink 表示(計測値 + コミッショニング QR)、ボタン/ブザー | 目視 | M |
 | (別トラック) | ICD/バッテリー運用 | — | コアの ICD 実装後 |
 
@@ -401,8 +401,9 @@ A5 が追加で L。
   温湿度は参考ログ)。データモデルは §5 の 3 EP(A1 example と同一)+ EP0 は
   C6 e5-light と同じ管理系 5 クラスタ。AirQuality は CO2/PM2.5 worst-of
   (材料が無い項は Unknown=Ord 最小として max 合成)。VOC/NOx はログのみ(§4.3)。
-- フットプリント(espflash save-image): スモーク 104,928 B / s3-light 911,600 B /
-  airq-sensor 952,544 B(8MB flash に対し 12% 未満)。
+- フットプリント(espflash save-image): スモーク 104,928 B / s3-light 906,800 B /
+  airq-sensor 953,168 B(8MB flash に対し 12% 未満。2026-07-12 のヒープ調整 +
+  heap-stats 後の実測)。
 - ゲート: 3 bin ビルド green + clippy 0(esp channel)、コア 518 + smctl 58 green、
   C6 riscv ビルド green(回帰なし)。**実機ゲート(§7.3)は AirQ 接続後**。
 
@@ -449,6 +450,70 @@ A5 が追加で L。
      時間変動(換気・呼気で CO2 を動かす)のレポート受信。
    - リブート → fabric/資格情報復元 → 自動 Wi-Fi join → CASE 再確立 → read。
 5. 結果を本書 §7.1 の A5 行・ports/esp32s3/README.md・memory へ反映する。
+
+### 7.3.1 実機検証記録(2026-07-12、A5 完了)
+
+個体: esp32s3 rev v0.2 / 8MB flash / MAC 48:27:e2:e3:0f:b8(/dev/ttyACM0。
+espflash board-info で確認。キットの v1.0/v1.1 目視確認は未実施 — 挙動上の
+差分は観測されず、R8 は顕在化しなかった)。espflash 4.4.0、NVS erase
+(0x9000 0x6000)から実施。
+
+1. **段階 1 スモーク ✅**: バナー / TRNG サンプル / P-256 keygen(SEC1 tag 0x04)/
+   1Hz heartbeat すべて green。
+2. **段階 2(s3-light)**: 単独では実施せず(airq-sensor が同一 transport 構成
+   = BLE+Wi-Fi coex + UDP/mDNS を包含するため、段階 3 の E2E でまとめて検証)。
+3. **I2C / センサ ✅**: `[sensors] SCD40 serial=135177073b70` /
+   `SEN55 serial=443544363146`(0x62/0x69 応答、100kHz で NACK なし)。
+   GPIO10=LOW→1s 待ち→reinit の電源シーケンス、GPIO46 HOLD とも問題なし。
+   実測値: CO2 800-840ppm / PM2.5 1.6-5.2µg/m³ / RH 34-43% と現実的な室内値。
+   温度は 32-33°C 表示で室温より数 °C 高い(筐体内自己発熱。SEN55/SCD40 とも
+   同傾向で、既存 esp-matter FW でも知られる AirQ の特性。補正は将来課題)。
+   VOC/NOx はログのみ(仕様どおり)。ウォームアップ中の SEN55 nox=3276.7
+   (=0x7FFF/10、未較正マーカー)も初回読みで観測 — 実害なし。
+4. **E2E**:
+   - **S3 固有バグを発見・修正**: 初回 `chip-tool pairing ble-wifi` で BTP 確立
+     直後に **stack guard 破壊 PANIC**(OpCreds invoke → `RcKeypair::sign` →
+     p256 `ProjectivePoint::mul` の同期呼び出し連鎖)。原因は S3 の DRAM リンカ
+     領域(約 340KiB)が C6 より狭く、ヒープ 144KiB + embassy main タスク POOL
+     約 59KiB の残り = **.stack が約 37KiB** しかなかったこと(C6 e5-light は
+     約 130KiB)。ヒープを **112KiB に削減**して .stack ≈ 69KiB を確保し解消。
+     esp-alloc の `internal-heap-stats` を有効化し `[alive]` ログで heap_max を
+     常時監視 — **E2E ピーク実測 90,160B / 114,688B**(コミッショニング +
+     coex 中。マージン約 24KiB)。C6 で 112KiB が枯渇した ATT 切断は S3 では
+     再現せず(radio blob のヒープ要求が C6 と異なる)。
+   - chip-tool `pairing ble-wifi 1 <ssid> <pass> 20202021 3840 --ble-controller 0
+     --paa-trust-store-path ...`(**--bypass 無し** = DAC/PAI 実検証)で
+     **フルコミッショニング完走**: BTP(fragment=244)→ PASE → CSR/AddNOC →
+     `[kvs] saved 1 fabrics` → Wi-Fi join → DHCP → mDNS operational →
+     CASE over UDP → CommissioningComplete → BLE クリーン切断。
+   - chip-tool read(実測値): `airquality read air-quality` = 2(Fair)/
+     CO2 = 832.0(f32)/ PM2.5 = 2.4(f32)/ 温度(EP2)= 3267 / 湿度(EP3)=
+     4169 / device-type-list = 44(Air Quality Sensor)。
+   - smctl 2 fabric 目: **OCW は不可**(本 bin の EP0 は e5-light と同じ管理系
+     5 クラスタで AdminCommissioning 0x003C 未搭載 — PC example には有り。
+     搭載は将来課題)。代替の既存経路 `smctl pairing address 2 20202021
+     <ip>`(PASE over UDP、attestation 実検証)で **2 fabric 目完走**。
+     `--names` read: device-type-list = `0x002c(AirQualitySensor)`、CO2 = 833、
+     PM2.5 = 2.5、温度 = 3284、湿度 = 4166。
+   - smctl subscribe: `carbon-dioxide-concentration subscribe measured-value
+     0 60 2 1` → ESTABLISHED(CASE は Sigma2Resume 再開)+ 周期レポート受信
+     (+26s/+86s)。`air-quality subscribe` も ESTABLISHED + レポート受信
+     (= 2。観測中に空気質レベル遷移なし — CO2 が 800-840ppm で安定していた
+     ため。A1 の PC シムで全レベル遷移の配信は実証済み)。
+5. **リブート永続化 ✅**: リセット → `[kvs] restored 2 fabrics / 2 resumptions /
+   wifi credentials` → 自動 join(初回 AuthenticationExpired で 1 回リトライ後
+   成功 — 自動再接続が機能)→ DHCP 同一 IP → chip-tool(fabric 1)/
+   smctl(fabric 2)とも CASE 再確立して read 成功。
+
+既知の罠の対処: BlueZ 亡霊キャッシュ(FFF6 の `bluetoothctl remove`)と
+chip-tool kvs のフレッシュ化(`rm ~/snap/chip-tool/common/chip_tool_kvs`)を
+事前に実施。`espflash reset` は cat がポートを開いたまま実行すると DOWNLOAD
+モードへ落ちることがある(USB-Serial-JTAG のストラップ干渉)— reset 単独実行
+→ 直後に stty+cat の順なら正常起動を捕捉できる。
+
+残課題(A5 スコープ外): AdminCommissioning(OCW)を S3 bin へ搭載
+(PC example の写しで可能)、SEN55 温度の自己発熱補正、既存 esp-matter FW との
+同一個体値比較(R2 の完全クローズ)、s3-light 単独の onoff E2E。
 
 ## 8. 参考(調査ソース)
 

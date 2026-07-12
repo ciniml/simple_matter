@@ -590,8 +590,9 @@ async fn pump(
         let now = now_ms(start);
         if now >= next_heartbeat_ms {
             let (_, snap) = sensors::snapshot();
+            let heap = esp_alloc::HEAP.stats();
             println!(
-                "[alive] t={}s conn={:?} sub={} wifi={:?} ip={:?} aq={:?} co2={:?} pm2.5={:?}",
+                "[alive] t={}s conn={:?} sub={} wifi={:?} ip={:?} aq={:?} co2={:?} pm2.5={:?} heap_max={}",
                 now / 1000,
                 conn.map(|c| c.0),
                 subscribed,
@@ -600,6 +601,7 @@ async fn pump(
                 stack.device().air_quality.air_quality(),
                 snap.co2_ppm,
                 snap.pm25,
+                heap.max_usage,
             );
             next_heartbeat_ms = now + 10_000;
         }
@@ -923,9 +925,14 @@ async fn main(_spawner: Spawner) {
     // GPIO10 = SEN55 電源(LOW で ON)。起動待ち 1 秒は sensor_task が担う。
     let sen55_power = Output::new(peripherals.GPIO10, Level::Low, OutputConfig::default());
 
-    // Wi-Fi + BLE coex は esp-radio のヒープ要求が増える(C6 E5 と同じ 144KiB)。
-    // MatterStack 自体はヒープレス(main のスタック上に置く)。
-    esp_alloc::heap_allocator!(size: 144 * 1024);
+    // Wi-Fi + BLE coex は esp-radio のヒープ要求が増える。C6 E5 は 144KiB だが、
+    // S3 は DRAM リンカ領域が約 340KiB と狭く、.bss(ヒープ + embassy タスク POOL
+    // 約 59KiB)の残りが main スタック(.stack)になる。144KiB では .stack が約
+    // 37KiB しか残らず、コミッショニング中の P-256 署名(OpCreds invoke →
+    // RcKeypair::sign)の同期呼び出し連鎖で stack guard 破壊 = 実機 PANIC を確認
+    // (2026-07-12、AirQ 実機)。112KiB へ削減して .stack を約 70KiB 確保する
+    // (ヒープ実測 max_usage は [alive] ログで監視)。
+    esp_alloc::heap_allocator!(size: 112 * 1024);
 
     // esp-radio は preemptive スケジューラ(esp-rtos)を要求する。
     // 「スケジューラ開始 → radio 初期化」の順序が必須(esp-radio ドキュメント)。

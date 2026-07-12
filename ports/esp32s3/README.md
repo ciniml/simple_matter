@@ -9,9 +9,13 @@ workspace**。S3 は espup の esp channel(rustc フォーク)を要求し、
 `rust-toolchain.toml` が stable 前提の両者と衝突するため、workspace 分離が
 必須(airq-port.md §3.3)。
 
-> **状態(2026-07-09)**: A5 段階 1-3(ツールチェーン + 全 bin)ビルド green・
-> clippy 0。**AirQ 実機は未検証(未接続)**。実機ゲートは
-> 「AirQ 接続後のチェックリスト」(airq-port.md §7.3)を参照。
+> **状態(2026-07-12)**: **A5 完了 — AirQ 実機(esp32s3 rev v0.2 / 8MB /
+> MAC 48:27:e2:e3:0f:b8)で §7.3 チェックリスト全項目 green**。
+> SEN55/SCD40 実測値取得、chip-tool `pairing ble-wifi` フル E2E
+> (--paa-trust-store-path、attestation 実検証)、smctl 2 fabric 目 +
+> subscribe、リブート永続化まで確認。実機で発見した S3 固有バグ
+> (main スタック逼迫 → ヒープ 112KiB 化)と検証記録は
+> airq-port.md §7.3.1 を参照。
 
 ## ツールチェーン(C6 との最大の違い)
 
@@ -83,13 +87,22 @@ cd ports/esp32s3
 cargo build --release --bins
 ```
 
-フラッシュイメージ実測(espflash save-image、2026-07-09):
+フラッシュイメージ実測(espflash save-image、2026-07-12):
 
 | bin | app image |
 |---|---|
 | esp32s3-firmware(スモーク) | 104,928 B |
-| s3-light | 911,600 B |
-| airq-sensor | 952,544 B |
+| s3-light | 906,800 B |
+| airq-sensor | 953,168 B |
+
+**RAM 配分の注意(S3 固有、実機で顕在化)**: S3 の DRAM リンカ領域は約 340KiB
+(C6 より狭い)で、main スタック(`.stack`)は「.data/.bss の残り」になる。
+ヒープ 144KiB(C6 E5 と同値)では .stack が約 37KiB しか残らず、
+**コミッショニング中の P-256 署名(OpCreds invoke → sign)の同期呼び出し連鎖で
+stack guard 破壊 PANIC** を実機で確認(2026-07-12)。両 Matter bin とも
+**ヒープ 112KiB**(.stack ≈ 69-75KiB)に調整済み。esp-alloc の
+`internal-heap-stats` を有効化しており、`[alive]` ログの `heap_max` で最高水位を
+常時監視できる(E2E ピーク実測 90,160B / 114,688B — マージン約 24KiB)。
 
 ELF は `target/xtensa-esp32s3-none-elf/release/` に生成される。
 
@@ -107,6 +120,10 @@ espflash flash --port <PORT> target/xtensa-esp32s3-none-elf/release/airq-sensor
 stty -F <PORT> 115200 raw -echo
 cat <PORT>
 ```
+
+ブートログを頭から捕りたいときは `espflash reset -p <PORT>` → 直後に stty+cat。
+**cat がポートを開いたまま reset すると DOWNLOAD モードに落ちることがある**
+(USB-Serial-JTAG のストラップ干渉。AirQ 実機で確認)— reset は単独で実行する。
 
 実機検証の残作業チェックリストは `docs/design/airq-port.md` §7.3。
 

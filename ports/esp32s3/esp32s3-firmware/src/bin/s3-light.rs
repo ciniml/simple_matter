@@ -800,8 +800,11 @@ async fn main(_spawner: Spawner) {
     println!("======================================================");
 
     // Wi-Fi + BLE coex は esp-radio のヒープ要求が増える(E4 の 72KiB から増量)。
-    // MatterStack 自体はヒープレス(main のスタック上に置く)。
-    esp_alloc::heap_allocator!(size: 144 * 1024);
+    // S3 の DRAM リンカ領域は約 340KiB と狭く、144KiB では main スタック(.stack =
+    // .bss の残り)が約 37KiB になり、コミッショニング中の P-256 署名の同期呼び出し
+    // 連鎖で stack guard 破壊 = PANIC(airq-sensor の AirQ 実機で確認、2026-07-12)。
+    // airq-sensor と同じ 112KiB に削減して .stack 約 70KiB を確保する。
+    esp_alloc::heap_allocator!(size: 112 * 1024);
 
     // esp-radio は preemptive スケジューラ(esp-rtos)を要求する。
     // 「スケジューラ開始 → radio 初期化」の順序が必須(esp-radio ドキュメント)。

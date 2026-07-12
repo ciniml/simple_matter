@@ -60,7 +60,9 @@ esp-rtos = { version = "0.3.0", features = [
     "esp-radio",
     "esp-alloc",
 ] }
-esp-alloc = "0.10.0"
+# internal-heap-stats: HeapStats::max_usage(ヒープ最高水位)を [alive] ログで
+# 監視するため(S3 は DRAM が狭くヒープ/スタック配分がタイトなので常時計測する)。
+esp-alloc = { version = "0.10.0", features = ["internal-heap-stats"] }
 trouble-host = { version = "0.6.0", default-features = false, features = [
     "peripheral",
     "gatt",
