@@ -78,6 +78,7 @@ ports/esp32s3/
         ├── net.rs          # UDP trait 群の embassy-net 実装
         ├── wifi.rs         # WifiDriver trait の esp-radio 実装
         ├── sensors.rs      # SEN55(sen5x-rs)+ SCD40(libscd)統合タスク
+        ├── display.rs      # e-ink(GDEW0154D67=SSD1681、epd-waveshare)表示タスク
         └── bin/
             ├── s3-light.rs     # 段階 2: C6 e5-light の S3 版(dual-transport、LED なし)
             └── airq-sensor.rs  # 段階 3: AirQ 本番 FW(3 EP 空気質センサ + 実センサ)
@@ -91,13 +92,13 @@ cd ports/esp32s3
 cargo build --release --bins
 ```
 
-フラッシュイメージ実測(2026-07-13、残改善バッチ 1 = OCW 搭載後):
+フラッシュイメージ実測(2026-07-13、残改善バッチ 1+2 = OCW + e-ink 搭載後):
 
 | bin | app image |
 |---|---|
 | esp32s3-firmware(スモーク) | 104,928 B |
-| s3-light | 912,016 B |
-| airq-sensor | 959,408 B |
+| s3-light | 912,016 B(OCW 搭載後。e-ink なし) |
+| airq-sensor | 981,184 B(OCW + e-ink 表示) |
 
 **RAM 配分の注意(S3 固有、実機で顕在化)**: S3 の DRAM リンカ領域は約 340KiB
 (C6 より狭い)で、main スタック(`.stack`)は「.data/.bss の残り」になる。
@@ -137,4 +138,8 @@ cat <PORT>
   + RTC8563 が同居。
 - SEN55 電源: **GPIO10 = LOW で ON**(ロードスイッチ)。ON 後 **1 秒待ち**必須。
 - 電源保持: **GPIO46 = HIGH 固定**(バッテリー動作時の電源維持。起動直後に設定)。
-- e-ink / ボタン / ブザー / RTC / バッテリー運用は初期スコープ外(§6)。
+- e-ink: GDEW0154D67(**SSD1681 系**、200x200)。SPI 10MHz mode0、
+  BUSY=1(HIGH=busy)/ RST=2 / DC=3 / CS=4 / SCK=5 / MOSI=6。
+  ドライバは epd-waveshare 0.6 `epd1in54_v2`(選定根拠と更新戦略 =
+  airq-port.md §7.5)。30 秒毎クイック更新 + 10 分毎フル更新。
+- ボタン / ブザー / RTC / バッテリー運用はスコープ外(§6)。

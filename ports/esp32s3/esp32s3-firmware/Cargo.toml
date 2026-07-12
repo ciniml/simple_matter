@@ -89,7 +89,19 @@ sen5x-rs = "0.4.0"
 # libscd: SCD40(0x62)。sync API + scd4x feature(SCD40/41 共通コマンドのみ)。
 libscd = { version = "0.5.1", features = ["sync", "scd4x"] }
 # 1 本の I2C バス(SDA=11/SCL=12)を 2 ドライバへ分配する RefCellDevice。
+# SPI 側では ExclusiveDevice(CS + delay 付き SpiDevice 化)を e-ink に使う。
 embedded-hal-bus = "0.3"
+
+# --- e-ink ディスプレイ(GDEW0154D67 = SSD1681 系 1.54" 200x200。airq-port.md §7.5)---
+# epd1in54_v2 モジュールが同一パネル(GDEH0154D67)向け。embedded-hal 1.0 / no_std。
+# epd2in13_v3 は未使用だが必須(crate が 2in13 モジュールを無条件コンパイルし
+# variant feature の選択を強制するため。dead-code はリンカが落とす)。
+epd-waveshare = { version = "0.6.0", default-features = false, features = [
+    "graphics",
+    "epd2in13_v3",
+] }
+# 表示描画(テキスト)。epd-waveshare の Display1in54 が DrawTarget を実装する。
+embedded-graphics = "0.8"
 
 # --- Wi-Fi 実 join + UDP/mDNS(embassy-net)---
 embassy-net = { version = "0.9", default-features = false, features = [

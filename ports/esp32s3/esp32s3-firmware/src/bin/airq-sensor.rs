@@ -45,17 +45,19 @@ use esp_backtrace as _;
 use core::cell::RefCell;
 
 use embassy_executor::Spawner;
-use embassy_futures::join::{join, join5};
+use embassy_futures::join::{join3, join5};
 use embassy_futures::select::{select4, Either4};
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::StackResources;
 use embassy_time::{Instant, Timer};
 
 use esp_hal::clock::CpuClock;
-use esp_hal::gpio::{Level, Output, OutputConfig};
+use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::rng::{Trng, TrngSource};
+use esp_hal::spi::master::{Config as SpiConfig, Spi};
+use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println::println;
 
@@ -94,6 +96,7 @@ use simple_matter::transport::net::{
 use simple_matter::wifi::WifiDriver;
 
 use esp32s3_firmware::ble::{gatt_worker, BtpGattServer, GattChannels, TroubleGattPeripheral};
+use esp32s3_firmware::display::{self, display_task};
 use esp32s3_firmware::kvs::EspKvs;
 use esp32s3_firmware::net::{peer_v4, peer_v6, v4_as_mapped, EspUdp};
 use esp32s3_firmware::sensors::{self, sensor_task, SensorSnapshot};
@@ -311,6 +314,8 @@ impl AirQualityDevice<'_> {
         .unwrap_or(AirQualityEnum::Unknown);
         let prev = self.air_quality.air_quality();
         self.air_quality.set_air_quality(aq);
+        // e-ink 表示タスクへ総合評価を共有する(クラスタ本体は pump が所有するため)。
+        display::set_air_quality_level(aq as u8);
         if prev != aq {
             println!(
                 "[airq] AirQuality {:?} -> {:?} (co2={:?}ppm pm2.5={:?}ug/m3 voc={:?} nox={:?})",
@@ -1117,6 +1122,24 @@ async fn main(_spawner: Spawner) {
         .with_scl(peripherals.GPIO12);
     println!("[i2c] SDA=GPIO11 SCL=GPIO12 100kHz (SEN55=0x69, SCD40=0x62)");
 
+    // --- e-ink SPI(GDEW0154D67 = SSD1681 系。BUSY=1 RST=2 DC=3 CS=4 SCK=5 MOSI=6)---
+    // 旧 FW は 40MHz だが SSD1681 定格に収まる 10MHz(mode 0)で駆動(display.rs)。
+    let epd_spi = Spi::new(
+        peripherals.SPI2,
+        SpiConfig::default().with_frequency(Rate::from_mhz(10)),
+    )
+    .expect("SPI init")
+    .with_sck(peripherals.GPIO5)
+    .with_mosi(peripherals.GPIO6);
+    let epd_cs = Output::new(peripherals.GPIO4, Level::High, OutputConfig::default());
+    let epd_dc = Output::new(peripherals.GPIO3, Level::High, OutputConfig::default());
+    let epd_rst = Output::new(peripherals.GPIO2, Level::High, OutputConfig::default());
+    let epd_busy = Input::new(
+        peripherals.GPIO1,
+        InputConfig::default().with_pull(Pull::Up),
+    );
+    println!("[epd] SPI2 10MHz (BUSY=1 RST=2 DC=3 CS=4 SCK=5 MOSI=6)");
+
     // --- Wi-Fi station(esp-radio、BLE と coex)+ embassy-net(DHCPv4)---
     let (wifi_controller, wifi_interfaces) = esp_radio::wifi::new(
         peripherals.WIFI,
@@ -1284,8 +1307,8 @@ async fn main(_spawner: Spawner) {
     );
 
     // TrouBLE host runner / GATT worker / Wi-Fi task / embassy-net runner / pump /
-    // センサタスクを単一 executor 上で並走させる。
-    join(
+    // センサタスク / e-ink 表示タスクを単一 executor 上で並走させる。
+    join3(
         join5(
             async {
                 // runner は HCI イベントループ。落ちたら BLE 全体が止まるので panic で知らせる。
@@ -1308,6 +1331,7 @@ async fn main(_spawner: Spawner) {
             ),
         ),
         sensor_task(i2c, sen55_power),
+        display_task(epd_spi, epd_cs, epd_busy, epd_dc, epd_rst),
     )
     .await;
     unreachable!();

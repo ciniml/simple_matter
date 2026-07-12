@@ -18,6 +18,7 @@
 #![no_std]
 
 pub mod ble;
+pub mod display;
 pub mod kvs;
 pub mod net;
 pub mod sensors;

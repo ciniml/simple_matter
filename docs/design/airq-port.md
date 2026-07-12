@@ -346,7 +346,7 @@ sensor-hub と同じ「1 計測ドメイン = 1 EP」の分離構成を採る。
 
 | 項目 | 初期スコープ | 将来 |
 |---|---|---|
-| e-ink 表示 | **外す**。Matter ノードとしては不要。デバッグはシリアルログ | `ssd1681`/`epd-waveshare` 系 crate で計測値表示(D2 フェーズ)。embedded-graphics ベースなので no_std 整合は良い |
+| e-ink 表示 | ~~外す~~ → **計測値の定期表示を実装済み(2026-07-13、§7.5)**。epd-waveshare 0.6 epd1in54_v2 + embedded-graphics | コミッショニング QR 表示、バッテリー運用時の deep sleep |
 | 電源保持 | GPIO46 HIGH 固定(起動直後)+ USB 給電前提 | — |
 | バッテリー運用 / スリープ | **外す**。SEN55 はファン駆動で連続計測前提のため、スリープ設計は計測戦略ごと変える必要がある(間欠計測 + RTC wake) | Matter **ICD**(SIT/LIT)はコア未実装(project-status 残課題)。ICD 実装後に「RTC8563 timer wake + 間欠計測 + LIT」を別トラックで設計 |
 | ボタン/ブザー | 外す(factory reset は既存の手段で) | ボタン A 長押し = factory reset、ブザー = Identify 応答など |
@@ -365,7 +365,7 @@ sensor-hub と同じ「1 計測ドメイン = 1 EP」の分離構成を採る。
 | **A3: センサドライバ統合(C6)** | `sen5x-rs`/`scd4x`(async)を embassy タスクに統合、SCD4x 初期化シーケンス移植(§1.3)、AirQualityEnum 算出ロジック、`airq-c6` bin(e5-light ベース) | シリアルで実測値ログ(既存 FW と同一個体センサの値比較)| **M** |
 | **A4: C6 実機 E2E** | chip-tool `pairing ble-wifi` → 全属性 read / subscribe(30s/10s 周期更新の配信)、リブート後 CASE 再確立(E4 資産) | chip-tool + smctl のフル E2E、フットプリント実測を README に記録 | **S〜M** |
 | **A5: ESP32-S3(AirQ 実機)ポート** | espup 導入、`ports/esp32s3` workspace(rust-toolchain 分離)、E1 相当スモーク(boot/TRNG)→ E2-E5 相当の再検証(S3 radio/coex)→ airq bin 移植 + GPIO10 電源制御 + GPIO46 HOLD | AirQ 実機で chip-tool フル E2E | **✅ 完了(2026-07-12、AirQ 実機で §7.3 全項目 green。S3 固有のスタック逼迫バグ 1 件を発見・修正 = §7.3 実機検証記録)** |
-| **A6(任意): 表示・UX** | e-ink 表示(計測値 + コミッショニング QR)、ボタン/ブザー | 目視 | M |
+| **A6(任意): 表示・UX** | e-ink 表示(計測値 + コミッショニング QR)、ボタン/ブザー | 目視 | **計測値表示は ✅ 完了(2026-07-13、§7.5 = 残改善バッチ 2)**。QR/ボタン/ブザーは未着手 |
 | (別トラック) | ICD/バッテリー運用 | — | コアの ICD 実装後 |
 
 A1 と A2 は並行可能。総工数感: **A1-A4 で L 相当**(C6 ベース完成まで)、
@@ -610,6 +610,64 @@ onoff E2E。
 riscv/thumbv6m/no-default-features check green、S3 3 bin + C6 ビルド green。
 フットプリント: airq-sensor 959,408 B(前回 953,168 B から +6.2KB =
 AdminCommissioning + 窓配線 + mDNS commissionable)。
+
+## 7.5 残改善バッチ 2(2026-07-13): e-ink ディスプレイ
+
+### 7.5.1 パネル調査とドライバ選定
+
+- **コントローラ判定: SSD1681 系で確定**。パネル名 GDEW0154D67 は UC8151 系を
+  示唆するが、旧 FW の LGFX `Panel_GDEW0154D67`(m5stack_matter_examples 内の
+  M5GFX コピー)の初期化列は完全に SSD1681: `0x12` SWReset / `0x01` Driver
+  Output(200 gate)/ `0x11` Data Entry / `0x3C` Border / `0x18` 内蔵温度センサ /
+  `0x0C` Booster / `0x24` RAM write / `0x22`+`0x20` update。UC8151 系の
+  0x00 PSR / 0x04 PON は登場しない。LGFX は OTP 内蔵 LUT + Display Mode 1(フル)
+  / Mode 2(差分)を使い、リフレッシュ所要目安 256ms(Mode 2)。BUSY は
+  **HIGH=busy**。専用電源レールなし(FW が制御する電源 GPIO は SEN55 の 10 のみ)。
+- **採用 crate: `epd-waveshare` 0.6.0 の `epd1in54_v2`**。同モジュールは
+  **GDEH0154D67(同一 D67 パネル)向け**と明記。embedded-hal 1.0 / no_std /
+  embedded-graphics 0.8 `DrawTarget`(`Display1in54`、5000B 静的バッファ)/
+  `RefreshLut::Full/Quick`。esp-hal `Spi<Blocking>`(SpiBus)を embedded-hal-bus
+  `ExclusiveDevice` で SpiDevice 化する接着のみで適合した。
+  - 代替比較: `weact-studio-epd`(1.54" 非対応)、`ssd1681` crate(partial
+    update 非対応)、`uc8151`(コントローラ違い)。
+  - LGFX との方式差: epd-waveshare は OTP でなく **159B のカスタム LUT を 0x32 で
+    書く**方式(同一パネルの Waveshare 1.54 V2 実績波形)。booster 調整
+    (0x0C 8B 9C 96 0F)は入らないが実機で問題なし。
+  - crate の feature 罠: `default-features = false` でも `epd2in13_v2/v3` の
+    どちらかが必須(2in13 モジュールが無条件コンパイルされるため。未使用 =
+    dead-code はリンカが落とす)。
+- 配線は §1.3 のとおり BUSY=1 / RST=2 / DC=3 / CS=4 / SCK=5 / MOSI=6。
+  SPI は旧 FW の 40MHz に対し **10MHz(mode 0)** に落とした(SSD1681 定格内の
+  安全側。実測で十分)。
+
+### 7.5.2 表示内容と更新戦略(実装 = esp32s3-firmware/src/display.rs)
+
+- 表示: ヘッダ + **AirQuality(総合評価ラベル)/ CO2 ppm / PM2.5 µg/m³ /
+  温度(補正後)/ 湿度** + 更新カウンタ(FONT_10X20 / 6X10)。AirQuality は
+  pump → `display::set_air_quality_level`(AtomicU8)で共有、他は
+  `sensors::snapshot()` から。
+- 更新周期 **30 秒**(旧 FW と同じ)。通常はクイック更新(フリッカーなし)、
+  **20 回に 1 回(10 分毎)フル更新**でゴーストをリセット(旧 FW はフル更新なし
+  = ゴースト対策なしだった改善点)。値が変わらない周期はパネルを触らない。
+- blocking ドライバの executor 停止対策: リフレッシュ起動(`display_frame`)は
+  完了を待たずに戻るため、**次にパネルへ触るまで 4 秒 await** して
+  `wait_until_idle` の実ブロックをほぼゼロにする(唯一の例外 = 起動時の
+  init + 全面クリアの数秒、Matter トラフィック開始前)。
+- 電源: 常時給電前提で deep sleep(0x10)は使わない(将来のバッテリー運用時に
+  ICD と合わせて設計)。
+
+### 7.5.3 実機 E2E 記録
+
+- `[epd] initialized (SSD1681 / epd1in54_v2, full clear done)` → update #1(full、
+  センサ未確定で "---" 表示)→ 30 秒毎の quick 更新で実測値
+  (例: `update #7 (quick) aq=Fair co2=831 pm2.5(x10)=71 T(x10)=304 RH(x10)=389`)。
+- 表示更新と並行して chip-tool read(fabric 1)/ smctl read + subscribe
+  (fabric 2、keep-alive レポート +30s/+60s 受信)が無停滞で動作 — 4 秒 settle
+  戦略で MRP/購読への影響なし。heap_max 91,908B / 114,688B(マージン維持)。
+  .stack は 65,284B(フレームバッファ 5KB が main future に載った分減、余裕あり)。
+- 表示内容の目視確認はユーザに依頼(ログの update #N の値と画面表示の一致)。
+- フットプリント: airq-sensor 981,184B(バッチ 1 の 959,408B から +21.8KB =
+  epd-waveshare + embedded-graphics + フォント)。
 
 ## 8. 参考(調査ソース)
 
