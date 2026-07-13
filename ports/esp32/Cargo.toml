@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["esp32c6-firmware"]
+members = ["esp32c6-firmware", "esp32c6-thread"]
+# esp32c6-thread(T1 Thread スモーク)は default-members から外す。
+# esp-radio 0.18 は `ieee802154`(esp32c6-thread)と `wifi`(esp32c6-firmware)の
+# 同時有効化を build.rs で拒否するため、両パッケージを 1 回の cargo 呼び出しで
+# ビルドすると feature 統一で panic する。`cargo build --release` は従来どおり
+# esp32c6-firmware のみ、Thread 側は `cargo build -p esp32c6-thread --release`
+# (docs/design/thread-port.md §T1)。`cargo build --workspace` は使わないこと。
+default-members = ["esp32c6-firmware"]
 
 # esp 系依存(esp-hal / esp-println / esp-backtrace)はビルドターゲットが
 # riscv32imac-unknown-none-elf 固定で、ホスト側 workspace(ルート)の依存解決や

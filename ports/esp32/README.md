@@ -29,20 +29,25 @@ BLE フルコミッショニング)/ E4(fabric 永続化 = リブート後の CA
 
 ```
 ports/esp32/
-├── Cargo.toml              # 別 workspace(members = ["esp32c6-firmware"])
+├── Cargo.toml              # 別 workspace(default-members = ["esp32c6-firmware"])
 ├── rust-toolchain.toml     # stable + riscv32imac ターゲット
 ├── .cargo/config.toml      # ターゲット既定・linkall.x・force-frame-pointers・espflash runner
-└── esp32c6-firmware/       # lib + 複数 bin
-    └── src/
-        ├── main.rs         # default bin(E1 骨格ファームウェア)
-        ├── lib.rs          # 共有部(EspRng)
-        ├── ble.rs          # GattPeripheral の TrouBLE 実装 + GATT worker(E2)
-        ├── kvs.rs          # Kvs trait の esp-storage + sequential-storage 実装(E4)
-        └── bin/
-            ├── e2-ble.rs       # E2: BLE adv + BTP handshake(スタック無し)
-            ├── e3-ble-light.rs # E3: MatterStack 統合 On/Off ライト(BLE フルコミッショニング)
-            ├── e4-ble-light.rs # E4: e3 + fabric 永続化(リブート後 CASE 再確立)
-            └── hci-smoke.rs    # 生 HCI 広告スモーク(RF 切り分け用)
+├── esp32c6-firmware/       # lib + 複数 bin(Wi-Fi/BLE 系)
+│   └── src/
+│       ├── main.rs         # default bin(E1 骨格ファームウェア)
+│       ├── lib.rs          # 共有部(EspRng)
+│       ├── ble.rs          # GattPeripheral の TrouBLE 実装 + GATT worker(E2)
+│       ├── kvs.rs          # Kvs trait の esp-storage + sequential-storage 実装(E4)
+│       └── bin/
+│           ├── e2-ble.rs       # E2: BLE adv + BTP handshake(スタック無し)
+│           ├── e3-ble-light.rs # E3: MatterStack 統合 On/Off ライト(BLE フルコミッショニング)
+│           ├── e4-ble-light.rs # E4: e3 + fabric 永続化(リブート後 CASE 再確立)
+│           └── hci-smoke.rs    # 生 HCI 広告スモーク(RF 切り分け用)
+└── esp32c6-thread/         # T1: Thread(openthread)系 bin。esp-radio が
+    └── src/main.rs         #   ieee802154×wifi 排他のため別パッケージ
+                            #   (docs/design/thread-port.md §2.3)。ビルドは
+                            #   cargo build -p esp32c6-thread --release
+                            #   (cargo build --workspace は使用不可)
 ```
 
 ## 前提

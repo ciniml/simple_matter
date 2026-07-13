@@ -1,0 +1,90 @@
+[package]
+name = "esp32c6-thread"
+version = "0.1.0"
+edition = "2021"
+license = "BSL-1.0"
+publish = false
+
+# T1: Thread(openthread)検証ファームウェア(docs/design/thread-port.md)。
+#
+# esp32c6-firmware とは **別パッケージ** にする理由: esp-radio 0.18 の build.rs は
+# `ieee802154` と `wifi` の同時有効化を明示的に拒否する(「802.15.4 and Wi-Fi
+# won't work together」で panic)。esp32c6-firmware は E5 で wifi + coex を
+# 有効化しているため、同一パッケージ(= 同一 feature 解決)に Thread bin を
+# 同居させられない。ワークスペースの default-members からも外してあり、
+# ビルドは `cargo build -p esp32c6-thread --release` で行う
+# (`cargo build --workspace` は feature 統一により panic するので不可)。
+#
+# ieee802154 + ble の同時有効化は許可されている(esp-radio build.rs 確認済み)
+# ため、T2 の `pairing ble-thread`(BLE コミッショニング + Thread 運用)は
+# このパッケージ系列で成立する。
+
+[[bin]]
+name = "thread-smoke"
+path = "src/main.rs"
+
+[dependencies]
+esp-hal = { version = "1.1.1", features = ["esp32c6", "unstable"] }
+# log-04: `esp_println::logger`(log crate バックエンド)。openthread クレートの
+# 内部ログ(feature "log")もここに乗る。
+esp-println = { version = "0.17.0", features = ["esp32c6", "log-04"] }
+esp-backtrace = { version = "0.19.0", features = [
+    "esp32c6",
+    "println",
+    "panic-handler",
+] }
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32c6"] }
+
+# IEEE 802.15.4 radio(openthread の下回り)+ BLE(T2 の ble-thread pairing 用。
+# T1 では未使用だが、ieee802154 と ble が同時にビルドできることを先行検証する)。
+# wifi は有効化**不可**(上記コメント参照)。
+esp-radio = { version = "0.18.0", features = [
+    "esp32c6",
+    "ieee802154",
+    "ble",
+    "unstable",
+] }
+# esp-radio が要求する preemptive スケジューラ(esp32c6-firmware と同一構成)。
+esp-rtos = { version = "0.3.0", features = [
+    "esp32c6",
+    "embassy",
+    "esp-radio",
+    "esp-alloc",
+] }
+esp-alloc = "0.10.0"
+
+# --- openthread(esp-rs 公式 Rust バインディング)---
+#
+# 0.2.0(2026-06-25 リリース)。riscv32imac-unknown-none-elf 向けには
+# OpenThread C ライブラリのプリビルト .a + 事前生成 bindgen バインディングが
+# 同梱されるため、ホストに clang/CMake/Ninja が無くても stable rustc だけで
+# ビルドできる(`force-generate-bindings` を立てた場合のみ C ツールチェーンが必要)。
+# default-features(= matter バンドル + mbedtls-rs-sys)は切る。feature 名は
+# 0.2.0 時点のもの(`srp`。git main では srp-client に改名済み。srp ⊃ udp)。
+openthread = { version = "0.2.0", default-features = false, features = [
+    "udp",       # OT ネイティブ UDP ソケット(コアの UdpSend/UdpReceive の下回り)
+    "srp",       # T2: SRP client(運用広告の mDNS 代替)。ビルド検証のため先行有効化
+    "esp-radio", # EspRadio(esp-radio の ieee802154 ドライバの Radio 実装)
+    "isupper",   # OT が呼ぶ isupper() の内蔵実装
+    "log",       # OT プラットフォームログを log crate へ
+    # 0.2.0 のプリビルト libopenthread.a は MbedTLS を同梱せず、外部の
+    # mbedtls-rs-sys クレートの mbedtls_* シンボルにリンクする(無しだと
+    # otPlatCryptoSha256Update 等が undefined symbol)。default feature にも
+    # 入っている構成。git main では bundled MbedTLS に切り替わっている。
+    "mbedtls-rs-sys",
+] }
+# OpenThread C コードが参照する str*/mem* 系 libc シンボルのポリフィル
+# (esp-rs/openthread の esp example と同じ構成)。
+tinyrlibc = { version = "0.5", default-features = false, features = [
+    "utoa",
+    "strtoul",
+] }
+# (openthread の OtRngCore = rand_core 0.9 の RngCore は esp-hal 1.1 の Rng が
+#  実装済みのため、rand_core への直接依存は不要。)
+log = "0.4"
+
+# esp-rtos の executor 統合を使うため arch-* feature は付けない(esp-rtos README)。
+embassy-executor = "0.10.0"
+embassy-time = "0.5.1"
+heapless = "0.9"
+static_cell = "2.1"
