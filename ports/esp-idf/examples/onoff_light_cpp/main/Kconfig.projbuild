@@ -1,0 +1,22 @@
+menu "simple-matter onoff_light example"
+
+    config SM_WIFI_SSID
+        string "WiFi SSID"
+        default "my-ssid"
+        help
+            接続先 WiFi の SSID。ビルドを通すためのプレースホルダ。実機では
+            menuconfig で上書きする。
+
+    config SM_WIFI_PASSWORD
+        string "WiFi password"
+        default "my-password"
+        help
+            WiFi パスフレーズ(WPA2-PSK)。
+
+    config SM_LED_GPIO
+        int "OnOff LED GPIO"
+        default 7
+        help
+            OnOff 状態を反映する LED の GPIO 番号。既定は M5 NanoC6 の GPIO7。
+
+endmenu

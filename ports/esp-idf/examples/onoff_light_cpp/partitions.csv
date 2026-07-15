@@ -1,0 +1,7 @@
+# onoff_light_cpp のパーティションテーブル(ESP32-C6、4MB flash 想定)。
+# 既定 1MB の factory では simple-matter staticlib + WiFi/mbedTLS を含む
+# アプリ(~1.1MB)が収まらないため app を 1.875MB に拡張する。
+# Name,   Type, SubType, Offset,   Size,    Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+factory,  app,  factory, 0x10000,  0x1E0000,

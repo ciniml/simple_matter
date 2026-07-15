@@ -1,0 +1,22 @@
+# ESP32-C6 向け既定設定(onoff_light_cpp)。
+CONFIG_IDF_TARGET="esp32c6"
+
+# カスタムパーティション: 既定 1MB では app が収まらないため拡張(partitions.csv)。
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# メインタスクは軽い(pump は別タスク)。
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
+
+# lwIP: IPv6 + マルチキャスト(mDNS の v4 IGMP / v6 MLD join)を有効化。
+# 注: IPv4 IGMP は ESP-IDF lwIP で常時有効(専用 Kconfig 無し)。
+CONFIG_LWIP_IPV6=y
+CONFIG_LWIP_IPV6_AUTOCONFIG=y
+# SO_REUSEADDR / SO_REUSEPORT を使う。
+CONFIG_LWIP_SO_REUSE=y
+# select() を使うのでソケット数に余裕を持たせる。
+CONFIG_LWIP_MAX_SOCKETS=10
+
+# C++: 例外・RTTI は不要(コード量/バイナリ削減)。C++17 は IDF v5.4 既定。
+CONFIG_COMPILER_CXX_EXCEPTIONS=n
+CONFIG_COMPILER_CXX_RTTI=n

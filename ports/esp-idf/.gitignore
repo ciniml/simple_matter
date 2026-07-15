@@ -1,0 +1,10 @@
+# ESP-IDF のビルド生成物(idf.py build / set-target が作る)。
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+
+# エディタ/IDE 補助
+.vscode/
+compile_commands.json

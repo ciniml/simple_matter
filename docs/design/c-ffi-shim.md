@@ -171,3 +171,47 @@ F1 のホスト E2E が本設計の核心ゲート: **C++ から見た API の�
   C 関数ポインタへ委譲する汎用クラスタ。TLV は「型付きスカラの get/set ヘルパ」を
   シムが提供し、C++ 側に TLV エンコーダを書かせない。
 - Thread 版は ThreadDriver trait 確定(thread-port.md T2)後に同型の給餌 API を追加。
+
+## 7. 完了記録
+
+### F1(完了、コミット d574ff9)
+
+シム crate(`crates/simple-matter-cffi` = staticlib + rlib)+ cbindgen ヘッダ
+`include/simple_matter.h` + C++17 RAII ラッパ `include/sm_wrapper.hpp` + ホスト
+C++17 テストデバイス(`ctest/onoff_light.cpp`)。ホスト E2E(smctl `pairing
+onnetwork` → toggle → read → プロセス再起動後 resumption)green、riscv32imac
+`--features panic-abort` ビルド green、ヘッダ生成差分ゼロ。
+
+### F2(完了)
+
+ESP-IDF コンポーネント + onoff_light_cpp example(ESP32-C6 向け)。
+
+追加物:
+- `ports/esp-idf/components/simple_matter/`:
+  - `CMakeLists.txt` — 2 経路のリンク。(a) `SM_PREBUILT_A` でビルド済み .a を
+    受ける(Rust ツールチェーン不要)、(b) 未指定なら custom command で
+    `cargo build -p simple-matter-cffi --release --target <triple>
+    --features panic-abort` を叩く。`add_prebuilt_library` + `INCLUDE_DIRS` で
+    ヘッダ 2 枚を公開。IDF_TARGET → Rust ターゲット対応付け(esp32c6/c3 =
+    `riscv32imac-unknown-none-elf`、非対応は `FATAL_ERROR`。S3/Xtensa は F4)。
+  - `sm_component_stub.c` — COMPONENT_LIB を STATIC library 化する空 TU
+    (経路 (b) の cargo 実行順序を `add_dependencies` で強制するため)。
+  - `README.md` — 組み込み手順(components 追加・`SM_PREBUILT_A` の渡し方・
+    経路 (b) の前提)。
+- `ports/esp-idf/examples/onoff_light_cpp/`(C++17、C6): §3 の 5 項目
+  (esp_wifi 接続 → `sm_set_addrs`、UDP 5540 dual-stack + 5353 v4/v6 join、
+  単一タスクのポンプループ、NVS を `kvs_*` へ配線 namespace `smatter`、
+  `esp_timer` 時刻、LED GPIO7=NanoC6)。RNG は `esp_fill_random`。
+  `partitions.csv`(app 1.875MB、既定 1MB では収まらないため)、`sdkconfig.defaults`
+  (C6、IPv6 有効)、`Kconfig.projbuild`(WiFi SSID/PASS・LED GPIO)。
+- `ports/esp-idf/.gitignore`(build/・sdkconfig・managed_components 除外)。
+
+ゲート(実測、`espressif/idf:release-v5.4` docker):
+- ホスト .a ビルド green(`libsimple_matter_cffi.a` 12.9MB)。
+- `idf.py set-target esp32c6 && idf.py build` を `SM_PREBUILT_A` 経路で完走。
+  `Project build complete`、app バイナリ 1,107,616 B(partition 44% free)。
+- 最終 ELF に sm_init/sm_udp_rx/sm_poll ほか全 11 シンボルが `T` で存在(nm 確認)。
+  C++17(`sm_wrapper.hpp` include)コンパイル通過。
+- コア(`crates/simple-matter`)・シム(`crates/simple-matter-cffi`)への変更ゼロ。
+
+実機 flash はユーザの機材・ポート確認後(F2 のゲートはビルドまで)。
