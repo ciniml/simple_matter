@@ -18,6 +18,8 @@ crate-type = ["staticlib", "rlib"]
 simple-matter = { path = "../simple-matter", default-features = false, features = [
     "rustcrypto",
 ] }
+# カスタムクラスタの実行時メタ(attr/cmd 表)を固定容量で保持する(no-alloc)。
+heapless = { version = "0.8", default-features = false }
 
 [features]
 default = []

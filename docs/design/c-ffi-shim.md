@@ -149,7 +149,9 @@ C からも使える。
 | **F1** | シム crate + cbindgen ヘッダ + **ホスト C++17 テストデバイス**(POSIX ソケットで onoff-light 相当を C++ から駆動) | ホストで smctl `pairing onnetwork` → toggle → read → リブート(プロセス再起動)後 resumption E2E。コアテスト回帰なし、clippy 0、riscv32imac ビルド green、ヘッダ生成差分ゼロ |
 | **F2** | ESP-IDF コンポーネント + onoff_light_cpp example(C6 向け) | esp-idf docker(ot_rcp ビルドで使用済みの環境)で `idf.py build` green。**実機 flash はユーザの機材・ポート確認後** |
 | **F3**(後続) | BLE 給餌 API(`sm_ble_event`、NimBLE 接続)= `pairing ble-wifi` 対応 | C6 実機 |
-| **F4**(後続) | カスタムクラスタ C vtable(read/write/invoke ハンドラ登録)、S3/Xtensa .a、Zephyr 消費(RW612 doc §4 と合流) | — |
+| **F4a** | S3/Xtensa 向け .a(esp チャネル + build-std)+ コンポーネントの esp32s3 対応 | esp32s3 の `idf.py build` green(docker、SM_PREBUILT_A 経路) |
+| **F4b** | カスタムクラスタ C vtable(§8。read/write/invoke ハンドラ登録 + dirty 通知) | ホスト ctest E2E(カスタムクラスタを smctl の any read/write/invoke + subscribe で検証) |
+| **F5**(後続) | Zephyr 消費(RW612 doc §4 と合流) | 機材(FRDM-RW612)待ち |
 
 F1 のホスト E2E が本設計の核心ゲート: **C++ から見た API の妥当性をハードウェア無しで
 フル検証できる**(smctl も同一リポジトリ内)。
@@ -167,10 +169,100 @@ F1 のホスト E2E が本設計の核心ゲート: **C++ から見た API の�
 
 - `sm_ble_event(const sm_ble_event_t*, ...)` + C1/C2 給餌(F3)。BTP はコア実装済みなので
   シムの追加面は薄い。
-- `sm_cluster_register(const sm_cluster_vtable_t*)`(F4): read/write/invoke を
+- `sm_cluster_register(const sm_cluster_def_t*)`(F4b、§8): read/write/invoke を
   C 関数ポインタへ委譲する汎用クラスタ。TLV は「型付きスカラの get/set ヘルパ」を
   シムが提供し、C++ 側に TLV エンコーダを書かせない。
+
+## 8. カスタムクラスタ C vtable(F4b 設計)
+
+目的: C++ アプリが自前のエンドポイント/クラスタを追加できるようにする
+(v1 プリセットの EP1 OnOff の隣に、既存 C++ 資産のドメインロジックを載せる)。
+
+### 8.1 C API
+
+```c
+typedef enum { SM_T_BOOL, SM_T_U8, SM_T_U16, SM_T_U32, SM_T_U64,
+               SM_T_I8, SM_T_I16, SM_T_I32, SM_T_I64, SM_T_F32,
+               SM_T_STRING, SM_T_OCTETS } sm_attr_type_t;
+
+typedef struct {            /* スカラ + 短いバイト列の tagged union */
+  sm_attr_type_t type;
+  bool is_null;             /* NULLABLE 属性のみ有効 */
+  union { bool b; uint64_t u; int64_t i; float f;
+          struct { uint8_t buf[64]; uint8_t len; } bytes; } v;
+} sm_attr_value_t;
+
+#define SM_ATTR_WRITABLE  (1u << 0)
+#define SM_ATTR_NULLABLE  (1u << 1)
+#define SM_ATTR_TIMED     (1u << 2)   /* timed write 必須 */
+#define SM_CMD_TIMED      (1u << 0)
+
+typedef struct { uint32_t attr_id; sm_attr_type_t type; uint32_t flags; } sm_attr_def_t;
+typedef struct { uint32_t cmd_id; uint32_t flags; } sm_cmd_def_t;
+
+typedef struct {
+  uint16_t endpoint;        /* 新規 EP(2..)またはプリセット EP1 への追加 */
+  uint32_t cluster_id;      /* vendor 領域 or 標準 ID */
+  uint16_t revision;
+  uint32_t feature_map;
+  const sm_attr_def_t *attrs;  size_t n_attrs;
+  const sm_cmd_def_t  *cmds;   size_t n_cmds;
+  /* 戻り値は IM ステータス(0=Success、0x87=ConstraintError 等の下位バイト) */
+  uint8_t (*read)  (void *ctx, uint32_t attr_id, sm_attr_value_t *out);
+  uint8_t (*write) (void *ctx, uint32_t attr_id, const sm_attr_value_t *val);
+  uint8_t (*invoke)(void *ctx, uint32_t cmd_id,
+                    const sm_attr_value_t *args, size_t n_args, uint64_t now_ms);
+  void *ctx;
+} sm_cluster_def_t;
+
+/* sm_init より前に呼ぶ(以降は SM_ERR)。def/attrs/cmds は呼び出し側が静的に保持 */
+int  sm_cluster_register(const sm_cluster_def_t *def);
+int  sm_endpoint_register(uint16_t endpoint, uint32_t device_type, uint8_t dt_revision);
+/* 値変化を購読レポートへ(C++ 側の値が変わったら呼ぶ) */
+void sm_attr_mark_dirty(uint16_t endpoint, uint32_t cluster_id, uint32_t attr_id);
+```
+
+### 8.2 設計判断
+
+- **値の所有は C++ 側**。read は毎回コールバック(単線アクセスなので安全)。シムは
+  キャッシュしない。dirty 追跡だけ `sm_attr_mark_dirty` で IM へ橋渡し
+  (subscribe レポートの契機)。
+- **invoke の引数はスカラ列に平坦化**(TLV context tag 0..N-1 を宣言順で
+  `sm_attr_value_t` にデコードして渡す)。応答はステータスのみ(v1)。
+  応答ペイロード・構造体引数・イベント post は将来(§6 に残す)。
+- **Rust 側は `CustomCluster`(ServerCluster trait の手書き実装)1 型**: 実行時メタ
+  (attr/cmd 表)を heapless 固定容量で保持し、read/write/invoke を vtable へ委譲。
+  `cluster!` マクロは使わない(静的メタ前提のため)。GlobalAttributes
+  (ClusterRevision/FeatureMap/AttributeList/AcceptedCommandList)はシムが合成。
+- **容量固定**: 追加エンドポイント最大 4、カスタムクラスタ最大 8、クラスタあたり
+  属性 16・コマンド 8(超過は SM_ERR)。Descriptor(PartsList/ServerList/DeviceTypeList)
+  はプリセット分と合成して自動生成。
+- 権限は既定(read=View、write/invoke=Operate、SM_ATTR_TIMED/SM_CMD_TIMED で
+  timed 必須)。Administer 指定は将来フラグ。
+- 文字列/オクテット列は 64B 上限(`sm_attr_value_t` 内固定バッファ。長大データは
+  スコープ外と明記)。
 - Thread 版は ThreadDriver trait 確定(thread-port.md T2)後に同型の給餌 API を追加。
+
+### 8.3 実装で確定した差分(F4b)
+
+設計 §8.1/§8.2 に対し、実装で以下を確定した(§8 本文は上記のまま、差分をここに集約):
+
+- **union は cbindgen が名前付き型 `sm_attr_value_data` として出力**する(匿名インライン
+  union にはならない)。C からの値アクセスは設計どおり `val.v.u` / `val.v.b` /
+  `val.v.i` / `val.v.f` / `val.v.bytes`。`bytes` は名前付き型 `sm_attr_bytes`
+  (`{ uint8_t buf[64]; uint8_t len; }`)。`sm_attr_value_t.type` は Rust の
+  `r#type` から `type` として出力される(設計どおり)。
+- **登録の戻り値**(`sm_cluster_register`/`sm_endpoint_register`): `0`=OK、`-1`=NULL、
+  `-2`=sm_init 済み(SM_ERR)、`-3`=不正 or 属性/コマンド上限超過、`-4`=クラスタ/EP 数上限、
+  `-5`=プリセット EP(0/1)への `sm_endpoint_register`(予約)。
+- **カスタム属性は既定で subscribe 可**(`subscribable=true`)。IM 経由の write 成功でも
+  自動 dirty にする(C からの `sm_attr_mark_dirty` と併せて購読へ反映)。
+- **Descriptor 合成**: sm_init 時に「プリセット EP0/EP1 + カスタム EP」をマージし、各 EP の
+  ServerList・DeviceTypeList・EP0 の PartsList を再構成する(新規 EP には 0x001D を自動付与)。
+- 権限は設計どおり read=View / write・invoke=Operate。`SM_ATTR_TIMED`/`SM_CMD_TIMED` の
+  timed 強制は既存 IM エンジン(メタの `timed` フラグ)がそのまま担う。
+- smctl に **`any subscribe <node> <ep> <cluster-id> <attr-id> <min> <max>`** を追加
+  (テーブル未収載のカスタムクラスタを ID 直指定で購読する escape hatch。テスト用ツール)。
 
 ## 7. 完了記録
 
@@ -215,3 +307,59 @@ ESP-IDF コンポーネント + onoff_light_cpp example(ESP32-C6 向け)。
 - コア(`crates/simple-matter`)・シム(`crates/simple-matter-cffi`)への変更ゼロ。
 
 実機 flash はユーザの機材・ポート確認後(F2 のゲートはビルドまで)。
+
+### F4a(完了)
+
+S3/Xtensa 向け staticlib + コンポーネントの esp32s3 対応。
+
+- **xtensa staticlib ビルド**: ルート workspace から
+  `cargo +esp build -p simple-matter-cffi --release --target xtensa-esp32s3-none-elf
+  -Zbuild-std=core --features panic-abort` で完走(espup 環境。ラッパ不要 — ルートに
+  rust-toolchain.toml が無く default stable のため `+esp` 上書きが効く。`-Zbuild-std=core`
+  と `--target` はコマンドラインで渡す)。`libsimple_matter_cffi.a` 8.4MB。
+- **コンポーネント**: `CMakeLists.txt` の IDF_TARGET 対応表に
+  `esp32s3 = xtensa-esp32s3-none-elf` を追加。S3 は esp channel + build-std が要るため
+  経路 (b)(cargo 自動ビルド)は不可 → **経路 (a) `SM_PREBUILT_A` のみサポート**
+  (S3 で (b) を選ぶと明示的 `FATAL_ERROR`)。README にビルド手順を追記。
+- **example**: LED GPIO を Kconfig 化済み(既定 C6=GPIO7、`IDF_TARGET_ESP32S3` は GPIO48)。
+  `sdkconfig.defaults` から `CONFIG_IDF_TARGET` を外しターゲット非依存化(set-target で選ぶ)。
+  onoff_light_cpp にオンデバイスのカスタムクラスタ登録(EP2)も追加(F4b をハードウェア
+  経路でも実演し、新シンボルを ELF に残す)。
+
+ゲート(実測、`espressif/idf:release-v5.4` docker、`SM_PREBUILT_A` 経路):
+- **esp32s3 `idf.py build` green**: `Project build complete`、app バイナリ 1,018,432 B
+  (partition 48% free)。ELF に sm_init/sm_udp_rx/sm_poll + 新規
+  sm_cluster_register/sm_endpoint_register/sm_attr_mark_dirty が `T` で存在(nm 確認)。
+- **esp32c6 `idf.py build` 回帰なし**(riscv .a、同 docker)。
+- docker 終了時にコンテナ内で `build/`・`sdkconfig` を rm(root 所有残骸なし)。
+
+### F4b(完了)
+
+カスタムクラスタ C vtable(§8)。
+
+追加物:
+- `crates/simple-matter-cffi/src/custom.rs`: C ABI 型(`sm_attr_type_t`/`sm_attr_value_t`/
+  `sm_attr_def_t`/`sm_cmd_def_t`/`sm_cluster_def_t`)+ `CustomCluster`(`ServerCluster` の
+  手書き実装、heapless 固定容量 §8.2)+ 登録ステージング `PendingRegistry`。
+- `src/lib.rs`: `sm_cluster_register`/`sm_endpoint_register`/`sm_attr_mark_dirty` の 3 関数、
+  `Light` にカスタムクラスタ/合成 Descriptor/マージ EndpointMeta を保持し
+  `install_custom` で sm_init 時に合成。`heapless` 依存を追加。
+- ヘッダ再生成(冪等)。`ctest/onoff_light.cpp` を拡張(EP2 にカスタムクラスタ登録:
+  U16 rw / BOOL ro / STRING ro / nullable i16 ro / U16 ro(周期 mark_dirty)、コマンド
+  引数 2 個)。smctl に `any subscribe`(ID 直指定)を追加。
+
+ゲート(実測):
+- Rust 単体テスト 7 本追加(read/write/invoke ディスパッチ、全型 read、nullable、
+  型不一致 ConstraintError、幅超過、meta 合成 + timed フラグ、from_def 容量拒否)。
+  `cargo test --workspace` = 595 pass(588 + 新規 7、回帰なし)。clippy 0。
+- **ホスト E2E green**(ctest ↔ smctl、`--state-dir` 分離、127.0.0.1):
+  - pairing onnetwork → COMPLETE。
+  - any read(EP2): u16=100 / bool=false / str="custom-label" / i16=-42(全型一致)。
+  - any write u16=4242 → C コールバック到達 → read 反映。
+  - any invoke cmd 0x0000(u8:1, u16:1234)→ invoke ハンドラ実行 → writable=1234 / flag=true。
+  - any subscribe(0x0004)→ 周期更新レポート 4→5→6→7(mark_dirty 経由)。
+  - descriptor: EP0 PartsList=[1,2]、EP2 ServerList=[0x001D, 0xFFF1FC01]、
+    EP2 DeviceTypeList=[{0:0xFFF10055, 1:1}]。
+
+コア(`crates/simple-matter`)への変更ゼロ(`ServerCluster` の pub 契約のみで実装。
+ClusterMeta の `&'static` は CustomCluster がシム static 内で自己参照を確定して満たす)。

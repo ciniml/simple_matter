@@ -17,14 +17,21 @@ set(SM_CRATE_DIR "${SM_REPO_ROOT}/crates/simple-matter-cffi")
 set(SM_INCLUDE_DIR "${SM_CRATE_DIR}/include")
 
 # IDF_TARGET から Rust ターゲットトリプルを対応付ける。
-# F2 は RISC-V(C6/C3)のみ。S3/Xtensa(xtensa-esp32s3-none-elf)は F4。
+#   RISC-V(C6/C3) = riscv32imac-unknown-none-elf(stable rustc、経路 (a)/(b) 両対応)
+#   Xtensa(S3)   = xtensa-esp32s3-none-elf(esp channel + -Zbuild-std=core が必須。
+#                  経路 (b) の素朴な `cargo build` では通らないため S3 は経路 (a)
+#                  = SM_PREBUILT_A のみサポート。F4a、docs/design/c-ffi-shim.md §4)
+set(SM_TARGET_XTENSA FALSE)
 if(IDF_TARGET STREQUAL "esp32c6" OR IDF_TARGET STREQUAL "esp32c3")
     set(SM_RUST_TARGET "riscv32imac-unknown-none-elf")
+elseif(IDF_TARGET STREQUAL "esp32s3")
+    set(SM_RUST_TARGET "xtensa-esp32s3-none-elf")
+    set(SM_TARGET_XTENSA TRUE)
 else()
     message(FATAL_ERROR
         "simple_matter: unsupported IDF_TARGET '${IDF_TARGET}'. "
-        "F2 supports esp32c6/esp32c3 (riscv32imac-unknown-none-elf). "
-        "S3/Xtensa is F4 (see docs/design/c-ffi-shim.md §4).")
+        "Supported: esp32c6/esp32c3 (riscv32imac-unknown-none-elf), "
+        "esp32s3 (xtensa-esp32s3-none-elf). See docs/design/c-ffi-shim.md §4.")
 endif()
 
 # ヘッダのみ公開するコンポーネント(実体は下で add_prebuilt_library でリンク)。
@@ -44,8 +51,19 @@ if(DEFINED SM_PREBUILT_A AND NOT "${SM_PREBUILT_A}" STREQUAL "")
     message(STATUS "simple_matter: using prebuilt staticlib ${SM_STATICLIB}")
     add_prebuilt_library(simple_matter_rust "${SM_STATICLIB}")
     target_link_libraries(${COMPONENT_LIB} PUBLIC simple_matter_rust)
+elseif(SM_TARGET_XTENSA)
+    # S3/Xtensa は esp channel + `-Zbuild-std=core` が要るため、経路 (b) の素朴な
+    # `cargo build` では通らない。SM_PREBUILT_A(経路 (a))を必須とする(F4a)。
+    message(FATAL_ERROR
+        "simple_matter: esp32s3 (Xtensa) requires a prebuilt staticlib. Build it with the "
+        "esp toolchain:\n"
+        "  . ~/export-esp.sh\n"
+        "  cargo +esp build -p simple-matter-cffi --release "
+        "--target xtensa-esp32s3-none-elf -Zbuild-std=core --features panic-abort\n"
+        "then pass -DSM_PREBUILT_A=<repo>/target/xtensa-esp32s3-none-elf/release/"
+        "libsimple_matter_cffi.a (also at set-target). See ports/esp-idf/components/simple_matter/README.md.")
 else()
-    # 経路 (b): cargo build で .a を生成する。
+    # 経路 (b): cargo build で .a を生成する(RISC-V のみ)。
     set(SM_STATICLIB "${SM_REPO_ROOT}/target/${SM_RUST_TARGET}/release/libsimple_matter_cffi.a")
     find_program(CARGO_EXECUTABLE cargo)
     if(NOT CARGO_EXECUTABLE)

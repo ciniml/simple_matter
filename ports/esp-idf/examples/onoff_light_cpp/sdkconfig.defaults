@@ -1,5 +1,6 @@
-# ESP32-C6 向け既定設定(onoff_light_cpp)。
-CONFIG_IDF_TARGET="esp32c6"
+# onoff_light_cpp 既定設定(ターゲット非依存: esp32c6 / esp32s3 両対応)。
+# ターゲットは `idf.py set-target <esp32c6|esp32s3>` で選ぶ(CONFIG_IDF_TARGET は
+# ここに固定しない。F4a で S3 対応のため非依存化)。
 
 # カスタムパーティション: 既定 1MB では app が収まらないため拡張(partitions.csv)。
 CONFIG_PARTITION_TABLE_CUSTOM=y

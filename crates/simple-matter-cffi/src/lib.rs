@@ -55,6 +55,9 @@ use simple_matter::stack::{DefaultStack, MatterStack, SharedFabricCreds};
 use simple_matter::tlv::TlvTag;
 use simple_matter::transport::net::PeerAddr;
 
+mod custom;
+use custom::{sm_cluster_def_t, CustomCluster, PendingRegistry};
+
 // ==========================================================================
 // サイジング(DefaultStack 相当、NF=5 固定)
 // ==========================================================================
@@ -63,6 +66,10 @@ use simple_matter::transport::net::PeerAddr;
 const NF: usize = 5;
 /// ACL テーブル容量(fabric 5 × per-fabric 上限 4)。
 const NACL: usize = 20;
+/// マージ後の総エンドポイント数上限(プリセット EP0/EP1 + カスタム)。
+const MAX_EP_TOTAL: usize = 2 + custom::MAX_CUSTOM_ENDPOINTS;
+/// 1 エンドポイントあたりのサーバクラスタ ID 上限(合成 Descriptor 用)。
+const MAX_SERVERS: usize = 16;
 /// SPAKE2+ ソルト(PC example と同じ開発用固定値)。
 const SALT: [u8; 16] = *b"SPAKE2P Key Salt";
 /// 期限なしのセンチネル([`sm_next_deadline`] が返す。C 側 `SM_NO_DEADLINE`)。
@@ -326,56 +333,96 @@ struct Light {
     desc1: DescriptorCluster,
     groups: &'static RefCell<DefaultGroupStore>,
     removed_fabric: Option<NonZeroU8>,
+    // ---- カスタムクラスタ(F4b、docs/design/c-ffi-shim.md §8)----
+    /// C 登録のカスタムクラスタ(read/write/invoke を C vtable へ委譲)。
+    custom_clusters: heapless::Vec<CustomCluster, { custom::MAX_CUSTOM_CLUSTERS }>,
+    /// カスタムエンドポイント用に自動合成した Descriptor(0x001D)。
+    custom_descs: heapless::Vec<DescriptorCluster, { custom::MAX_CUSTOM_ENDPOINTS }>,
+    /// `custom_descs` と並行するエンドポイント ID。
+    custom_ep_ids: heapless::Vec<u16, { custom::MAX_CUSTOM_ENDPOINTS }>,
+    /// マージ後の全エンドポイントメタ([`DataModel::endpoints`] が返す)。
+    endpoint_metas: heapless::Vec<EndpointMeta, MAX_EP_TOTAL>,
+    /// 各エンドポイントのサーバクラスタ ID(`endpoint_metas` が `&'static` で借用する裏付け)。
+    ep_servers: heapless::Vec<heapless::Vec<ClusterId, MAX_SERVERS>, MAX_EP_TOTAL>,
+    /// 各エンドポイントのデバイスタイプ(同上)。
+    ep_dts: heapless::Vec<heapless::Vec<DeviceType, 2>, MAX_EP_TOTAL>,
+    /// EP0 の PartsList(EP1 + カスタムエンドポイント)。
+    ep0_parts: heapless::Vec<EndpointId, MAX_EP_TOTAL>,
+}
+
+/// `heapless::Vec` の内容を指す `&'static` スライスを作る。
+///
+/// # Safety
+/// `v` がシム static 内に固定(sm_init 後は移動・変更しない)であること。
+unsafe fn static_slice<T, const N: usize>(v: &heapless::Vec<T, N>) -> &'static [T] {
+    core::slice::from_raw_parts(v.as_ptr(), v.len())
 }
 
 impl DataModel for Light {
     fn endpoints(&self) -> &[EndpointMeta] {
-        static EPS: &[EndpointMeta] = &[
-            EndpointMeta::new(EndpointId(0), EP0_DT, EP0_SERVERS),
-            EndpointMeta::new(EndpointId(1), EP1_DT, EP1_SERVERS),
-        ];
-        EPS
+        &self.endpoint_metas
     }
     fn clusters_on(&self, ep: EndpointId) -> &[ClusterId] {
-        match ep.0 {
-            0 => EP0_SERVERS,
-            1 => EP1_SERVERS,
-            _ => &[],
+        for m in &self.endpoint_metas {
+            if m.id == ep {
+                return m.clusters;
+            }
         }
+        &[]
     }
     fn cluster(&self, ep: EndpointId, cl: ClusterId) -> Option<&dyn ServerCluster> {
         match (ep.0, cl.0) {
-            (0, 0x001F) => Some(&self.access_control),
-            (0, 0x0028) => Some(&self.basic),
-            (0, 0x0030) => Some(&self.gc),
-            (0, 0x0031) => Some(&self.net),
-            (0, 0x003C) => Some(&self.admin),
-            (0, 0x003E) => Some(&self.opcreds),
-            (0, 0x003F) => Some(&self.gkm),
-            (0, 0x001D) => Some(&self.desc0),
-            (1, 0x0003) => Some(&self.identify),
-            (1, 0x0004) => Some(&self.groups_cl),
-            (1, 0x0006) => Some(&self.onoff),
-            (1, 0x001D) => Some(&self.desc1),
-            _ => None,
+            (0, 0x001F) => return Some(&self.access_control),
+            (0, 0x0028) => return Some(&self.basic),
+            (0, 0x0030) => return Some(&self.gc),
+            (0, 0x0031) => return Some(&self.net),
+            (0, 0x003C) => return Some(&self.admin),
+            (0, 0x003E) => return Some(&self.opcreds),
+            (0, 0x003F) => return Some(&self.gkm),
+            (0, 0x001D) => return Some(&self.desc0),
+            (1, 0x0003) => return Some(&self.identify),
+            (1, 0x0004) => return Some(&self.groups_cl),
+            (1, 0x0006) => return Some(&self.onoff),
+            (1, 0x001D) => return Some(&self.desc1),
+            _ => {}
         }
+        // カスタムエンドポイントの合成 Descriptor。
+        if cl.0 == 0x001D {
+            if let Some(i) = self.custom_ep_ids.iter().position(|&cep| cep == ep.0) {
+                return Some(&self.custom_descs[i]);
+            }
+        }
+        // カスタムクラスタ。
+        self.custom_clusters
+            .iter()
+            .find(|c| c.endpoint == ep.0 && c.cluster_id() == cl.0)
+            .map(|c| c as &dyn ServerCluster)
     }
     fn cluster_mut(&mut self, ep: EndpointId, cl: ClusterId) -> Option<&mut dyn ServerCluster> {
         match (ep.0, cl.0) {
-            (0, 0x001F) => Some(&mut self.access_control),
-            (0, 0x0028) => Some(&mut self.basic),
-            (0, 0x0030) => Some(&mut self.gc),
-            (0, 0x0031) => Some(&mut self.net),
-            (0, 0x003C) => Some(&mut self.admin),
-            (0, 0x003E) => Some(&mut self.opcreds),
-            (0, 0x003F) => Some(&mut self.gkm),
-            (0, 0x001D) => Some(&mut self.desc0),
-            (1, 0x0003) => Some(&mut self.identify),
-            (1, 0x0004) => Some(&mut self.groups_cl),
-            (1, 0x0006) => Some(&mut self.onoff),
-            (1, 0x001D) => Some(&mut self.desc1),
-            _ => None,
+            (0, 0x001F) => return Some(&mut self.access_control),
+            (0, 0x0028) => return Some(&mut self.basic),
+            (0, 0x0030) => return Some(&mut self.gc),
+            (0, 0x0031) => return Some(&mut self.net),
+            (0, 0x003C) => return Some(&mut self.admin),
+            (0, 0x003E) => return Some(&mut self.opcreds),
+            (0, 0x003F) => return Some(&mut self.gkm),
+            (0, 0x001D) => return Some(&mut self.desc0),
+            (1, 0x0003) => return Some(&mut self.identify),
+            (1, 0x0004) => return Some(&mut self.groups_cl),
+            (1, 0x0006) => return Some(&mut self.onoff),
+            (1, 0x001D) => return Some(&mut self.desc1),
+            _ => {}
         }
+        if cl.0 == 0x001D {
+            if let Some(i) = self.custom_ep_ids.iter().position(|&cep| cep == ep.0) {
+                return Some(&mut self.custom_descs[i]);
+            }
+        }
+        self.custom_clusters
+            .iter_mut()
+            .find(|c| c.endpoint == ep.0 && c.cluster_id() == cl.0)
+            .map(|c| c as &mut dyn ServerCluster)
     }
     fn on_tick(&mut self, now_ms: u64) -> Option<u64> {
         if self.gc.on_tick(now_ms) {
@@ -409,6 +456,124 @@ impl DataModel for Light {
     }
 }
 
+impl Light {
+    /// ステージング済みのカスタム登録を取り込み、マージ後のメタ(endpoints/server list/
+    /// Descriptor)を合成する(F4b、`docs/design/c-ffi-shim.md` §8.2)。
+    ///
+    /// `self` は既にシム static 内の最終位置に居ること(自己参照 `&'static` スライスの前提)。
+    /// カスタム登録が無くてもプリセット EP0/EP1 のメタを構築する(常に sm_init で 1 度呼ぶ)。
+    fn install_custom(&mut self, pending: PendingRegistry) {
+        self.custom_clusters = pending.clusters;
+
+        // 1) エンドポイント集合(0/1 + カスタムクラスタの EP + 登録 EP)を昇順で確定。
+        let mut ep_ids: heapless::Vec<u16, MAX_EP_TOTAL> = heapless::Vec::new();
+        let _ = ep_ids.push(0);
+        let _ = ep_ids.push(1);
+        for c in &self.custom_clusters {
+            if c.endpoint > 1 && !ep_ids.contains(&c.endpoint) {
+                let _ = ep_ids.push(c.endpoint);
+            }
+        }
+        for er in &pending.endpoints {
+            if er.endpoint > 1 && !ep_ids.contains(&er.endpoint) {
+                let _ = ep_ids.push(er.endpoint);
+            }
+        }
+        ep_ids.sort_unstable();
+
+        // 2) 各 EP のサーバリスト・デバイスタイプを裏付け Vec に構築。
+        self.ep_servers.clear();
+        self.ep_dts.clear();
+        for &ep in ep_ids.iter() {
+            let mut servers: heapless::Vec<ClusterId, MAX_SERVERS> = heapless::Vec::new();
+            let mut dts: heapless::Vec<DeviceType, 2> = heapless::Vec::new();
+            match ep {
+                0 => {
+                    for c in EP0_SERVERS {
+                        let _ = servers.push(*c);
+                    }
+                    for d in EP0_DT {
+                        let _ = dts.push(*d);
+                    }
+                }
+                1 => {
+                    for c in EP1_SERVERS {
+                        let _ = servers.push(*c);
+                    }
+                    for d in EP1_DT {
+                        let _ = dts.push(*d);
+                    }
+                }
+                _ => {
+                    // 新規エンドポイント: 登録デバイスタイプ + 合成 Descriptor(0x001D)。
+                    if let Some(er) = pending.endpoints.iter().find(|e| e.endpoint == ep) {
+                        let _ = dts.push(DeviceType::new(er.device_type, er.dt_revision));
+                    }
+                    let _ = servers.push(ClusterId(0x001D));
+                }
+            }
+            for c in &self.custom_clusters {
+                if c.endpoint == ep && !servers.iter().any(|s| s.0 == c.cluster_id()) {
+                    let _ = servers.push(ClusterId(c.cluster_id()));
+                }
+            }
+            let _ = self.ep_servers.push(servers);
+            let _ = self.ep_dts.push(dts);
+        }
+
+        // 3) EP0 の PartsList = EP0 以外の全 EP。
+        self.ep0_parts.clear();
+        for &ep in ep_ids.iter() {
+            if ep != 0 {
+                let _ = self.ep0_parts.push(EndpointId(ep));
+            }
+        }
+
+        // 4) カスタムクラスタの meta 自己参照を最終確定(以降 attr/cmd Vec は不変)。
+        for c in self.custom_clusters.iter_mut() {
+            // SAFETY: self はシム static 内の最終位置。attr_metas/cmd_metas は以降変更しない。
+            unsafe { c.finalize() };
+        }
+
+        // 5) EndpointMeta と Descriptor を裏付け Vec の &'static スライスで合成。
+        self.endpoint_metas.clear();
+        self.custom_descs.clear();
+        self.custom_ep_ids.clear();
+        for (i, &ep) in ep_ids.iter().enumerate() {
+            // SAFETY: ep_servers/ep_dts/ep0_parts はこれ以降変更しない(static スライス化)。
+            let servers: &'static [ClusterId] = unsafe { static_slice(&self.ep_servers[i]) };
+            let dts: &'static [DeviceType] = unsafe { static_slice(&self.ep_dts[i]) };
+            let _ = self
+                .endpoint_metas
+                .push(EndpointMeta::new(EndpointId(ep), dts, servers));
+            match ep {
+                0 => {
+                    let parts: &'static [EndpointId] = unsafe { static_slice(&self.ep0_parts) };
+                    self.desc0 = DescriptorCluster::new(EndpointId(0), dts, servers, &[], parts);
+                }
+                1 => {
+                    self.desc1 = DescriptorCluster::new(EndpointId(1), dts, servers, &[], &[]);
+                }
+                _ => {
+                    let d = DescriptorCluster::new(EndpointId(ep), dts, servers, &[], &[]);
+                    let _ = self.custom_descs.push(d);
+                    let _ = self.custom_ep_ids.push(ep);
+                }
+            }
+        }
+    }
+
+    /// C からの dirty 通知(`sm_attr_mark_dirty`)を該当カスタムクラスタへ橋渡しする。
+    fn mark_custom_dirty(&mut self, ep: u16, cluster_id: u32, _attr_id: u32) {
+        for c in self.custom_clusters.iter_mut() {
+            if c.endpoint == ep && c.cluster_id() == cluster_id {
+                c.mark_dirty();
+                return;
+            }
+        }
+    }
+}
+
 /// 外部所有(スタックが `&'static` で借用する)テーブル群。
 struct Owned {
     crypto: Backend,
@@ -437,6 +602,13 @@ fn build_light(o: &'static Owned, rng: CRng) -> Light {
         desc1: DescriptorCluster::new(EndpointId(1), EP1_DT, EP1_SERVERS, &[], EP1_PARTS),
         removed_fabric: None,
         groups: &o.groups,
+        custom_clusters: heapless::Vec::new(),
+        custom_descs: heapless::Vec::new(),
+        custom_ep_ids: heapless::Vec::new(),
+        endpoint_metas: heapless::Vec::new(),
+        ep_servers: heapless::Vec::new(),
+        ep_dts: heapless::Vec::new(),
+        ep0_parts: heapless::Vec::new(),
     }
 }
 
@@ -807,6 +979,10 @@ pub extern "C" fn sm_init(cfg: *const sm_config_t, now_ms: u64) -> i32 {
         addr_of_mut!((*sp).boot_window_open).write(true);
         addr_of_mut!((*sp).events).write(EventRing::new());
 
+        // カスタム登録(sm_init 前にステージング)を最終位置の Light へ取り込む(F4b、§8)。
+        let pending = custom::take_pending();
+        (*sp).stack.device_mut().install_custom(pending);
+
         INITED.store(true, Ordering::SeqCst);
         (*sp).restore_and_advertise(now_ms);
     }
@@ -1021,6 +1197,76 @@ pub extern "C" fn sm_fabric_count() -> u8 {
     // SAFETY: 単線契約。
     let s = unsafe { shim() };
     s.owned.fabrics.borrow().len() as u8
+}
+
+// ==========================================================================
+// カスタムクラスタ C vtable(F4b、docs/design/c-ffi-shim.md §8)
+// ==========================================================================
+
+/// カスタムクラスタを登録する(sm_init より前。0=OK、負値=失敗)。
+///
+/// `def`/`attrs`/`cmds` の内容はここでコピーするため、呼び出し後は解放してよい
+/// (コールバックポインタ・ctx は保持されるので有効に保つこと)。sm_init 済みは `-2`。
+#[no_mangle]
+pub extern "C" fn sm_cluster_register(def: *const sm_cluster_def_t) -> i32 {
+    if INITED.load(Ordering::SeqCst) {
+        return -2; // sm_init 後の登録は SM_ERR。
+    }
+    if def.is_null() {
+        return -1;
+    }
+    // SAFETY: caller が有効な sm_cluster_def_t を与える契約。
+    let def = unsafe { &*def };
+    // SAFETY: attrs/cmds は n_attrs/n_cmds 要素を指す契約(from_def 内で検証)。
+    let cluster = match unsafe { CustomCluster::from_def(def) } {
+        Ok(c) => c,
+        Err(()) => return -3, // 容量超過 or 不正なポインタ。
+    };
+    // SAFETY: 単線契約・sm_init 前のステージング。
+    let p = unsafe { custom::pending() };
+    if p.clusters.push(cluster).is_err() {
+        return -4; // カスタムクラスタ数上限。
+    }
+    0
+}
+
+/// 新規エンドポイント(2..)にデバイスタイプを付与して登録する(sm_init より前)。
+///
+/// プリセット EP0/EP1(0/1)は登録不可(`-5`)。sm_init 済みは `-2`。
+#[no_mangle]
+pub extern "C" fn sm_endpoint_register(endpoint: u16, device_type: u32, dt_revision: u8) -> i32 {
+    if INITED.load(Ordering::SeqCst) {
+        return -2;
+    }
+    if endpoint <= 1 {
+        return -5; // プリセットエンドポイントは予約。
+    }
+    // SAFETY: 単線契約・sm_init 前。
+    let p = unsafe { custom::pending() };
+    if p.endpoints
+        .push(custom::EndpointReg {
+            endpoint,
+            device_type,
+            dt_revision: dt_revision as u16,
+        })
+        .is_err()
+    {
+        return -4; // エンドポイント数上限。
+    }
+    0
+}
+
+/// C 側の値変化を購読レポートへ橋渡しする(該当カスタムクラスタを dirty にする)。
+#[no_mangle]
+pub extern "C" fn sm_attr_mark_dirty(endpoint: u16, cluster_id: u32, attr_id: u32) {
+    if !INITED.load(Ordering::SeqCst) {
+        return;
+    }
+    // SAFETY: 単線契約。
+    let s = unsafe { shim() };
+    s.stack
+        .device_mut()
+        .mark_custom_dirty(endpoint, cluster_id, attr_id);
 }
 
 // ==========================================================================

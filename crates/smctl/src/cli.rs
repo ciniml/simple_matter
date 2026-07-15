@@ -706,7 +706,32 @@ fn parse_any(args: &[String]) -> Result<Cmd, String> {
                 raw_fields,
             })
         }
-        _ => Err("usage: smctl any <read|write|invoke> ... (see `smctl help`)".into()),
+        "subscribe" => {
+            let [node, ep, cid, aid, mins, maxs] = expect_args(
+                args,
+                1,
+                6,
+                "any subscribe <node-id> <endpoint> <cluster-id> <attribute-id> \
+                 <min-interval-s> <max-interval-s>",
+            )?[..] else {
+                unreachable!()
+            };
+            let min: u16 = mins
+                .parse()
+                .map_err(|_| format!("invalid min interval: {mins:?}"))?;
+            let max: u16 = maxs
+                .parse()
+                .map_err(|_| format!("invalid max interval: {maxs:?}"))?;
+            Ok(Cmd::Subscribe {
+                node: parse_u64(node)?,
+                ep: parse_ep(ep)?,
+                cluster: ClusterId(parse_id32(cid)?),
+                attr: AttributeId(parse_id32(aid)?),
+                min_s: min,
+                max_s: max,
+            })
+        }
+        _ => Err("usage: smctl any <read|write|invoke|subscribe> ... (see `smctl help`)".into()),
     }
 }
 
@@ -971,6 +996,8 @@ USAGE:
   smctl any write  <node-id> <endpoint> <cluster-id> <attribute-id> <type>:<value>
   smctl any invoke <node-id> <endpoint> <cluster-id> <command-id>
                    [<tag>=<type>:<value>... | tlv:<hex>]
+  smctl any subscribe <node-id> <endpoint> <cluster-id> <attribute-id>
+                   <min-interval-s> <max-interval-s>
   smctl batch <file|->       one command per line (# comments); CASE sessions and
                              subscriptions are shared across lines; `wait <sec>`
                              receives subscription reports between commands

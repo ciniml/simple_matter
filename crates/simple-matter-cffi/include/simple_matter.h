@@ -10,6 +10,52 @@
 // 期限なしのセンチネル([`sm_next_deadline`] が返す。C 側 `SM_NO_DEADLINE`)。
 #define SM_NO_DEADLINE UINT64_MAX
 
+// 追加できるカスタムクラスタの最大数。
+#define MAX_CUSTOM_CLUSTERS 8
+
+// 追加できる新規エンドポイントの最大数。
+#define MAX_CUSTOM_ENDPOINTS 4
+
+// 1 クラスタあたりの属性上限。
+#define MAX_ATTRS 16
+
+// 1 クラスタあたりのコマンド上限。
+#define MAX_CMDS 8
+
+// invoke の引数(context tag)上限。
+#define MAX_ARGS 8
+
+// 文字列/オクテット列の上限バイト数(`sm_attr_value_t` 内固定バッファ)。
+#define STR_CAP 64
+
+// 書き込み可能(未指定は read-only)。
+#define SM_ATTR_WRITABLE (1 << 0)
+
+// NULLABLE(null 許容)。
+#define SM_ATTR_NULLABLE (1 << 1)
+
+// timed write 必須。
+#define SM_ATTR_TIMED (1 << 2)
+
+// timed invoke 必須。
+#define SM_CMD_TIMED (1 << 0)
+
+// 属性/引数のスカラ型タグ(§8.1)。
+typedef enum {
+  SM_T_BOOL = 0,
+  SM_T_U8,
+  SM_T_U16,
+  SM_T_U32,
+  SM_T_U64,
+  SM_T_I8,
+  SM_T_I16,
+  SM_T_I32,
+  SM_T_I64,
+  SM_T_F32,
+  SM_T_STRING,
+  SM_T_OCTETS,
+} sm_attr_type_t;
+
 // アプリイベント種別(`docs/design/c-ffi-shim.md` §1)。
 typedef enum {
   SM_EV_NONE = 0,
@@ -78,6 +124,93 @@ typedef struct {
   uint8_t arg;
 } sm_event_t;
 
+// 属性定義(§8.1)。
+typedef struct {
+  // 属性 ID。
+  uint32_t attr_id;
+  // スカラ型。
+  sm_attr_type_t type;
+  // `SM_ATTR_*` フラグ。
+  uint32_t flags;
+} sm_attr_def_t;
+
+// コマンド定義(§8.1)。
+typedef struct {
+  // コマンド ID。
+  uint32_t cmd_id;
+  // `SM_CMD_*` フラグ。
+  uint32_t flags;
+} sm_cmd_def_t;
+
+// 短いバイト列/文字列(64B 上限。§8.2)。
+typedef struct {
+  // バイト内容(STRING は UTF-8、末尾 NUL 不要)。
+  uint8_t buf[STR_CAP];
+  // 有効バイト数。
+  uint8_t len;
+} sm_attr_bytes;
+
+// スカラ + 短いバイト列の tagged union の値部(§8.1)。
+typedef union {
+  // 真偽値。
+  bool b;
+  // 符号なし整数。
+  uint64_t u;
+  // 符号付き整数。
+  int64_t i;
+  // 単精度浮動小数点数。
+  float f;
+  // 文字列/オクテット列。
+  sm_attr_bytes bytes;
+} sm_attr_value_data;
+
+// スカラ + 短いバイト列の tagged union(§8.1)。
+typedef struct {
+  // 値の型。
+  sm_attr_type_t type;
+  // NULLABLE 属性のみ有効(true = null)。
+  bool is_null;
+  // 値本体(`type` で解釈)。
+  sm_attr_value_data v;
+} sm_attr_value_t;
+
+// read コールバック(値を `out` へ。戻り値 = IM ステータス、0=Success)。
+typedef uint8_t (*SmClusterRead)(void *ctx, uint32_t attr_id, sm_attr_value_t *out);
+
+// write コールバック(戻り値 = IM ステータス)。
+typedef uint8_t (*SmClusterWrite)(void *ctx, uint32_t attr_id, const sm_attr_value_t *val);
+
+// invoke コールバック(引数はスカラ列に平坦化。戻り値 = IM ステータス)。
+typedef uint8_t (*SmClusterInvoke)(void *ctx, uint32_t cmd_id, const sm_attr_value_t *args, size_t n_args, uint64_t now_ms);
+
+// カスタムクラスタ定義(§8.1)。`attrs`/`cmds` は登録時にシムがコピーする。
+typedef struct {
+  // 追加先エンドポイント(新規 EP は 2..、プリセット EP1 への追加も可)。
+  uint16_t endpoint;
+  // クラスタ ID(vendor 領域 or 標準 ID)。
+  uint32_t cluster_id;
+  // クラスタリビジョン。
+  uint16_t revision;
+  // FeatureMap。
+  uint32_t feature_map;
+  // 属性定義配列。
+  const sm_attr_def_t *attrs;
+  // 属性定義数。
+  size_t n_attrs;
+  // コマンド定義配列。
+  const sm_cmd_def_t *cmds;
+  // コマンド定義数。
+  size_t n_cmds;
+  // read ハンドラ。
+  SmClusterRead read;
+  // write ハンドラ。
+  SmClusterWrite write;
+  // invoke ハンドラ。
+  SmClusterInvoke invoke;
+  // コールバック ctx。
+  void *ctx;
+} sm_cluster_def_t;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -132,6 +265,24 @@ bool sm_onoff_get(void);
 
 // コミッション済み fabric 数。
 uint8_t sm_fabric_count(void);
+
+// カスタムクラスタを登録する(sm_init より前。0=OK、負値=失敗)。
+//
+// `def`/`attrs`/`cmds` の内容はここでコピーするため、呼び出し後は解放してよい
+// (コールバックポインタ・ctx は保持されるので有効に保つこと)。sm_init 済みは `-2`。
+int32_t sm_cluster_register(const sm_cluster_def_t *def);
+
+// 新規エンドポイント(2..)にデバイスタイプを付与して登録する(sm_init より前)。
+//
+// プリセット EP0/EP1(0/1)は登録不可(`-5`)。sm_init 済みは `-2`。
+int32_t sm_endpoint_register(uint16_t endpoint,
+                             uint32_t device_type,
+                             uint8_t dt_revision);
+
+// C 側の値変化を購読レポートへ橋渡しする(該当カスタムクラスタを dirty にする)。
+void sm_attr_mark_dirty(uint16_t endpoint,
+                        uint32_t cluster_id,
+                        uint32_t attr_id);
 
 #ifdef __cplusplus
 } // extern "C"

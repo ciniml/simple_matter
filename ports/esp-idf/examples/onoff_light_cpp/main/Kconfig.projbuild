@@ -15,8 +15,10 @@ menu "simple-matter onoff_light example"
 
     config SM_LED_GPIO
         int "OnOff LED GPIO"
+        default 48 if IDF_TARGET_ESP32S3
         default 7
         help
-            OnOff 状態を反映する LED の GPIO 番号。既定は M5 NanoC6 の GPIO7。
+            OnOff 状態を反映する LED の GPIO 番号。既定は M5 NanoC6 の GPIO7
+            (ESP32-S3 は DevKitC の RGB LED = GPIO48)。
 
 endmenu

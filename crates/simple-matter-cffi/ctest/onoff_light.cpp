@@ -237,6 +237,124 @@ const char *event_name(sm_event_kind_t k) {
   }
 }
 
+// ---- F4b: カスタムクラスタ(EP2、vendor 領域クラスタ ID)----
+//
+// docs/design/c-ffi-shim.md §8。値の所有は C++ 側(ここ)で、read/write/invoke を
+// C vtable としてシムへ渡す。sm_init より前に登録する。
+
+constexpr uint16_t kCustomEndpoint = 2;
+constexpr uint32_t kCustomCluster = 0xFFF1FC01u; // vendor 0xFFF1 の MS クラスタ(0xFC01)
+constexpr uint32_t kCustomDeviceType = 0xFFF10055u;
+
+// 属性 ID。
+constexpr uint32_t kAttrWritableU16 = 0x0000; // U16 rw
+constexpr uint32_t kAttrFlagBool = 0x0001;    // BOOL ro
+constexpr uint32_t kAttrLabelStr = 0x0002;    // STRING ro
+constexpr uint32_t kAttrSignedI16 = 0x0003;   // nullable i16 ro
+constexpr uint32_t kAttrCounterU16 = 0x0004;  // U16 ro(周期更新 → mark_dirty)
+constexpr uint32_t kCmdSetState = 0x0000;     // 引数 (u8, u16)
+
+struct CustomState {
+  uint16_t writable = 100;
+  bool flag = false;
+  int16_t signedv = -42;
+  bool signed_null = false;
+  uint16_t counter = 0;
+};
+CustomState g_custom;
+
+extern "C" uint8_t custom_read(void *, uint32_t attr_id, sm_attr_value_t *out) {
+  switch (attr_id) {
+  case kAttrWritableU16:
+    out->type = SM_T_U16;
+    out->v.u = g_custom.writable;
+    return 0;
+  case kAttrFlagBool:
+    out->type = SM_T_BOOL;
+    out->v.b = g_custom.flag;
+    return 0;
+  case kAttrLabelStr: {
+    out->type = SM_T_STRING;
+    const char *s = "custom-label";
+    size_t n = strlen(s);
+    memcpy(out->v.bytes.buf, s, n);
+    out->v.bytes.len = (uint8_t)n;
+    return 0;
+  }
+  case kAttrSignedI16:
+    out->type = SM_T_I16;
+    if (g_custom.signed_null) {
+      out->is_null = true;
+    } else {
+      out->v.i = g_custom.signedv;
+    }
+    return 0;
+  case kAttrCounterU16:
+    out->type = SM_T_U16;
+    out->v.u = g_custom.counter;
+    return 0;
+  default:
+    return 0x86; // UnsupportedAttribute
+  }
+}
+
+extern "C" uint8_t custom_write(void *, uint32_t attr_id, const sm_attr_value_t *val) {
+  if (attr_id == kAttrWritableU16) {
+    g_custom.writable = (uint16_t)val->v.u;
+    printf("CUSTOM write attr 0x%04x = %u\n", attr_id, g_custom.writable);
+    fflush(stdout);
+    return 0;
+  }
+  return 0x88; // UnsupportedWrite
+}
+
+extern "C" uint8_t custom_invoke(void *, uint32_t cmd_id, const sm_attr_value_t *args,
+                                 size_t n_args, uint64_t now_ms) {
+  if (cmd_id == kCmdSetState && n_args == 2) {
+    uint8_t a = (uint8_t)args[0].v.u;
+    uint16_t b = (uint16_t)args[1].v.u;
+    g_custom.flag = (a != 0);
+    g_custom.writable = b;
+    printf("CUSTOM invoke cmd 0x%04x a=%u b=%u now=%llu\n", cmd_id, a, b,
+           (unsigned long long)now_ms);
+    fflush(stdout);
+    return 0;
+  }
+  return 0x85; // InvalidCommand
+}
+
+void register_custom() {
+  static const sm_attr_def_t attrs[] = {
+      {kAttrWritableU16, SM_T_U16, SM_ATTR_WRITABLE},
+      {kAttrFlagBool, SM_T_BOOL, 0},
+      {kAttrLabelStr, SM_T_STRING, 0},
+      {kAttrSignedI16, SM_T_I16, SM_ATTR_NULLABLE},
+      {kAttrCounterU16, SM_T_U16, 0},
+  };
+  static const sm_cmd_def_t cmds[] = {
+      {kCmdSetState, 0},
+  };
+  sm_cluster_def_t def;
+  memset(&def, 0, sizeof(def));
+  def.endpoint = kCustomEndpoint;
+  def.cluster_id = kCustomCluster;
+  def.revision = 1;
+  def.feature_map = 0;
+  def.attrs = attrs;
+  def.n_attrs = sizeof(attrs) / sizeof(attrs[0]);
+  def.cmds = cmds;
+  def.n_cmds = sizeof(cmds) / sizeof(cmds[0]);
+  def.read = custom_read;
+  def.write = custom_write;
+  def.invoke = custom_invoke;
+  def.ctx = nullptr;
+  int r1 = sm_endpoint_register(kCustomEndpoint, kCustomDeviceType, 1);
+  int r2 = sm_cluster_register(&def);
+  printf("custom register: endpoint rc=%d cluster rc=%d (EP%u cluster=0x%08x)\n", r1, r2,
+         kCustomEndpoint, kCustomCluster);
+  fflush(stdout);
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -275,6 +393,9 @@ int main(int argc, char **argv) {
   cfg.kvs_ctx = nullptr;
   cfg.rng_fill = rng_fill;
   cfg.rng_ctx = nullptr;
+
+  // カスタムクラスタは sm_init より前に登録する(F4b、§8)。
+  register_custom();
 
   SmStack stack(cfg, now_ms());
   if (!stack.ok()) {
@@ -361,6 +482,14 @@ int main(int argc, char **argv) {
         sm_addr_t sa = sockaddr_to_smaddr(src);
         stack.mdns_rx(rx, (size_t)n, sa, mdns_send);
       }
+    }
+
+    // カスタム属性の周期更新(Counter を 2 秒ごとに +1 → mark_dirty で購読へ)。
+    static uint64_t last_counter_ms = 0;
+    if (now - last_counter_ms >= 2000) {
+      last_counter_ms = now;
+      g_custom.counter++;
+      sm_attr_mark_dirty(kCustomEndpoint, kCustomCluster, kAttrCounterU16);
     }
 
     // 時間駆動の送出・イベント・mDNS announce。

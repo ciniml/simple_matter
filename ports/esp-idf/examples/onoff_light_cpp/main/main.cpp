@@ -298,6 +298,81 @@ static void led_init() {
 
 static void led_set(bool on) { gpio_set_level((gpio_num_t)SM_LED_GPIO, on ? 1 : 0); }
 
+// ---- カスタムクラスタ(F4b、EP2、vendor 領域クラスタ)-----------------------
+//
+// docs/design/c-ffi-shim.md §8。sm_init より前に登録する。値の所有はここ(C++ 側)。
+// 周期更新 Counter は sm_attr_mark_dirty で購読へ流す。
+
+static constexpr uint16_t kCustomEp = 2;
+static constexpr uint32_t kCustomCluster = 0xFFF1FC01u; // vendor 0xFFF1 の MS クラスタ
+static constexpr uint32_t kCustomDeviceType = 0xFFF10055u;
+
+static struct {
+  uint16_t writable = 100;
+  bool flag = false;
+  uint16_t counter = 0;
+} g_custom;
+
+extern "C" uint8_t custom_read(void *, uint32_t attr_id, sm_attr_value_t *out) {
+  switch (attr_id) {
+  case 0x0000:
+    out->type = SM_T_U16;
+    out->v.u = g_custom.writable;
+    return 0;
+  case 0x0001:
+    out->type = SM_T_BOOL;
+    out->v.b = g_custom.flag;
+    return 0;
+  case 0x0004:
+    out->type = SM_T_U16;
+    out->v.u = g_custom.counter;
+    return 0;
+  default:
+    return 0x86; // UnsupportedAttribute
+  }
+}
+
+extern "C" uint8_t custom_write(void *, uint32_t attr_id, const sm_attr_value_t *val) {
+  if (attr_id == 0x0000) {
+    g_custom.writable = (uint16_t)val->v.u;
+    return 0;
+  }
+  return 0x88; // UnsupportedWrite
+}
+
+extern "C" uint8_t custom_invoke(void *, uint32_t cmd_id, const sm_attr_value_t *args,
+                                 size_t n_args, uint64_t) {
+  if (cmd_id == 0x0000 && n_args == 2) {
+    g_custom.flag = (((uint8_t)args[0].v.u) != 0);
+    g_custom.writable = (uint16_t)args[1].v.u;
+    return 0;
+  }
+  return 0x85; // InvalidCommand
+}
+
+static void register_custom() {
+  static const sm_attr_def_t attrs[] = {
+      {0x0000, SM_T_U16, SM_ATTR_WRITABLE},
+      {0x0001, SM_T_BOOL, 0},
+      {0x0004, SM_T_U16, 0},
+  };
+  static const sm_cmd_def_t cmds[] = {{0x0000, 0}};
+  sm_cluster_def_t def;
+  memset(&def, 0, sizeof(def));
+  def.endpoint = kCustomEp;
+  def.cluster_id = kCustomCluster;
+  def.revision = 1;
+  def.attrs = attrs;
+  def.n_attrs = sizeof(attrs) / sizeof(attrs[0]);
+  def.cmds = cmds;
+  def.n_cmds = sizeof(cmds) / sizeof(cmds[0]);
+  def.read = custom_read;
+  def.write = custom_write;
+  def.invoke = custom_invoke;
+  sm_endpoint_register(kCustomEp, kCustomDeviceType, 1);
+  sm_cluster_register(&def);
+}
+
 // ---- pump タスク -----------------------------------------------------------
 
 static void matter_task(void *) {
@@ -316,6 +391,9 @@ static void matter_task(void *) {
   cfg.kvs_ctx = nullptr;
   cfg.rng_fill = rng_fill;
   cfg.rng_ctx = nullptr;
+
+  // カスタムクラスタ(EP2)は sm_init より前に登録する(F4b、§8)。
+  register_custom();
 
   SmStack stack(cfg, now_ms());
   if (!stack.ok()) {
@@ -353,8 +431,16 @@ static void matter_task(void *) {
   SmStack::Sender mdns_send = make_sender(mdns_fd);
 
   static uint8_t rx[2048];
+  uint64_t last_counter_ms = 0;
   for (;;) {
     uint64_t now = now_ms();
+
+    // カスタム Counter(EP2/0x0004)を 2 秒ごとに更新 → 購読へ(mark_dirty)。
+    if (now - last_counter_ms >= 2000) {
+      last_counter_ms = now;
+      g_custom.counter++;
+      sm_attr_mark_dirty(kCustomEp, kCustomCluster, 0x0004);
+    }
 
     // WiFi/IP・ローカル操作のコマンドを排出(同一タスクで sm_* を呼ぶ)。
     Cmd c;

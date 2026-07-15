@@ -157,4 +157,409 @@ fn ffi_lifecycle_roundtrip() {
     // deadline は取得できる(announce 期限があるため NO_DEADLINE 未満)。
     let dl = sm_next_deadline(50);
     assert!(dl < NO_DEADLINE);
+
+    // ---- F4b: sm_init 済みでのカスタム登録拒否(SM_ERR) ----
+    let attrs = [custom::sm_attr_def_t {
+        attr_id: 0x0000,
+        r#type: custom::sm_attr_type_t::SM_T_U16,
+        flags: custom::SM_ATTR_WRITABLE,
+    }];
+    let def = custom::sm_cluster_def_t {
+        endpoint: 2,
+        cluster_id: 0xFFF1_FC01,
+        revision: 1,
+        feature_map: 0,
+        attrs: attrs.as_ptr(),
+        n_attrs: 1,
+        cmds: core::ptr::null(),
+        n_cmds: 0,
+        read: None,
+        write: None,
+        invoke: None,
+        ctx: core::ptr::null_mut(),
+    };
+    assert_eq!(sm_cluster_register(&def), -2);
+    assert_eq!(sm_endpoint_register(2, 0x0100, 1), -2);
+}
+
+// ==========================================================================
+// F4b: カスタムクラスタ(CustomCluster レベルの単体テスト。グローバル状態非依存)
+// ==========================================================================
+
+mod custom_cluster {
+    use super::super::custom::*;
+    use core::ffi::c_void;
+    use simple_matter::dm::codec::{AttrEncoder, CmdResponder};
+    use simple_matter::dm::meta::{
+        AccessContext, AttributeId, CommandId, Privilege, SessionKind,
+    };
+    use simple_matter::dm::{AttrWrite, ServerCluster};
+    use simple_matter::im::wire::ImStatus;
+    use simple_matter::tlv::{ContainerType, TlvReader, TlvTag, TlvValue, TlvWriter};
+    use core::num::NonZeroU8;
+
+    /// C++ 側の値所有を模した状態(ctx 経由で read/write/invoke が触る)。
+    #[repr(C)]
+    struct CState {
+        u16v: u16,
+        boolv: bool,
+        i16v: Option<i16>,
+        last_cmd_a: u8,
+        last_cmd_b: u16,
+        invoked: bool,
+    }
+
+    const A_U16: u32 = 0x0000; // U16 rw
+    const A_BOOL: u32 = 0x0001; // BOOL ro
+    const A_STR: u32 = 0x0002; // STRING ro
+    const A_I16: u32 = 0x0003; // nullable i16 ro
+    const C_SET: u32 = 0x0000; // 引数 (u8, u16)
+
+    extern "C" fn cb_read(ctx: *mut c_void, attr_id: u32, out: *mut sm_attr_value_t) -> u8 {
+        let s = unsafe { &*(ctx as *const CState) };
+        let out = unsafe { &mut *out };
+        match attr_id {
+            A_U16 => {
+                out.r#type = sm_attr_type_t::SM_T_U16;
+                out.v.u = s.u16v as u64;
+            }
+            A_BOOL => {
+                out.r#type = sm_attr_type_t::SM_T_BOOL;
+                out.v.b = s.boolv;
+            }
+            A_STR => {
+                out.r#type = sm_attr_type_t::SM_T_STRING;
+                let bytes = b"hello";
+                let mut b = sm_attr_bytes {
+                    buf: [0u8; 64],
+                    len: bytes.len() as u8,
+                };
+                b.buf[..bytes.len()].copy_from_slice(bytes);
+                out.v.bytes = b;
+            }
+            A_I16 => {
+                out.r#type = sm_attr_type_t::SM_T_I16;
+                match s.i16v {
+                    Some(v) => out.v.i = v as i64,
+                    None => out.is_null = true,
+                }
+            }
+            _ => return ImStatus::UnsupportedAttribute.to_u8(),
+        }
+        0
+    }
+
+    extern "C" fn cb_write(ctx: *mut c_void, attr_id: u32, val: *const sm_attr_value_t) -> u8 {
+        let s = unsafe { &mut *(ctx as *mut CState) };
+        let val = unsafe { &*val };
+        if attr_id == A_U16 {
+            s.u16v = unsafe { val.v.u } as u16;
+            0
+        } else {
+            ImStatus::UnsupportedWrite.to_u8()
+        }
+    }
+
+    extern "C" fn cb_invoke(
+        ctx: *mut c_void,
+        cmd_id: u32,
+        args: *const sm_attr_value_t,
+        n_args: usize,
+        _now_ms: u64,
+    ) -> u8 {
+        let s = unsafe { &mut *(ctx as *mut CState) };
+        if cmd_id == C_SET && n_args == 2 {
+            let a = unsafe { &*args.add(0) };
+            let b = unsafe { &*args.add(1) };
+            s.last_cmd_a = unsafe { a.v.u } as u8;
+            s.last_cmd_b = unsafe { b.v.u } as u16;
+            s.invoked = true;
+            0
+        } else {
+            ImStatus::InvalidCommand.to_u8()
+        }
+    }
+
+    fn build_cluster(state: &mut CState) -> CustomCluster {
+        let attrs = [
+            sm_attr_def_t {
+                attr_id: A_U16,
+                r#type: sm_attr_type_t::SM_T_U16,
+                flags: SM_ATTR_WRITABLE,
+            },
+            sm_attr_def_t {
+                attr_id: A_BOOL,
+                r#type: sm_attr_type_t::SM_T_BOOL,
+                flags: 0,
+            },
+            sm_attr_def_t {
+                attr_id: A_STR,
+                r#type: sm_attr_type_t::SM_T_STRING,
+                flags: 0,
+            },
+            sm_attr_def_t {
+                attr_id: A_I16,
+                r#type: sm_attr_type_t::SM_T_I16,
+                flags: SM_ATTR_NULLABLE,
+            },
+        ];
+        let cmds = [sm_cmd_def_t {
+            cmd_id: C_SET,
+            flags: SM_CMD_TIMED,
+        }];
+        let def = sm_cluster_def_t {
+            endpoint: 2,
+            cluster_id: 0xFFF1_FC01,
+            revision: 3,
+            feature_map: 0,
+            attrs: attrs.as_ptr(),
+            n_attrs: attrs.len(),
+            cmds: cmds.as_ptr(),
+            n_cmds: cmds.len(),
+            read: Some(cb_read),
+            write: Some(cb_write),
+            invoke: Some(cb_invoke),
+            ctx: state as *mut CState as *mut c_void,
+        };
+        let mut c = unsafe { CustomCluster::from_def(&def) }.expect("from_def");
+        // meta 自己参照を確定(単体テストではその場で固定)。
+        unsafe { c.finalize() };
+        c
+    }
+
+    fn acc() -> AccessContext {
+        AccessContext::new(SessionKind::Case, NonZeroU8::new(1), 0, Privilege::Administer)
+            .with_env(1234, [0u8; 16])
+    }
+
+    fn read_attr(c: &CustomCluster, id: u32, buf: &mut [u8]) -> Result<usize, ImStatus> {
+        let mut w = TlvWriter::new(buf);
+        {
+            let mut e = AttrEncoder::new(&mut w, TlvTag::Anonymous);
+            c.read_attribute(AttributeId(id), &mut e, &acc())?;
+        }
+        Ok(w.len())
+    }
+
+    fn decode_first(buf: &[u8]) -> TlvValue<'_> {
+        let mut r = TlvReader::new(buf);
+        r.read_next().unwrap().unwrap().value
+    }
+
+    #[test]
+    fn read_dispatch_all_types() {
+        let mut st = CState {
+            u16v: 4242,
+            boolv: true,
+            i16v: Some(-100),
+            last_cmd_a: 0,
+            last_cmd_b: 0,
+            invoked: false,
+        };
+        let c = build_cluster(&mut st);
+        let mut buf = [0u8; 96];
+
+        let n = read_attr(&c, A_U16, &mut buf).unwrap();
+        assert_eq!(decode_first(&buf[..n]).as_unsigned().unwrap(), 4242);
+
+        let n = read_attr(&c, A_BOOL, &mut buf).unwrap();
+        assert!(decode_first(&buf[..n]).as_bool().unwrap());
+
+        let n = read_attr(&c, A_STR, &mut buf).unwrap();
+        assert_eq!(decode_first(&buf[..n]).as_str().unwrap(), "hello");
+
+        let n = read_attr(&c, A_I16, &mut buf).unwrap();
+        assert_eq!(decode_first(&buf[..n]).as_signed().unwrap(), -100);
+
+        // 未知属性は UnsupportedAttribute。
+        assert_eq!(read_attr(&c, 0x00FF, &mut buf), Err(ImStatus::UnsupportedAttribute));
+    }
+
+    #[test]
+    fn nullable_read_null() {
+        let mut st = CState {
+            u16v: 0,
+            boolv: false,
+            i16v: None,
+            last_cmd_a: 0,
+            last_cmd_b: 0,
+            invoked: false,
+        };
+        let c = build_cluster(&mut st);
+        let mut buf = [0u8; 16];
+        let n = read_attr(&c, A_I16, &mut buf).unwrap();
+        assert!(matches!(decode_first(&buf[..n]), TlvValue::Null));
+    }
+
+    #[test]
+    fn write_dispatch_and_type_mismatch() {
+        let mut st = CState {
+            u16v: 0,
+            boolv: false,
+            i16v: None,
+            last_cmd_a: 0,
+            last_cmd_b: 0,
+            invoked: false,
+        };
+        let mut c = build_cluster(&mut st);
+
+        // 正常な U16 write → C ハンドラに届く + dirty。
+        let mut buf = [0u8; 16];
+        let mut w = TlvWriter::new(&mut buf);
+        w.write_u16(&TlvTag::Anonymous, 777).unwrap();
+        let n = w.len();
+        c.write_attribute(AttributeId(A_U16), AttrWrite::new(&buf[..n]), &acc())
+            .unwrap();
+        assert!(c.take_dirty());
+        assert!(!c.take_dirty()); // クリアされる
+        assert_eq!(st.u16v, 777);
+
+        // 型不一致(bool を U16 属性へ)→ ConstraintError、C ハンドラ未到達。
+        let mut c = build_cluster(&mut st);
+        let mut buf = [0u8; 16];
+        let mut w = TlvWriter::new(&mut buf);
+        w.write_bool(&TlvTag::Anonymous, true).unwrap();
+        let n = w.len();
+        assert_eq!(
+            c.write_attribute(AttributeId(A_U16), AttrWrite::new(&buf[..n]), &acc()),
+            Err(ImStatus::ConstraintError)
+        );
+
+        // 幅超過(U16 に 0x1_0000)→ ConstraintError。
+        let mut buf = [0u8; 16];
+        let mut w = TlvWriter::new(&mut buf);
+        w.write_u32(&TlvTag::Anonymous, 0x1_0000).unwrap();
+        let n = w.len();
+        assert_eq!(
+            c.write_attribute(AttributeId(A_U16), AttrWrite::new(&buf[..n]), &acc()),
+            Err(ImStatus::ConstraintError)
+        );
+
+        // read-only 属性への write は UnsupportedWrite。
+        let mut buf = [0u8; 16];
+        let mut w = TlvWriter::new(&mut buf);
+        w.write_bool(&TlvTag::Anonymous, true).unwrap();
+        let n = w.len();
+        assert_eq!(
+            c.write_attribute(AttributeId(A_BOOL), AttrWrite::new(&buf[..n]), &acc()),
+            Err(ImStatus::UnsupportedWrite)
+        );
+    }
+
+    #[test]
+    fn invoke_dispatch_flattens_args() {
+        let mut st = CState {
+            u16v: 0,
+            boolv: false,
+            i16v: None,
+            last_cmd_a: 0,
+            last_cmd_b: 0,
+            invoked: false,
+        };
+        let mut c = build_cluster(&mut st);
+
+        // フィールド構造体 { 0: u8=9, 1: u16=1000 }。
+        let mut buf = [0u8; 32];
+        let mut w = TlvWriter::new(&mut buf);
+        w.start_container(&TlvTag::Anonymous, ContainerType::Structure)
+            .unwrap();
+        w.write_u8(&TlvTag::ContextSpecific(0), 9).unwrap();
+        w.write_u16(&TlvTag::ContextSpecific(1), 1000).unwrap();
+        w.end_container().unwrap();
+        let n = w.len();
+
+        let mut scratch = [0u8; 64];
+        let mut sw = TlvWriter::new(&mut scratch);
+        let mut resp = CmdResponder::new(&mut sw);
+        let mut fr = TlvReader::new(&buf[..n]);
+        c.invoke_command(CommandId(C_SET), &mut fr, &mut resp, &acc())
+            .unwrap();
+        assert!(st.invoked);
+        assert_eq!(st.last_cmd_a, 9);
+        assert_eq!(st.last_cmd_b, 1000);
+
+        // 未知コマンドは UnsupportedCommand。
+        let mut fr = TlvReader::new(&buf[..n]);
+        assert_eq!(
+            c.invoke_command(CommandId(0x99), &mut fr, &mut resp, &acc()),
+            Err(ImStatus::UnsupportedCommand)
+        );
+    }
+
+    #[test]
+    fn meta_synthesis_and_timed_flags() {
+        let mut st = CState {
+            u16v: 0,
+            boolv: false,
+            i16v: None,
+            last_cmd_a: 0,
+            last_cmd_b: 0,
+            invoked: false,
+        };
+        let c = build_cluster(&mut st);
+        let meta = c.meta();
+        assert_eq!(meta.id.0, 0xFFF1_FC01);
+        assert_eq!(meta.revision, 3);
+        assert_eq!(meta.attributes.len(), 4);
+        assert_eq!(meta.accepted_commands.len(), 1);
+        // U16 は writable/Operate、read=View。
+        let m = meta.attribute(AttributeId(A_U16)).unwrap();
+        assert!(m.writable);
+        assert_eq!(m.access, Privilege::View);
+        assert_eq!(m.write_access, Privilege::Operate);
+        // コマンドは timed 必須(SM_CMD_TIMED)。
+        assert!(meta.accepted_commands[0].timed);
+    }
+
+    #[test]
+    fn from_def_capacity_rejected() {
+        // 属性数が上限超過 → Err。
+        let attrs = [sm_attr_def_t {
+            attr_id: 0,
+            r#type: sm_attr_type_t::SM_T_U8,
+            flags: 0,
+        }; MAX_ATTRS + 1];
+        let def = sm_cluster_def_t {
+            endpoint: 2,
+            cluster_id: 0xFFF1_FC02,
+            revision: 1,
+            feature_map: 0,
+            attrs: attrs.as_ptr(),
+            n_attrs: attrs.len(),
+            cmds: core::ptr::null(),
+            n_cmds: 0,
+            read: None,
+            write: None,
+            invoke: None,
+            ctx: core::ptr::null_mut(),
+        };
+        assert!(unsafe { CustomCluster::from_def(&def) }.is_err());
+    }
+
+    #[test]
+    fn timed_flag_on_attribute() {
+        // SM_ATTR_TIMED を立てた属性は meta.timed=true。
+        let attrs = [sm_attr_def_t {
+            attr_id: 0x0000,
+            r#type: sm_attr_type_t::SM_T_U16,
+            flags: SM_ATTR_WRITABLE | SM_ATTR_TIMED,
+        }];
+        let def = sm_cluster_def_t {
+            endpoint: 2,
+            cluster_id: 0xFFF1_FC03,
+            revision: 1,
+            feature_map: 0,
+            attrs: attrs.as_ptr(),
+            n_attrs: 1,
+            cmds: core::ptr::null(),
+            n_cmds: 0,
+            read: None,
+            write: None,
+            invoke: None,
+            ctx: core::ptr::null_mut(),
+        };
+        let mut c = unsafe { CustomCluster::from_def(&def) }.unwrap();
+        unsafe { c.finalize() };
+        assert!(c.meta().attribute(AttributeId(0x0000)).unwrap().timed);
+    }
 }

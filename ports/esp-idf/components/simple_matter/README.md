@@ -10,10 +10,27 @@ Rust staticlib `libsimple_matter_cffi.a` を `add_prebuilt_library` で最終 EL
 
 | IDF_TARGET | Rust target | 状態 |
 |---|---|---|
-| esp32c6 / esp32c3 | `riscv32imac-unknown-none-elf` | F2(本コンポーネント) |
-| esp32s3 | `xtensa-esp32s3-none-elf` | F4(未対応、`FATAL_ERROR`) |
+| esp32c6 / esp32c3 | `riscv32imac-unknown-none-elf` | F2(経路 (a)/(b) 両対応) |
+| esp32s3 | `xtensa-esp32s3-none-elf` | F4a(経路 (a) = `SM_PREBUILT_A` のみ) |
 
 非対応の `IDF_TARGET` を選ぶと configure 時に `FATAL_ERROR` になる。
+
+**S3/Xtensa の注意**: `xtensa-esp32s3-none-elf` は upstream rustc に無く、esp channel
+(espup)+ `-Zbuild-std=core` が要る。コンポーネントの経路 (b)(cargo 自動ビルド)は
+素朴な `cargo build` を叩くだけなので S3 では通らない。S3 は**必ず経路 (a)
+(`SM_PREBUILT_A`)**を使うこと(経路 (b) を選ぶと明示的に `FATAL_ERROR`)。.a は
+以下でビルドする:
+
+```sh
+. ~/export-esp.sh
+cargo +esp build -p simple-matter-cffi --release \
+    --target xtensa-esp32s3-none-elf -Zbuild-std=core --features panic-abort
+# → target/xtensa-esp32s3-none-elf/release/libsimple_matter_cffi.a
+
+A=/abs/.../target/xtensa-esp32s3-none-elf/release/libsimple_matter_cffi.a
+idf.py -DSM_PREBUILT_A=$A set-target esp32s3   # set-target にも -DSM_PREBUILT_A が必要
+idf.py -DSM_PREBUILT_A=$A build
+```
 
 ## 既存プロジェクトへの組み込み
 

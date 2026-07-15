@@ -38,6 +38,11 @@ exclude = [
   "MatterStack",
   "FabricTable",
   "RefCell",
+  "CustomCluster",
+  "PendingRegistry",
+  "PendingCell",
+  "EndpointReg",
+  "Vec",
 ]
 
 [parse]
