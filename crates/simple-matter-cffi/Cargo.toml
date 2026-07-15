@@ -1,0 +1,29 @@
+[package]
+name = "simple-matter-cffi"
+description = "C ABI shim (staticlib) exposing the simple-matter device stack to C/C++17"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# staticlib: ESP-IDF / Zephyr / host C++ からリンクする .a。
+# rlib: 本 crate の #[test](FFI 境界のラウンドトリップ)をワークスペースの
+#       `cargo test` で走らせるため。
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+# デバイス(responder)専用。default-features 無しでコアの alloc を持ち込まない
+# (定常パス no-alloc の方針を維持。rustcrypto のみ有効化)。
+[dependencies]
+simple-matter = { path = "../simple-matter", default-features = false, features = [
+    "rustcrypto",
+] }
+
+[features]
+default = []
+# ホスト向けビルド(ctest の staticlib・cargo test)で std を有効にし、
+# std のパニックハンドラ・lang item を使う(docs/design/c-ffi-shim.md §2)。
+std = []
+# ベアメタル(no_std)ビルド向けに #[panic_handler] を提供する。
+# ホストビルドでは使わない(std のハンドラを使う)。
+panic-abort = []

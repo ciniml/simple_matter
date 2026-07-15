@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/simple-matter",
+    "crates/simple-matter-cffi",
     "crates/bloat-check",
     "crates/simple-matter-ble",
     "crates/smctl",
