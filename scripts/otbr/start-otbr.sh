@@ -24,6 +24,12 @@ NAME="${OTBR_NAME:-otbr}"
 IMAGE="${OTBR_IMAGE:-openthread/otbr:latest}"
 HTTP_PORT="${OTBR_HTTP_PORT:-8080}"
 BACKBONE_IF="${OTBR_BACKBONE_IF:-$(ip route show default | awk '{print $5; exit}')}"
+# OTBR コンテナ内 firewall(ingress ip6tables フィルタ)を有効化するか。
+# 既定 0: ホストカーネルに ip6table_filter が無い環境("Table does not exist"で
+# エントリポイントが die する)でも起動できるようにする。T1 の join スモークでは
+# ingress フィルタは不要。LAN 側 border routing の ingress 制御が要るなら
+# ホストで `sudo modprobe ip6table_filter` 後に OTBR_FIREWALL=1 を指定する。
+FIREWALL="${OTBR_FIREWALL:-0}"
 
 if [ ! -e "${RADIO_DEV}" ]; then
     echo "error: radio device ${RADIO_DEV} not found." >&2
@@ -39,20 +45,36 @@ echo "radio    : spinel+hdlc+uart://${RADIO_DEV}?uart-baudrate=${BAUD}"
 echo "backbone : ${BACKBONE_IF}"
 echo "web GUI  : http://127.0.0.1:${HTTP_PORT}"
 
+# Border Routing に必要な sysctl(IPv6 有効化 + v4/v6 フォワーディング)は
+# ホスト側で設定する。docker 28.x は --network host のコンテナで net.* sysctl の
+# 指定を拒否する("sysctl ... not allowed in host network namespace")ため、
+# ここでホストの値を確認し、不足していれば警告する(root で
+# `sudo sysctl -w <key>=<val>` を実行)。host network なのでホストの値が
+# そのままコンテナに効く。
+check_sysctl() {
+    local key="$1" want="$2" have
+    have="$(sysctl -n "${key}" 2>/dev/null || echo "?")"
+    if [ "${have}" != "${want}" ]; then
+        echo "warn: ${key}=${have} (期待 ${want})。Border Routing に必要。" >&2
+        echo "      root で: sudo sysctl -w ${key}=${want}" >&2
+    fi
+}
+check_sysctl net.ipv6.conf.all.disable_ipv6 0
+check_sysctl net.ipv4.conf.all.forwarding 1
+check_sysctl net.ipv6.conf.all.forwarding 1
+
 # --network host: chip-tool(ホスト側)が wpan0 経由で Thread 網へ到達し、
 #   advertising proxy の mDNS が LAN にそのまま流れるようにする(Matter 前提)。
 # --privileged + /dev/net/tun: wpan0(TUN)作成に必要。
-# sysctl: IPv6 有効化 + v4/v6 フォワーディング(Border Routing に必要)。
 # otbr-data ボリューム: Thread 網の状態(active dataset 等)を再起動間で保持。
 exec docker run -d --rm --name "${NAME}" \
     --privileged --network host \
-    --sysctl "net.ipv6.conf.all.disable_ipv6=0" \
-    --sysctl "net.ipv4.conf.all.forwarding=1" \
-    --sysctl "net.ipv6.conf.all.forwarding=1" \
     --device /dev/net/tun \
     -v "${RADIO_DEV}:${RADIO_DEV}" \
     -v otbr-data:/var/lib/thread \
     -e HTTP_PORT="${HTTP_PORT}" \
+    -e FIREWALL="${FIREWALL}" \
+    -e NAT64="${OTBR_NAT64:-0}" \
     "${IMAGE}" \
     --radio-url "spinel+hdlc+uart://${RADIO_DEV}?uart-baudrate=${BAUD}" \
     --backbone-interface "${BACKBONE_IF}"

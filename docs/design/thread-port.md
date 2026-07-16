@@ -344,16 +344,51 @@ Thread 版では BLE 広告のみ(既存 AdvData)。`pairing ble-thread` は BLE
 
 ## 7. 実装フェーズ
 
-### T1: Thread join スモーク(**ハード非依存分は完了**)
+### T1: Thread join スモーク(**実機実施済み。join+可視化 PASS / データパス未達**)
 
 - 内容: `ports/esp32/esp32c6-thread`(bin `thread-smoke`)。コンパイル時定数の
   dataset で join → role 遷移ログ(Detached→Child)→ mesh-local アドレス表示 →
   UDP echo(:11095)。OTBR 環境スクリプト一式。
 - 済み: ビルド green(§1)、OTBR/イメージ/RCP FW ビルド、プリフライト。
-- **残り(実機。次フェーズ)**: RCP 書き込み → OTBR 起動 → thread-smoke 書き込み →
-  join 確認。
 - 検証ゲート: ① role が Child/Router に遷移 ② OTBR から mesh-local へ ping 応答
   ③ `ot-ctl udp send` に echo 応答 ④ 既存全ビルド・全テスト回帰なし(済)。
+
+#### T1 実機結果(2026-07-17、NanoC6×2: RCP=/dev/ttyACM5, DUT=/dev/ttyACM1)
+
+- **R3(RCP over USB-Serial-JTAG)= 当初不成立 → 再ビルドで解決(最重要成果)。**
+  既定の esp-idf `ot_rcp`(v5.4)は `CONFIG_OPENTHREAD_RCP_UART=y` で spinel を
+  **ハードウェア UART(GPIO)**に出すため、UART ブリッジの無い NanoC6 の USB ポート
+  (/dev/ttyACM5 = USB-Serial-JTAG)には spinel が流れない。OTBR は
+  `spinel_driver.cpp:87: Init() Failure` で radio を開けなかった。
+  **解決**: `ot_rcp` を `CONFIG_OPENTHREAD_RCP_USB_SERIAL_JTAG=y`(+ `RCP_UART=n`)で
+  再ビルドして spinel を USB CDC に出す(esp-idf の RCP transport 選択肢に存在。
+  依存 `ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG` は既定で満たされる)。
+  再ビルド後 OTBR は正常起動し、`ot-ctl rcp version` が round-trip
+  (`openthread-esp32/...; esp32c6; ...`)= **spinel over USB-Serial-JTAG は成立**。
+  → `build-ot-rcp.sh` に `RCP_OVER_USB=1`(既定)を実装。**外付け UART / DevKitC は不要**。
+- **ゲート① role 遷移 = PASS。** DUT ログ: `Role disabled -> detached -> child`、
+  `RLOC16 fffe -> 1403`、eui64 `404ccafffe5b2fe0`(DUT MAC と一致)、dataset
+  (extpanid `c933e160a23d1143`, panid `0x2702`)投入、mesh-local + ML-EID 取得、
+  `UDP echo listening on port 11095`。
+- **ゲート② OTBR 可視化 = PASS。** `ot-ctl child table` に DUT が Child として出現
+  (RLOC 0x1403/…、Ext MAC `ca45e5a6d824c492` = DUT ログの extended address と一致、
+  Mode `r`=rx-on MTD, LQ 3, RSSI -43〜-53)。`childip` に DUT の ML-EID 登録あり。
+- **ゲート③ ping / UDP echo = FAIL(データパス未達)。** OTBR→DUT の ICMPv6 ping・
+  UDP(:11095)いずれも **無応答**(0 received、DUT シリアルに `[echo]` 出ず)。
+  child の Age が attach 後に単調増加(88→108→128…、240s タイムアウトへ)し、
+  **DUT は attach 数秒後に上り MLE キープアライブも停止** = 送受信とも止まる。
+  切り分け: (a) コンソール drain 継続下でも echo せず、(b) 停止済み DUT にリーダ
+  (cat)を付けても復帰せず出力ゼロ → **USB-Serial-JTAG の println ブロックによる
+  ストールではない**。attach 直後に OT スタック/無線サービス(`ot.run`/esp-radio
+  ieee802154/executor)が丸ごと停止していると推定。root-cause は T2 の最初の課題。
+  候補: `ot.run` タスク飢餓、15.4 IRQ 処理停止、ヒープ(96KiB)枯渇、OT alarm/timer
+  ロックアップ。**注**: attach 自体は双方向ユニキャスト(Parent/Child ID 交換)を要する
+  ため無線 TX/RX は attach 時点までは機能している。
+- 手順補正(実施済み・スクリプト反映): docker 28.x は `--network host` で `net.*`
+  sysctl 指定を拒否 → `start-otbr.sh` はホスト側 sysctl を確認する方式に変更。
+  ホストに `ip6table_filter` が無く otbr の firewall init が die → `OTBR_FIREWALL`
+  (既定 0)で無効化可能に。DUT モニタは `stty + timeout cat`(espflash monitor 不使用)。
+- 未回帰: 既存ビルド/テストは無改造(コア変更なし。T1 はポート bin と scripts のみ)。
 
 ### T2: Matter over Thread 最小 E2E(コミッショニング + On/Off)
 
@@ -392,7 +427,8 @@ Thread 版では BLE 広告のみ(既存 AdvData)。`pairing ble-thread` は BLE
 |---|---|---|---|
 | R1 | openthread 0.2.0 は若い(0.2 が実質初リリース)。API 改名進行中(srp→srp-client 等)、プリビルト .a と feature 組合せの罠 | 中 | バージョン固定(=0.2.0)。upstream の rs-matter 実績が同系統。改名は追従容易 |
 | R2 | **BLE + 802.15.4 の実行時同時動作が未検証**(ビルド可は確認済み。esp-radio の coex feature は Wi-Fi/BLE 用で 15.4/BLE の明示コエグジスタンスは無い) | 高(T2 の pairing ble-thread が成立しない可能性) | T2 最初のゲートで単体検証(BLE 広告中に attach)。ダメなら「BLE で dataset 受領 → BLE 切断 → 15.4 起動」の時分割(Matter 的には ConnectNetwork 後の BTP 維持は必須でない — chip-tool は CASE を Thread 側で張る) |
-| R3 | **RCP ボードの USB-Serial-JTAG 問題**: ot_rcp 既定は UART0。M5 NanoC6 等 UART ブリッジ無しボードでは USB ポート越しに spinel が通らない可能性 | 中(検証環境が組めない) | 実機フェーズ最初に確認。代替: 外付け USB-UART を UART0 ピンへ / DevKitC(ブリッジ有り)を RCP に使う / sdkconfig で USB-Serial-JTAG コンソール無効化 + UART 設定変更 |
+| R3 | ~~**RCP ボードの USB-Serial-JTAG 問題**: ot_rcp 既定は UART。NanoC6 等 UART ブリッジ無しボードでは USB ポート越しに spinel が通らない~~ **→ 解決済み(T1 実測 2026-07-17)** | ~~中~~ 解消 | **`ot_rcp` を `CONFIG_OPENTHREAD_RCP_USB_SERIAL_JTAG=y` で再ビルドすれば spinel が USB-Serial-JTAG に出て NanoC6 の USB ポート越しに OTBR が接続できる**(`build-ot-rcp.sh` の `RCP_OVER_USB=1` 既定に実装)。外付け UART / DevKitC は不要。詳細は §7 T1 実機結果 |
+| R9 | **DUT が attach 数秒後に停止**(role→Child まで到達後、上下とも無線が止まる。T1 で発見) | 高(Thread データパスが成立しない = T2 の CASE over Thread が不可) | T2 最初の root-cause 対象。候補: `ot.run` タスク飢餓 / esp-radio 15.4 IRQ 停止 / ヒープ枯渇 / OT timer ロックアップ。切り分け済み: コンソール println ブロックではない(§7 T1 実機結果) |
 | R4 | Wi-Fi と Thread の同一 FW 共存不可(esp-radio 0.18 制約。§2.3) | 低(設計で吸収済み) | パッケージ分離済み。SKU 分割は製品慣行に一致 |
 | R5 | フットプリント: OT + MbedTLS + simple-matter + BLE の合算が未計測(smoke 332KiB、e5-light 1.13MiB — 単純合算なら ~1.4MiB) | 低〜中 | 4MiB flash に対し余裕はあるが、T2 でサイズレポートを取り bloat-check の監視対象に追加 |
 | R6 | KvsSettings の flash 書き込みが 15.4/BLE 動作中のキャッシュ停止と干渉(kvs.rs 既知課題の再来) | 中 | T2 で実測。必要なら idle 時 flush のキューイング |

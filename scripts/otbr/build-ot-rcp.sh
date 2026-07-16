@@ -22,6 +22,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DIST_DIR="${SCRIPT_DIR}/dist"
 WORK_DIR="${DIST_DIR}/work"
 
+# RCP の spinel トランスポートを USB-Serial-JTAG にするか(既定 1 = する)。
+# 既定の ot_rcp は spinel をハードウェア UART(GPIO)に出すため、UART ブリッジの
+# 無い M5 NanoC6 等では USB ポート越しに spinel が通らない(T1 実測で確定。
+# docs/design/thread-port.md リスク R3 / §T1)。この構成では
+# CONFIG_OPENTHREAD_RCP_USB_SERIAL_JTAG=y にして spinel を USB CDC へ出す。
+# UART ブリッジ付きボード(DevKitC 等)を UART で使う場合は RCP_OVER_USB=0。
+RCP_OVER_USB="${RCP_OVER_USB:-1}"
+
 mkdir -p "${WORK_DIR}"
 
 # esp-idf 同梱の examples/openthread/ot_rcp をコンテナ内でコピーしてビルドする。
@@ -33,15 +41,26 @@ docker run --rm \
     -e HOME=/tmp \
     -e FIX_UID="$(id -u)" \
     -e FIX_GID="$(id -g)" \
+    -e RCP_OVER_USB="${RCP_OVER_USB}" \
     "${IDF_IMAGE}" \
     bash -ec '
         # コンテナは root で走るため、終了時に成果物をホストユーザへ chown する
         # (これが無いとホスト側で rm -rf dist できなくなる)。
         trap "chown -R ${FIX_UID}:${FIX_GID} /work" EXIT
+        rm -rf /work/ot_rcp
         cp -r "${IDF_PATH}/examples/openthread/ot_rcp" /work/
         cd /work/ot_rcp
+        if [ "${RCP_OVER_USB}" = "1" ]; then
+            # spinel を USB-Serial-JTAG に出す(NanoC6 等 UART ブリッジ無しボード向け)。
+            {
+                echo ""
+                echo "CONFIG_OPENTHREAD_RCP_UART=n"
+                echo "CONFIG_OPENTHREAD_RCP_USB_SERIAL_JTAG=y"
+            } >> sdkconfig.defaults
+        fi
         idf.py set-target esp32c6
         idf.py build
+        grep -E "OPENTHREAD_RCP_(UART|USB_SERIAL_JTAG)" sdkconfig || true
         idf.py merge-bin -o merged_ot_rcp.bin
     '
 

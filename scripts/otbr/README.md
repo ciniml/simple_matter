@@ -69,12 +69,28 @@ advertising proxy(SRP → LAN の mDNS)経由。
 
 ## トラブルシュート
 
+- **USB-Serial-JTAG 直結ボード(M5 NanoC6 等、UART ブリッジ無し)を RCP に使う**:
+  既定の `ot_rcp` は spinel を**ハードウェア UART(GPIO)**に出すため、USB ポート
+  (/dev/ttyACM*)には spinel が流れず OTBR は `spinel_driver.cpp: Init() Failure`
+  になる(T1 実測で確定。`docs/design/thread-port.md` R3)。**対策: `build-ot-rcp.sh`
+  を `RCP_OVER_USB=1`(既定)でビルドする** → `CONFIG_OPENTHREAD_RCP_USB_SERIAL_JTAG=y`
+  で spinel が USB CDC に出て、そのまま `OTBR_RADIO_DEV=/dev/ttyACM<n>` で接続できる。
+  UART ブリッジ付きボード(DevKitC 等)を UART 配線で使う場合は `RCP_OVER_USB=0`。
+  疎通確認: `docker exec otbr ot-ctl rcp version`(RCP 版が返れば spinel リンク OK)。
+- **`docker run` が sysctl で失敗**(`net.ipv4.conf.all.forwarding not allowed in
+  host network namespace`): docker 28.x は `--network host` で `net.*` sysctl 指定を
+  拒否する。`start-otbr.sh` は指定をやめ、**ホスト側の値を確認**する方式にした。
+  不足していれば `sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0`,
+  `... net.ipv4.conf.all.forwarding=1`, `... net.ipv6.conf.all.forwarding=1` を実行。
+- **otbr のエントリポイントが firewall init で die**(`ip6tables ... Table 'filter'
+  does not exist`): ホストカーネルに `ip6table_filter` が無い。`start-otbr.sh` は
+  `OTBR_FIREWALL`(既定 0)で otbr 内 firewall を無効化して回避する(T1 join では不要)。
+  ingress フィルタが要るなら `sudo modprobe ip6table_filter` 後に `OTBR_FIREWALL=1`。
 - **otbr-agent が radio を開けない**: baudrate(既定 460800。`OTBR_BAUD`)と
   デバイス名を確認。`docker logs otbr` に spinel のエラーが出る。
-- **ボードの USB が USB-Serial-JTAG 直結の場合**(M5 NanoC6 等、外付け
-  UART ブリッジ無し): 既定の ot_rcp は UART0 想定。USB-Serial-JTAG 経由の
-  spinel は要実機確認(`docs/design/thread-port.md` リスク表 R3)。ダメな場合は
-  外付け USB-UART アダプタを RCP の UART0 ピンに接続する。
+- **DUT のシリアルモニタ**: `espflash monitor --no-reset` は使わない(flasher stub を
+  保持し無線が止まる)。`stty -F /dev/ttyACM<n> 115200 raw -echo` + `timeout N cat` で
+  読む。`espflash reset` の前後は `fuser -k /dev/ttyACM<n>` でポートを解放する。
 - **web GUI**: http://127.0.0.1:8080(`OTBR_HTTP_PORT` で変更)。
 - **完全リセット**: `./stop-otbr.sh && docker volume rm otbr-data`。
 - **REST API**: :8081(otbr-agent の rest listener。host network)。
