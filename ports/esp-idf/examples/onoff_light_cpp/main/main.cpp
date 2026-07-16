@@ -524,5 +524,9 @@ extern "C" void app_main() {
   wifi_init_sta();
 
   // sm_* を単線で扱う pump タスク(sans-IO 契約: 全 API を同一タスクから)。
-  xTaskCreate(&matter_task, "matter", 8192, nullptr, 5, nullptr);
+  // スタック 128KB 必須級(NanoC6 実機で確定): sm_init はスタック構築 → static へ
+  // move のため一時コピーが多段に積まれ 80KB でも Stack protection fault、さらに
+  // コミッショニング中の P-256 署名チェーンも深い(ベアメタル実測 ~70KB)。
+  // 8KB だと WiFi 開始直後に即リセットループになる。
+  xTaskCreate(&matter_task, "matter", 128 * 1024, nullptr, 5, nullptr);
 }

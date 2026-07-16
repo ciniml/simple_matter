@@ -8,3 +8,4 @@ dependencies.lock
 # エディタ/IDE 補助
 .vscode/
 compile_commands.json
+sdkconfig.local

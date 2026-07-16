@@ -363,3 +363,19 @@ S3/Xtensa 向け staticlib + コンポーネントの esp32s3 対応。
 
 コア(`crates/simple-matter`)への変更ゼロ(`ServerCluster` の pub 契約のみで実装。
 ClusterMeta の `&'static` は CustomCluster がシム static 内で自己参照を確定して満たす)。
+
+### 実機検証(NanoC6、2026-07-16)
+
+onoff_light_cpp を M5Stack NanoC6(esp32c6、4MB)で実機 E2E green:
+WiFi join(iotap)→ smctl `pairing onnetwork --at <ip>` COMPLETE(約 4 秒)→
+onoff toggle → カスタムクラスタ any read / invoke(u8,u16 → 反映確認)→
+リブートで NVS から fabrics=1 復元 → Sigma2Resume で toggle。
+資格情報は `sdkconfig.local`(gitignore)を `SDKCONFIG_DEFAULTS` に連結して注入、
+flash は `espflash write-bin`(0x0/0x8000/0x10000)。
+
+**実機で確定した必須知見: pump タスクのスタックは 128KB 級が必要。**
+8KB(当初値)は起動直後に Stack protection fault で即リセットループ、80KB でも
+不足(SP が下限を 11.5KB 突き抜け)。原因は `sm_init` の「スタック上で構築 →
+static へ move」の一時コピー多段(LTO/opt-z でも解消しない)+コミッショニング中の
+P-256 署名チェーン(ベアメタル実測 ~70KB)。将来の削減案: シム内の完全 in-place
+構築(§2 の MaybeUninit 直書きを構築式の内側まで徹底)。
