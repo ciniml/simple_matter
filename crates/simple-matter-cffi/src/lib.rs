@@ -40,9 +40,15 @@ use simple_matter::discovery::{
 use simple_matter::dm::clusters::{
     AccessControlCluster, AdminCommissioningCluster, BasicInfoConfig, BasicInformationCluster,
     CommissioningWindow, DescriptorCluster, GeneralCommissioning, GroupKeyManagementCluster,
-    GroupsCluster, IdentifyCluster, NetworkCommissioning, OnOffCluster, OpCredsCluster,
-    TestDacProvider, WindowEvent,
+    GroupsCluster, IdentifyCluster, OnOffCluster, OpCredsCluster, TestDacProvider, WindowEvent,
 };
+// NetworkCommissioning は ble の有無で型を切り替える(§9.2):
+// - ble 有効: WiFi 版(take 方式ドライバ注入)で `pairing ble-wifi` を成立させる。
+// - ble 無効: 従来の Ethernet 版(F2 の固定 SSID を C++ が自力 join)。
+#[cfg(not(feature = "ble"))]
+use simple_matter::dm::clusters::NetworkCommissioning;
+#[cfg(feature = "ble")]
+use simple_matter::dm::clusters::NetworkCommissioningWifi;
 use simple_matter::dm::meta::{ClusterId, DeviceType, EndpointId, EndpointMeta, EventId};
 use simple_matter::dm::{tick_clusters, DataModel, ServerCluster};
 use simple_matter::fabric::FabricTable;
@@ -57,6 +63,28 @@ use simple_matter::transport::net::PeerAddr;
 
 mod custom;
 use custom::{sm_cluster_def_t, CustomCluster, PendingRegistry};
+
+// ---- BLE(BTP)+ WiFi プロビジョン(F3、docs/design/c-ffi-shim.md §9)----
+#[cfg(feature = "ble")]
+use simple_matter::btp::gatt::{AdvData, ADV_TOTAL_LEN};
+#[cfg(feature = "ble")]
+use simple_matter::btp::{Btp, BtpRole};
+#[cfg(feature = "ble")]
+use simple_matter::transport::net::{BtpConnId, MAX_RX_PACKET_SIZE};
+#[cfg(feature = "ble")]
+mod wifi_driver;
+#[cfg(feature = "ble")]
+use wifi_driver::ShimWifiDriver;
+
+/// NetworkCommissioning クラスタの実型(§9.2 で ble により切替)。
+#[cfg(feature = "ble")]
+type NetCommImpl = NetworkCommissioningWifi<ShimWifiDriver>;
+#[cfg(not(feature = "ble"))]
+type NetCommImpl = NetworkCommissioning;
+
+/// BTP window(コアの参照実装 `ble-onoff-light.rs` と同じ 6)。
+#[cfg(feature = "ble")]
+const BTP_WINDOW: usize = 6;
 
 // ==========================================================================
 // サイジング(DefaultStack 相当、NF=5 固定)
@@ -163,6 +191,24 @@ pub enum sm_event_kind_t {
     SM_EV_COMMISSIONED = 2,
     SM_EV_FABRIC_REMOVED = 3,
     SM_EV_WINDOW_CHANGED = 4,
+    /// BLE commissionable 広告の内容が変わった(`sm_ble_adv_data` を再取得して反映。§9.1)。
+    SM_EV_BLE_ADV_CHANGED = 5,
+    /// ConnectNetwork 受理で WiFi join 要求が立った(`sm_take_wifi_request` で取り出す。§9.1)。
+    SM_EV_WIFI_CONNECT_REQUEST = 6,
+}
+
+/// BLE(BTP)イベント種別(`sm_ble_event` の引数、`docs/design/c-ffi-shim.md` §9.1)。
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum sm_ble_event_kind_t {
+    /// GATT 接続確立。`arg` = ATT MTU(不明なら 0 = 23 扱い)。
+    SM_BLE_CONNECTED = 0,
+    /// GATT 切断。
+    SM_BLE_DISCONNECTED = 1,
+    /// C1(0xFFF6 write)受信。`data`/`len` = 書き込まれた 1 BTP フラグメント。
+    SM_BLE_C1_WRITE = 2,
+    /// C2(indicate)CCCD subscribe 完了。以降 `sm_ble_poll` のフラグメントを送出可。
+    SM_BLE_C2_SUBSCRIBED = 3,
 }
 
 /// アプリイベント(立った順にリングから取り出す)。
@@ -322,7 +368,7 @@ struct Light {
     access_control: AccessControlCluster<'static, NACL>,
     basic: BasicInformationCluster,
     gc: GeneralCommissioning,
-    net: NetworkCommissioning,
+    net: NetCommImpl,
     admin: AdminCommissioningCluster<'static>,
     opcreds: OpCreds,
     gkm: GroupKeyManagementCluster<'static, Backend, NF, 6, 8, 8>,
@@ -583,6 +629,16 @@ struct Owned {
     groups: RefCell<DefaultGroupStore>,
 }
 
+/// NetworkCommissioning クラスタを ble の有無で作り分ける(§9.2)。
+#[cfg(feature = "ble")]
+fn new_netcomm() -> NetCommImpl {
+    NetworkCommissioningWifi::with_driver(ShimWifiDriver::new())
+}
+#[cfg(not(feature = "ble"))]
+fn new_netcomm() -> NetCommImpl {
+    NetworkCommissioning::new(b"eth0")
+}
+
 fn build_light(o: &'static Owned, rng: CRng) -> Light {
     let dac_crypto = RustCrypto::new(rng);
     let dac = TestDacProvider::new(&dac_crypto).expect("test DAC");
@@ -591,7 +647,7 @@ fn build_light(o: &'static Owned, rng: CRng) -> Light {
         access_control: AccessControlCluster::new(&o.acl),
         basic: BasicInformationCluster::new(&CFG),
         gc: GeneralCommissioning::default_config(),
-        net: NetworkCommissioning::new(b"eth0"),
+        net: new_netcomm(),
         admin: AdminCommissioningCluster::new(&o.window),
         opcreds: OpCredsCluster::new_shared(&o.fabrics, RustCrypto::new(rng), dac),
         gkm: GroupKeyManagementCluster::new_shared(&o.groups, &o.fabrics, RustCrypto::new(rng)),
@@ -635,7 +691,29 @@ struct Shim {
     last_fabric_count: usize,
     last_on: bool,
     boot_window_open: bool,
+    /// 現在 commissionable(BLE 広告すべき)なら Some(discriminator)、無ければ None。
+    /// mDNS の set_commissionable と同じ場所で更新し、BLE 広告(§9.1)の生成元にする。
+    commissionable_disc: Option<u16>,
     events: EventRing,
+    // ---- BLE(BTP)給餌(F3、docs/design/c-ffi-shim.md §9)----
+    /// BTP 状態機械(peripheral)。同時 1 接続。
+    #[cfg(feature = "ble")]
+    btp: Btp<BTP_WINDOW>,
+    /// 現在の BLE 接続ハンドル(Matter は同時 1 本)。
+    #[cfg(feature = "ble")]
+    ble_conn: Option<BtpConnId>,
+    /// 交渉済み ATT MTU(不明なら None)。
+    #[cfg(feature = "ble")]
+    ble_mtu: Option<u16>,
+    /// C2 subscribe 済み(以降 indicate 可)。
+    #[cfg(feature = "ble")]
+    ble_subscribed: bool,
+    /// 直近に生成した BLE 広告バイト列(内容変化検出用。None=広告停止)。
+    #[cfg(feature = "ble")]
+    ble_adv: Option<[u8; ADV_TOTAL_LEN]>,
+    /// WiFi join 要求の SM_EV_WIFI_CONNECT_REQUEST を既に立てたか(多重発火抑止)。
+    #[cfg(feature = "ble")]
+    wifi_req_signaled: bool,
 }
 
 /// `MaybeUninit<Shim>` を包む Sync セル(単一インスタンス・単線アクセス契約)。
@@ -692,10 +770,13 @@ impl Shim {
         if count == 0 && self.boot_window_open {
             let ad = self.commissionable_ad(self.discriminator, CommissioningMode::Standard);
             self.mdns.set_commissionable(Some(ad));
+            self.commissionable_disc = Some(self.discriminator);
         } else {
             self.refresh_operational();
+            self.commissionable_disc = None;
         }
         self.mdns.notify_change(now);
+        self.sync_ble_adv(now);
     }
 
     /// KVS からの復元 + 広告初期化(sm_init 末尾)。
@@ -770,6 +851,7 @@ impl Shim {
                 self.boot_window_open = false;
                 self.stack.set_pase_enabled(false);
                 self.mdns.set_commissionable(None);
+                self.commissionable_disc = None;
                 self.mdns.notify_change(now);
             } else if !self.boot_window_open && count == 0 && !self.owned.window.borrow().is_open() {
                 self.boot_window_open = true;
@@ -779,6 +861,7 @@ impl Shim {
                 }
                 let ad = self.commissionable_ad(self.discriminator, CommissioningMode::Standard);
                 self.mdns.set_commissionable(Some(ad));
+                self.commissionable_disc = Some(self.discriminator);
                 self.mdns.notify_change(now);
             }
             self.last_fabric_count = count;
@@ -813,6 +896,7 @@ impl Shim {
                         let ad =
                             self.commissionable_ad(discriminator, CommissioningMode::Enhanced);
                         self.mdns.set_commissionable(Some(ad));
+                        self.commissionable_disc = Some(discriminator);
                         self.mdns.notify_change(now);
                         self.events.push(sm_event_kind_t::SM_EV_WINDOW_CHANGED, 1);
                     }
@@ -825,12 +909,14 @@ impl Shim {
                     let ad =
                         self.commissionable_ad(self.discriminator, CommissioningMode::Standard);
                     self.mdns.set_commissionable(Some(ad));
+                    self.commissionable_disc = Some(self.discriminator);
                     self.mdns.notify_change(now);
                     self.events.push(sm_event_kind_t::SM_EV_WINDOW_CHANGED, 1);
                 }
                 WindowEvent::Closed => {
                     self.stack.set_pase_enabled(false);
                     self.mdns.set_commissionable(None);
+                    self.commissionable_disc = None;
                     self.mdns.notify_change(now);
                     self.events.push(sm_event_kind_t::SM_EV_WINDOW_CHANGED, 0);
                 }
@@ -843,7 +929,59 @@ impl Shim {
                 }
             }
         }
+
+        // BLE(F3): WiFi ドライバ状態の属性反映・join 要求イベント・広告差分同期。
+        self.housekeep_ble(now);
     }
+
+    /// BLE 給餌に伴う定常処理(§9)。ble 無効ビルドでは no-op。
+    #[cfg(feature = "ble")]
+    fn housekeep_ble(&mut self, now: u64) {
+        // WiFi driver の join 結果を NetworkCommissioning 属性へ反映(遅延応答の裏付け)。
+        self.stack.device_mut().net.update_from_driver();
+        // 未取り出しの join 要求があれば 1 回だけ SM_EV_WIFI_CONNECT_REQUEST を立てる。
+        let pending = self.stack.device().net.driver().has_pending();
+        if pending && !self.wifi_req_signaled {
+            self.wifi_req_signaled = true;
+            self.events
+                .push(sm_event_kind_t::SM_EV_WIFI_CONNECT_REQUEST, 0);
+        } else if !pending {
+            self.wifi_req_signaled = false;
+        }
+        // BLE 広告の差分同期(commissionable_disc は上で更新済み)。
+        self.sync_ble_adv(now);
+    }
+
+    #[cfg(not(feature = "ble"))]
+    #[inline]
+    fn housekeep_ble(&mut self, _now: u64) {}
+
+    /// `commissionable_disc` から BLE 広告バイト列を生成し、変化時に
+    /// `SM_EV_BLE_ADV_CHANGED` を立てる(§9.1・§9.2)。ble 無効ビルドでは no-op。
+    #[cfg(feature = "ble")]
+    fn sync_ble_adv(&mut self, _now: u64) {
+        let desired: Option<[u8; ADV_TOTAL_LEN]> = self.commissionable_disc.map(|disc| {
+            let adv = AdvData {
+                discriminator: disc,
+                vendor_id: self.vendor_id,
+                product_id: self.product_id,
+                additional_data: false,
+                ext_announcement: false,
+            };
+            let mut buf = [0u8; ADV_TOTAL_LEN];
+            // encode_adv は ADV_TOTAL_LEN 固定長で失敗しない。
+            let _ = adv.encode_adv(&mut buf);
+            buf
+        });
+        if desired != self.ble_adv {
+            self.ble_adv = desired;
+            self.events.push(sm_event_kind_t::SM_EV_BLE_ADV_CHANGED, 0);
+        }
+    }
+
+    #[cfg(not(feature = "ble"))]
+    #[inline]
+    fn sync_ble_adv(&mut self, _now: u64) {}
 }
 
 // ==========================================================================
@@ -977,7 +1115,17 @@ pub extern "C" fn sm_init(cfg: *const sm_config_t, now_ms: u64) -> i32 {
         addr_of_mut!((*sp).last_fabric_count).write(0);
         addr_of_mut!((*sp).last_on).write(false);
         addr_of_mut!((*sp).boot_window_open).write(true);
+        addr_of_mut!((*sp).commissionable_disc).write(None);
         addr_of_mut!((*sp).events).write(EventRing::new());
+        #[cfg(feature = "ble")]
+        {
+            addr_of_mut!((*sp).btp).write(Btp::new(BtpRole::Peripheral));
+            addr_of_mut!((*sp).ble_conn).write(None);
+            addr_of_mut!((*sp).ble_mtu).write(None);
+            addr_of_mut!((*sp).ble_subscribed).write(false);
+            addr_of_mut!((*sp).ble_adv).write(None);
+            addr_of_mut!((*sp).wifi_req_signaled).write(false);
+        }
 
         // カスタム登録(sm_init 前にステージング)を最終位置の Light へ取り込む(F4b、§8)。
         let pending = custom::take_pending();
@@ -985,6 +1133,9 @@ pub extern "C" fn sm_init(cfg: *const sm_config_t, now_ms: u64) -> i32 {
 
         INITED.store(true, Ordering::SeqCst);
         (*sp).restore_and_advertise(now_ms);
+        // 初期広告の SM_EV_BLE_ADV_CHANGED は抑止(C++ は sm_init 後に sm_ble_adv_data で
+        // 広告をブートストラップする)。以降の変化のみイベント化する。§9.1。
+        (*sp).events = EventRing::new();
     }
     0
 }
@@ -1037,15 +1188,49 @@ pub extern "C" fn sm_poll(
     let s = unsafe { shim() };
     s.housekeep(now_ms);
     let tx = unsafe { core::slice::from_raw_parts_mut(tx_out, tx_cap) };
-    match s.stack.poll(now_ms, tx) {
-        Some(d) => {
-            if !tx_dst.is_null() {
-                unsafe { *tx_dst = peer_to_addr(d.addr) };
-            }
-            d.len
+    // BLE 宛の SendDirective は BTP に載せ(送出は sm_ble_poll が担う)、UDP 宛のみ返す。
+    // BLE 宛を返してしまうと C++ が UDP として送ってしまうため、ここで振り分ける(§9.2)。
+    loop {
+        match s.stack.poll(now_ms, tx) {
+            Some(d) => match route_directive(s, &d, tx) {
+                Some(len) => {
+                    if !tx_dst.is_null() {
+                        unsafe { *tx_dst = peer_to_addr(d.addr) };
+                    }
+                    return len;
+                }
+                None => continue, // BLE 宛は BTP に載せた。次の directive を引く。
+            },
+            None => return 0,
         }
-        None => 0,
     }
+}
+
+/// SendDirective の宛先で振り分ける。UDP なら `Some(len)`(そのまま返す)、BLE なら
+/// BTP に載せて `None`(sm_ble_poll が排出する)。ble 無効時は常に UDP 扱い。
+#[cfg(feature = "ble")]
+fn route_directive(s: &mut Shim, d: &simple_matter::stack::SendDirective, tx: &[u8]) -> Option<usize> {
+    match d.addr {
+        PeerAddr::Ble(_) => {
+            let _ = s.btp.send(&tx[..d.len], 0);
+            None
+        }
+        PeerAddr::Udp(_) => Some(d.len),
+    }
+}
+#[cfg(not(feature = "ble"))]
+#[inline]
+fn route_directive(_s: &mut Shim, d: &simple_matter::stack::SendDirective, _tx: &[u8]) -> Option<usize> {
+    Some(d.len)
+}
+
+/// 再組立済み 1 SDU を `out` にコピーして長さを返す(`Btp::recv` の借用を切るため。§9)。
+#[cfg(feature = "ble")]
+fn take_sdu(btp: &mut Btp<BTP_WINDOW>, out: &mut [u8]) -> Option<usize> {
+    let sdu = btp.recv()?;
+    let n = sdu.len();
+    out[..n].copy_from_slice(sdu);
+    Some(n)
 }
 
 /// 次に sm_poll を呼ぶべき時刻(ms)。SM_NO_DEADLINE(=UINT64_MAX)= 期限なし。
@@ -1058,7 +1243,14 @@ pub extern "C" fn sm_next_deadline(now_ms: u64) -> u64 {
     let s = unsafe { shim() };
     let stack_dl = s.stack.next_deadline(now_ms).unwrap_or(NO_DEADLINE);
     let mdns_dl = s.mdns.next_announce_deadline();
-    stack_dl.min(mdns_dl)
+    let dl = stack_dl.min(mdns_dl);
+    // BTP の ACK / keep-alive / liveness 期限も併合する(§9.2)。
+    #[cfg(feature = "ble")]
+    let dl = match s.btp.next_deadline() {
+        Some(btp_dl) => dl.min(btp_dl),
+        None => dl,
+    };
+    dl
 }
 
 /// DHCP 後のアドレス反映(A/AAAA 更新)。NULL は「未設定」。
@@ -1267,6 +1459,216 @@ pub extern "C" fn sm_attr_mark_dirty(endpoint: u16, cluster_id: u32, attr_id: u3
     s.stack
         .device_mut()
         .mark_custom_dirty(endpoint, cluster_id, attr_id);
+}
+
+// ==========================================================================
+// BLE(BTP)給餌 + WiFi プロビジョン(F3、docs/design/c-ffi-shim.md §9)
+//
+// ヘッダは常時宣言し、ble 無効ビルドでは SM_ERR(-1)/ 0 を返す(後方互換。§9.2)。
+// ==========================================================================
+
+/// BLE(BTP)イベントをシムへ給餌する(§9.1)。0=OK、負値=エラー。
+///
+/// - `SM_BLE_CONNECTED`(`arg`=ATT MTU、0=不明): 2 本目の接続は `-2`(C++ は切断すべき)。
+/// - `SM_BLE_C1_WRITE`(`data`/`len`=1 上りフラグメント): BTP に投入し、再組立できた
+///   Matter メッセージを処理して応答を BTP に積む(送出は `sm_ble_poll`)。
+/// - `SM_BLE_C2_SUBSCRIBED` / `SM_BLE_DISCONNECTED`: セッション状態を更新。
+///
+/// ble 無効ビルドは常に `-1`。
+#[no_mangle]
+pub extern "C" fn sm_ble_event(
+    kind: sm_ble_event_kind_t,
+    arg: u16,
+    data: *const u8,
+    len: usize,
+    now_ms: u64,
+) -> i32 {
+    #[cfg(not(feature = "ble"))]
+    {
+        let _ = (kind, arg, data, len, now_ms);
+        -1
+    }
+    #[cfg(feature = "ble")]
+    {
+        if !INITED.load(Ordering::SeqCst) {
+            return -1;
+        }
+        // SAFETY: 単線契約。
+        let s = unsafe { shim() };
+        match kind {
+            sm_ble_event_kind_t::SM_BLE_CONNECTED => {
+                if s.ble_conn.is_some() {
+                    return -2; // 同時 1 接続(§9.2)。C++ は 2 本目を切断する。
+                }
+                s.ble_conn = Some(BtpConnId(0));
+                s.ble_mtu = if arg == 0 { None } else { Some(arg) };
+                s.ble_subscribed = false;
+                s.btp.reset();
+                0
+            }
+            sm_ble_event_kind_t::SM_BLE_DISCONNECTED => {
+                s.ble_conn = None;
+                s.ble_subscribed = false;
+                s.btp.reset();
+                0
+            }
+            sm_ble_event_kind_t::SM_BLE_C2_SUBSCRIBED => {
+                s.ble_subscribed = true;
+                0
+            }
+            sm_ble_event_kind_t::SM_BLE_C1_WRITE => {
+                if data.is_null() {
+                    return -1;
+                }
+                let Some(conn) = s.ble_conn else {
+                    return -1;
+                };
+                // SAFETY: caller が有効な data/len を与える契約。
+                let frag = unsafe { core::slice::from_raw_parts(data, len) };
+                if s.btp.process_incoming(frag, s.ble_mtu, now_ms).is_err() {
+                    return -3;
+                }
+                // 再組立できた Matter メッセージを stack へ渡し、応答を BTP に積む。
+                let mut sdu = [0u8; MAX_RX_PACKET_SIZE];
+                let mut txd = [0u8; MAX_RX_PACKET_SIZE];
+                // take_sdu は s.btp の借用を都度切る(次行で s.stack を可変借用するため)。
+                while let Some(slen) = take_sdu(&mut s.btp, &mut sdu) {
+                    let dir =
+                        s.stack
+                            .handle_rx(&mut sdu[..slen], PeerAddr::Ble(conn), now_ms, &mut txd);
+                    if let Some(d) = dir {
+                        // BLE rx への応答は BLE 宛。BTP に載せる(UDP 宛はここでは起きない)。
+                        if matches!(d.addr, PeerAddr::Ble(_)) {
+                            let _ = s.btp.send(&txd[..d.len], now_ms);
+                        }
+                    }
+                }
+                s.housekeep(now_ms);
+                0
+            }
+        }
+    }
+}
+
+/// C2 indication で送るべき次の BTP フラグメントを取り出す(§9.1)。0 = なし。
+///
+/// subscribe 完了前・未接続は 0(handshake 応答も subscribe 後に排出する)。BTP の
+/// 再送・keep-alive ACK もここから産まれる(`sm_next_deadline` が BTP 期限を併合する)。
+/// ble 無効ビルドは常に 0。
+#[no_mangle]
+pub extern "C" fn sm_ble_poll(now_ms: u64, frag_out: *mut u8, cap: usize) -> usize {
+    #[cfg(not(feature = "ble"))]
+    {
+        let _ = (now_ms, frag_out, cap);
+        0
+    }
+    #[cfg(feature = "ble")]
+    {
+        if !INITED.load(Ordering::SeqCst) || frag_out.is_null() {
+            return 0;
+        }
+        // SAFETY: 単線契約。
+        let s = unsafe { shim() };
+        if s.ble_conn.is_none() || !s.ble_subscribed {
+            return 0;
+        }
+        let out = unsafe { core::slice::from_raw_parts_mut(frag_out, cap) };
+        s.btp.process_outgoing(out, s.ble_mtu, now_ms).unwrap_or(0)
+    }
+}
+
+/// commissionable 広告(Flags AD + Service Data 0xFFF6、計 15 バイト)を `out` に書く(§9.1)。
+///
+/// 戻り値 = 書いた長さ。0 = 広告を停止すべき状態(fabric あり・窓閉)。内容が変わると
+/// `SM_EV_BLE_ADV_CHANGED` が立つので、C++ はそれを受けて本 API を再取得し NimBLE に反映する。
+/// ble 無効ビルドは常に 0。
+#[no_mangle]
+pub extern "C" fn sm_ble_adv_data(out: *mut u8, cap: usize) -> usize {
+    #[cfg(not(feature = "ble"))]
+    {
+        let _ = (out, cap);
+        0
+    }
+    #[cfg(feature = "ble")]
+    {
+        if !INITED.load(Ordering::SeqCst) || out.is_null() {
+            return 0;
+        }
+        // SAFETY: 単線契約。
+        let s = unsafe { shim() };
+        match s.ble_adv {
+            Some(adv) if cap >= adv.len() => {
+                let dst = unsafe { core::slice::from_raw_parts_mut(out, adv.len()) };
+                dst.copy_from_slice(&adv);
+                adv.len()
+            }
+            _ => 0,
+        }
+    }
+}
+
+/// ConnectNetwork で受理した WiFi join 要求(SSID/資格情報)を取り出す(§9.1)。
+///
+/// 戻り値 = SSID バイト長(0 = 保留要求なし)。`pass_len` に資格情報長を返す。
+/// `SM_EV_WIFI_CONNECT_REQUEST` を受けて呼ぶ。取り出したら C++ が esp_wifi で join し、
+/// 結果を [`sm_wifi_status`] で報告する。ble 無効ビルドは常に 0。
+#[no_mangle]
+pub extern "C" fn sm_take_wifi_request(
+    ssid_out: *mut u8,
+    ssid_cap: usize,
+    pass_out: *mut u8,
+    pass_cap: usize,
+    pass_len: *mut usize,
+) -> usize {
+    #[cfg(not(feature = "ble"))]
+    {
+        let _ = (ssid_out, ssid_cap, pass_out, pass_cap, pass_len);
+        0
+    }
+    #[cfg(feature = "ble")]
+    {
+        if !INITED.load(Ordering::SeqCst) || ssid_out.is_null() || pass_out.is_null() {
+            return 0;
+        }
+        // SAFETY: 単線契約。
+        let s = unsafe { shim() };
+        let driver = s.stack.device_mut().net.driver_mut();
+        let Some((ssid, creds)) = driver.take_request() else {
+            return 0;
+        };
+        let sn = ssid.len().min(ssid_cap);
+        // SAFETY: caller が ssid_cap バイトの ssid_out を与える契約。
+        unsafe { core::ptr::copy_nonoverlapping(ssid.as_ptr(), ssid_out, sn) };
+        let pn = creds.len().min(pass_cap);
+        // SAFETY: 同上(pass_out / pass_cap)。
+        unsafe { core::ptr::copy_nonoverlapping(creds.as_ptr(), pass_out, pn) };
+        if !pass_len.is_null() {
+            unsafe { *pass_len = pn };
+        }
+        sn
+    }
+}
+
+/// WiFi join 結果を報告する(§9.1)。遅延 ConnectNetworkResponse がこれで確定する。
+///
+/// `connected`=true で Connected、false で Failed。次の `sm_poll`/`sm_ble_poll` サイクルで
+/// コアが遅延 ConnectNetworkResponse を BTP に積む。ble 無効ビルドは no-op。
+#[no_mangle]
+pub extern "C" fn sm_wifi_status(connected: bool, now_ms: u64) {
+    #[cfg(not(feature = "ble"))]
+    {
+        let _ = (connected, now_ms);
+    }
+    #[cfg(feature = "ble")]
+    {
+        if !INITED.load(Ordering::SeqCst) {
+            return;
+        }
+        // SAFETY: 単線契約。
+        let s = unsafe { shim() };
+        s.stack.device_mut().net.driver_mut().set_status(connected);
+        s.housekeep(now_ms);
+    }
 }
 
 // ==========================================================================

@@ -22,10 +22,15 @@ simple-matter = { path = "../simple-matter", default-features = false, features 
 heapless = { version = "0.8", default-features = false }
 
 [features]
-default = []
+# BLE(BTP)給餌 API を既定で有効にする(docs/design/c-ffi-shim.md §9)。
+default = ["ble"]
 # ホスト向けビルド(ctest の staticlib・cargo test)で std を有効にし、
 # std のパニックハンドラ・lang item を使う(docs/design/c-ffi-shim.md §2)。
 std = []
 # ベアメタル(no_std)ビルド向けに #[panic_handler] を提供する。
 # ホストビルドでは使わない(std のハンドラを使う)。
 panic-abort = []
+# BLE 給餌 API(sm_ble_event / sm_ble_poll / sm_ble_adv_data + WiFi プロビジョンの
+# take 方式)。コアの ble feature(BTP + PeerAddr::Ble)を引き込む。無効ビルドでも
+# C ヘッダは常時宣言し、各 API は SM_ERR / 0 を返す(後方互換。§9.2)。
+ble = ["simple-matter/ble"]

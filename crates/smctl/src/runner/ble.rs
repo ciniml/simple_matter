@@ -20,7 +20,7 @@
 //! アダプタは `SM_BLE_ADAPTER=hciN` で指定できる。`SM_BTP_TRACE=1` で BTP フラグメントを
 //! トレースする。tokio(current_thread)はこのモジュール内でのみ使う(設計 doc §2.4)。
 
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 use simple_matter::btp::gatt::{GattCentral, ScanFilter};
@@ -91,6 +91,7 @@ pub fn pair_ble(
         discriminator,
         handoff,
         wifi.as_ref().map(|(s, p)| (s.as_bytes(), p.as_bytes())),
+        g.at.as_deref(),
     ))?;
 
     // 発行済み serial を CA 状態に反映し、アドレス帳へ記帳する。
@@ -131,6 +132,7 @@ async fn run_ble(
     discriminator: Option<u16>,
     handoff: bool,
     wifi: Option<(&[u8], &[u8])>,
+    at: Option<&[IpAddr]>,
 ) -> Result<SocketAddr, String> {
     // ble-wifi はデバイスが Wi-Fi join 後に IP 到達可能になるため、CASE 以降は必ず
     // 運用 UDP で行う(handoff と同じ保留遷移)。
@@ -308,7 +310,15 @@ async fn run_ble(
             } else {
                 RESOLVE_TIMEOUT
             };
-            let device_addr = mdns::resolve_operational(ca, node_id, resolve_timeout)?;
+            // --at 指定時はユニキャスト QU で解決する(マルチキャストを落とす AP / IGMP
+            // snooping 環境。ble-wifi では特に、デバイスの運用 mDNS 応答がホストへ届かない
+            // ケースがある。実機で確認済み)。
+            let device_addr = match at {
+                Some(targets) => {
+                    mdns::resolve_operational_at(ca, node_id, targets, resolve_timeout)?
+                }
+                None => mdns::resolve_operational(ca, node_id, resolve_timeout)?,
+            };
             crate::log::logf!(
                 crate::log::Level::Info,
                 "ctl",

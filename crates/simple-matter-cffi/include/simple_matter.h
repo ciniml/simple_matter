@@ -56,6 +56,18 @@ typedef enum {
   SM_T_OCTETS,
 } sm_attr_type_t;
 
+// BLE(BTP)イベント種別(`sm_ble_event` の引数、`docs/design/c-ffi-shim.md` §9.1)。
+typedef enum {
+  // GATT 接続確立。`arg` = ATT MTU(不明なら 0 = 23 扱い)。
+  SM_BLE_CONNECTED = 0,
+  // GATT 切断。
+  SM_BLE_DISCONNECTED = 1,
+  // C1(0xFFF6 write)受信。`data`/`len` = 書き込まれた 1 BTP フラグメント。
+  SM_BLE_C1_WRITE = 2,
+  // C2(indicate)CCCD subscribe 完了。以降 `sm_ble_poll` のフラグメントを送出可。
+  SM_BLE_C2_SUBSCRIBED = 3,
+} sm_ble_event_kind_t;
+
 // アプリイベント種別(`docs/design/c-ffi-shim.md` §1)。
 typedef enum {
   SM_EV_NONE = 0,
@@ -63,6 +75,10 @@ typedef enum {
   SM_EV_COMMISSIONED = 2,
   SM_EV_FABRIC_REMOVED = 3,
   SM_EV_WINDOW_CHANGED = 4,
+  // BLE commissionable 広告の内容が変わった(`sm_ble_adv_data` を再取得して反映。§9.1)。
+  SM_EV_BLE_ADV_CHANGED = 5,
+  // ConnectNetwork 受理で WiFi join 要求が立った(`sm_take_wifi_request` で取り出す。§9.1)。
+  SM_EV_WIFI_CONNECT_REQUEST = 6,
 } sm_event_kind_t;
 
 // KVS get コールバック: 値を `buf` へ書き実長を返す(無ければ負値)。
@@ -283,6 +299,55 @@ int32_t sm_endpoint_register(uint16_t endpoint,
 void sm_attr_mark_dirty(uint16_t endpoint,
                         uint32_t cluster_id,
                         uint32_t attr_id);
+
+// BLE(BTP)イベントをシムへ給餌する(§9.1)。0=OK、負値=エラー。
+//
+// - `SM_BLE_CONNECTED`(`arg`=ATT MTU、0=不明): 2 本目の接続は `-2`(C++ は切断すべき)。
+// - `SM_BLE_C1_WRITE`(`data`/`len`=1 上りフラグメント): BTP に投入し、再組立できた
+//   Matter メッセージを処理して応答を BTP に積む(送出は `sm_ble_poll`)。
+// - `SM_BLE_C2_SUBSCRIBED` / `SM_BLE_DISCONNECTED`: セッション状態を更新。
+//
+// ble 無効ビルドは常に `-1`。
+int32_t sm_ble_event(sm_ble_event_kind_t kind,
+                     uint16_t arg,
+                     const uint8_t *data,
+                     size_t len,
+                     uint64_t now_ms);
+
+// C2 indication で送るべき次の BTP フラグメントを取り出す(§9.1)。0 = なし。
+//
+// subscribe 完了前・未接続は 0(handshake 応答も subscribe 後に排出する)。BTP の
+// 再送・keep-alive ACK もここから産まれる(`sm_next_deadline` が BTP 期限を併合する)。
+// ble 無効ビルドは常に 0。
+size_t sm_ble_poll(uint64_t now_ms,
+                   uint8_t *frag_out,
+                   size_t cap);
+
+// commissionable 広告(Flags AD + Service Data 0xFFF6、計 15 バイト)を `out` に書く(§9.1)。
+//
+// 戻り値 = 書いた長さ。0 = 広告を停止すべき状態(fabric あり・窓閉)。内容が変わると
+// `SM_EV_BLE_ADV_CHANGED` が立つので、C++ はそれを受けて本 API を再取得し NimBLE に反映する。
+// ble 無効ビルドは常に 0。
+size_t sm_ble_adv_data(uint8_t *out,
+                       size_t cap);
+
+// ConnectNetwork で受理した WiFi join 要求(SSID/資格情報)を取り出す(§9.1)。
+//
+// 戻り値 = SSID バイト長(0 = 保留要求なし)。`pass_len` に資格情報長を返す。
+// `SM_EV_WIFI_CONNECT_REQUEST` を受けて呼ぶ。取り出したら C++ が esp_wifi で join し、
+// 結果を [`sm_wifi_status`] で報告する。ble 無効ビルドは常に 0。
+size_t sm_take_wifi_request(uint8_t *ssid_out,
+                            size_t ssid_cap,
+                            uint8_t *pass_out,
+                            size_t pass_cap,
+                            size_t *pass_len);
+
+// WiFi join 結果を報告する(§9.1)。遅延 ConnectNetworkResponse がこれで確定する。
+//
+// `connected`=true で Connected、false で Failed。次の `sm_poll`/`sm_ble_poll` サイクルで
+// コアが遅延 ConnectNetworkResponse を BTP に積む。ble 無効ビルドは no-op。
+void sm_wifi_status(bool connected,
+                    uint64_t now_ms);
 
 #ifdef __cplusplus
 } // extern "C"

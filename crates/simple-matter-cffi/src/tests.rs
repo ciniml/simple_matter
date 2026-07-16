@@ -180,6 +180,197 @@ fn ffi_lifecycle_roundtrip() {
     };
     assert_eq!(sm_cluster_register(&def), -2);
     assert_eq!(sm_endpoint_register(2, 0x0100, 1), -2);
+
+    // ---- F3: BLE 給餌(この時点で fabric 0・commissionable。§9)----
+    #[cfg(feature = "ble")]
+    ble_checks();
+}
+
+/// F3 の BLE/WiFi API を初期化済みインスタンス上で検証する
+/// (単一 static 共有のため `ffi_lifecycle_roundtrip` 末尾から呼ぶ)。
+#[cfg(feature = "ble")]
+fn ble_checks() {
+    use simple_matter::btp::gatt::ADV_TOTAL_LEN;
+    use simple_matter::btp::{Btp, BtpRole};
+
+    // (1) 広告データ生成: commissionable 状態なので Flags+ServiceData 15 バイト。
+    let mut adv = [0u8; 64];
+    let n = sm_ble_adv_data(adv.as_mut_ptr(), adv.len());
+    assert_eq!(n, ADV_TOTAL_LEN);
+    assert_eq!(adv[0], 0x02); // Flags AD length
+    assert_eq!(adv[4], 0x16); // Service Data - 16bit UUID
+    assert_eq!(adv[7], 0x00); // commissionable OpCode
+                              // discriminator(下位 12bit)= 3840 が service data に載る。
+    let disc = u16::from_le_bytes([adv[8], adv[9]]) & 0x0FFF;
+    assert_eq!(disc, 3840);
+    // cap 不足は 0 返し。
+    assert_eq!(sm_ble_adv_data(adv.as_mut_ptr(), 4), 0);
+
+    // (2) BTP handshake フラグメントラウンドトリップ。
+    let mtu: u16 = 247;
+    assert_eq!(
+        sm_ble_event(
+            sm_ble_event_kind_t::SM_BLE_CONNECTED,
+            mtu,
+            core::ptr::null(),
+            0,
+            1000,
+        ),
+        0
+    );
+    // 2 本目の接続は拒否(-2)。
+    assert_eq!(
+        sm_ble_event(
+            sm_ble_event_kind_t::SM_BLE_CONNECTED,
+            mtu,
+            core::ptr::null(),
+            0,
+            1000,
+        ),
+        -2
+    );
+
+    // central 側 BTP で handshake request を生成 → C1 write として給餌。
+    let mut central = Btp::<6>::new(BtpRole::Central);
+    let mut req = [0u8; 32];
+    let rlen = central.start_handshake(&mut req, Some(mtu), 1000).unwrap();
+    assert_eq!(
+        sm_ble_event(
+            sm_ble_event_kind_t::SM_BLE_C1_WRITE,
+            0,
+            req.as_ptr(),
+            rlen,
+            1001,
+        ),
+        0
+    );
+    // subscribe 前は indicate 不可(handshake resp も保留)。
+    let mut frag = [0u8; 64];
+    assert_eq!(sm_ble_poll(1002, frag.as_mut_ptr(), frag.len()), 0);
+
+    // subscribe 後に handshake response フラグメントが取り出せる。
+    assert_eq!(
+        sm_ble_event(
+            sm_ble_event_kind_t::SM_BLE_C2_SUBSCRIBED,
+            0,
+            core::ptr::null(),
+            0,
+            1003,
+        ),
+        0
+    );
+    let fl = sm_ble_poll(1004, frag.as_mut_ptr(), frag.len());
+    assert!(fl > 0, "handshake response fragment expected");
+    // central がその応答を取り込むと BTP セッションが確立する。
+    central
+        .process_incoming(&frag[..fl], Some(mtu), 1005)
+        .unwrap();
+    assert!(central.is_established(), "central BTP established");
+
+    // 切断でセッションがリセットされ、再接続を受け付ける。
+    assert_eq!(
+        sm_ble_event(
+            sm_ble_event_kind_t::SM_BLE_DISCONNECTED,
+            0,
+            core::ptr::null(),
+            0,
+            1006,
+        ),
+        0
+    );
+    assert_eq!(
+        sm_ble_event(
+            sm_ble_event_kind_t::SM_BLE_CONNECTED,
+            0, // mtu 不明 = 既定 23 扱い
+            core::ptr::null(),
+            0,
+            1007,
+        ),
+        0
+    );
+    sm_ble_event(
+        sm_ble_event_kind_t::SM_BLE_DISCONNECTED,
+        0,
+        core::ptr::null(),
+        0,
+        1008,
+    );
+
+    // (3) WiFi request take: 保留がなければ 0。ドライバへ直接 connect を注入して take を確認。
+    let mut ssid = [0u8; 32];
+    let mut pass = [0u8; 64];
+    let mut plen = 0usize;
+    assert_eq!(
+        sm_take_wifi_request(
+            ssid.as_mut_ptr(),
+            ssid.len(),
+            pass.as_mut_ptr(),
+            pass.len(),
+            &mut plen,
+        ),
+        0
+    );
+    // WifiDriver::connect(コアが ConnectNetwork で呼ぶ経路)を直接叩いて要求を立てる。
+    {
+        use simple_matter::wifi::WifiDriver;
+        // SAFETY: 単線・初期化済み。
+        let s = unsafe { shim() };
+        s.stack
+            .device_mut()
+            .net
+            .driver_mut()
+            .connect(b"iotap", b"hunter2xx");
+    }
+    let sn = sm_take_wifi_request(
+        ssid.as_mut_ptr(),
+        ssid.len(),
+        pass.as_mut_ptr(),
+        pass.len(),
+        &mut plen,
+    );
+    assert_eq!(sn, 5);
+    assert_eq!(&ssid[..5], b"iotap");
+    assert_eq!(plen, 9);
+    assert_eq!(&pass[..9], b"hunter2xx");
+    // 取り出し後は保留なし。
+    assert_eq!(
+        sm_take_wifi_request(
+            ssid.as_mut_ptr(),
+            ssid.len(),
+            pass.as_mut_ptr(),
+            pass.len(),
+            &mut plen,
+        ),
+        0
+    );
+    // 結果報告は panic しない(遅延応答の裏付け)。
+    sm_wifi_status(true, 1009);
+}
+
+/// ble 無効ビルドでは BLE/WiFi API が SM_ERR(-1)/ 0 を返す(後方互換。§9.2)。
+/// `cargo test -p simple-matter-cffi --no-default-features` でのみ走る。
+#[cfg(not(feature = "ble"))]
+#[test]
+fn ble_disabled_returns_sm_err() {
+    let mut buf = [0u8; 64];
+    let mut plen = 0usize;
+    assert_eq!(
+        sm_ble_event(
+            sm_ble_event_kind_t::SM_BLE_C1_WRITE,
+            0,
+            core::ptr::null(),
+            0,
+            0,
+        ),
+        -1
+    );
+    assert_eq!(sm_ble_poll(0, buf.as_mut_ptr(), buf.len()), 0);
+    assert_eq!(sm_ble_adv_data(buf.as_mut_ptr(), buf.len()), 0);
+    assert_eq!(
+        sm_take_wifi_request(buf.as_mut_ptr(), 32, buf.as_mut_ptr(), 32, &mut plen),
+        0
+    );
+    sm_wifi_status(true, 0); // no-op(panic しない)
 }
 
 // ==========================================================================

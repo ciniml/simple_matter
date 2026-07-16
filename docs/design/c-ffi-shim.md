@@ -364,6 +364,152 @@ S3/Xtensa 向け staticlib + コンポーネントの esp32s3 対応。
 コア(`crates/simple-matter`)への変更ゼロ(`ServerCluster` の pub 契約のみで実装。
 ClusterMeta の `&'static` は CustomCluster がシム static 内で自己参照を確定して満たす)。
 
+### F3(完了、NanoC6 実機 E2E green 2026-07-16)
+
+BLE(BTP)給餌 API + NimBLE 配線。`pairing ble-wifi`(BLE コミッショニング → WiFi
+プロビジョン → 運用 UDP)を NanoC6 実機で通した。
+
+追加/変更物:
+- `crates/simple-matter-cffi`:
+  - `Cargo.toml`: feature `ble`(default on)= `simple-matter/ble` を引き込む。
+  - `src/lib.rs`: §9.1 の 5 API(`sm_ble_event`/`sm_ble_poll`/`sm_ble_adv_data`/
+    `sm_take_wifi_request`/`sm_wifi_status`)+ `sm_ble_event_kind_t` + イベント
+    `SM_EV_BLE_ADV_CHANGED`/`SM_EV_WIFI_CONNECT_REQUEST`。Shim に `Btp<6>` + BLE 接続状態
+    (conn/mtu/subscribed/adv)を ble-gated 保持。`sm_poll` は BLE 宛 SendDirective を
+    BTP に載せ替え(UDP 宛のみ返す)、`sm_next_deadline` に BTP deadline を併合。
+    NetworkCommissioning を ble 有無で `NetworkCommissioningWifi<ShimWifiDriver>` /
+    `NetworkCommissioning`(Ethernet)に切替。
+  - `src/wifi_driver.rs`: take 方式 `ShimWifiDriver`(§9.2)。`connect` で SSID/creds を
+    退避 + `Connecting`、`sm_take_wifi_request` で降ろし、`sm_wifi_status` で
+    `Connected`/`Failed` を反映 → コアの `poll_deferred` が遅延 ConnectNetworkResponse を確定。
+  - `src/tests.rs`: BTP handshake フラグメントラウンドトリップ(central→C1 write→subscribe→
+    `sm_ble_poll` で handshake resp→central 確立)、adv data 生成、wifi request take を
+    `ffi_lifecycle_roundtrip` に追加。ble 無効時 SM_ERR は `ble_disabled_returns_sm_err`
+    (`--no-default-features` で走る新規テスト)。
+  - ヘッダ再生成(冪等)。
+- `ports/esp-idf/examples/onoff_light_cpp`(NimBLE、C6):
+  - `main/ble.cpp` + `ble.hpp`: NimBLE(GATT 0xFFF6 / C1 write / C2 indicate / 広告)。
+    コールバックは `app_cmd.hpp` の Cmd queue で matter タスクへ直列化。indicate は
+    確認(EDONE)まで待って次フラグメントを直列送出。MTU 交換で `SM_BLE_CONNECTED`
+    (C1 write が先着したら mtu=0 で先行送出)。
+  - `main/main.cpp`: BLE 有効時は起動時 WiFi join を止め、`SM_EV_WIFI_CONNECT_REQUEST`
+    → `sm_take_wifi_request` → esp_wifi join → got_ip/失敗で `sm_wifi_status`。
+    `SM_EV_BLE_ADV_CHANGED` → `sm_ble_adv_data` を NimBLE に反映。WiFi 資格情報は NVS
+    (namespace `smwifi`)に保存し、起動時 fabric>0 なら復元 auto-join(再起動 resumption 用)。
+    `esp_wifi_set_ps(WIFI_PS_NONE)`(省電力オフ。mDNS/CASE の UDP 取りこぼし対策)。
+  - `main/Kconfig.projbuild`: `CONFIG_SM_ENABLE_BLE`(C6 既定 y / それ以外 n)。
+  - `sdkconfig.defaults.esp32c6`: NimBLE(peripheral)+ WiFi/BLE coex 有効(S3 は読まれず
+    BLE 無効ビルド)。`main/CMakeLists.txt`: `bt` を常時要求(条件付き REQUIRES は
+    sdkconfig 展開前に評価されるため不可。S3 は BT 無効でスタブ)。matter タスクスタック
+    128KB は §7 の知見どおり維持。
+- `crates/smctl/src/runner/ble.rs`(テストツール): `pairing ble-wifi` の運用 mDNS 解決に
+  `--at`(ユニキャスト QU)を配線(既存 `resolve_operational_at` を使用)。マルチキャストを
+  落とす AP / IGMP snooping 環境で運用ノードが解決できない実機症状の回避。
+
+ゲート(実測):
+- `cargo test --workspace` = 595 pass(BLE ラウンドトリップ等を `ffi_lifecycle_roundtrip`
+  に集約。単一 static 契約のため)。`--no-default-features` で +1(ble 無効 SM_ERR)。clippy 0。
+- riscv32imac staticlib: `--features panic-abort,ble` green + `--features panic-abort`
+  (ble 無効・後方互換)green。ヘッダ冪等。5 新規シンボルが最終 ELF に `T` で存在。
+- `idf.py build`: esp32c6(BLE 有効)green(app 1,504,320B、partition 24% free)。
+  esp32s3(`CONFIG_SM_ENABLE_BLE=n`、BT 無効)green(app 1,019,344B、48% free)= 回帰なし。
+- **実機 E2E(NanoC6、/dev/ttyACM1、MAC 40:4c:ca:5b:2f:e0)green**: フレッシュ NVS →
+  `smctl --at 192.168.2.129 pairing ble-wifi 1 20202021 iotap hogeFugapiyo 3840`:
+  PASE→ArmFailSafe→…→AddNOC→AddOrUpdateWiFiNetwork→ConnectNetwork(`sm_take_wifi_request`
+  経由で esp_wifi join、got_ip で `sm_wifi_status(true)` → 遅延 ConnectNetworkResponse)→
+  BLE close → 運用ノード unicast 解決(192.168.2.129:5540)→ CASE(Sigma1/2/3) over UDP →
+  **CommissioningComplete** → onoff toggle(Success)。運用中の read は Sigma2Resume で確立。
+  **リブート → `fabrics=1` 復元 + 保存 WiFi で auto-join → Sigma2Resume で toggle** 確認。
+- RAM 実測(BLE+WiFi coex + 128KB スタック): `sm_init` 直後 free heap ≈ 92.7–93.2KB
+  (NimBLE 起動後・WiFi 接続前)。逼迫なし。
+- コア(`crates/simple-matter`)への変更ゼロ。
+
+## 9. BLE 給餌 API(F3 設計)
+
+目的: C++ 側が所有する BLE スタック(ESP-IDF なら NimBLE)から BTP バイト列を
+給餌し、`pairing ble-wifi`(BLE コミッショニング → WiFi プロビジョン → 運用 UDP)を
+成立させる。コアの BTP はポンプ型(`Btp::process_incoming` / `recv` / `send` /
+`process_outgoing`)なので、UDP と同じ out-buffer 流儀で写像する。
+
+### 9.1 C API
+
+```c
+/* ---- BLE(BTP)。GATT サービス 0xFFF6 / C1 write / C2 indicate は C++ 側所有 ---- */
+typedef enum { SM_BLE_CONNECTED,      /* arg = ATT MTU(不明なら 0 = 23 扱い) */
+               SM_BLE_DISCONNECTED,
+               SM_BLE_C1_WRITE,       /* data/len = 書き込まれた 1 フラグメント */
+               SM_BLE_C2_SUBSCRIBED   /* CCCD subscribe 完了 */ } sm_ble_event_kind_t;
+int    sm_ble_event(sm_ble_event_kind_t kind, uint16_t arg,
+                    const uint8_t *data, size_t len, uint64_t now_ms);
+/* C2 indication で送るべき次フラグメント(0 = なし)。indication 完了(ACK)を
+   待たず次を取り出してよい(C++ 側は NimBLE の indicate 完了イベントで直列化) */
+size_t sm_ble_poll(uint64_t now_ms, uint8_t *frag_out, size_t cap);
+/* commissionable 広告の service data(0xFFF6)。0 = 広告停止すべき状態。
+   内容が変わったら SM_EV_BLE_ADV_CHANGED イベントが立つ */
+size_t sm_ble_adv_data(uint8_t *out, size_t cap);
+
+/* ---- WiFi プロビジョン(NetworkCommissioning → C++ の esp_wifi へ) ---- */
+/* ConnectNetwork 受理で SM_EV_WIFI_CONNECT_REQUEST が立つ → C++ が取り出して join */
+size_t sm_take_wifi_request(uint8_t *ssid_out, size_t ssid_cap,
+                            uint8_t *pass_out, size_t pass_cap, size_t *pass_len);
+/* join 結果の報告(遅延 ConnectNetworkResponse がこれで確定する) */
+void   sm_wifi_status(bool connected, uint64_t now_ms);
+```
+
+### 9.2 設計判断
+
+- **BLE 接続は同時 1 本**(BTP エンジン 1 個。Matter デバイスの通例。2 本目の
+  CONNECTED は拒否 = C++ 側で接続を切る)。conn id は API に出さない。
+- **fragment サイズ = CONNECTED で渡された ATT MTU から BTP が交渉**(mtu=0 は
+  「不明」= 23 既定。E4 実機で fragment=244 実証済みの経路)。
+- `sm_ble_poll` は BTP の再送・keep-alive ACK(2.5s、chip ack-timer 互換)も
+  産むため、`sm_next_deadline` は BTP の deadline も併合する。
+- **WiFi driver は callback でなく take 方式**(pump 単線契約の維持)。コアの
+  NetworkCommissioningWifi(即 Success + バックグラウンド join + 遅延
+  ConnectNetworkResponse)に `sm_take_wifi_request` / `sm_wifi_status` で橋渡し。
+  v1 プリセット(F2 example)の「固定 SSID を C++ が自力 join」も引き続き可
+  (BLE 無効ビルド/未使用なら従来どおり)。
+- 広告ペイロードはシムが生成(discriminator/VID/PID 入り Matter service data)。
+  開始/停止の判断もシム(fabric 有無・窓状態)で、C++ は SM_EV_BLE_ADV_CHANGED を
+  受けて `sm_ble_adv_data` を反映するだけ。
+- シムの `ble` は Cargo feature(default on。ヘッダは常時宣言、無効ビルドは
+  SM_ERR 返し)。
+
+### 9.3 example(NimBLE)
+
+onoff_light_cpp に NimBLE 配線を追加(Kconfig で BLE on/off):
+GATT サービス 0xFFF6(C1 write / C2 indicate)、広告 = `sm_ble_adv_data`、
+indicate 完了イベントで次フラグメント送出、MTU 交換後に SM_BLE_CONNECTED。
+WiFi は起動時 join をやめ(BLE 有効時)、`sm_take_wifi_request` 駆動に切替。
+
+ゲート: NanoC6 実機で PC から smctl `pairing ble-wifi`(BLE コミッショニング →
+WiFi provision → BLE close → 運用 mDNS → CASE over UDP)+ chip-tool 相互試験。
+
+### 9.4 実装で確定した差分(F3)
+
+設計 §9.1/§9.2/§9.3 に対し、実装で以下を確定した(§9 本文はそのまま、差分をここに集約):
+
+- **`sm_ble_adv_data` は完全な広告ペイロード(15 バイト)を返す**。§9.1 の「service data
+  (0xFFF6)」は、C++ がそのまま `ble_gap_adv_set_data` に渡せるよう **Flags AD + Service
+  Data AD(`AdvData::encode_adv`、`ADV_TOTAL_LEN=15`)** を返す実装にした(8 バイトの
+  service data 単体ではない)。`cap` 不足は 0 返し。
+- **`sm_ble_event` の戻り値**: `0`=OK、`-1`=未初期化/NULL/ble 無効、`-2`=2 本目の接続拒否
+  (C++ は当該接続を切る)、`-3`=BTP `process_incoming` 失敗。
+- **`sm_ble_poll` は subscribe 完了前は 0**(handshake resp も含め、C2 subscribe 後に排出)。
+- **`sm_take_wifi_request` は SSID バイト長を返す**(0=保留なし)、`pass_len` に資格情報長。
+- **初期広告イベントは抑止**: `sm_init` 末尾で立つ最初の `SM_EV_BLE_ADV_CHANGED` は
+  イベントリングから除去する(C++ は init 後に `sm_ble_adv_data` で広告をブートストラップ
+  するため。以降の変化のみイベント化)。
+- **ATT MTU が未知でも成立**: MTU 交換前の C1 write 先着時は `SM_BLE_CONNECTED(mtu=0)` を
+  先行送出し、BTP handshake は central 提示 MTU からフラグメントを算出する(実機 chip/smctl は
+  MTU 交換後に BTP handshake するため通常は交渉済み MTU が入る)。
+- **example の追加(§9.3 外だが実運用に必須)**: (a) WiFi 資格情報の NVS 永続化 + 起動時
+  auto-join(再起動 resumption)、(b) `esp_wifi_set_ps(WIFI_PS_NONE)`(coex 省電力で mDNS/CASE
+  の UDP を取りこぼす対策)。
+- **`Kconfig SM_ENABLE_BLE` は C6 のみ既定 y**(S3 は既定 n = 従来の UDP 直接 PASE)。BT/NimBLE
+  の sdkconfig は `sdkconfig.defaults.esp32c6` に置き S3 では読まれない。`bt` は常時 REQUIRES
+  (条件付き REQUIRES 不可)。
+
 ### 実機検証(NanoC6、2026-07-16)
 
 onoff_light_cpp を M5Stack NanoC6(esp32c6、4MB)で実機 E2E green:

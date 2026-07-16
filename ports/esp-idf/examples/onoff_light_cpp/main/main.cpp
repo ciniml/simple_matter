@@ -18,13 +18,19 @@
 
 #include "sm_wrapper.hpp"
 
+#include "app_cmd.hpp"
+#include "ble.hpp"
+
 #include <cstring>
+
+#include "sdkconfig.h"
 
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_random.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "nvs.h"
@@ -113,6 +119,43 @@ extern "C" int32_t kvs_delete(void *, const char *key) {
 // ---- RNG コールバック ------------------------------------------------------
 
 extern "C" void rng_fill(void *, uint8_t *buf, size_t len) { esp_fill_random(buf, len); }
+
+// ---- WiFi 資格情報の永続化(BLE プロビジョン後の再起動で自動 join) -----------
+//
+// BLE 有効時は起動時 join を止め ConnectNetwork 駆動にするが、コミッショニング済み
+// (fabric 復元)デバイスは再起動後も運用 mDNS/CASE のため WiFi に居る必要がある。
+// コアの NetworkCommissioningWifi は資格情報を RAM にしか持たないため、C++ 側で
+// sm_take_wifi_request の値を NVS に保存し、起動時 fabric>0 なら復元して join する
+// (e5-light.rs と同じ方式)。
+#if CONFIG_SM_ENABLE_BLE
+static void save_wifi_creds(const uint8_t *ssid, size_t sl, const uint8_t *pass, size_t pl) {
+  nvs_handle_t h;
+  if (nvs_open("smwifi", NVS_READWRITE, &h) != ESP_OK) {
+    return;
+  }
+  nvs_set_blob(h, "ssid", ssid, sl);
+  nvs_set_blob(h, "pass", pass, pl);
+  nvs_commit(h);
+  nvs_close(h);
+}
+
+static bool load_wifi_creds(uint8_t *ssid, size_t *sl, uint8_t *pass, size_t *pl) {
+  nvs_handle_t h;
+  if (nvs_open("smwifi", NVS_READONLY, &h) != ESP_OK) {
+    return false;
+  }
+  size_t s = *sl, p = *pl;
+  esp_err_t e1 = nvs_get_blob(h, "ssid", ssid, &s);
+  esp_err_t e2 = nvs_get_blob(h, "pass", pass, &p);
+  nvs_close(h);
+  if (e1 == ESP_OK && e2 == ESP_OK) {
+    *sl = s;
+    *pl = p;
+    return true;
+  }
+  return false;
+}
+#endif
 
 // ---- sockaddr <-> sm_addr_t ------------------------------------------------
 
@@ -213,32 +256,51 @@ static int open_mdns_socket() {
   return fd;
 }
 
-// ---- タスク間メッセージ(WiFi/IP イベント → matter_task) -------------------
-
-enum class CmdKind { IpV4, IpV6, LocalToggle };
-struct Cmd {
-  CmdKind kind;
-  uint8_t v4[4];
-  uint8_t v6[16];
-};
+// ---- タスク間メッセージ(app_cmd.hpp)--------------------------------------
 
 static QueueHandle_t g_cmd_queue = nullptr;
 
 // ---- WiFi ------------------------------------------------------------------
 
 static esp_netif_t *g_sta_netif = nullptr;
+// WiFi 状態(STA_DISCONNECTED の扱いを分岐する)。
+static volatile bool g_wifi_connected = false; // 一度でも got_ip したか
+static volatile bool g_wifi_joining = false;   // esp_wifi_connect 発行〜結果待ち
 
 static void on_wifi_event(void *, esp_event_base_t base, int32_t id, void *) {
   if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-    esp_wifi_connect();
+#if CONFIG_SM_ENABLE_BLE
+    // BLE 有効時は起動時 join をしない。ConnectNetwork(sm_take_wifi_request)駆動。
+#else
+    esp_wifi_connect(); // 従来: 固定 SSID を起動時に join(F2 経路)。
+#endif
   } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-    ESP_LOGW(TAG, "wifi disconnected, retrying");
-    esp_wifi_connect();
+    if (g_wifi_connected) {
+      // 運用中の切断: 再接続を試みる。
+      esp_wifi_connect();
+    } else if (g_wifi_joining) {
+      // プロビジョン中の join 失敗 → sm へ報告(コアがリトライ契機にする)。
+      g_wifi_joining = false;
+#if CONFIG_SM_ENABLE_BLE
+      Cmd c{};
+      c.kind = CmdKind::WifiFailed;
+      if (g_cmd_queue) {
+        xQueueSend(g_cmd_queue, &c, 0);
+      }
+#endif
+    } else {
+#if !CONFIG_SM_ENABLE_BLE
+      ESP_LOGW(TAG, "wifi disconnected, retrying");
+      esp_wifi_connect();
+#endif
+    }
   }
 }
 
 static void on_got_ip4(void *, esp_event_base_t, int32_t, void *event_data) {
   auto *ev = (ip_event_got_ip_t *)event_data;
+  g_wifi_connected = true;
+  g_wifi_joining = false;
   Cmd c{};
   c.kind = CmdKind::IpV4;
   uint32_t ip = ev->ip_info.ip.addr; // network byte order (lwIP)
@@ -275,16 +337,38 @@ static void wifi_init_sta() {
   ESP_ERROR_CHECK(esp_event_handler_instance_register(
       IP_EVENT, IP_EVENT_GOT_IP6, &on_got_ip6, nullptr, nullptr));
 
+  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+#if !CONFIG_SM_ENABLE_BLE
+  // 従来(F2)経路: 固定 SSID を設定して起動時に join する。
   wifi_config_t wc{};
   strncpy((char *)wc.sta.ssid, SM_WIFI_SSID, sizeof(wc.sta.ssid) - 1);
   strncpy((char *)wc.sta.password, SM_WIFI_PASS, sizeof(wc.sta.password) - 1);
   wc.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-
-  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
   ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
+#endif
   ESP_ERROR_CHECK(esp_wifi_start());
-  ESP_LOGI(TAG, "wifi station started (ssid=%s)", SM_WIFI_SSID);
+  // 省電力(modem-sleep)を無効化する。有効だと STA が DTIM 間欠受信になり、mDNS の
+  // ユニキャスト QU 応答や CASE の UDP が取りこぼされ operational 解決に失敗しやすい
+  // (BLE coex 併用で顕著)。運用トランスポート = UDP なので常時受信にする。
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  ESP_LOGI(TAG, "wifi station started (ps=none)");
 }
+
+#if CONFIG_SM_ENABLE_BLE
+// ConnectNetwork(sm_take_wifi_request)で得た SSID/pass を設定して join を開始する。
+static void wifi_join(const uint8_t *ssid, size_t ssid_len, const uint8_t *pass, size_t pass_len) {
+  wifi_config_t wc{};
+  size_t sn = ssid_len < sizeof(wc.sta.ssid) ? ssid_len : sizeof(wc.sta.ssid) - 1;
+  memcpy(wc.sta.ssid, ssid, sn);
+  size_t pn = pass_len < sizeof(wc.sta.password) ? pass_len : sizeof(wc.sta.password) - 1;
+  memcpy(wc.sta.password, pass, pn);
+  wc.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+  esp_wifi_set_config(WIFI_IF_STA, &wc);
+  g_wifi_joining = true;
+  esp_err_t err = esp_wifi_connect();
+  ESP_LOGI(TAG, "wifi join requested (ssid=%.*s) err=%d", (int)sn, (const char *)wc.sta.ssid, err);
+}
+#endif
 
 // ---- LED -------------------------------------------------------------------
 
@@ -402,14 +486,60 @@ static void matter_task(void *) {
     return;
   }
   ESP_LOGI(TAG, "sm_init ok: fabrics=%u onoff=%d", stack.fabric_count(), stack.onoff_get());
+  ESP_LOGI(TAG, "free heap after sm_init: %u", (unsigned)esp_get_free_heap_size());
   led_set(stack.onoff_get());
 
   stack.on_event([](const sm_event_t &ev) {
     ESP_LOGI(TAG, "EVENT kind=%d arg=%u", (int)ev.kind, (unsigned)ev.arg);
-    if (ev.kind == SM_EV_ONOFF_CHANGED) {
+    switch (ev.kind) {
+    case SM_EV_ONOFF_CHANGED:
       led_set(ev.arg != 0);
+      break;
+#if CONFIG_SM_ENABLE_BLE
+    case SM_EV_BLE_ADV_CHANGED: {
+      // 広告内容が変わった → 再取得して NimBLE に反映(n==0 は広告停止)。
+      uint8_t adv[31];
+      size_t n = sm_ble_adv_data(adv, sizeof(adv));
+      sm_ble_set_adv(adv, n);
+      break;
+    }
+    case SM_EV_WIFI_CONNECT_REQUEST: {
+      // ConnectNetwork 受理 → 資格情報を取り出して esp_wifi で join。
+      uint8_t ssid[33];
+      uint8_t pass[65];
+      size_t plen = 0;
+      size_t sn = sm_take_wifi_request(ssid, sizeof(ssid), pass, sizeof(pass), &plen);
+      if (sn > 0) {
+        wifi_join(ssid, sn, pass, plen);
+        save_wifi_creds(ssid, sn, pass, plen); // 再起動後の自動 join 用に永続化。
+      }
+      break;
+    }
+#endif
+    default:
+      break;
     }
   });
+
+#if CONFIG_SM_ENABLE_BLE
+  // 起動時の広告ブートストラップ(初期 SM_EV_BLE_ADV_CHANGED は抑止されているため)。
+  {
+    uint8_t adv[31];
+    size_t n = sm_ble_adv_data(adv, sizeof(adv));
+    sm_ble_set_adv(adv, n);
+  }
+  // コミッショニング済み(fabric 復元)なら、保存済み WiFi 資格情報で自動 join する
+  // (再起動後も運用 mDNS / CASE over UDP に到達できるように)。
+  if (stack.fabric_count() > 0) {
+    uint8_t ssid[33];
+    uint8_t pass[65];
+    size_t sl = sizeof(ssid), pl = sizeof(pass);
+    if (load_wifi_creds(ssid, &sl, pass, &pl)) {
+      ESP_LOGI(TAG, "fabric restored; auto-joining saved WiFi (%.*s)", (int)sl, (const char *)ssid);
+      wifi_join(ssid, sl, pass, pl);
+    }
+  }
+#endif
 
   int udp_fd = open_matter_udp();
   int mdns_fd = open_mdns_socket();
@@ -432,6 +562,7 @@ static void matter_task(void *) {
 
   static uint8_t rx[2048];
   uint64_t last_counter_ms = 0;
+  bool ble_conn_active = false;
   for (;;) {
     uint64_t now = now_ms();
 
@@ -442,12 +573,15 @@ static void matter_task(void *) {
       sm_attr_mark_dirty(kCustomEp, kCustomCluster, 0x0004);
     }
 
-    // WiFi/IP・ローカル操作のコマンドを排出(同一タスクで sm_* を呼ぶ)。
+    // WiFi/IP・BLE・ローカル操作のコマンドを排出(同一タスクで sm_* を呼ぶ)。
     Cmd c;
     while (g_cmd_queue && xQueueReceive(g_cmd_queue, &c, 0) == pdTRUE) {
       switch (c.kind) {
       case CmdKind::IpV4:
         stack.set_addrs(c.v4, nullptr);
+#if CONFIG_SM_ENABLE_BLE
+        sm_wifi_status(true, now); // 遅延 ConnectNetworkResponse を Success で確定。
+#endif
         break;
       case CmdKind::IpV6:
         stack.set_addrs(nullptr, c.v6);
@@ -456,19 +590,43 @@ static void matter_task(void *) {
         stack.onoff_set(!stack.onoff_get(), now);
         led_set(stack.onoff_get());
         break;
+#if CONFIG_SM_ENABLE_BLE
+      case CmdKind::BleConnected:
+        sm_ble_event(SM_BLE_CONNECTED, c.mtu, nullptr, 0, now);
+        ble_conn_active = true;
+        break;
+      case CmdKind::BleDisconnected:
+        sm_ble_event(SM_BLE_DISCONNECTED, 0, nullptr, 0, now);
+        ble_conn_active = false;
+        break;
+      case CmdKind::BleC1Write:
+        sm_ble_event(SM_BLE_C1_WRITE, 0, c.frag, c.frag_len, now);
+        break;
+      case CmdKind::BleC2Subscribed:
+        sm_ble_event(SM_BLE_C2_SUBSCRIBED, 0, nullptr, 0, now);
+        break;
+      case CmdKind::WifiFailed:
+        sm_wifi_status(false, now); // コアが残リトライで再要求する(SM_EV_WIFI_CONNECT_REQUEST)。
+        break;
+#endif
+      default:
+        // BLE 無効ビルドでは Ble*/WifiFailed は生成されない(-Werror=switch 対策)。
+        break;
       }
     }
 
-    // 待ち時間 = sm_next_deadline と mDNS announce の近い方(上限 1s)。
+    // 待ち時間 = sm_next_deadline と mDNS announce の近い方。BLE 接続中は queue イベントへの
+    // 追従のため上限を短く(select は queue で起きないので 20ms 周期で拾う)。
+    uint64_t cap_ms = ble_conn_active ? 20 : 1000;
     uint64_t dl = stack.next_deadline(now);
     struct timeval tv;
     if (dl == SM_NO_DEADLINE) {
-      tv.tv_sec = 1;
-      tv.tv_usec = 0;
+      tv.tv_sec = cap_ms / 1000;
+      tv.tv_usec = (cap_ms % 1000) * 1000;
     } else {
       uint64_t wait = (dl > now) ? (dl - now) : 0;
-      if (wait > 1000) {
-        wait = 1000;
+      if (wait > cap_ms) {
+        wait = cap_ms;
       }
       tv.tv_sec = wait / 1000;
       tv.tv_usec = (wait % 1000) * 1000;
@@ -503,6 +661,19 @@ static void matter_task(void *) {
 
     // 時間駆動の送出・イベント・mDNS announce。
     stack.pump(now, udp_send);
+#if CONFIG_SM_ENABLE_BLE
+    // BLE 宛の下りフラグメント(handshake resp / データ / 遅延 ConnectNetworkResponse /
+    // keep-alive ACK)を C2 indication で直列排出する(indicate 完了まで待つ)。
+    {
+      static uint8_t frag[256];
+      size_t fn;
+      while ((fn = sm_ble_poll(now, frag, sizeof(frag))) > 0) {
+        if (!sm_ble_indicate(frag, fn)) {
+          break; // リンク断等: 打ち切り(切断イベントで BTP はリセットされる)。
+        }
+      }
+    }
+#endif
     stack.mdns_poll(now, mdns_send);
   }
 }
@@ -522,6 +693,11 @@ extern "C" void app_main() {
 
   led_init();
   wifi_init_sta();
+
+#if CONFIG_SM_ENABLE_BLE
+  // NimBLE を起動(GATT 0xFFF6 / 広告)。BLE イベントは g_cmd_queue 経由で matter_task へ。
+  sm_ble_init(g_cmd_queue);
+#endif
 
   // sm_* を単線で扱う pump タスク(sans-IO 契約: 全 API を同一タスクから)。
   // スタック 128KB 必須級(NanoC6 実機で確定): sm_init はスタック構築 → static へ

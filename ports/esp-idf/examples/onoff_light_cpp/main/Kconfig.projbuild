@@ -21,4 +21,15 @@ menu "simple-matter onoff_light example"
             OnOff 状態を反映する LED の GPIO 番号。既定は M5 NanoC6 の GPIO7
             (ESP32-S3 は DevKitC の RGB LED = GPIO48)。
 
+    config SM_ENABLE_BLE
+        bool "Enable BLE (NimBLE) commissioning"
+        default y if IDF_TARGET_ESP32C6
+        default n
+        help
+            BLE(NimBLE)給餌によるコミッショニング(pairing ble-wifi)を有効にする
+            (docs/design/c-ffi-shim.md §9)。有効時は起動時 WiFi join を止め、
+            ConnectNetwork(sm_take_wifi_request)駆動で join する。BLE コントローラを
+            持つ ESP32-C6 で既定 y。ESP32-S3 は既定 n(従来の UDP 直接 PASE のみ。
+            BLE を使うなら menuconfig で y にし bt を有効化すること)。
+
 endmenu
