@@ -344,7 +344,15 @@ Thread 版では BLE 広告のみ(既存 AdvData)。`pairing ble-thread` は BLE
 
 ## 7. 実装フェーズ
 
-### T1: Thread join スモーク(**実機実施済み。join+可視化 PASS / データパス未達**)
+### T1: Thread join スモーク(**完了 2026-07-17。全ゲート PASS**)
+
+**最終結果**: R9(RX 沈黙)を TX キックワークアラウンド(リスク表 R9 参照)で解消し、
+①role 遷移(Detached→Child)②OTBR child table 可視 ③**ping 疎通(無送信 225 秒
+ソーク後も 100%)** ④**UDP echo 双方向**(`ot-ctl udp send <ML-EID> 11095 hello_thread`
+→ DUT `[echo]` → OTBR 側で echo 受信)の T1 全ゲートを実測 green。
+R9 の切り分け過程(TX プローブ / heartbeat / ble feature / ログレベルの bisect)は
+main.rs に診断コード(5 秒 heartbeat、`SM_TX_PROBE=<addr>` 環境変数ゲートの
+周期送信タスク)として残してある。
 
 - 内容: `ports/esp32/esp32c6-thread`(bin `thread-smoke`)。コンパイル時定数の
   dataset で join → role 遷移ログ(Detached→Child)→ mesh-local アドレス表示 →
@@ -428,7 +436,7 @@ Thread 版では BLE 広告のみ(既存 AdvData)。`pairing ble-thread` は BLE
 | R1 | openthread 0.2.0 は若い(0.2 が実質初リリース)。API 改名進行中(srp→srp-client 等)、プリビルト .a と feature 組合せの罠 | 中 | バージョン固定(=0.2.0)。upstream の rs-matter 実績が同系統。改名は追従容易 |
 | R2 | **BLE + 802.15.4 の実行時同時動作が未検証**(ビルド可は確認済み。esp-radio の coex feature は Wi-Fi/BLE 用で 15.4/BLE の明示コエグジスタンスは無い) | 高(T2 の pairing ble-thread が成立しない可能性) | T2 最初のゲートで単体検証(BLE 広告中に attach)。ダメなら「BLE で dataset 受領 → BLE 切断 → 15.4 起動」の時分割(Matter 的には ConnectNetwork 後の BTP 維持は必須でない — chip-tool は CASE を Thread 側で張る) |
 | R3 | ~~**RCP ボードの USB-Serial-JTAG 問題**: ot_rcp 既定は UART。NanoC6 等 UART ブリッジ無しボードでは USB ポート越しに spinel が通らない~~ **→ 解決済み(T1 実測 2026-07-17)** | ~~中~~ 解消 | **`ot_rcp` を `CONFIG_OPENTHREAD_RCP_USB_SERIAL_JTAG=y` で再ビルドすれば spinel が USB-Serial-JTAG に出て NanoC6 の USB ポート越しに OTBR が接続できる**(`build-ot-rcp.sh` の `RCP_OVER_USB=1` 既定に実装)。外付け UART / DevKitC は不要。詳細は §7 T1 実機結果 |
-| R9 | **DUT が attach 数秒後に停止**(role→Child まで到達後、上下とも無線が止まる。T1 で発見) | 高(Thread データパスが成立しない = T2 の CASE over Thread が不可) | T2 最初の root-cause 対象。候補: `ot.run` タスク飢餓 / esp-radio 15.4 IRQ 停止 / ヒープ枯渇 / OT timer ロックアップ。切り分け済み: コンソール println ブロックではない(§7 T1 実機結果) |
+| R9 | ~~**DUT が attach 数秒後に停止**(role→Child まで到達後、無線が止まる。T1 で発見)~~ **→ 実測で特定・ワークアラウンド済み(2026-07-17)**: 停止は **RX 方向のみ**(TX は正常 — 周期 UDP 送信は OTBR に届き続ける)。executor/embassy-time/OT 状態機械は全て生存(heartbeat 継続・role=Child 維持)。回復手段は**実 TX のみ**(tx_init の stop_current_operation → 完了後 next_operation の rx_init+enable_rx フル再初期化)。`start_receive()`(state==Receive/TxAck では no-op)や `ensure_receive_enabled`(RxStart 再発行)の周期実行では回復しないことを実測 → esp-radio 0.18 の 15.4 状態機械が RX 再アーム不能な状態に座礁している(TxAck 系 state の event 取りこぼしが有力。coex/ble feature・ログレベルは無関係と bisect 済み) | ~~高~~ 解消(暫定) | **vendored openthread(`ports/esp32/vendor/openthread`、[patch.crates-io])の `EspRadio::receive` に TX キックを実装**: RX シグナル 5 秒無音で宛先なし imm-ACK(3 バイト、他ノードは UnexpectedAck として破棄)を送出し TX 完了経路で RX を再初期化。無送信ソーク 225 秒 + ping / UDP echo / MLE keepalive 全て green を実測。**根本修正は esp-radio 側 = upstream 報告候補**(再現手順と切り分けログは §7 T1 実機結果) |
 | R4 | Wi-Fi と Thread の同一 FW 共存不可(esp-radio 0.18 制約。§2.3) | 低(設計で吸収済み) | パッケージ分離済み。SKU 分割は製品慣行に一致 |
 | R5 | フットプリント: OT + MbedTLS + simple-matter + BLE の合算が未計測(smoke 332KiB、e5-light 1.13MiB — 単純合算なら ~1.4MiB) | 低〜中 | 4MiB flash に対し余裕はあるが、T2 でサイズレポートを取り bloat-check の監視対象に追加 |
 | R6 | KvsSettings の flash 書き込みが 15.4/BLE 動作中のキャッシュ停止と干渉(kvs.rs 既知課題の再来) | 中 | T2 で実測。必要なら idle 時 flush のキューイング |

@@ -1,0 +1,160 @@
+//! `Radio` trait implementation for the `embassy-nrf` ESP IEEE 802.15.4 radio.
+
+pub use embassy_nrf::radio::ieee802154::{Cca as RadioCca, Packet};
+
+use crate::fmt::Bytes;
+use crate::{
+    Capabilities, Cca, Config, MacCapabilities, PsduMeta, Radio, RadioError, RadioErrorKind,
+};
+
+pub use embassy_nrf::radio::ieee802154::Radio as Ieee802154;
+pub use embassy_nrf::radio::{Error, Instance as Ieee802154Peripheral};
+
+impl RadioError for Error {
+    fn kind(&self) -> RadioErrorKind {
+        // TODO
+        RadioErrorKind::Other
+    }
+}
+
+/// The `embassy-nrf` ESP IEEE 802.15.4 radio.
+pub struct NrfRadio<'a> {
+    driver: Ieee802154<'a>,
+    config: Config,
+}
+
+impl<'a> NrfRadio<'a> {
+    const DEFAULT_CONFIG: Config = Config::new();
+
+    /// Create a new `EspRadio` instance.
+    pub fn new(radio: Ieee802154<'a>) -> Self {
+        let mut this = Self {
+            driver: radio,
+            config: Self::DEFAULT_CONFIG,
+        };
+
+        this.update_driver_config();
+
+        this
+    }
+
+    fn update_driver_config(&mut self) {
+        let config = &self.config;
+
+        self.driver.set_channel(config.channel);
+        self.driver.set_cca(match config.cca {
+            Cca::Carrier => RadioCca::CarrierSense,
+            Cca::Ed { ed_threshold } => RadioCca::EnergyDetection { ed_threshold },
+            Cca::CarrierAndEd { ed_threshold } => RadioCca::EnergyDetection { ed_threshold },
+            Cca::CarrierOrEd { ed_threshold } => RadioCca::EnergyDetection { ed_threshold },
+        });
+        self.driver
+            .set_transmission_power(Self::clamp_tx_power(config.power));
+    }
+
+    /// Snap a requested transmit power (in dBm) to a value the nRF radio's
+    /// `set_transmission_power` accepts.
+    ///
+    /// `Config::power` is a cross-platform dBm value.
+    /// The nRF radio however only supports a discrete set of dBm levels with
+    /// a much lower ceiling (+8 dBm on the nRF52840), and `embassy-nrf`'s
+    /// `set_transmission_power` *panics* on any value not in that set. So map the
+    /// request to the highest supported level not exceeding it (clamping to the
+    /// min/max of the supported range), which both avoids the panic and applies
+    /// the closest power the radio can actually produce.
+    fn clamp_tx_power(power: i8) -> i8 {
+        // The dBm levels `embassy-nrf` accepts for the nRF52840, descending.
+        // Other nRF variants support a subset (e.g. the nRF52811 / nRF5340
+        // network core drop the higher positive levels), but these are the ones
+        // this driver targets. Keep in sync with `embassy_nrf`'s
+        // `Radio::set_transmission_power`.
+        //
+        // TODO: This table is nRF52840-specific. If/when this driver targets
+        // other nRF variants (nRF52811, nRF5340 net core, ...), gate it by chip
+        // `cfg` to match `embassy_nrf`'s own per-chip `match` arms (the higher
+        // positive levels are unavailable on some, and the 5340 net core adds
+        // extra negative levels).
+        const SUPPORTED_DBM: [i8; 15] = [8, 7, 6, 5, 4, 3, 2, 0, -4, -8, -12, -16, -20, -30, -40];
+
+        // Highest supported level <= requested power; if the request is below the
+        // minimum, use the minimum.
+        SUPPORTED_DBM
+            .into_iter()
+            .find(|&level| level <= power)
+            .unwrap_or(SUPPORTED_DBM[SUPPORTED_DBM.len() - 1])
+    }
+}
+
+impl Radio for NrfRadio<'_> {
+    type Error = Error;
+
+    const CAPS: Capabilities = Capabilities::empty();
+
+    // The NRF radio does not have any MAC offloading capabilities
+    const MAC_CAPS: MacCapabilities = MacCapabilities::empty();
+
+    async fn set_config(&mut self, config: &Config) -> Result<(), Self::Error> {
+        if self.config != *config {
+            trace!("Setting radio config: {:?}", config);
+
+            self.config = config.clone();
+            self.update_driver_config();
+        }
+
+        Ok(())
+    }
+
+    async fn transmit(
+        &mut self,
+        psdu: &[u8],
+        _csma: bool,
+        _ack_psdu_buf: Option<&mut [u8]>,
+    ) -> Result<Option<PsduMeta>, Self::Error> {
+        trace!("NRF Radio, about to transmit: {}", Bytes(psdu));
+
+        let mut packet = Packet::new();
+        // TODO: `embassy-nrf` driver wants the PSDU without the CRC,
+        // however, OpenThread provides 2 bytes CRC
+        packet.copy_from_slice(&psdu[..psdu.len() - 2]);
+
+        self.driver.try_send(&mut packet).await?;
+
+        trace!("NRF Radio, transmission done");
+
+        Ok(None)
+    }
+
+    async fn receive(&mut self, psdu_buf: &mut [u8]) -> Result<PsduMeta, Self::Error> {
+        trace!("NRF Radio, about to receive");
+
+        let channel = self.config.channel;
+
+        loop {
+            let mut packet = Packet::new();
+
+            let result = self.driver.receive(&mut packet).await;
+            if matches!(&result, Err(Error::CrcFailed(_))) {
+                trace!("CRC error");
+                continue;
+            } else {
+                result?;
+            }
+
+            let len = packet.len() as _;
+            psdu_buf[..len].copy_from_slice(&packet);
+
+            trace!("NRF Radio, received: {}", Bytes(&psdu_buf[..len]));
+
+            let lqi = packet.lqi();
+            let rssi = lqi as _; // TODO: Convert LQI to RSSI
+
+            break Ok(PsduMeta {
+                // TODO: `embassy-nrf` driver provides the PSDU without the CRC,
+                // however, OpenThread wants the PSDU len to include the CRC
+                len: len + 2,
+                channel,
+                rssi: Some(rssi),
+            });
+        }
+    }
+}

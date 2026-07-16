@@ -2319,8 +2319,6 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "openthread"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "251a14ec4e77c2fa805df3651f8003073142daa103d9260b4714b704fc83880c"
 dependencies = [
  "bitflags 2.13.0",
  "embassy-futures",

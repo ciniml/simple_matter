@@ -154,6 +154,10 @@ async fn main(spawner: Spawner) {
     // 状態遷移(role)と IPv6 アドレス(mesh-local 含む)の監視ログタスク。
     spawner.spawn(run_ot_state_log(ot.clone()).unwrap());
 
+    // R9 切り分け用 heartbeat(5 秒周期)。これが止まる = executor/タイマ層ごと停止、
+    // 続く = OT 層のみ停止、を区別する(thread-port.md R9)。
+    spawner.spawn(run_heartbeat(ot.clone()).unwrap());
+
     info!("dataset (TLV hex): {THREAD_DATASET}");
 
     ot.set_active_dataset_tlv_hexstr(THREAD_DATASET)
@@ -165,7 +169,7 @@ async fn main(spawner: Spawner) {
 
     // UDP echo。OTBR から `ot-ctl udp send <addr> 11095 hello` で確認する。
     let socket = UdpSocket::bind(
-        ot,
+        ot.clone(),
         &SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, ECHO_PORT, 0, 0),
     )
     .expect("UDP bind failed");
@@ -173,6 +177,14 @@ async fn main(spawner: Spawner) {
     info!("UDP echo listening on port {ECHO_PORT}");
 
     let buf = mk_static!([u8; UDP_SOCKETS_BUF], [0; UDP_SOCKETS_BUF]);
+
+    // R9 切り分け: TX 生死の直接確認。SM_TX_PROBE=<OTBR の ML-EID> を与えると
+    // 10 秒周期で UDP を送る(OTBR 側は `ot-ctl udp bind :: 12345` で観測)。
+    if let Some(target) = option_env!("SM_TX_PROBE") {
+        if let Ok(addr) = target.parse::<Ipv6Addr>() {
+            spawner.spawn(run_tx_probe(ot.clone(), addr).unwrap());
+        }
+    }
 
     loop {
         match socket.recv(buf).await {
@@ -191,6 +203,37 @@ async fn main(spawner: Spawner) {
 #[embassy_executor::task]
 async fn run_ot(ot: OpenThread<'static>, radio: EspRadio<'static>) -> ! {
     ot.run(radio).await
+}
+
+/// R9 切り分け用 TX プローブ。attach 後の TX 経路が生きているかを直接確認する。
+#[embassy_executor::task]
+async fn run_tx_probe(ot: OpenThread<'static>, target: Ipv6Addr) -> ! {
+    // 2 本目のソケット(UDP_MAX_SOCKETS=2 の範囲内、共有 OtUdpResources を使う)。
+    let sock = UdpSocket::bind(
+        ot,
+        &SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 12346, 0, 0),
+    )
+    .expect("probe bind failed");
+    let mut n = 0u32;
+    loop {
+        embassy_time::Timer::after(embassy_time::Duration::from_secs(10)).await;
+        n += 1;
+        let r = sock
+            .send(b"probe", None, &SocketAddrV6::new(target, 12345, 0, 0))
+            .await;
+        info!("[txprobe] #{n} -> {target}: {r:?}");
+    }
+}
+
+/// R9 切り分け用 heartbeat。executor と embassy-time が生きている限り出続ける。
+#[embassy_executor::task]
+async fn run_heartbeat(ot: OpenThread<'static>) -> ! {
+    let mut n = 0u32;
+    loop {
+        embassy_time::Timer::after(embassy_time::Duration::from_secs(5)).await;
+        n += 1;
+        info!("[hb] {}s role={:?}", n * 5, ot.net_status().role);
+    }
 }
 
 /// 状態変化を監視し、role 遷移(detached → child/router)と IPv6 アドレスを

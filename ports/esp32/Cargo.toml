@@ -17,3 +17,9 @@ default-members = ["esp32c6-firmware"]
 opt-level = "s"
 lto = true
 codegen-units = 1
+
+# R9 ワークアラウンド: openthread 0.2.0 の EspRadio::receive に周期再キックを当てる
+# (enh-ack 要求フレームで esp-radio が TxEnhAck 座礁し RX が止まる問題。
+#  詳細は docs/design/thread-port.md R9)。
+[patch.crates-io]
+openthread = { path = "vendor/openthread" }
