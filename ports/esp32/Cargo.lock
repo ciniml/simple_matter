@@ -1566,8 +1566,13 @@ dependencies = [
 name = "esp32c6-thread"
 version = "0.1.0"
 dependencies = [
+ "bt-hci",
  "embassy-executor",
+ "embassy-futures",
+ "embassy-sync 0.7.2",
  "embassy-time",
+ "embedded-storage",
+ "embedded-storage-async",
  "esp-alloc",
  "esp-backtrace",
  "esp-bootloader-esp-idf",
@@ -1575,11 +1580,15 @@ dependencies = [
  "esp-println",
  "esp-radio",
  "esp-rtos",
+ "esp-storage",
  "heapless 0.9.3",
  "log",
  "openthread",
+ "sequential-storage",
+ "simple-matter",
  "static_cell",
  "tinyrlibc",
+ "trouble-host",
 ]
 
 [[package]]

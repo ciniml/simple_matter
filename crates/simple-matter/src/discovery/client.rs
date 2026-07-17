@@ -246,6 +246,76 @@ impl MdnsClient {
         }
         Some(DiscoveredNode { addrs, port })
     }
+
+    /// operational SRV 応答から SRV target ホスト名(先頭ラベル)とポートだけを抽出する。
+    ///
+    /// mDNS 実装によっては SRV 応答の additional に A/AAAA を同梱しない
+    /// (OTBR の native mDNS publisher で実測)。その場合は本関数で target を取り、
+    /// [`build_resolve_host_aaaa`](MdnsClient::build_resolve_host_aaaa) の追加クエリで
+    /// アドレスを解決する(2 段解決)。
+    ///
+    /// `host_out` に target の先頭ラベル(`<host>.local` の `<host>`)をコピーし、
+    /// `Some((ラベル長, port))` を返す。
+    pub fn parse_operational_srv(
+        pkt: &[u8],
+        compressed_fabric_id: &[u8; 8],
+        node_id: u64,
+        host_out: &mut [u8; 63],
+    ) -> Option<(usize, u16)> {
+        let resp = Response::parse(pkt)?;
+        let mut inst = [0u8; 33];
+        operational_instance_label(compressed_fabric_id, node_id, &mut inst);
+        for r in resp.records() {
+            if r.rtype == T_SRV && r.name.eq_ci(&[&inst, b"_matter", b"_tcp", b"local"]) {
+                if let Some((_, _, port, tgt)) = r.srv() {
+                    // `<host>.local` 形(2 ラベル)のみ対応(自レスポンダ / OTBR 双方この形)。
+                    if tgt.len() != 2 {
+                        return None;
+                    }
+                    let label = tgt.label(0);
+                    if label.is_empty() || label.len() > host_out.len() {
+                        return None;
+                    }
+                    host_out[..label.len()].copy_from_slice(label);
+                    return Some((label.len(), port));
+                }
+            }
+        }
+        None
+    }
+
+    /// ホスト名 `<host>.local` の AAAA クエリを `out` に生成する(2 段解決の後段)。
+    pub fn build_resolve_host_aaaa(
+        out: &mut [u8],
+        host_label: &[u8],
+        unicast_response: bool,
+    ) -> Result<usize> {
+        let mut w = QueryWriter::new(out)?;
+        w.question(&[host_label, b"local"], T_AAAA, unicast_response)?;
+        Ok(w.finish())
+    }
+
+    /// `<host>.local` の A/AAAA 応答からアドレスを抽出する(2 段解決の後段)。
+    pub fn parse_host_addrs(pkt: &[u8], host_label: &[u8]) -> FixedVec<IpAddr, MAX_ADDRS> {
+        let mut addrs = FixedVec::new();
+        let Some(resp) = Response::parse(pkt) else {
+            return addrs;
+        };
+        for r in resp.records() {
+            if r.rtype != T_A && r.rtype != T_AAAA {
+                continue;
+            }
+            if !r.name.eq_ci(&[host_label, b"local"]) {
+                continue;
+            }
+            if let Some(a) = r.a() {
+                let _ = addrs.push(IpAddr::V4(Ipv4Addr::from(a)));
+            } else if let Some(a) = r.aaaa() {
+                let _ = addrs.push(IpAddr::V6(Ipv6Addr::from(a)));
+            }
+        }
+        addrs
+    }
 }
 
 /// [`CommissionableSet::ingest`] の結果。

@@ -53,7 +53,9 @@ pub use measurement::{
     FlowMeasurementCluster, IlluminanceMeasurementCluster, PressureMeasurementCluster,
     RelativeHumidityMeasurementCluster, TemperatureMeasurementCluster,
 };
-pub use network_commissioning::{NetworkCommissioning, NetworkCommissioningWifi};
+pub use network_commissioning::{
+    NetworkCommissioning, NetworkCommissioningThread, NetworkCommissioningWifi,
+};
 pub use occupancy_sensing::OccupancySensingCluster;
 pub use on_off::OnOffCluster;
 pub use operational_credentials::{DacProvider, OpCredsCluster, TestDacProvider};

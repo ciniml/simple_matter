@@ -50,13 +50,14 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(35);
 /// `ble-wifi` での運用 mDNS 解決タイムアウト。デバイスの Wi-Fi association(認証
 /// リトライ込みで実測 ~25 秒かかることがある)+ DHCP + 運用 mDNS 開始を待ち、さらに
 /// クエリが届かない環境でも定期 announce(30 秒間隔)を 1 回は拾えるだけの長さを取る。
-const WIFI_RESOLVE_TIMEOUT: Duration = Duration::from_secs(60);
+const WIFI_RESOLVE_TIMEOUT: Duration = Duration::from_secs(120);
 /// フル BLE パスでの best-effort 運用解決のタイムアウト(失敗しても致命ではない)。
 const RESOLVE_BEST_EFFORT: Duration = Duration::from_secs(10);
 /// 運用 UDP フェーズ(CASE + CommissioningComplete)の全体タイムアウト。
 const UDP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `pairing ble` / `pairing ble-handoff` / `pairing ble-wifi` のエントリポイント。
+#[allow(clippy::too_many_arguments)]
 pub fn pair_ble(
     g: &Globals,
     node_id: u64,
@@ -64,6 +65,7 @@ pub fn pair_ble(
     discriminator: Option<u16>,
     handoff: bool,
     wifi: Option<(String, String)>,
+    thread: Option<Vec<u8>>,
 ) -> Result<(), String> {
     let state = StateDir::open(&g.state_dir)?;
     let crypto = simple_matter::crypto::rustcrypto::RustCrypto::new(OsRng);
@@ -91,6 +93,7 @@ pub fn pair_ble(
         discriminator,
         handoff,
         wifi.as_ref().map(|(s, p)| (s.as_bytes(), p.as_bytes())),
+        thread.as_deref(),
         g.at.as_deref(),
     ))?;
 
@@ -132,11 +135,12 @@ async fn run_ble(
     discriminator: Option<u16>,
     handoff: bool,
     wifi: Option<(&[u8], &[u8])>,
+    thread: Option<&[u8]>,
     at: Option<&[IpAddr]>,
 ) -> Result<SocketAddr, String> {
-    // ble-wifi はデバイスが Wi-Fi join 後に IP 到達可能になるため、CASE 以降は必ず
-    // 運用 UDP で行う(handoff と同じ保留遷移)。
-    let udp_case = handoff || wifi.is_some();
+    // ble-wifi / ble-thread はデバイスがネットワーク join 後に IP 到達可能になるため、
+    // CASE 以降は必ず運用 UDP で行う(handoff と同じ保留遷移)。
+    let udp_case = handoff || wifi.is_some() || thread.is_some();
     let ctrl_creds = simple_matter::controller::ControllerCreds::new(ca, crypto, 0);
     let sc_init = ScInitiator::new(crypto, OsRng, ctrl_creds);
     let mut ctrl: Ctrl =
@@ -241,6 +245,16 @@ async fn run_ble(
             String::from_utf8_lossy(ssid)
         );
     }
+    if let Some(tlv) = thread {
+        comm.set_thread_dataset(tlv)
+            .map_err(|e| format!("set_thread_dataset: {e:?}"))?;
+        crate::log::logf!(
+            crate::log::Level::Info,
+            "ctl",
+            "thread provisioning enabled (dataset {} bytes)",
+            tlv.len()
+        );
+    }
     comm.commission(peer, passcode, node_id, now_ms(&start))
         .map_err(|e| format!("commission() rejected: {e:?}"))?;
     crate::log::logf!(
@@ -299,7 +313,7 @@ async fn run_ble(
             // chip は AddNOC 受理後に自ら BLE を閉じるので、失敗は無視する。
             let _ = gatt.disconnect(conn).await;
 
-            let resolve_timeout = if wifi.is_some() {
+            let resolve_timeout = if wifi.is_some() || thread.is_some() {
                 crate::log::logf!(
                     crate::log::Level::Info,
                     "ctl",

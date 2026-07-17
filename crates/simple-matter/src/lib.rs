@@ -36,6 +36,7 @@ pub mod kvs;
 pub mod sc;
 #[cfg(feature = "rustcrypto")]
 pub mod stack;
+pub mod thread;
 pub mod tlv;
 pub mod transport;
 pub mod wifi;

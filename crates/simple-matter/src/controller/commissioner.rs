@@ -53,15 +53,22 @@ const CERT_TYPE_PAI: u8 = 2;
 const CMD_ADD_NOC: u32 = 0x06;
 const CMD_ADD_TRUSTED_ROOT: u32 = 0x0B;
 const CMD_ADD_OR_UPDATE_WIFI_NETWORK: u32 = 0x02;
+const CMD_ADD_OR_UPDATE_THREAD_NETWORK: u32 = 0x03;
 const CMD_CONNECT_NETWORK: u32 = 0x06;
 
 /// [`Commissioner::set_wifi_credentials`] の SSID 最大長(Matter §11.8: 32 バイト)。
 pub const MAX_WIFI_SSID_LEN: usize = 32;
 /// [`Commissioner::set_wifi_credentials`] の資格情報最大長(WPA2/WPA3 パスフレーズ: 64 バイト)。
 pub const MAX_WIFI_CREDENTIALS_LEN: usize = 64;
+/// [`Commissioner::set_thread_dataset`] の Operational Dataset TLV 最大長(§11.8: 254 バイト)。
+pub const MAX_THREAD_DATASET_LEN: usize = 254;
 
 /// fail-safe タイマの有効秒数(ArmFailSafe に載せる)。
-const FAIL_SAFE_EXPIRY_S: u16 = 120;
+///
+/// Thread(ble-thread)は attach 後の SRP 登録 → advertising proxy 反映まで実測で
+/// 2 分近くかかることがあり(esp-radio 15.4 の TX 損失 + SRP リトライ)、120 秒だと
+/// 運用解決中に fail-safe が切れて AddNOC が巻き戻る。スペック上限(900)内で余裕を取る。
+const FAIL_SAFE_EXPIRY_S: u16 = 300;
 
 /// CSRRequest の nonce(自作デバイス・自己整合テスト向けに固定。デバイスは署名対象として扱う)。
 const CSR_NONCE: [u8; 32] = [0x5Au8; 32];
@@ -241,6 +248,10 @@ pub struct Commissioner<'a, C: Crypto> {
     /// [`set_wifi_credentials`](Self::set_wifi_credentials) で設定した Wi-Fi 資格情報。
     /// `Some` なら AddNOC 後に AddOrUpdateWiFiNetwork → ConnectNetwork を挿入する。
     wifi: Option<WifiCreds>,
+    /// [`set_thread_dataset`](Self::set_thread_dataset) で設定した Thread dataset。
+    /// `Some` なら AddNOC 後に AddOrUpdateThreadNetwork → ConnectNetwork を挿入する
+    /// (`wifi` とは排他。両方設定時は `wifi` 優先)。
+    thread: Option<ThreadDataset>,
     /// `Phase::Attestation`(`Verify`)のサブステップ: 0=DAC 要求, 1=PAI 要求,
     /// 2=AttestationRequest, 3=検証完了(§3)。`Skip` では未使用。
     att_step: u8,
@@ -281,6 +292,20 @@ impl WifiCreds {
     }
 }
 
+/// AddOrUpdateThreadNetwork / ConnectNetwork へ渡す Thread Operational Dataset(固定長バッファ)。
+struct ThreadDataset {
+    tlv: [u8; MAX_THREAD_DATASET_LEN],
+    tlv_len: u8,
+    /// dataset から抽出した Extended PAN ID(= NetworkID、ConnectNetwork の照合キー)。
+    ext_pan_id: [u8; 8],
+}
+
+impl ThreadDataset {
+    fn tlv(&self) -> &[u8] {
+        &self.tlv[..self.tlv_len as usize]
+    }
+}
+
 impl<'a, C: Crypto> Commissioner<'a, C> {
     /// CA・crypto・attestation ポリシからコミッショナを作る(初期フェーズ = Idle)。
     pub fn new(ca: &'a Ca<C>, crypto: &'a C, policy: AttestationPolicy<'a>) -> Self {
@@ -302,6 +327,7 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
             scratch: [0u8; MAX_CERT_TLV_LEN],
             suspend_before_case: false,
             wifi: None,
+            thread: None,
             att_step: 0,
             dac_der: [0u8; ATT_CERT_BUF],
             dac_len: 0,
@@ -343,6 +369,37 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
         w.ssid[..ssid.len()].copy_from_slice(ssid);
         w.credentials[..credentials.len()].copy_from_slice(credentials);
         self.wifi = Some(w);
+        Ok(())
+    }
+
+    /// AddNOC 後に Thread をプロビジョンする(chip-tool `pairing ble-thread` 相当)。
+    ///
+    /// 設定すると AddNOC 成功後、CASE の前に **同一(PASE)セッション上で**
+    /// AddOrUpdateThreadNetwork(0x31/0x03: `{0: operationalDataset, 1: breadcrumb}`)→
+    /// ConnectNetwork(0x31/0x06: `{0: networkID = ExtPanID}`)を送る。デバイスは
+    /// ConnectNetwork の応答を attach 完了まで遅延するため
+    /// (`docs/design/thread-port.md` §4)、呼び出し側は通常
+    /// [`suspend_before_case`](Self::suspend_before_case) と併用し、BLE を閉じて
+    /// 運用アドレス解決 → UDP(Thread)で CASE を再開する。
+    ///
+    /// `tlv` は Thread Operational Dataset(TLV バイト列、最大
+    /// [`MAX_THREAD_DATASET_LEN`])。Extended PAN ID(type=2)を含まない・
+    /// 壊れている dataset は [`Error::Decode`]。
+    pub fn set_thread_dataset(&mut self, tlv: &[u8]) -> Result<()> {
+        if tlv.is_empty() {
+            return Err(Error::InvalidState);
+        }
+        if tlv.len() > MAX_THREAD_DATASET_LEN {
+            return Err(Error::NoSpace);
+        }
+        let ext_pan_id = crate::thread::extract_ext_pan_id(tlv).ok_or(Error::Decode)?;
+        let mut t = ThreadDataset {
+            tlv: [0u8; MAX_THREAD_DATASET_LEN],
+            tlv_len: tlv.len() as u8,
+            ext_pan_id,
+        };
+        t.tlv[..tlv.len()].copy_from_slice(tlv);
+        self.thread = Some(t);
         Ok(())
     }
 
@@ -604,39 +661,69 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
             }
             Phase::AddWifiNetwork => {
                 let session = self.pase_session.ok_or(CommissionError::Protocol)?;
-                let wifi = self.wifi.as_ref().ok_or(CommissionError::Protocol)?;
-                let ssid = wifi.ssid();
-                let creds = wifi.credentials();
-                stack
-                    .start_invoke(
-                        session,
-                        cmd_path(
-                            CLUSTER_NETWORK_COMMISSIONING,
-                            CMD_ADD_OR_UPDATE_WIFI_NETWORK,
-                        ),
-                        move |w, t| {
-                            w.start_struct(t)?;
-                            w.write_bytes(&cx(0), ssid)?; // SSID
-                            w.write_bytes(&cx(1), creds)?; // Credentials
-                            w.write_u64(&cx(2), 0)?; // Breadcrumb
-                            w.end_container()
-                        },
-                        now_ms,
-                        tx_out,
-                    )
-                    .map_err(CommissionError::Stack)
+                if let Some(wifi) = self.wifi.as_ref() {
+                    let ssid = wifi.ssid();
+                    let creds = wifi.credentials();
+                    stack
+                        .start_invoke(
+                            session,
+                            cmd_path(
+                                CLUSTER_NETWORK_COMMISSIONING,
+                                CMD_ADD_OR_UPDATE_WIFI_NETWORK,
+                            ),
+                            move |w, t| {
+                                w.start_struct(t)?;
+                                w.write_bytes(&cx(0), ssid)?; // SSID
+                                w.write_bytes(&cx(1), creds)?; // Credentials
+                                w.write_u64(&cx(2), 0)?; // Breadcrumb
+                                w.end_container()
+                            },
+                            now_ms,
+                            tx_out,
+                        )
+                        .map_err(CommissionError::Stack)
+                } else {
+                    // Thread: AddOrUpdateThreadNetwork(0x03: {0: dataset, 1: breadcrumb})。
+                    let thread = self.thread.as_ref().ok_or(CommissionError::Protocol)?;
+                    let tlv = thread.tlv();
+                    stack
+                        .start_invoke(
+                            session,
+                            cmd_path(
+                                CLUSTER_NETWORK_COMMISSIONING,
+                                CMD_ADD_OR_UPDATE_THREAD_NETWORK,
+                            ),
+                            move |w, t| {
+                                w.start_struct(t)?;
+                                w.write_bytes(&cx(0), tlv)?; // OperationalDataset
+                                w.write_u64(&cx(1), 0)?; // Breadcrumb
+                                w.end_container()
+                            },
+                            now_ms,
+                            tx_out,
+                        )
+                        .map_err(CommissionError::Stack)
+                }
             }
             Phase::ConnectNetwork => {
                 let session = self.pase_session.ok_or(CommissionError::Protocol)?;
-                let wifi = self.wifi.as_ref().ok_or(CommissionError::Protocol)?;
-                let ssid = wifi.ssid();
+                // NetworkID: Wi-Fi は SSID、Thread は Extended PAN ID(8B)。
+                let network_id: &[u8] = if let Some(wifi) = self.wifi.as_ref() {
+                    wifi.ssid()
+                } else {
+                    &self
+                        .thread
+                        .as_ref()
+                        .ok_or(CommissionError::Protocol)?
+                        .ext_pan_id
+                };
                 stack
                     .start_invoke(
                         session,
                         cmd_path(CLUSTER_NETWORK_COMMISSIONING, CMD_CONNECT_NETWORK),
                         move |w, t| {
                             w.start_struct(t)?;
-                            w.write_bytes(&cx(0), ssid)?; // NetworkID = SSID
+                            w.write_bytes(&cx(0), network_id)?; // NetworkID
                             w.write_u64(&cx(1), 0)?; // Breadcrumb
                             w.end_container()
                         },
@@ -766,7 +853,7 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
             // AddTrustedRootCertificate はステータスのみの応答(command 応答ではない)。
             Phase::AddTrustedRoot => self.advance(Phase::AddNoc),
             Phase::AddNoc => match response_status_code(stack.im_result()) {
-                Ok(0) => self.advance(if self.wifi.is_some() {
+                Ok(0) => self.advance(if self.wifi.is_some() || self.thread.is_some() {
                     Phase::AddWifiNetwork
                 } else {
                     Phase::Case

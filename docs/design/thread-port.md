@@ -398,9 +398,9 @@ main.rs に診断コード(5 秒 heartbeat、`SM_TX_PROBE=<addr>` 環境変数�
   (既定 0)で無効化可能に。DUT モニタは `stty + timeout cat`(espflash monitor 不使用)。
 - 未回帰: 既存ビルド/テストは無改造(コア変更なし。T1 はポート bin と scripts のみ)。
 
-### T2: Matter over Thread 最小 E2E(コミッショニング + On/Off)
+### T2: Matter over Thread 最小 E2E(コミッショニング + On/Off)— **完了 2026-07-17、全ゲート PASS(実測)**
 
-- コア: `ThreadDriver` + `NullThreadDriver` + ExtPanID 抽出 util + 
+- コア: `ThreadDriver` + `NullThreadDriver` + ExtPanID 抽出 util +
   `NetworkCommissioningThread`(§4)+ ホストテスト(IM レベルで
   AddOrUpdateThreadNetwork/ConnectNetwork の wire を検証)。
 - ports: bin `t2-light`(e4-ble-light をベースに Wi-Fi 抜き / OtUdp pump /
@@ -410,6 +410,88 @@ main.rs に診断コード(5 秒 heartbeat、`SM_TX_PROBE=<addr>` 環境変数�
   ④ リブート後 re-attach + CASE 再確立(KvsSettings)⑤ OTBR の advertising proxy
   経由で `_matter._tcp` が LAN に見える。
 - 規模感: コア ~400 行 + テスト、ports ~600 行(見積り。pump は e5-light 流用)。
+
+#### T2 実機結果(2026-07-17、NanoC6×2: RCP=/dev/ttyACM5 + OTBR docker、DUT=/dev/ttyACM1)
+
+**全ゲート green(②③は smctl 代替 — chip-tool は環境の mDNS 5353 競合で発見不能、下記)**:
+
+- **ゲート①(R2: BLE+15.4 同時動作)= PASS。** BLE(BTP)接続を維持したまま 15.4
+  attach(Detached→Child)が成立し、遅延 ConnectNetworkResponse も BLE 上で配送された
+  (時分割不要)。**ただし運用フェーズは時分割**: esp-radio に BLE/15.4 コエグジスタンス
+  調停が無く、常時 BLE 広告が 15.4 の RX/TX を恒常的に劣化させることを実測
+  (CASE over Thread が成立しない)。コミッショニング完了(fabric 保有 + BLE 切断)後は
+  BLE 広告を停止して 15.4 に無線を明け渡す(`GattChannels::set_adv_enabled`。
+  コミッショニング済みで起動した場合は最初から広告しない)。
+- **ゲート②(コミッショニング完走)= PASS(smctl)。**
+  `smctl pairing ble-thread 1 20202021 <dataset-hex> 3840 --at <OTBRホストIP>` で
+  BLE/BTP → PASE → CSR/AddNOC → AddOrUpdateThreadNetwork → ConnectNetwork(遅延応答、
+  attach 後)→ BLE close → 運用解決(QU ユニキャスト)→ **CASE over Thread(full
+  Sigma1/2/3)→ CommissioningComplete** まで完走(`COMPLETE over UDP. session=0x3`)。
+  コアの `Commissioner` に `set_thread_dataset`(AddOrUpdateThreadNetwork 0x03 +
+  NetworkID=ExtPanID)を追加し、smctl に `pairing ble-thread` を実装した。
+  **chip-tool は運用発見で不成立(環境問題)**: この otbr イメージは avahi ではなく
+  otbr-agent 内蔵の native mDNS publisher を使い、ホストでは avahi + chip-tool +
+  otbr の 3 者が 5353 を共有(SO_REUSEPORT)する。publisher はエフェメラルポートからの
+  QU クエリには正しく応答する(実測)が、5353 同士の QM 経路が届かず chip-tool の
+  resolve が 100% タイムアウトする。さらに chip-tool の mDNS ブロードキャストは
+  wpan0 経由でメッシュへ流入し、RCP を圧迫して otbr-agent ごと落とした事例あり
+  (`HandleRcpTimeout` → 死亡。stop→start で復旧)。
+- **ゲート③(toggle、CASE over Thread)= PASS。** `smctl --timeout 90 onoff toggle 1 1`
+  → `CASE ESTABLISHED (full handshake)` → `onoff cmd 0x02 OK`。
+- **ゲート④(リブート永続化)= PASS。** リブート後: fabric/resumption 復元(EspKvs)+
+  dataset 自前永続化(`otds` キー)による自動 re-attach → CASE **full** 再確立 + toggle OK
+  → 2 回目の toggle は **`Sigma2Resume`(resumption)で 1.4 秒**で確立し toggle OK。
+- **ゲート⑤(SRP → LAN mDNS)= PASS。** SRP 登録(host `SM<MAC>` /
+  instance `<fab16>-<node16>` / TXT SII,SAI,T)が OTBR SRP server に受理され、
+  advertising proxy 経由で LAN の avahi-browse に `_matter._tcp` PTR が見える。
+  SRV/AAAA は QU ユニキャストで解決可能(上記 5353 問題により QM は不可)。
+
+#### T2 で確定した重要な技術的知見(ワークアラウンド込み)
+
+1. **OMR アドレスの手動生成が必須**(発見不能の根本原因の一つ)。プリビルト
+   libopenthread.a は SLAAC 無効ビルド(`otIp6SetSlaacEnabled` 未リンク)で、DUT は
+   link-local + mesh-local しか持たず、SRP auto host address が mesh-local に落ちて
+   advertising proxy が AAAA を出さない。vendored openthread に
+   `add_unicast_address`(`otIp6AddUnicastAddress`)を追加し、attach 後に netdata の
+   SLAAC prefix + EUI64 IID で OMR アドレスを合成・追加する(`maybe_add_omr_address`)。
+2. **多フラグメント TX のペーシングが必須**(CASE sigma2 ~900B 不达の根本原因)。
+   RCP(ot_rcp、spinel over USB-CDC)は back-to-back の 6LoWPAN 断片を HW auto-ack
+   した後 spinel 側で取りこぼす(OTBR の `Dropping rx frag frame`(先頭/中間断片欠落)
+   で実測。ACK 済みのため OT は再送しない)。vendored `EspRadio::transmit` に
+   「64B 超フレームの送信成功後 8ms 待つ」ペーシングを実装して解消。
+3. **TX 完了イベント喪失のリカバリ**(R9 拡張)。esp-radio 0.18 は tx_done/tx_failed を
+   取りこぼすことがあり、`TX_SIGNAL.wait()` が永久に完了せず OT radio タスク全体が停止
+   する(sigma2 送信バーストで実機再現)。`transmit` に 500ms タイムアウト + 同一 PSDU
+   再送出(tx_init の stop_current_operation で状態機械ごと復帰)を実装。
+4. **KVS 裏打ちの OT Settings は T2 では不成立(リスク R6 の実測)**。attach 時の
+   flash 書き込みバースト(フレッシュ NVS では領域初期化 erase 込み)が 15.4 radio を
+   R9 の TX キックでも回復不能な形で停止させる(ping 100% loss、executor は生存)。
+   T2 は RAM settings + dataset 自前永続化(doc §5.3 の許容フォールバック)。実装は
+   `ot_settings.rs`(KvsSettings)に残置 — T3 で write キューイング/安全窓 flush と
+   共に再導入。**帰結**: SRP ECDSA 鍵が揮発のため、リブート後の SRP 再登録は
+   サーバに残る旧登録(key-lease 既定 ~7.8 日)と鍵衝突し得る(検証では OTBR 再起動で
+   回避。運用 CASE は resumption + 既知アドレスで疎通するため toggle は影響なし)。
+5. **SRP client の登録がバックオフで数分沈黙し得る** → pump に「attach 済み・未登録の
+   まま 30 秒毎に `srp_stop` → `srp_autostart` 再発行」の再キックを実装。加えて遅延
+   ConnectNetworkResponse は「SRP サーバ確認済み or attach+5 秒」まで保留する
+   (IM の deferred 締切 20 秒と attach ~10 秒に収める)。
+6. **コミッショナ側の余裕**: `Commissioner` の fail-safe を 120→300 秒(SRP 反映待ちで
+   運用解決中に fail-safe が切れて AddNOC が巻き戻る事故の防止)、smctl の運用解決
+   タイムアウトを 60→120 秒に拡大。smctl の `--at` ユニキャスト解決に **2 段解決**
+   (SRV-only 応答 → `<host>.local` AAAA 追加クエリ)を実装(otbr native publisher は
+   SRV 応答に AAAA を同梱しない)。
+7. **リンク品質**: 本環境の 15.4 リンクはフレーム損失が大きく(ping loss 30-50% の
+   時間帯あり、R9 キックで回復する RX 沈黙窓を含む)、CASE 確立はリトライ前提
+   (`--timeout 90` 推奨)。T3 の安定化課題。
+
+#### 残課題(T3 へ)
+
+- chip-tool での発見成立(otbr を avahi 連携ビルドにする / ホスト avahi 停止 /
+  ネットワーク名前空間分離のいずれか)。smctl パスは green。
+- KvsSettings(write キューイング)による OT 自己永続化と SRP 鍵の保持。
+- 15.4 リンク品質の改善(esp-radio 0.18 の RX 沈黙・イベント喪失は upstream 報告候補。
+  ペーシング 8ms の削減・調整、RCP 側フロー制御)。
+- 診断ログ(`[udp] rx` / 大フレーム TX/RX)の整理(T2 検証用に残置)。
 
 ### T3: 運用強化(E2E 安定化)
 
@@ -434,12 +516,12 @@ main.rs に診断コード(5 秒 heartbeat、`SM_TX_PROBE=<addr>` 環境変数�
 | # | リスク | 影響 | 緩和 |
 |---|---|---|---|
 | R1 | openthread 0.2.0 は若い(0.2 が実質初リリース)。API 改名進行中(srp→srp-client 等)、プリビルト .a と feature 組合せの罠 | 中 | バージョン固定(=0.2.0)。upstream の rs-matter 実績が同系統。改名は追従容易 |
-| R2 | **BLE + 802.15.4 の実行時同時動作が未検証**(ビルド可は確認済み。esp-radio の coex feature は Wi-Fi/BLE 用で 15.4/BLE の明示コエグジスタンスは無い) | 高(T2 の pairing ble-thread が成立しない可能性) | T2 最初のゲートで単体検証(BLE 広告中に attach)。ダメなら「BLE で dataset 受領 → BLE 切断 → 15.4 起動」の時分割(Matter 的には ConnectNetwork 後の BTP 維持は必須でない — chip-tool は CASE を Thread 側で張る) |
+| R2 | ~~**BLE + 802.15.4 の実行時同時動作が未検証**~~ **→ T2 実測で確定(2026-07-17)**: コミッショニング中の同時動作は**成立**(BLE/BTP 維持のまま attach + 遅延 ConnectNetworkResponse 配送)。ただし**常時 BLE 広告は 15.4 の RX/TX を恒常的に劣化させ、運用フェーズの CASE over Thread が成立しない** | 中(部分的に顕在化) | **運用フェーズは時分割**: コミッショニング完了(fabric 保有 + BLE 切断)後に BLE 広告を停止(`GattChannels::set_adv_enabled(false)`)。コミッショニング済み起動時は広告自体を抑止 |
 | R3 | ~~**RCP ボードの USB-Serial-JTAG 問題**: ot_rcp 既定は UART。NanoC6 等 UART ブリッジ無しボードでは USB ポート越しに spinel が通らない~~ **→ 解決済み(T1 実測 2026-07-17)** | ~~中~~ 解消 | **`ot_rcp` を `CONFIG_OPENTHREAD_RCP_USB_SERIAL_JTAG=y` で再ビルドすれば spinel が USB-Serial-JTAG に出て NanoC6 の USB ポート越しに OTBR が接続できる**(`build-ot-rcp.sh` の `RCP_OVER_USB=1` 既定に実装)。外付け UART / DevKitC は不要。詳細は §7 T1 実機結果 |
-| R9 | ~~**DUT が attach 数秒後に停止**(role→Child まで到達後、無線が止まる。T1 で発見)~~ **→ 実測で特定・ワークアラウンド済み(2026-07-17)**: 停止は **RX 方向のみ**(TX は正常 — 周期 UDP 送信は OTBR に届き続ける)。executor/embassy-time/OT 状態機械は全て生存(heartbeat 継続・role=Child 維持)。回復手段は**実 TX のみ**(tx_init の stop_current_operation → 完了後 next_operation の rx_init+enable_rx フル再初期化)。`start_receive()`(state==Receive/TxAck では no-op)や `ensure_receive_enabled`(RxStart 再発行)の周期実行では回復しないことを実測 → esp-radio 0.18 の 15.4 状態機械が RX 再アーム不能な状態に座礁している(TxAck 系 state の event 取りこぼしが有力。coex/ble feature・ログレベルは無関係と bisect 済み) | ~~高~~ 解消(暫定) | **vendored openthread(`ports/esp32/vendor/openthread`、[patch.crates-io])の `EspRadio::receive` に TX キックを実装**: RX シグナル 5 秒無音で宛先なし imm-ACK(3 バイト、他ノードは UnexpectedAck として破棄)を送出し TX 完了経路で RX を再初期化。無送信ソーク 225 秒 + ping / UDP echo / MLE keepalive 全て green を実測。**根本修正は esp-radio 側 = upstream 報告候補**(再現手順と切り分けログは §7 T1 実機結果) |
+| R9 | ~~**DUT が attach 数秒後に停止**(role→Child まで到達後、無線が止まる。T1 で発見)~~ **→ 実測で特定・ワークアラウンド済み(2026-07-17)**: 停止は **RX 方向のみ**(TX は正常 — 周期 UDP 送信は OTBR に届き続ける)。executor/embassy-time/OT 状態機械は全て生存(heartbeat 継続・role=Child 維持)。回復手段は**実 TX のみ**(tx_init の stop_current_operation → 完了後 next_operation の rx_init+enable_rx フル再初期化)。`start_receive()`(state==Receive/TxAck では no-op)や `ensure_receive_enabled`(RxStart 再発行)の周期実行では回復しないことを実測 → esp-radio 0.18 の 15.4 状態機械が RX 再アーム不能な状態に座礁している(TxAck 系 state の event 取りこぼしが有力。coex/ble feature・ログレベルは無関係と bisect 済み) | ~~高~~ 解消(暫定) | **vendored openthread(`ports/esp32/vendor/openthread`、[patch.crates-io])の `EspRadio::receive` に TX キックを実装**: RX シグナル 5 秒無音で宛先なし imm-ACK(3 バイト、他ノードは UnexpectedAck として破棄)を送出し TX 完了経路で RX を再初期化。無送信ソーク 225 秒 + ping / UDP echo / MLE keepalive 全て green を実測。**根本修正は esp-radio 側 = upstream 報告候補**(再現手順と切り分けログは §7 T1 実機結果)。**T2 追加**: ①tx_done/tx_failed イベント喪失で `transmit` が永久待ちになり radio タスク全体が停止する事象を発見 → 500ms タイムアウト + 同一 PSDU 再送出で回復。②RCP(spinel over USB-CDC)が back-to-back の 6LoWPAN 断片を auto-ack 後に取りこぼす(ACK 済みのため OT 再送なし)→ 64B 超フレーム送信後 8ms のペーシングで解消(§T2 実機結果) |
 | R4 | Wi-Fi と Thread の同一 FW 共存不可(esp-radio 0.18 制約。§2.3) | 低(設計で吸収済み) | パッケージ分離済み。SKU 分割は製品慣行に一致 |
 | R5 | フットプリント: OT + MbedTLS + simple-matter + BLE の合算が未計測(smoke 332KiB、e5-light 1.13MiB — 単純合算なら ~1.4MiB) | 低〜中 | 4MiB flash に対し余裕はあるが、T2 でサイズレポートを取り bloat-check の監視対象に追加 |
-| R6 | KvsSettings の flash 書き込みが 15.4/BLE 動作中のキャッシュ停止と干渉(kvs.rs 既知課題の再来) | 中 | T2 で実測。必要なら idle 時 flush のキューイング |
+| R6 | ~~KvsSettings の flash 書き込みが 15.4/BLE 動作中のキャッシュ停止と干渉~~ **→ T2 実測で顕在化**: attach 時の OT settings 書き込みバースト(フレッシュ NVS では erase 込み)が 15.4 radio を回復不能停止させる(ping 100% loss) | 高(顕在化) | T2 は RAM settings + dataset 自前永続化に割り切り(§T2 実機結果)。T3 で write キューイング + 安全窓 flush と共に KvsSettings を再導入。なお pump 側の低頻度 flash 書き込み(fabric/resumption/dataset 各 1 回級)は問題を起こしていない |
 | R7 | OT 内部ヒープ(固定バッファ)の枯渇(SRP + UDP + DTLS 併用時) | 低 | `heap-int-<N>` で増量可。`buffer_info()` 相当の診断ログを T2 に仕込む |
 | R8 | embassy-sync 二重化(既存 0.7 = trouble-host 系 / openthread 内部 0.8) | 低 | 型は互いに漏れない(検証済みビルド green)。トラブル時は trouble-host 更新と合わせ 0.8 系へ統一検討 |
 

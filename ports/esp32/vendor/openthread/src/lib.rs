@@ -77,8 +77,9 @@ use sys::{
     otError_OT_ERROR_ABORT, otError_OT_ERROR_CHANNEL_ACCESS_FAILURE, otError_OT_ERROR_DROP,
     otError_OT_ERROR_NONE, otError_OT_ERROR_NOT_FOUND, otError_OT_ERROR_NO_ACK,
     otError_OT_ERROR_NO_BUFS, otInstance, otInstanceFinalize, otInstanceInitSingle, otIp6Address,
-    otIp6GetUnicastAddresses, otIp6IsEnabled, otIp6NewMessageFromBuffer, otIp6Send,
-    otIp6SetEnabled, otIp6SetReceiveCallback, otLinkModeConfig, otMessage, otMessageFree,
+    otIp6AddUnicastAddress, otIp6GetUnicastAddresses, otIp6IsEnabled, otIp6NewMessageFromBuffer,
+    otIp6Send, otIp6SetEnabled, otIp6SetReceiveCallback, otLinkModeConfig, otMessage,
+    otMessageFree, otNetifAddress,
     otMessagePriority_OT_MESSAGE_PRIORITY_NORMAL, otMessageRead, otMessageSettings,
     otOperationalDataset, otOperationalDatasetTlvs, otPlatAlarmMilliFired, otPlatRadioReceiveDone,
     otPlatRadioTxDone, otPlatRadioTxStarted, otRadioCaps, otRadioFrame, otSetStateChangedCallback,
@@ -410,6 +411,41 @@ impl<'a> OpenThread<'a> {
         let state = ot.state();
 
         ot!(unsafe { otIp6SetEnabled(state.ot.instance, enable) })
+    }
+
+    /// Add an external unicast address to the Thread interface.
+    ///
+    /// Substitute for SLAAC when the prebuilt OpenThread library is compiled
+    /// without `OPENTHREAD_CONFIG_IP6_SLAAC_ENABLE` (the case for the bundled
+    /// riscv32 `.a`): Matter over Thread requires a routable (OMR-prefix)
+    /// address — the SRP client's auto host address and the operational
+    /// transport both rely on it. Without one the device only has link-local +
+    /// mesh-local addresses and the Border Router's advertising proxy will not
+    /// publish a usable AAAA. The caller composes `prefix + IID` from the
+    /// netdata on-mesh (SLAAC-flagged) prefix and adds it here; OpenThread
+    /// copies the value into its internal external-address pool.
+    pub fn add_unicast_address(
+        &self,
+        addr: core::net::Ipv6Addr,
+        prefix_len: u8,
+    ) -> Result<(), OtError> {
+        let mut ot = self.activate();
+        let state = ot.state();
+
+        let mut netif = otNetifAddress {
+            mAddress: otIp6Address {
+                mFields: sys::otIp6Address__bindgen_ty_1 {
+                    m8: addr.octets(),
+                },
+            },
+            mPrefixLength: prefix_len,
+            mAddressOrigin: 0,
+            ..otNetifAddress::default()
+        };
+        netif.set_mPreferred(true);
+        netif.set_mValid(true);
+
+        ot!(unsafe { otIp6AddUnicastAddress(state.ot.instance, &netif) })
     }
 
     /// Enable or disable the reception of IPv6 packets.

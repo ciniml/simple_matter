@@ -123,15 +123,62 @@ impl Radio for EspRadio<'_> {
             psdu.len(),
             self.config.channel
         );
+        // [simple_matter 診断] 多フラグメント TX の切り分け(>100B フレームのみ)。
+        if psdu.len() > 100 {
+            info!("802.15.4: TX large frame {} bytes", psdu.len());
+        }
 
         self.driver
             .transmit_raw(psdu, cca)
             .map_err(|_| RadioErrorKind::Other)?;
 
-        let success = TX_SIGNAL.wait().await;
+        // [simple_matter R9 拡張ワークアラウンド]
+        // esp-radio 0.18 は tx_done/tx_failed イベントを取りこぼすことがあり
+        // (RX 沈黙と同族の状態機械バグ)、その場合 `TX_SIGNAL.wait()` が永久に
+        // 完了せず OT の radio タスク全体(TX/RX とも)が停止する。多フラグメント
+        // 送信バースト(6LoWPAN 断片化した CASE sigma2 ~900B)で実機再現。
+        // 完了待ちに 500ms のタイムアウトを入れ、タイムアウト時は同一 PSDU を
+        // 再送出する(esp-radio の tx_init は stop_current_operation を先行させる
+        // ため、座礁した状態機械ごと復帰する)。数回で回復しなければ TxFailed を
+        // 返し、OT SubMac のリトライに委ねる。根本修正は esp-radio 側。
+        let mut attempts = 0u8;
+        let success = loop {
+            let timeout = embassy_time::Timer::after(embassy_time::Duration::from_millis(500));
+            match embassy_futures::select::select(TX_SIGNAL.wait(), timeout).await {
+                embassy_futures::select::Either::First(ok) => break ok,
+                embassy_futures::select::Either::Second(_) => {
+                    attempts += 1;
+                    warn!(
+                        "802.15.4: TX completion timeout; re-kicking TX (attempt {})",
+                        attempts
+                    );
+                    if attempts >= 3 {
+                        break false;
+                    }
+                    TX_SIGNAL.reset();
+                    if self.driver.transmit_raw(psdu, cca).is_err() {
+                        break false;
+                    }
+                }
+            }
+        };
 
         if success {
             trace!("802.15.4: TX done");
+            if psdu.len() > 100 {
+                info!("802.15.4: TX large frame done ({} bytes)", psdu.len());
+            }
+
+            // [simple_matter T2 ワークアラウンド / フラグメント TX ペーシング]
+            // RCP 構成の親(NanoC6 ot_rcp、spinel over USB-CDC)は、6LoWPAN 断片化
+            // フレームのバースト(back-to-back TX)を HW auto-ack した後に spinel 側で
+            // 取りこぼす(OTBR で "Dropping rx frag frame"(先頭/中間断片欠落)を実測。
+            // ACK 済みのため OT は再送しない)。大きめのフレーム送信後に短い間隔を
+            // 空けて RCP の排出(~3ms/frame @460800baud)を待つ。CASE sigma2(~900B、
+            // 7 断片)の成立に必須。根本対処は RCP 側バッファ/フロー制御。
+            if psdu.len() > 64 {
+                embassy_time::Timer::after(embassy_time::Duration::from_millis(8)).await;
+            }
 
             if let Some(ack_psdu_buf) = ack_psdu_buf {
                 // After tx_done signal received, get the ACK frame:
@@ -252,6 +299,10 @@ impl Radio for EspRadio<'_> {
             raw.channel,
             rssi
         );
+        // [simple_matter 診断] 多フラグメント RX の切り分け(>100B フレームのみ)。
+        if psdu_len > 100 {
+            info!("802.15.4: RX large frame {} bytes", psdu_len);
+        }
 
         Ok(PsduMeta {
             len: psdu_len,

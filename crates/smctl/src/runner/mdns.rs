@@ -551,31 +551,82 @@ pub fn resolve_operational_at(
     let start = Instant::now();
     let mut last_query = Instant::now() - MDNS_REQUERY_INTERVAL;
     let mut rx = [0u8; 1500];
+    // 2 段解決の状態: SRV のみ先に得られた場合の target ホスト名(先頭ラベル)とポート。
+    //
+    // OTBR の native mDNS publisher は SRV 応答の additional に AAAA を同梱しない
+    // (Matter over Thread の advertising proxy 経由で実測)。その場合は
+    // `<host>.local` の AAAA を追加クエリで解決し、**応答の AAAA(デバイスの
+    // OMR/mesh-local アドレス)** へ接続する(プロキシ応答のため `src` への adopt は
+    // 不可 — src は OTBR ホスト自身)。
+    let mut srv_host = [0u8; 63];
+    let mut srv: Option<(usize, u16)> = None;
     while start.elapsed() < timeout {
         if last_query.elapsed() >= MDNS_REQUERY_INTERVAL {
-            socks.send_query(build);
+            match srv {
+                None => socks.send_query(build),
+                Some((hlen, _)) => {
+                    let host = &srv_host[..hlen];
+                    socks.send_query(|buf: &mut [u8; 128]| {
+                        MdnsClient::build_resolve_host_aaaa(buf, host, true)
+                    });
+                }
+            }
             last_query = Instant::now();
             if trace {
-                dis_trace!("(at) operational query sent to {} host(s)", targets.len());
+                dis_trace!(
+                    "(at) {} query sent to {} host(s)",
+                    if srv.is_none() {
+                        "operational(SRV)"
+                    } else {
+                        "host(AAAA)"
+                    },
+                    targets.len()
+                );
             }
         }
         match socks.recv(&mut rx) {
             Some((n, src)) => {
+                // 1 パケット完結(SRV + AAAA 同梱)ならそのまま採用。
                 let parsed = MdnsClient::parse_operational(&rx[..n], &compressed, node_id);
-                if trace {
-                    dis_trace!(
-                        "(at) rx {n}B from {src} parse={}",
-                        if parsed.is_some() {
-                            "operational"
-                        } else {
-                            "no-match"
-                        }
-                    );
-                }
                 if let Some(node) = parsed {
+                    // アドレス付き応答: プロキシ応答(AAAA がデバイスのアドレス)を優先し、
+                    // 無ければ従来どおり応答元へ adopt する。
+                    if let Some(v6) = node.addrs.iter().find(|a| a.is_ipv6()) {
+                        let addr = SocketAddr::new(*v6, node.port);
+                        dis_info!("(at) operational node resolved at {addr}");
+                        return Ok(addr);
+                    }
                     let addr = socks.adopt(src, node.port);
                     dis_info!("(at) operational node adopted at {addr}");
                     return Ok(addr);
+                }
+                // SRV のみの応答(OTBR native publisher)→ 2 段目(AAAA)へ移行。
+                if srv.is_none() {
+                    if let Some((hlen, port)) =
+                        MdnsClient::parse_operational_srv(&rx[..n], &compressed, node_id, &mut srv_host)
+                    {
+                        srv = Some((hlen, port));
+                        dis_info!(
+                            "(at) SRV-only answer: target={}.local port={port}; resolving AAAA...",
+                            String::from_utf8_lossy(&srv_host[..hlen])
+                        );
+                        // 即座に AAAA クエリを撃つ。
+                        last_query = Instant::now() - MDNS_REQUERY_INTERVAL;
+                        continue;
+                    }
+                }
+                // 2 段目: AAAA 応答からデバイスアドレスを得る。
+                if let Some((hlen, port)) = srv {
+                    let addrs = MdnsClient::parse_host_addrs(&rx[..n], &srv_host[..hlen]);
+                    let v6 = addrs.iter().find(|a| a.is_ipv6()).copied();
+                    if let Some(v6) = v6 {
+                        let addr = SocketAddr::new(v6, port);
+                        dis_info!("(at) operational node resolved at {addr} (two-step)");
+                        return Ok(addr);
+                    }
+                }
+                if trace {
+                    dis_trace!("(at) rx {n}B from {src} parse=no-match");
                 }
             }
             None => std::thread::sleep(MDNS_POLL_SLEEP),

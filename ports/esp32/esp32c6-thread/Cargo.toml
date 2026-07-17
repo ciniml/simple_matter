@@ -19,9 +19,18 @@ publish = false
 # ため、T2 の `pairing ble-thread`(BLE コミッショニング + Thread 運用)は
 # このパッケージ系列で成立する。
 
+# 共有部(no_std): BLE(コピー)/ KVS(コピー)/ OtUdp / OtThreadDriver / EspRng。
+[lib]
+name = "esp32c6_thread"
+
 [[bin]]
 name = "thread-smoke"
 path = "src/main.rs"
+
+# T2: Matter over Thread 最小 E2E(BLE コミッショニング + Thread 運用 + On/Off)。
+[[bin]]
+name = "t2-light"
+path = "src/bin/t2-light.rs"
 
 [dependencies]
 esp-hal = { version = "1.1.1", features = ["esp32c6", "unstable"] }
@@ -88,3 +97,28 @@ embassy-executor = "0.10.0"
 embassy-time = "0.5.1"
 heapless = "0.9"
 static_cell = "2.1"
+
+# --- T2: Matter over Thread(t2-light bin / lib)---
+#
+# コア。default-features=false で std を排し rustcrypto + ble のみ(e3/e4 系と同構成)。
+# esp32c6-firmware lib は wifi feature を引くため依存不可 → ble.rs/kvs.rs はコピー。
+simple-matter = { path = "../../../crates/simple-matter", default-features = false, features = [
+    "rustcrypto",
+    "ble",
+] }
+# BLE(BTP): esp-radio 0.18 BleConnector(bt-hci 0.8)+ trouble-host 0.6(esp32c6-firmware と同版)。
+trouble-host = { version = "0.6.0", default-features = false, features = [
+    "peripheral",
+    "gatt",
+    "derive",
+    "default-packet-pool",
+] }
+bt-hci = "0.8"
+embassy-futures = "0.1.2"
+# trouble-host 0.6 の gatt_server マクロが参照する embassy_sync(0.7 系)。
+embassy-sync = "0.7"
+# flash KVS(fabric / resumption / dataset 永続化)。esp32c6-firmware kvs.rs と同構成。
+esp-storage = { version = "0.9.0", features = ["esp32c6"] }
+sequential-storage = "7.2"
+embedded-storage = "0.3"
+embedded-storage-async = "0.4"

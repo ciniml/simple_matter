@@ -125,6 +125,8 @@ pub enum Cmd {
         discriminator: Option<u16>,
         handoff: bool,
         wifi: Option<(String, String)>,
+        /// `pairing ble-thread`: Thread Operational Dataset(TLV hex デコード済み)。
+        thread: Option<Vec<u8>>,
     },
     DiscoverCommissionable {
         discriminator: Option<u16>,
@@ -383,7 +385,8 @@ pub fn dispatch(g: &Globals, cmd: Cmd) -> Result<(), String> {
             discriminator,
             handoff,
             wifi,
-        } => crate::runner::ble::pair_ble(g, node, passcode, discriminator, handoff, wifi),
+            thread,
+        } => crate::runner::ble::pair_ble(g, node, passcode, discriminator, handoff, wifi, thread),
         #[cfg(not(feature = "ble"))]
         Cmd::PairBle { .. } => {
             Err("BLE support is not compiled in; rebuild with `--features ble`".into())
@@ -471,6 +474,7 @@ fn parse_pairing(args: &[String]) -> Result<Cmd, String> {
                 discriminator,
                 handoff: sub == "ble-handoff",
                 wifi: None,
+                thread: None,
             })
         }
         "ble-wifi" => {
@@ -501,6 +505,46 @@ fn parse_pairing(args: &[String]) -> Result<Cmd, String> {
                 discriminator,
                 handoff: false,
                 wifi: Some((ssid, password)),
+                thread: None,
+            })
+        }
+        "ble-thread" => {
+            // pairing ble-thread <node-id> <passcode> <dataset-tlv-hex> [discriminator]
+            let rest = &args[1..];
+            if rest.len() < 3 || rest.len() > 4 {
+                return Err(
+                    "usage: smctl pairing ble-thread <node-id> <passcode> <dataset-tlv-hex> \
+                     [discriminator]"
+                        .into(),
+                );
+            }
+            let hex: String = rest[2]
+                .strip_prefix("hex:")
+                .unwrap_or(&rest[2])
+                .chars()
+                .filter(|c| c.is_ascii_hexdigit())
+                .collect();
+            if hex.is_empty() || !hex.len().is_multiple_of(2) || hex.len() > 254 * 2 {
+                return Err(format!(
+                    "invalid dataset TLV hex (even length, <=508 hex chars): {:?}",
+                    rest[2]
+                ));
+            }
+            let tlv: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            let discriminator = match rest.get(3) {
+                Some(d) => Some(parse_disc(d)?),
+                None => None,
+            };
+            Ok(Cmd::PairBle {
+                node: parse_u64(&rest[0])?,
+                passcode: parse_passcode(&rest[1])?,
+                discriminator,
+                handoff: false,
+                wifi: None,
+                thread: Some(tlv),
             })
         }
         "list" => Ok(Cmd::PairingList),
@@ -514,7 +558,7 @@ fn parse_pairing(args: &[String]) -> Result<Cmd, String> {
         }
         _ => Err(
             "usage: smctl pairing <onnetwork|onnetwork-long|address|ble|ble-handoff|ble-wifi|\
-             unpair|list> ... (see `smctl help`)"
+             ble-thread|unpair|list> ... (see `smctl help`)"
                 .into(),
         ),
     }
@@ -979,6 +1023,8 @@ USAGE:
   smctl pairing ble-handoff     <node-id> <passcode> [discriminator]   (AddNOC over BLE -> CASE over UDP)
   smctl pairing ble-wifi        <node-id> <passcode> <ssid> <password> [discriminator]
                                 (BLE commissioning + WiFi provisioning -> CASE over UDP)
+  smctl pairing ble-thread      <node-id> <passcode> <dataset-tlv-hex> [discriminator]
+                                (BLE commissioning + Thread provisioning -> CASE over Thread/UDP)
   smctl pairing unpair          <node-id>   (RemoveFabric own fabric, then drop local state)
   smctl pairing list
   smctl admincommissioning open-window <node-id> <timeout-s> <discriminator> [--passcode N]
@@ -1170,6 +1216,7 @@ mod tests {
                 discriminator: Some(3840),
                 handoff: false,
                 wifi: None,
+                thread: None,
             }
         ));
         let (_, cmd) = parse_ok("pairing ble-handoff 1 20202021");
@@ -1191,6 +1238,7 @@ mod tests {
                 discriminator: Some(3840),
                 handoff: false,
                 wifi: Some((ssid, pw)),
+                thread: None,
             } => {
                 assert_eq!(ssid, "iotap");
                 assert_eq!(pw, "hogeFugapiyo");
