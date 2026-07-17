@@ -486,8 +486,10 @@ main.rs に診断コード(5 秒 heartbeat、`SM_TX_PROBE=<addr>` 環境変数�
 
 #### 残課題(T3 へ)
 
-- chip-tool での発見成立(otbr を avahi 連携ビルドにする / ホスト avahi 停止 /
-  ネットワーク名前空間分離のいずれか)。smctl パスは green。
+- ~~chip-tool での発見成立(otbr を avahi 連携ビルドにする / ホスト avahi 停止 /
+  ネットワーク名前空間分離のいずれか)~~ **→ T3 で解決(2026-07-17、§T3 item 6)**: avahi 統合は
+  不要だった。真因は SRP ホスト鍵衝突で、再コミッション前に `ot-ctl srp server disable/enable` で
+  旧登録を掃除すれば chip-tool のマルチキャスト mDNS 解決も普通に通る。chip-tool ゲート A PASS。
 - KvsSettings(write キューイング)による OT 自己永続化と SRP 鍵の保持。
 - 15.4 リンク品質の改善(esp-radio 0.18 の RX 沈黙・イベント喪失は upstream 報告候補。
   ペーシング 8ms の削減・調整、RCP 側フロー制御)。
@@ -565,13 +567,48 @@ DUT は T2 と同じ t2-light bin(compressed fabric `9D4D94DDDE8BB05B`、host `S
   **検証済みのコア/運用系を壊すリスクが実装価値(chip-tool は既定でスキップ、現状は空成功シムで
   仕様上有効)を上回る**と判断し carried-over。現状は `ScanNetworks` は空結果 Success を返す。
 
-- **item 6: chip-tool 相互 = carried-over(症状記録)。**
-  ブロッカーは T2 で確定済みの **ホスト 5353 競合**(avahi + chip-tool + otbr native mDNS
-  publisher が SO_REUSEPORT で 5353 共有 → QM 経路不達)。回避案(otbr を `OTBR_MDNS=avahi` で
-  起動 / chip-tool の interface 制限)はいずれも **OTBR コンテナの再起動を要し、稼働中の DUT 接続と
-  ソークを切断する**ため、稼働系保全を優先して今回は未実施。smctl パスは全ゲート green のため
-  運用検証はカバー済み。推奨: 次回のメンテ窓で `OTBR_MDNS=avahi` ビルドの otbr を試す
-  (RCP 圧迫 = HandleRcpTimeout の再発に注意)。
+- **item 6: chip-tool 相互 = DONE(2026-07-17、ゲート A 実機 PASS)。**
+  **chip-tool(snap `/snap/bin/chip-tool`)による新規コミッショニング〜運用操作が Thread 経由で
+  完走した**。実測(DUT NVS 消去 → `chip-tool pairing ble-thread 1 hex:<dataset> 20202021 3840
+  --ble-controller 0 --paa-trust-store-path <dir>`):
+  - BLE 発見 → PASE → **DeviceAttestation 検証 PASS**(テスト PAA `Chip-Test-PAA-FFF1-Cert.der`)
+    → CSR/AddNOC → **ReadCommissioningInfo が `NetworkCommissioning Features: has Thread` を認識**
+    → `ThreadNetworkSetup`(AddOrUpdateThreadNetwork)→ ArmFailSafe → `ConnectNetwork`
+    (networkingStatus=0、attach 成功)→ **運用発見(mDNS 解決成功)→ CASE over Thread
+    (Sigma1/2/3、`[fd7a:…:2fe0]:5540`)→ CommissioningComplete → `Device commissioning
+    completed with success`**。
+  - `chip-tool onoff toggle 1 1` → `Cluster 0x0006 Command 0x02 Status=0x0 (SUCCESS)`、
+    `chip-tool onoff read on-off 1 1` → 完全 CASE(Sigma1/2/3)+ ReportData `OnOff: FALSE`。
+  - **root-cause 再評価(重要)**: T2/T3 が「chip-tool 発見 100% タイムアウト」を **ホスト 5353
+    競合**に帰していたが、実測での主因は **SRP ホスト鍵衝突**だった。DUT を再フラッシュ/NVS 消去
+    すると OT settings の SRP ECDSA 鍵が更新され、OTBR SRP server に残る旧登録(旧鍵、
+    同一ホスト名 `SM<MAC>`)と衝突して**新登録が受理されず、そもそも解決対象が publish されない**
+    (chip-tool は存在しないインスタンスを引き続けてタイムアウト)。**対処 = 再コミッション前に
+    `docker exec otbr ot-ctl srp server disable && ot-ctl srp server enable` で旧登録を一掃する**。
+    有効な SRP 登録さえあれば、**chip-tool の minimal-mDNS(マルチキャスト)も smctl の
+    マルチキャスト解決も普通に通り**、5353 競合は実運用で解決を阻害しなかった(`--at`
+    ユニキャストは不要。むしろ `--at` に DUT の OMR を渡すと mDNS 応答者が居らず 120s タイムアウト
+    する = smctl の `--at` は「応答者=OTBR ホスト」を指す用途)。→ **当初計画の `OTBR_MDNS=avahi`
+    (avahi 統合)は不要**。加えてこの no-sudo 環境では avahi 統合自体が実行不能でもある
+    (otbr-agent を host avahi に向けるには host system bus に otbr-agent の D-Bus ポリシを追加=
+    root 必須。コンテナ内 avahi は --network host で host avahi と 5353 衝突し、host avahi 停止も
+    root 必須。現行イメージは `ldd otbr-agent` に libavahi 無し = `OTBR_MDNS=openthread` ビルド)。
+  - 運用メモ: PAA ストアは snap 封じ込めのため **snap 到達パス**(`~/snap/chip-tool/common/paa`)に
+    `*.der` を置く(`/tmp/…` 直下は読めず `No PAAs found`)。chip-tool は `--ble-controller 0`
+    (=hci0)、smctl は `SM_BLE_ADAPTER=hci0`(自動選択だと hci1 を掴み
+    `le-connection-abort-by-local` で失敗する個体あり)。15.4 リンクは依然リトライ前提で、
+    **R9 の RX 沈黙窓に当たると Sigma1 に BUSY(0xDB)/タイムアウトを返す**(DUT `espflash reset`
+    で radio 再初期化 → ping 0% loss 復帰 → 通る)。テストで DUT が数回ハングしたのは既知の
+    esp-radio 座礁(R9)で、chip-tool/discovery とは無関係。
+  - **ゲート B(chip-tool fabric + smctl 共存)= 省略**。ゲート A の factory-reset で既存 smctl
+    fabric を消費したうえ、2 fabric 目の追加は ECM(open-commissioning-window)+ commissionable
+    SRP 広告を要すが t2-light は ECM commissionable 広告を未実装。多 fabric + resumption 共存は
+    T2/T3 で既に green のため、稼働系(ソーク)復旧を優先して省略。
+  - ソークは chip-tool 試験後に **smctl で fabric 9D4D94… を再コミッション**(`SM_BLE_ADAPTER=hci0
+    smctl pairing ble-thread 1 20202021 <dataset> 3840`、マルチキャスト解決で
+    `COMPLETE over UDP`)して復旧し、`scripts/otbr/soak.sh` を再起動済み。**注**: 現行
+    `target/release/smctl` は BLE 無効ビルドだった(`--features ble` 未指定)ため
+    `cargo build --release -p smctl --features ble` で再ビルドが必要(operational 用途は superset で無害)。
 
 - **item 7: ソーク準備 = DONE(起動状態で残置)。**
   `scripts/otbr/soak.sh`(+ `soak-stop.sh`)を追加。①DUT シリアル取り込み ②`smctl onoff subscribe`
@@ -582,9 +619,11 @@ DUT は T2 と同じ t2-light bin(compressed fabric `9D4D94DDDE8BB05B`、host `S
 
 **検証ゲート集計**: item 1(リブート永続化 + SRP 鍵保持)PASS、item 3(subscribe + SII/SAI)PASS、
 item 4(RX 再キック 1s 化で 70s→220s+ 安定・数値改善)PASS、CASE over Thread(toggle, resumption)
-再確認 PASS。item 2 コード done / 実機 carried-over、item 5 carried-over、item 6 症状記録。
-ルート workspace test/clippy/riscv クロス + t2-light/thread-smoke/e5-light ビルド回帰 green。
-コア(`crates/simple-matter`)は **T3 では無改造**(全変更は port + vendored openthread + scripts)。
+再確認 PASS、**item 6(chip-tool 相互, ゲート A)PASS**(pairing ble-thread 完走 + onoff toggle/read、
+2026-07-17)。item 2 コード done / 実機 carried-over、item 5 carried-over、item 6 ゲート B 省略
+(理由上記)。ルート workspace test/clippy/riscv クロス + t2-light/thread-smoke/e5-light ビルド回帰 green。
+コア(`crates/simple-matter`)は **T3 では無改造**(全変更は port + vendored openthread + scripts。
+chip-tool 相互検証はコア/ファーム無改造 — ツール運用と OTBR SRP 掃除のみ)。
 
 **リスク表更新**: R6 は **解決**(write-back + idle flush で顕在化を根治)。R9 は RX 再キックの
 1s 化で運用安定性が実用域に改善(根本は esp-radio、upstream 報告候補のまま)。
