@@ -52,8 +52,8 @@ use trouble_host::prelude::*;
 
 use openthread::esp::EspRadio;
 use openthread::{
-    OpenThread, OtResources, OtSrpResources, OtUdpResources, SimpleRamSettings, SrpConf,
-    SrpService, SrpState, UdpSocket,
+    OpenThread, OtResources, OtSrpResources, OtUdpResources, SrpConf, SrpService, SrpState,
+    UdpSocket,
 };
 
 use simple_matter::btp::gatt::{AdvData, GattPeripheral, PeripheralEvent};
@@ -79,6 +79,7 @@ use simple_matter::transport::net::{
 
 use esp32c6_thread::ble::{gatt_worker, BtpGattServer, GattChannels, TroubleGattPeripheral};
 use esp32c6_thread::kvs::EspKvs;
+use esp32c6_thread::ot_settings::{self, KvsSettings, SettingsStore};
 use esp32c6_thread::ot_thread::OtThreadDriver;
 use esp32c6_thread::ot_udp::OtUdp;
 use esp32c6_thread::EspRng;
@@ -329,8 +330,16 @@ fn register_srp(
 
     let mut instance = heapless::String::<40>::new();
     let _ = write!(instance, "{:016X}-{:016X}", compressed_fabric_id, node_id);
-    // TXT: SII/SAI/T(既存 mDNS 広告と同値の運用パラメータ)。
-    let txt: [(&str, &[u8]); 3] = [("SII", b"5000"), ("SAI", b"300"), ("T", b"0")];
+    // TXT: SII/SAI/T = MRP パラメータ(§T3。Thread は Wi-Fi よりレイテンシ大)。
+    //
+    // SII (Session Idle Interval) / SAI (Session Active Interval) は、コントローラが
+    // **この**ノードへ送る MRP メッセージの再送間隔をこの値まで待つよう指示する(ms)。
+    // Thread はメッシュのマルチホップ + 6LoWPAN 断片化 + 本ポートの 8ms TX ペーシング +
+    // TX イベント喪失リカバリ(500ms)で往復レイテンシが Wi-Fi より大きく、フレーム損失も
+    // 大きい(T2 実測: ping loss 30-50%)。Wi-Fi 版の SAI=300ms だとコントローラが応答到達
+    // 前に再送し、輻輳と重複処理を招く。Thread 向けに **SAI を 300→1000ms、SII を 5000→
+    // 10000ms** に拡大し、1 メッシュ往復ぶんの余裕を持たせる(実測で調整可能な運用パラメータ)。
+    let txt: [(&str, &[u8]); 3] = [("SII", b"10000"), ("SAI", b"1000"), ("T", b"0")];
     let service = SrpService {
         name: "_matter._tcp",
         instance_name: &instance,
@@ -352,6 +361,45 @@ fn register_srp(
         MATTER_PORT
     );
     Ok(())
+}
+
+/// fabric の増減(AddNOC / RemoveFabric)に合わせて SRP 運用登録を作り直す(§T3 項目 2)。
+///
+/// SRP のインスタンス名は `<compressedFabricId>-<nodeId>` で **fabric に紐づく**ため、
+/// AddNOC(新 fabric)/ RemoveFabric で node/fabric が変わると古い登録が陳腐化する。
+/// 変更時は既存サービスを全削除してから現行の先頭 fabric で登録し直す。fabric が
+/// 全て消えた(工場出荷相当)場合は SRP を全削除する(ホスト登録も撤去)。
+///
+/// 戻り値: 登録が有効(サービスあり)なら `true`、全削除したら `false`。
+fn resync_srp<const NF: usize>(
+    ot: &OpenThread<'_>,
+    fabrics: &RefCell<FabricTable<Backend, NF>>,
+    mac: &[u8; 6],
+) -> bool {
+    // 既存の SRP サービスを全撤去(サーバへ削除を通知)。
+    if let Err(e) = ot.srp_remove_all(false) {
+        println!("[srp] resync: remove_all error: {e:?}");
+    }
+    let fab = fabrics
+        .borrow()
+        .iter()
+        .next()
+        .map(|f| (f.compressed_fabric_id(), f.node_id()));
+    match fab {
+        Some((cfid, nid)) => {
+            match register_srp(ot, cfid, nid, mac) {
+                Ok(()) => println!("[srp] resync: re-registered for fabric node={nid:016X}"),
+                Err(e) => println!("[srp] resync: re-register error: {e:?}"),
+            }
+            true
+        }
+        None => {
+            // fabric 皆無 → SRP client を止め、広告を撤去する。
+            let _ = ot.srp_stop();
+            println!("[srp] resync: all fabrics removed; SRP torn down");
+            false
+        }
+    }
 }
 
 /// netdata の on-mesh(SLAAC フラグ付き)prefix から OMR アドレスを合成して追加する。
@@ -454,6 +502,7 @@ async fn pump(
     led: &mut Output<'_>,
     fabrics: &RefCell<FabricTable<Backend, NF>>,
     kvs: &RefCell<EspKvs>,
+    settings_store: &'static RefCell<SettingsStore>,
     matter_udp: &mut OtUdp<'_>,
     ot: OpenThread<'static>,
     mac: [u8; 6],
@@ -480,6 +529,23 @@ async fn pump(
     const OPERATIONAL_READY_FALLBACK_MS: u64 = 5_000;
     // SRP 登録が滞った際の再キック(stop→autostart)の最終発行時刻。
     let mut last_srp_kick_ms: u64 = 0;
+    // SRP 運用登録が有効な fabric 世代(item 2: fabric 増減で SRP を作り直す起点)。
+    let mut srp_fabric_gen = fabrics.borrow().generation();
+    // --- OT settings の idle 時 flush(item 1 / R6)---
+    // 直近に 15.4 radio が通信した時刻(UDP 送受で更新)。flash flush を静穏窓に限る。
+    let mut last_radio_activity_ms: u64 = 0;
+    // 直近に settings を flash へ書いた時刻(flush 頻度の絞り込み)。
+    let mut last_settings_flush_ms: u64 = 0;
+    // flash write(キャッシュ停止)を許してよい静穏時間(直近 UDP からの経過)。
+    const SETTINGS_QUIET_MS: u64 = 4_000;
+    // settings flush の最小間隔。重要データ(dataset / network key / SRP ECDSA 鍵)は
+    // attach 直後に一度書けば十分で、以降の軽微な更新(parent info / lease カウンタ)を
+    // 頻繁に flash へ書くと flash 摩耗とキャッシュ停止の機会が増える。60s に広げて
+    // ソーク中の書き込み回数を抑える(dirty が続いても 60s に 1 回まで)。
+    const SETTINGS_FLUSH_INTERVAL_MS: u64 = 60_000;
+    // attach 直後の settings 書き込みバースト(dataset/NetworkInfo/SRP 鍵)を RAM で吸収し、
+    // attach が落ち着くまで flush を遅らせる猶予(attach からの経過)。
+    const SETTINGS_ATTACH_SETTLE_MS: u64 = 10_000;
     // OMR アドレスを手動追加済みか(netdata 受信後 1 回だけ。maybe_add_omr_address)。
     let mut omr_added = false;
     // EUI-64(OMR アドレスの IID 生成用。main と同じ FF:FE 挿入)。
@@ -605,6 +671,8 @@ async fn pump(
             // --- Matter UDP 受信(CASE over Thread はここを通る)---
             Either3::Second(Ok((n, src))) => {
                 let now = now_ms(start);
+                // 15.4 radio が今 active(settings flush をこの直後は避ける)。
+                last_radio_activity_ms = now;
                 // 先頭 8 バイト(message flags / session id / security flags / counter)を
                 // 添えて受信を記録する(silent drop の切り分け用)。
                 let mut head = [0u8; 8];
@@ -660,6 +728,10 @@ async fn pump(
         // --- 時間駆動の送出 + 閉じた exchange の回収(毎周必須)+ 遅延 ConnectNetwork 解決 ---
         let now = now_ms(start);
         while let Some(d) = stack.poll(now, &mut txd) {
+            // 周期的な UDP 送出(subscribe レポート / MRP ack / 再送)= radio active。
+            if matches!(d.addr, PeerAddr::Udp(_)) {
+                last_radio_activity_ms = now;
+            }
             if let Err(e) = route_send(
                 gatt,
                 &mut btp,
@@ -714,7 +786,11 @@ async fn pump(
                 .map(|f| (f.compressed_fabric_id(), f.node_id()));
             if let Some((cfid, nid)) = fab {
                 match register_srp(&ot, cfid, nid, &mac) {
-                    Ok(()) => srp_submitted = true,
+                    Ok(()) => {
+                        srp_submitted = true;
+                        // 以降の fabric 世代変化(item 2 の resync)の起点を確定する。
+                        srp_fabric_gen = fabrics.borrow().generation();
+                    }
                     Err(e) => println!("[srp] register error: {:?}", e),
                 }
             }
@@ -790,6 +866,20 @@ async fn pump(
             }
         }
 
+        // --- fabric 増減で SRP 運用登録を作り直す(item 2)---
+        //
+        // 初回登録は下の `!srp_submitted` ブロックが担う。ここは **登録済みの後に**
+        // fabric 世代が変わった(AddNOC で追加 fabric / RemoveFabric / 全削除)場合に
+        // 反応する。全削除なら SRP を撤去し、次の fabric 追加で初回登録経路に戻す。
+        if srp_submitted && gen != srp_fabric_gen {
+            srp_fabric_gen = gen;
+            let still_registered = resync_srp(&ot, fabrics, &mac);
+            if !still_registered {
+                srp_submitted = false;
+                operational_ready = false;
+            }
+        }
+
         // --- CASE resumption ストアの世代変化を検知して flash 保存 ---
         let rgen = stack.resumption_generation();
         if rgen != saved_resumption_gen {
@@ -798,6 +888,34 @@ async fn pump(
                 Ok(()) => println!("[kvs] saved {} resumptions", stack.resumption_count()),
                 Err(e) => println!("[kvs] resumption save error: {:?}", e),
             }
+        }
+
+        // --- OT settings の idle 時 flush(item 1 / R6)---
+        //
+        // OT の settings 書き込みは RAM 権威([`SettingsStore`])で即応し flash に触れない。
+        // ここで **radio が静穏な窓** = ①直近 UDP から SETTINGS_QUIET_MS 経過 ②attach 済みで
+        // 落ち着き済み ③前回 flush から SETTINGS_FLUSH_INTERVAL_MS 経過 ―― が揃った時だけ
+        // flash へ 1 アイテムで書き出す。attach 時の書き込みバーストを RAM で吸収して 15.4
+        // radio を止めない(R6 根治)。dataset / NetworkInfo / SRP ECDSA 鍵が永続化される。
+        let now = now_ms(start);
+        let quiet = now.saturating_sub(last_radio_activity_ms) >= SETTINGS_QUIET_MS;
+        let settled = attached_since_ms
+            .map(|t| now.saturating_sub(t) >= SETTINGS_ATTACH_SETTLE_MS)
+            .unwrap_or(false);
+        let throttle_ok = now.saturating_sub(last_settings_flush_ms) >= SETTINGS_FLUSH_INTERVAL_MS
+            || last_settings_flush_ms == 0;
+        if settings_store.borrow().is_dirty()
+            && quiet
+            && settled
+            && throttle_ok
+            && ot_settings::flush(settings_store, kvs)
+        {
+            last_settings_flush_ms = now;
+            println!(
+                "[kvs] flushed OT settings ({} bytes) at idle t={}s",
+                settings_store.borrow().raw().len(),
+                now / 1000
+            );
         }
     }
 }
@@ -874,15 +992,19 @@ async fn main(spawner: Spawner) {
     );
     // MAX_SERVICES=2, BUF=512(SRP: host + _matter._tcp)。
     let ot_srp_resources = mk_static!(OtSrpResources<2, 512>, OtSrpResources::new());
-    // OT Settings は RAM(T2 割り切り、doc §5.3)。KVS 裏打ち(KvsSettings)は実測で
-    // attach 時の flash 書き込みバースト(フレッシュ NVS では領域初期化の erase 込み)が
-    // 15.4 radio を R9 の TX キックでも回復不能な形で停止させたため、T2 では見送り
-    // (リスク R6 の実測。T3 で write キューイング + 安全窓 flush と共に再導入)。
-    // dataset は自前で flash 永続化(DATASET_KEY)しており、リブート後の re-attach は成立する。
-    // SRP ECDSA 鍵は揮発のため、リブート後の SRP 再登録は SRP サーバに残る旧登録
-    // (key-lease 既定 ~7.8 日)と衝突し得る — 検証手順では OTBR 再起動で回避する。
-    let ot_settings_buf = mk_static!([u8; 1024], [0; 1024]);
-    let ot_settings = mk_static!(SimpleRamSettings, SimpleRamSettings::new(ot_settings_buf));
+    // OT Settings = **RAM 権威 + idle 時 flush**(item 1 / リスク R6 解決。ot_settings.rs)。
+    // OT の settings 書き込み(attach 時にバースト)はすべて RAM で即応し flash に触れない。
+    // pump が radio 静穏窓でまとめて 1 アイテムを flash へ書く。これで attach 時の書き込み
+    // バーストが 15.4 radio を止めず(T2 の R6 顕在化を根治)、dataset / NetworkInfo /
+    // **SRP ECDSA 鍵** が永続化される → リブート後に SRP 鍵が保たれ、SRP サーバに残る旧登録
+    // (key-lease 既定 ~7.8 日)と鍵衝突せず同一ホストで再登録できる。
+    let settings_store = mk_static!(RefCell<SettingsStore>, RefCell::new(SettingsStore::new()));
+    match ot_settings::restore(settings_store, kvs) {
+        Ok(0) => println!("[kvs] no persisted OT settings (fresh)"),
+        Ok(n) => println!("[kvs] restored OT settings ({} bytes)", n),
+        Err(()) => println!("[kvs] OT settings restore failed; starting empty"),
+    }
+    let ot_settings = mk_static!(KvsSettings, KvsSettings::new(settings_store));
 
     let ot = OpenThread::new_with_udp_srp(
         ieee_eui64,
@@ -1043,6 +1165,7 @@ async fn main(spawner: Spawner) {
             &mut led,
             &fabrics,
             kvs,
+            settings_store,
             &mut matter_udp,
             ot.clone(),
             mac,

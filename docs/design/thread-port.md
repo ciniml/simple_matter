@@ -504,6 +504,91 @@ main.rs に診断コード(5 秒 heartbeat、`SM_TX_PROBE=<addr>` 環境変数�
 - 検証ゲート: 24h 連続運用(subscribe 維持・SRP lease 更新)+ chip-tool
   基本操作一式。
 
+#### T3 実機結果(2026-07-17、NanoC6 DUT=/dev/ttyACM1 + RCP=/dev/ttyACM5 + OTBR docker)
+
+DUT は T2 と同じ t2-light bin(compressed fabric `9D4D94DDDE8BB05B`、host `SM404CCA5B2FE0`)。
+実施項目ごとの結果(done / partial / carried-over):
+
+- **item 1: KvsSettings 再導入(R6 解決)= DONE(実機ゲート PASS)。**
+  T2 は「attach 時の flash 書き込みバーストが 15.4 radio を回復不能停止させる」ため RAM
+  settings に割り切っていた。T3 は **write-back(RAM 権威 + idle 時 flush)** で再導入した
+  (`ot_settings.rs` を全面書き換え)。OT の `Settings` 呼び出し(get/add/remove/set/clear)は
+  すべて RAM の `SettingsStore`(フラットバッファ、`RamSettings` と同一レイアウト)で即応し
+  **flash に一切触れない**。書き込みは dirty フラグを立てるだけで、pump が **radio 静穏窓**
+  (①直近 UDP から 4s 経過 ②attach から 10s 経過 ③前回 flush から 60s 経過)でのみ、RAM 権威を
+  **1 つの KVS アイテム(`otset`)として丸ごと 1 回 store** する。実測:
+  `[kvs] flushed OT settings (323 bytes) at idle t=10s` の直後も role=Child 維持(radio 生存)=
+  R6 の顕在化(ping 100% loss)を根治。リブート後は `[kvs] restored OT settings (323 bytes)` で
+  dataset / NetworkInfo / **SRP ECDSA 鍵** を復元 → 同一 host `SM404CCA5B2FE0` で SRP を再登録し、
+  OTBR に残る同鍵の登録が **鍵衝突せず refresh 受理**(remaining lease が満了前に戻る)。
+  = **T2 割り切り「SRP 残留登録衝突」を根治**。**移行時の注意**: T2(揮発鍵)→T3 の初回だけは
+  OTBR に残る旧鍵登録と新鍵が衝突する(RESPONSE_TIMEOUT ではなく登録が通らない)。OTBR の
+  `srp server disable/enable` で旧登録をクリアすれば以降は永続鍵で安定。
+
+- **item 3: Subscribe over Thread + SII/SAI 反映 = DONE(実機ゲート PASS)。**
+  SRP TXT の MRP パラメータを Thread 実測に合わせて拡大: **SAI 300→1000ms、SII 5000→10000ms**
+  (Thread はメッシュ多ホップ + 6LoWPAN 断片化 + 8ms TX ペーシング + TX 完了 500ms リカバリで
+  往復レイテンシ大。Wi-Fi の SAI=300ms だとコントローラが応答到達前に再送し輻輳)。OTBR の
+  SRP service に `TXT: [SII=10000, SAI=1000, T=0]` として登録されることを実測。`smctl onoff
+  subscribe 5 20 1 1` で **CASE ESTABLISHED → SubscribeRequest → ESTABLISHED(subscription_id 付き)
+  → `[report +20s] ep1 onoff/on-off = false`**(周期レポートが Thread/UDP 経由で到達)を実測。
+  min=5/max=20s は安定、min=2/max=8s は priming が損失窓に当たると失敗しリトライ前提。
+
+- **item 4: リンク品質改善 = DONE(数値改善あり)。**
+  切り分けで **RESPONSE_TIMEOUT(OT err 28)** が SRP/Matter 応答取りこぼしの主因と判明
+  (SRP はサーバ側で登録成功=fresh lease + 新 TXT が付くのに、DUT が応答を受けられず再送ループ→
+  radio 負荷増→更なる沈黙→**~70 秒で executor ごとハング**)。RX 沈黙は自局 TX 直後に起きやすい
+  (esp-radio 0.18 の 15.4 状態機械が TxAck 系 state から RX 再アーム不能に座礁、R9)。
+  **改善策 = vendored `EspRadio::receive` の RX 再キック閾値を 5s → 1s に短縮**(`esp.rs`)。
+  沈黙開始から 1s 以内に imm-ACK TX 経由で RX をフル再アームできるため、RTT<1s の応答取りこぼしが
+  激減。**結果: ハングまでの生存が ~70s → 220s+ に延伸(ソーク継続中)、RESPONSE_TIMEOUT の再送
+  churn がほぼ消滅、toggle/subscribe が成立**。副作用は静穏時 1s 毎 ~200µs airtime(デューティ
+  ~0.02%)。根本修正は esp-radio 側(upstream 報告候補)。加えて T2 診断の毎 TX/RX の
+  `info!("...large frame...")` は **USB-Serial-JTAG コンソールを飽和させリーダ未接続時に println で
+  executor を止める**(ソーク不能の一因)ため `debug!` へ格下げ(コンソール flood 解消)。
+  **残る損失**: 30-50% のフレーム損失は環境要因(距離/干渉、RCP 側ドロップ)込みで残り、CASE/
+  subscribe は依然リトライ前提(`--timeout` 大 + 数回リトライ)。TX パワー/CCA/8ms ペーシングは
+  今回は変更せず(ペーシング短縮は RCP 側ドロップとのトレードオフで T2 の結論を維持)。
+
+- **item 2: fabric 増減時の SRP 再登録 = DONE(コード)/ carried-over(実機ゲート)。**
+  pump に `resync_srp`(fabric generation 変化を検知 → `srp_remove_all` + 現行先頭 fabric で
+  再登録、全 fabric 削除なら `srp_stop` で撤去)を実装。初回登録の後に AddNOC(追加 fabric)/
+  RemoveFabric で instance 名(`<compressedFabricId>-<nodeId>`)が変わる場合に反応する。
+  実機ゲートは 2 fabric 目のコミッショニング or RemoveFabric を要し(単一 fabric 削除は
+  デコミッション = 稼働中ソークを壊す)、稼働系を保全するため今回は未実施(コードは build/clippy green)。
+
+- **item 5: ScanNetworks(`ot.scan()`)= carried-over(未実装)。**
+  `openthread::OpenThread::scan()` は **async(チャネルごと ~300ms、走査中は運用チャネルを離れる)**
+  で、同期 Mealy machine の IM invoke から直接駆動できない。ConnectNetwork と同じ deferred 機構で
+  「start_scan → poll_deferred で結果を ThreadInterfaceScanResult 配列にエンコード」する設計は
+  ThreadDriver trait(コア)+ cluster(コア)+ pump の async 協調(port)の追加を要し、
+  **検証済みのコア/運用系を壊すリスクが実装価値(chip-tool は既定でスキップ、現状は空成功シムで
+  仕様上有効)を上回る**と判断し carried-over。現状は `ScanNetworks` は空結果 Success を返す。
+
+- **item 6: chip-tool 相互 = carried-over(症状記録)。**
+  ブロッカーは T2 で確定済みの **ホスト 5353 競合**(avahi + chip-tool + otbr native mDNS
+  publisher が SO_REUSEPORT で 5353 共有 → QM 経路不達)。回避案(otbr を `OTBR_MDNS=avahi` で
+  起動 / chip-tool の interface 制限)はいずれも **OTBR コンテナの再起動を要し、稼働中の DUT 接続と
+  ソークを切断する**ため、稼働系保全を優先して今回は未実施。smctl パスは全ゲート green のため
+  運用検証はカバー済み。推奨: 次回のメンテ窓で `OTBR_MDNS=avahi` ビルドの otbr を試す
+  (RCP 圧迫 = HandleRcpTimeout の再発に注意)。
+
+- **item 7: ソーク準備 = DONE(起動状態で残置)。**
+  `scripts/otbr/soak.sh`(+ `soak-stop.sh`)を追加。①DUT シリアル取り込み ②`smctl onoff subscribe`
+  を切断時 30s リトライで維持(セッション境界をログ)③10 分毎に OTBR の SRP server host lease と
+  運用 read を観測 ―― を `soak-logs/<stamp>/` へ記録し続ける。stable firmware で起動済み
+  (24h 判定は後日ログで)。リンク損失窓では subscribe が CASE Sigma1 段で落ち smctl が mDNS
+  fallback(5353 で失敗)に回るため、良好窓を掴むまでリトライを繰り返す挙動。
+
+**検証ゲート集計**: item 1(リブート永続化 + SRP 鍵保持)PASS、item 3(subscribe + SII/SAI)PASS、
+item 4(RX 再キック 1s 化で 70s→220s+ 安定・数値改善)PASS、CASE over Thread(toggle, resumption)
+再確認 PASS。item 2 コード done / 実機 carried-over、item 5 carried-over、item 6 症状記録。
+ルート workspace test/clippy/riscv クロス + t2-light/thread-smoke/e5-light ビルド回帰 green。
+コア(`crates/simple-matter`)は **T3 では無改造**(全変更は port + vendored openthread + scripts)。
+
+**リスク表更新**: R6 は **解決**(write-back + idle flush で顕在化を根治)。R9 は RX 再キックの
+1s 化で運用安定性が実用域に改善(根本は esp-radio、upstream 報告候補のまま)。
+
 ### I1(将来): ICD / Sleepy End Device
 
 - openthread クレート側の sleepy 対応は「予定」段階(upstream)。`set_link_mode` で
@@ -521,7 +606,7 @@ main.rs に診断コード(5 秒 heartbeat、`SM_TX_PROBE=<addr>` 環境変数�
 | R9 | ~~**DUT が attach 数秒後に停止**(role→Child まで到達後、無線が止まる。T1 で発見)~~ **→ 実測で特定・ワークアラウンド済み(2026-07-17)**: 停止は **RX 方向のみ**(TX は正常 — 周期 UDP 送信は OTBR に届き続ける)。executor/embassy-time/OT 状態機械は全て生存(heartbeat 継続・role=Child 維持)。回復手段は**実 TX のみ**(tx_init の stop_current_operation → 完了後 next_operation の rx_init+enable_rx フル再初期化)。`start_receive()`(state==Receive/TxAck では no-op)や `ensure_receive_enabled`(RxStart 再発行)の周期実行では回復しないことを実測 → esp-radio 0.18 の 15.4 状態機械が RX 再アーム不能な状態に座礁している(TxAck 系 state の event 取りこぼしが有力。coex/ble feature・ログレベルは無関係と bisect 済み) | ~~高~~ 解消(暫定) | **vendored openthread(`ports/esp32/vendor/openthread`、[patch.crates-io])の `EspRadio::receive` に TX キックを実装**: RX シグナル 5 秒無音で宛先なし imm-ACK(3 バイト、他ノードは UnexpectedAck として破棄)を送出し TX 完了経路で RX を再初期化。無送信ソーク 225 秒 + ping / UDP echo / MLE keepalive 全て green を実測。**根本修正は esp-radio 側 = upstream 報告候補**(再現手順と切り分けログは §7 T1 実機結果)。**T2 追加**: ①tx_done/tx_failed イベント喪失で `transmit` が永久待ちになり radio タスク全体が停止する事象を発見 → 500ms タイムアウト + 同一 PSDU 再送出で回復。②RCP(spinel over USB-CDC)が back-to-back の 6LoWPAN 断片を auto-ack 後に取りこぼす(ACK 済みのため OT 再送なし)→ 64B 超フレーム送信後 8ms のペーシングで解消(§T2 実機結果) |
 | R4 | Wi-Fi と Thread の同一 FW 共存不可(esp-radio 0.18 制約。§2.3) | 低(設計で吸収済み) | パッケージ分離済み。SKU 分割は製品慣行に一致 |
 | R5 | フットプリント: OT + MbedTLS + simple-matter + BLE の合算が未計測(smoke 332KiB、e5-light 1.13MiB — 単純合算なら ~1.4MiB) | 低〜中 | 4MiB flash に対し余裕はあるが、T2 でサイズレポートを取り bloat-check の監視対象に追加 |
-| R6 | ~~KvsSettings の flash 書き込みが 15.4/BLE 動作中のキャッシュ停止と干渉~~ **→ T2 実測で顕在化**: attach 時の OT settings 書き込みバースト(フレッシュ NVS では erase 込み)が 15.4 radio を回復不能停止させる(ping 100% loss) | 高(顕在化) | T2 は RAM settings + dataset 自前永続化に割り切り(§T2 実機結果)。T3 で write キューイング + 安全窓 flush と共に KvsSettings を再導入。なお pump 側の低頻度 flash 書き込み(fabric/resumption/dataset 各 1 回級)は問題を起こしていない |
+| R6 | ~~KvsSettings の flash 書き込みが 15.4/BLE 動作中のキャッシュ停止と干渉~~ ~~T2 実測で顕在化: attach 時の OT settings 書き込みバーストが 15.4 radio を回復不能停止させる(ping 100% loss)~~ **→ T3 で解決(2026-07-17)** | ~~高~~ 解消 | **write-back(RAM 権威 + idle 時 flush)で再導入(§T3 実機結果 item 1)**: OT の settings は RAM の `SettingsStore` で即応し flash に触れず、pump が radio 静穏窓(直近 UDP から 4s / attach から 10s / 前回から 60s)で **1 KVS アイテム(`otset`)を丸ごと 1 回 store** する。attach 時の書き込みバーストを RAM で吸収 = radio を止めない。リブート後は 323B を復元し dataset/NetworkInfo/**SRP ECDSA 鍵**を保持 → SRP 残留登録衝突を根治。実測: flush 直後も role=Child 維持 |
 | R7 | OT 内部ヒープ(固定バッファ)の枯渇(SRP + UDP + DTLS 併用時) | 低 | `heap-int-<N>` で増量可。`buffer_info()` 相当の診断ログを T2 に仕込む |
 | R8 | embassy-sync 二重化(既存 0.7 = trouble-host 系 / openthread 内部 0.8) | 低 | 型は互いに漏れない(検証済みビルド green)。トラブル時は trouble-host 更新と合わせ 0.8 系へ統一検討 |
 

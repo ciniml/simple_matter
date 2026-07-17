@@ -124,8 +124,10 @@ impl Radio for EspRadio<'_> {
             self.config.channel
         );
         // [simple_matter 診断] 多フラグメント TX の切り分け(>100B フレームのみ)。
+        // T3: info! は毎 TX で USB-Serial-JTAG コンソールを飽和させ、リーダ未接続時に
+        // println ブロックで executor を止める(ソーク不能)ため debug! へ格下げ。
         if psdu.len() > 100 {
-            info!("802.15.4: TX large frame {} bytes", psdu.len());
+            debug!("802.15.4: TX large frame {} bytes", psdu.len());
         }
 
         self.driver
@@ -166,7 +168,7 @@ impl Radio for EspRadio<'_> {
         if success {
             trace!("802.15.4: TX done");
             if psdu.len() > 100 {
-                info!("802.15.4: TX large frame done ({} bytes)", psdu.len());
+                debug!("802.15.4: TX large frame done ({} bytes)", psdu.len());
             }
 
             // [simple_matter T2 ワークアラウンド / フラグメント TX ペーシング]
@@ -249,12 +251,21 @@ impl Radio for EspRadio<'_> {
             // 周期実行では回復しないことを実測済みで、**回復する唯一の経路は実 TX**
             // (tx_init の stop_current_operation → 完了後 next_operation →
             // rx_init + enable_rx のフル再初期化)である。
-            // そこで受信シグナル待ちに 5 秒のタイムアウトを入れ、無受信が続いた
+            // そこで受信シグナル待ちにタイムアウトを入れ、無受信が続いた
             // 場合は宛先なしの imm-ACK フレーム(3 バイト。他ノードは
             // UnexpectedAck として破棄)を CCA 付きで送出し、TX 完了経路で RX を
-            // 再初期化する。副作用は静穏時 5 秒毎の約 200µs の airtime のみ。
-            // 根本修正は esp-radio 側(upstream 報告候補)。thread-port.md R9。
-            let timeout = embassy_time::Timer::after(embassy_time::Duration::from_secs(5));
+            // 再初期化する。
+            //
+            // [T3 item 4: リンク品質改善] タイムアウトを 5s → 1s に短縮する。
+            // RX 沈黙は自局 TX(SRP 更新 / MLE keepalive / 6LoWPAN 断片)の直後に
+            // 起きやすく、5s 窓では SRP/Matter の応答(RTT < 1s、OT の応答待ちは
+            // 数秒でタイムアウト)を取りこぼして RESPONSE_TIMEOUT(err 28)を招く
+            // ことを実機で実測(SRP 登録がサーバ側は成功しても DUT が応答を受けられず
+            // 再送ループ→radio 負荷増→更なる沈黙)。1s に縮めると沈黙開始から 1s 以内に
+            // RX を再アームでき、応答取りこぼしが大幅に減る。副作用は静穏時 1s 毎の
+            // 約 200µs airtime(デューティ ~0.02%)のみ。根本修正は esp-radio 側
+            // (upstream 報告候補)。thread-port.md R9 / T3 item 4。
+            let timeout = embassy_time::Timer::after(embassy_time::Duration::from_millis(1000));
             if let embassy_futures::select::Either::Second(_) =
                 embassy_futures::select::select(RX_SIGNAL.wait(), timeout).await
             {
@@ -300,8 +311,9 @@ impl Radio for EspRadio<'_> {
             rssi
         );
         // [simple_matter 診断] 多フラグメント RX の切り分け(>100B フレームのみ)。
+        // T3: 毎 RX のコンソール飽和を避けるため debug! へ格下げ(上記 TX 側と同理由)。
         if psdu_len > 100 {
-            info!("802.15.4: RX large frame {} bytes", psdu_len);
+            debug!("802.15.4: RX large frame {} bytes", psdu_len);
         }
 
         Ok(PsduMeta {
