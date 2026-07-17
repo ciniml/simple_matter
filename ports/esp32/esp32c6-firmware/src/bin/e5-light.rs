@@ -84,7 +84,7 @@ use simple_matter::dm::{tick_clusters, DataModel, ServerCluster};
 use simple_matter::error::Result as MResult;
 use simple_matter::fabric::FabricTable;
 use simple_matter::im::engine::InteractionModel;
-use simple_matter::sc::{PaseConfig, SecureChannel};
+use simple_matter::sc::SecureChannel;
 use simple_matter::stack::{
     DefaultStack, MatterStack, SendDirective, SharedFabricCreds, MAX_PACKET_SIZE,
 };
@@ -105,9 +105,7 @@ use simple_matter::kvs::Kvs;
 esp_bootloader_esp_idf::esp_app_desc!();
 
 /// コミッショニングパスコード(PC example と同値)。
-const PASSCODE: u32 = 20202021;
 /// SPAKE2+ 検証子導出のソルト(PC example と同値)。
-const SALT: [u8; 16] = *b"SPAKE2P Key Salt";
 /// コミッショニング discriminator(12 ビット、PC example と同値)。
 const DISCRIMINATOR: u16 = 3840;
 /// fabric テーブル容量(`DefaultStack` の NF と一致させる)。
@@ -801,7 +799,7 @@ async fn pump(
             } else if !boot_window_open && fabric_count == 0 && !window.borrow().is_open() {
                 // 全 fabric 削除: 初期状態(焼き込みパスコード)へ戻す。
                 boot_window_open = true;
-                let cfg = PaseConfig::from_passcode_default(PASSCODE, &SALT).expect("PASE config");
+                let cfg = simple_matter::dev_pase::dev_pase_config();
                 stack.set_pase_config(cfg);
                 stack.set_pase_enabled(true);
                 println!("[window] all fabrics removed; reopening initial commissioning window");
@@ -835,8 +833,7 @@ async fn pump(
                 }
                 WindowEvent::OpenedBasic => {
                     // 焼き込みパスコードへ戻す(PBKDF2 数百 ms、低頻度なので pump 停止は許容)。
-                    let cfg =
-                        PaseConfig::from_passcode_default(PASSCODE, &SALT).expect("PASE config");
+                    let cfg = simple_matter::dev_pase::dev_pase_config();
                     stack.set_pase_config(cfg);
                     stack.set_pase_enabled(true);
                     if let Some(r) = mdns.as_mut() {
@@ -1048,8 +1045,8 @@ async fn main(_spawner: Spawner) {
     }
 
     // SPAKE2+ 検証子の導出(PBKDF2)は C6 では数百 ms かかるため進捗を出す。
-    println!("[pase] deriving SPAKE2+ verifier from passcode (PBKDF2)...");
-    let pase = PaseConfig::from_passcode_default(PASSCODE, &SALT).expect("PASE config");
+    println!("[pase] loading embedded dev SPAKE2+ verifier (device holds no passcode)...");
+    let pase = simple_matter::dev_pase::dev_pase_config();
     println!("[pase] verifier ready");
 
     let creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
@@ -1129,12 +1126,12 @@ async fn main(_spawner: Spawner) {
         .expect("start_advertising");
 
     println!(
-        "[boot] passcode={} discriminator={} vid={:#06x} pid={:#06x}",
-        PASSCODE, DISCRIMINATOR, CFG.vendor_id, CFG.product_id
+        "[boot] dev verifier (passcode 20202021, not stored) discriminator={} vid={:#06x} pid={:#06x}",
+        DISCRIMINATOR, CFG.vendor_id, CFG.product_id
     );
     println!(
         "[boot] commission with: chip-tool pairing ble-wifi 1 <ssid> <pass> {} {} --bypass-attestation-verifier true",
-        PASSCODE, DISCRIMINATOR
+        20202021, DISCRIMINATOR
     );
 
     // TrouBLE host runner / GATT worker / Wi-Fi task / embassy-net runner / pump を

@@ -74,9 +74,11 @@ fn event_ring_overflow_drops_oldest() {
 
 #[test]
 fn ffi_lifecycle_roundtrip() {
+    // デバイスは verifier のみを受け取る(passcode は保持しない)。dev 定数を渡す。
     let cfg = sm_config_t {
         discriminator: 3840,
-        passcode: 20202021,
+        // passcode は verifier 指定時は無視される(0 でも動作する)。
+        passcode: 0,
         vendor_id: 0xFFF1,
         product_id: 0x8001,
         device_name: core::ptr::null(),
@@ -90,6 +92,10 @@ fn ffi_lifecycle_roundtrip() {
         // ble ビルドでは WiFi 構成(ble_checks が wifi_driver_mut を使う)。no-ble は
         // 種別を無視して Ethernet になる(後方互換)。
         network: sm_network_t::SM_NET_WIFI,
+        verifier_iterations: simple_matter::dev_pase::DEV_ITERATIONS,
+        verifier_salt: simple_matter::dev_pase::DEV_SALT.as_ptr(),
+        verifier_salt_len: simple_matter::dev_pase::DEV_SALT.len(),
+        verifier_w0_l: simple_matter::dev_pase::DEV_W0_L.as_ptr(),
     };
     assert_eq!(sm_init(&cfg, 0), 0);
     // 二重初期化は拒否。

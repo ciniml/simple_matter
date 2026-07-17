@@ -478,6 +478,31 @@ pub const SPAKE2P_RANDOM_LEN: usize = 32;
   incremental をそのまま使う(トランスクリプト用途は crypto.rs のドキュメントに明記済み)。
   PBKDF2 反復回数は既定 `2000`(`SPAKE2P_ITERATION_COUNT`)。
 
+#### 6.3.1 デバイスは verifier のみ保持する(passcode を持たない)
+
+Matter のセキュリティ要件上、**デバイス側(responder)は passcode を保持してはならない**。
+デバイスが持つのは SPAKE2+ 検証子 `(w0, L)` と `salt` / `iteration count` だけで、passcode は
+QR コード / 製品ラベル(= コミッショナ側)にのみ存在する。
+
+- 製品コードは [`PaseConfig::from_verifier`] で verifier を読み込む(工場プロビジョニングで
+  機器ごとに書き込む)。verifier は `smctl pase-verifier <passcode> [--salt <hex>]
+  [--iterations N]` で生成でき、出力の `w0‖L`(97 バイト)/ `salt` / `iterations` を
+  デバイスへ渡す。
+- `PaseConfig::from_passcode` / `from_passcode_default` は**開発・テスト・コントローラ
+  (prover)側専用**。コントローラは passcode から w0/w1 を導出するため `compute_verifier`
+  を使うのが正しい。デバイスコードでは使わない。
+- サンプル・移植先ファーム・C FFI シムは passcode をコードに置かず、事前計算した
+  **dev verifier 定数**([`dev_pase`] モジュール。passcode `20202021` 相当)を使う。
+  PC example は環境変数 `SM_PASE_VERIFIER=<iterations>:<salt_hex>:<w0l_hex>` で上書きできる。
+  C FFI は `sm_config_t.verifier_w0_l` / `verifier_salt` / `verifier_iterations` で渡す
+  (旧 `passcode` フィールドは後方互換の開発専用フォールバック)。
+
+PASE 成立は、コントローラの passcode 由来 w0/w1 とデバイスの埋め込み verifier w0/L が一致する
+ことによる。デバイスが passcode を一切知らなくても PASE は成立する。
+
+[`PaseConfig::from_verifier`]: crate::sc::PaseConfig::from_verifier
+[`dev_pase`]: crate::dev_pase
+
 ### 6.4 コミッショニング状態・タイムアウト・同時試行(Busy)
 
 ```rust

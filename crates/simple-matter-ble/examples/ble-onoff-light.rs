@@ -56,14 +56,15 @@ use simple_matter::dm::{DataModel, ServerCluster};
 use simple_matter::error::Result as MResult;
 use simple_matter::fabric::FabricTable;
 use simple_matter::im::engine::InteractionModel;
-use simple_matter::sc::{PaseConfig, SecureChannel};
+use simple_matter::sc::SecureChannel;
+
+#[path = "../../simple-matter/examples/common/pase.rs"]
+mod common_pase;
 use simple_matter::stack::{DefaultStack, MatterStack, SendDirective, SharedFabricCreds};
 use simple_matter::transport::net::{BtpConnId, PeerAddr, MAX_RX_PACKET_SIZE};
 
 use simple_matter_ble::bluer_peripheral::BluerPeripheral;
 
-const PASSCODE: u32 = 20202021;
-const SALT: [u8; 16] = *b"SPAKE2P Key Salt";
 const NF: usize = 5;
 /// コミッショニング discriminator(12 ビット)。UDP 版 `onoff-light` と同じ既定値。
 const DISCRIMINATOR: u16 = 3840;
@@ -275,7 +276,7 @@ async fn main() -> std::result::Result<(), String> {
     let crypto = RustCrypto::new(DemoRng::from_time());
     let fabrics: RefCell<FabricTable<Backend, NF>> = RefCell::new(FabricTable::new());
 
-    let config = PaseConfig::from_passcode_default(PASSCODE, &SALT).expect("PASE config");
+    let config = common_pase::config();
     let creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
     let sc = SecureChannel::new(&crypto, DemoRng::from_time(), config, creds);
     let im = InteractionModel::new(build_light(&fabrics));
@@ -343,7 +344,7 @@ async fn main() -> std::result::Result<(), String> {
     let mut subscribed = false;
 
     println!("simple-matter BLE+UDP On/Off light (dual-transport)");
-    println!("  passcode: {PASSCODE}  discriminator: {DISCRIMINATOR}");
+    println!("  PASE: {}  discriminator: {DISCRIMINATOR}", common_pase::config_labeled().1);
     println!("  BLE: 0xFFF6 service data advertising  |  UDP: 0.0.0.0:{MATTER_PORT}");
     match &mdns_socket {
         Some(_) => println!("  mDNS advertising on 224.0.0.251:5353 (A record: {local_ipv4})"),
@@ -355,7 +356,8 @@ async fn main() -> std::result::Result<(), String> {
         }
         _ => println!("  (no IPv6 link-local mDNS; IPv4-only discovery)"),
     }
-    println!("  commission with: chip-tool pairing ble-wifi 1 <ssid> <pass> {PASSCODE} {DISCRIMINATOR} --ble-controller 0 --bypass-attestation-verifier true");
+    println!("  commission with: chip-tool pairing ble-wifi 1 <ssid> <pass> 20202021 {DISCRIMINATOR} --ble-controller 0 --bypass-attestation-verifier true");
+    println!("  (passcode 20202021 is the dev default; the device holds only the verifier, not the passcode)");
 
     let start = Instant::now();
     let now_ms = |start: &Instant| start.elapsed().as_millis() as u64;

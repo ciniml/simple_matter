@@ -65,6 +65,15 @@ pub struct PaseConfig {
 impl PaseConfig {
     /// パスコード・salt・iteration count から設定を導出する。
     ///
+    /// # 開発専用
+    ///
+    /// **デバイスは passcode を保持してはならない**(Matter セキュリティ要件。デバイスが
+    /// 持ってよいのは検証子 `(w0, L)` と salt / iterations のみ。passcode は QR / ラベルに
+    /// のみ存在する)。製品のデバイス側は [`PaseConfig::from_verifier`] を使い、passcode を
+    /// 一切コードに置かないこと(サンプルは [`crate::dev_pase`] の dev verifier 定数を使う)。
+    /// 本メソッドはテストと、passcode を正当に扱うコントローラ(prover)側の verifier 計算
+    /// (`compute_verifier`)向けに残している。
+    ///
     /// salt は 16..=32 バイトでなければ [`Error::Crypto`]。導出失敗も同様。
     pub fn from_passcode(passcode: u32, salt: &[u8], iterations: u32) -> Result<Self> {
         let verifier = compute_verifier(passcode, salt, iterations)?;
@@ -93,6 +102,12 @@ impl PaseConfig {
     }
 
     /// パスコードと salt から既定反復回数([`SPAKE2P_ITERATION_COUNT`])で設定を作る。
+    ///
+    /// # 開発専用
+    ///
+    /// [`PaseConfig::from_passcode`] と同様、**デバイスは passcode を保持してはならない**。
+    /// 製品のデバイス側は [`PaseConfig::from_verifier`] を使うこと。本メソッドはテストと
+    /// コントローラ(prover)側の verifier 計算向けに残している。
     pub fn from_passcode_default(passcode: u32, salt: &[u8]) -> Result<Self> {
         Self::from_passcode(passcode, salt, SPAKE2P_ITERATION_COUNT)
     }

@@ -69,7 +69,7 @@ use simple_matter::dm::{DataModel, ServerCluster};
 use simple_matter::error::Result as MResult;
 use simple_matter::fabric::FabricTable;
 use simple_matter::im::engine::InteractionModel;
-use simple_matter::sc::{PaseConfig, SecureChannel};
+use simple_matter::sc::SecureChannel;
 use simple_matter::stack::{
     DefaultStack, MatterStack, SendDirective, SharedFabricCreds, MAX_PACKET_SIZE,
 };
@@ -90,9 +90,7 @@ use static_cell::StaticCell;
 esp_bootloader_esp_idf::esp_app_desc!();
 
 /// コミッショニングパスコード(PC example と同値)。
-const PASSCODE: u32 = 20202021;
 /// SPAKE2+ 検証子導出のソルト(PC example と同値)。
-const SALT: [u8; 16] = *b"SPAKE2P Key Salt";
 /// コミッショニング discriminator(12 ビット、PC example と同値)。
 const DISCRIMINATOR: u16 = 3840;
 /// fabric テーブル容量(`DefaultStack` の NF と一致させる)。
@@ -1077,8 +1075,8 @@ async fn main(spawner: Spawner) {
         }
     }
 
-    println!("[pase] deriving SPAKE2+ verifier from passcode (PBKDF2)...");
-    let pase = PaseConfig::from_passcode_default(PASSCODE, &SALT).expect("PASE config");
+    println!("[pase] loading embedded dev SPAKE2+ verifier (device holds no passcode)...");
+    let pase = simple_matter::dev_pase::dev_pase_config();
     println!("[pase] verifier ready");
 
     let creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
@@ -1145,10 +1143,10 @@ async fn main(spawner: Spawner) {
     }
 
     println!(
-        "[boot] passcode={} discriminator={} vid={:#06x} pid={:#06x}",
-        PASSCODE, DISCRIMINATOR, CFG.vendor_id, CFG.product_id
+        "[boot] dev verifier (passcode 20202021, not stored) discriminator={} vid={:#06x} pid={:#06x}",
+        DISCRIMINATOR, CFG.vendor_id, CFG.product_id
     );
-    println!("[boot] commission with: chip-tool pairing ble-thread 1 hex:<dataset-tlv> {} {} --ble-controller 0", PASSCODE, DISCRIMINATOR);
+    println!("[boot] commission with: chip-tool pairing ble-thread 1 hex:<dataset-tlv> {} {} --ble-controller 0", 20202021, DISCRIMINATOR);
 
     // TrouBLE host runner / GATT worker / 統合層 pump を単一 executor 上で並走させる
     // (OT スタックは spawner で別タスク)。

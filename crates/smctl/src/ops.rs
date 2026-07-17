@@ -434,6 +434,11 @@ impl<'a> Exec<'a> {
                 port,
                 secs,
             } => icd_checkin_listen(&self.g, *check_in_node, *key, *port, *secs),
+            Cmd::PaseVerifier {
+                passcode,
+                salt,
+                iterations,
+            } => pase_verifier(*passcode, salt.clone(), *iterations),
         }
     }
 
@@ -1684,6 +1689,62 @@ fn random_passcode() -> Result<u32, String> {
     Err("could not generate a valid passcode".into())
 }
 
+/// バイト列を小文字 hex 文字列にする。
+fn to_hex(b: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        let _ = write!(s, "{x:02x}");
+    }
+    s
+}
+
+/// `pase-verifier <passcode> [--salt <hex>] [--iterations N]`: SPAKE2+ verifier を生成する。
+///
+/// 工場プロビジョニングの代替として、あるいはデバイスへ埋め込む dev verifier 定数の
+/// 生成に使う。prover(コントローラ)側だけが passcode を扱い、デバイスには
+/// `iterations / salt / w0‖L`(97 バイト)だけを渡す(デバイスは passcode を保持しない
+/// = Matter セキュリティ要件)。まとめ行 `SM_PASE_VERIFIER=<iters>:<salt_hex>:<w0l_hex>` は
+/// examples の `SM_PASE_VERIFIER` 上書きにそのまま貼れる形式。
+pub fn pase_verifier(passcode: u32, salt: Option<Vec<u8>>, iterations: u32) -> Result<(), String> {
+    use simple_matter::crypto::spake2p::compute_verifier;
+    use simple_matter::crypto::Rng as _;
+
+    if !passcode_is_valid(passcode) {
+        return Err(format!("invalid setup passcode: {passcode}"));
+    }
+    let salt = match salt {
+        Some(s) => s,
+        None => {
+            let mut s = [0u8; 16];
+            OsRng.fill_bytes(&mut s).map_err(|e| format!("rng: {e:?}"))?;
+            s.to_vec()
+        }
+    };
+    let v = compute_verifier(passcode, &salt, iterations)
+        .map_err(|e| format!("compute_verifier: {e:?}"))?;
+    let mut w0l = Vec::with_capacity(97);
+    w0l.extend_from_slice(&v.w0);
+    w0l.extend_from_slice(&v.l);
+    let salt_hex = to_hex(&salt);
+    let w0l_hex = to_hex(&w0l);
+    let combined = format!("{iterations}:{salt_hex}:{w0l_hex}");
+    if json::enabled() {
+        Obj::new("paseVerifier")
+            .num("iterations", iterations)
+            .str("salt", &salt_hex)
+            .str("w0L", &w0l_hex)
+            .str("smPaseVerifier", &combined)
+            .emit();
+    } else {
+        println!("iterations: {iterations}");
+        println!("salt:       {salt_hex}");
+        println!("w0_l:       {w0l_hex}");
+        println!("SM_PASE_VERIFIER={combined}");
+    }
+    Ok(())
+}
+
 /// 11 桁 manual pairing code(§5.1.4.1、VID/PID なし・カスタムフローなし)。
 ///
 /// - digit 1: `(VID_PID_present(0) << 2) | (discriminator >> 10)`
@@ -1905,7 +1966,7 @@ pub fn parse_u64(s: &str) -> Result<u64, String> {
     r.map_err(|_| format!("invalid number: {s:?}"))
 }
 
-fn parse_hex(s: &str) -> Result<Vec<u8>, ()> {
+pub(crate) fn parse_hex(s: &str) -> Result<Vec<u8>, ()> {
     if !s.len().is_multiple_of(2) {
         return Err(());
     }

@@ -41,7 +41,7 @@ Zephyr/nRF は同じ .a とヘッダを使い回す)。
 /* ---- 初期化 ---- */
 typedef struct {
   uint16_t discriminator;      /* 例 3840 */
-  uint32_t passcode;           /* 例 20202021(開発用。verifier 供給は将来 API) */
+  uint32_t passcode;           /* [非推奨・開発専用] verifier_* 指定時は無視。§1.1 */
   uint16_t vendor_id, product_id;
   const char *device_name;     /* mDNS インスタンス名の素材(NULL 可) */
   uint8_t  mac[6];             /* hostname / instance id 用 */
@@ -52,6 +52,12 @@ typedef struct {
   void    *kvs_ctx;
   void   (*rng_fill)(void *ctx, uint8_t *buf, size_t len); /* esp_fill_random 等 */
   void    *rng_ctx;
+  sm_network_t network;        /* プリセット NetworkCommissioning 種別(§10.1) */
+  /* ---- PASE 資格情報(SPAKE2+ verifier)。§1.1 ---- */
+  uint32_t verifier_iterations;   /* 0 = 未指定(passcode 由来にフォールバック) */
+  const uint8_t *verifier_salt;   /* 16..=32 バイト。NULL = 既定 dev salt */
+  size_t   verifier_salt_len;
+  const uint8_t *verifier_w0_l;   /* w0‖L(97 バイト)。NULL = passcode 由来 */
 } sm_config_t;
 
 int  sm_init(const sm_config_t *cfg, uint64_t now_ms);   /* 0=OK。KVS から fabric 復元込み */
@@ -89,6 +95,22 @@ void sm_onoff_set(bool on, uint64_t now_ms);   /* ローカル操作の書き戻
 bool sm_onoff_get(void);
 uint8_t sm_fabric_count(void);
 ```
+
+### 1.1 PASE 資格情報(verifier 供給)
+
+Matter のセキュリティ要件上、**デバイスは passcode を保持してはならない**。デバイスが持つのは
+SPAKE2+ 検証子 `(w0, L)` + `salt` + `iteration count` だけで、passcode は QR / ラベル
+(= コミッショナ側)にのみ存在する。
+
+- 推奨: `sm_config_t.verifier_w0_l`(97 バイトの `w0‖L`)/ `verifier_salt`(16..=32 バイト、
+  NULL なら既定 dev salt)/ `verifier_iterations`(非 0)を設定する。工場では passcode ごとに
+  `smctl pase-verifier <passcode> [--salt <hex>] [--iterations N]` で生成した値を書き込む。
+- 後方互換: `verifier_w0_l == NULL` または `verifier_iterations == 0` のときは、旧
+  `passcode` フィールドから verifier を導出する(**開発専用フォールバック**)。verifier を
+  与えた場合 `passcode` は無視される。
+- `ctest/onoff_light.cpp` と `examples/onoff_light_cpp/main/main.cpp` は事前計算した
+  dev verifier 定数(passcode `20202021` 相当)を渡す。デバイスコードに passcode リテラルは
+  置かない(表示・ログも「dev verifier (passcode 20202021, not stored)」と明示)。
 
 設計メモ:
 
@@ -163,7 +185,8 @@ F1 のホスト E2E が本設計の核心ゲート: **C++ から見た API の�
 - デバイス構成はプリセット(EP0 標準 + EP1 OnOff ライト)。attestation はテスト DAC。
 - BLE コミッショニング不可(UDP 直接 PASE のみ。実用上は WiFi 接続済みデバイスの
   ヘッドレスコミッショニングに相当し、e5-light で常用している経路)。
-- OCW(AdminCommissioning)は搭載するが、PASE verifier の外部供給 API は将来。
+- OCW(AdminCommissioning)は搭載。PASE verifier の外部供給は `sm_config_t.verifier_*`
+  で対応済み(§1.1)。
 - `sm_addr_t` の scope_id は C++ 側の netif index をそのまま往復(シムは解釈しない)。
 
 ## 6. 将来の拡張点(API 予約)

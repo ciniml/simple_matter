@@ -192,6 +192,17 @@ pub enum Cmd {
     AdminRevoke {
         node: u64,
     },
+    /// `pase-verifier <passcode> [--salt <hex>] [--iterations N]`: SPAKE2+ verifier
+    /// (iterations / salt / w0‖L)を生成する。工場プロビジョニングの代替 +
+    /// デバイス埋め込み用 dev verifier 定数の生成に使う。prover(コントローラ)側の
+    /// passcode 導出とは別に、デバイスへ渡す verifier だけをオフラインで得るための道具
+    /// (デバイスは passcode を保持しない = Matter セキュリティ要件)。
+    PaseVerifier {
+        passcode: u32,
+        /// 省略時は 16 バイトを乱数生成する。
+        salt: Option<Vec<u8>>,
+        iterations: u32,
+    },
     /// バッチ実行(`-` = stdin)。
     Batch {
         source: String,
@@ -317,6 +328,12 @@ fn parse_globals(args: &[String], base: &Globals) -> Result<(Globals, Vec<String
 
 /// 引数列を (Globals, [`Cmd`]) にパースする(実行はしない)。
 pub fn parse(args: &[String], base: &Globals) -> Result<(Globals, Cmd), String> {
+    // `pase-verifier` は純ローカル計算(状態ディレクトリ・ネットワーク不要)で、独自の
+    // `--salt` / `--iterations` フラグを持つ。グローバルフラグパーサが未知 `--` として
+    // 弾くのを避けるため、先頭トークンがこのサブコマンドなら手前で処理する。
+    if args.first().map(String::as_str) == Some("pase-verifier") {
+        return Ok((base.clone(), parse_pase_verifier(&args[1..])?));
+    }
     let (g, pos) = parse_globals(args, base)?;
     let Some(cmd) = pos.first() else {
         return Ok((g, Cmd::Help));
@@ -393,6 +410,11 @@ pub fn dispatch(g: &Globals, cmd: Cmd) -> Result<(), String> {
             secs,
         } => crate::ops::icd_checkin_listen(g, check_in_node, key, port, secs),
         Cmd::Wait { .. } => Err("`wait` is a batch built-in (use it inside `smctl batch`)".into()),
+        Cmd::PaseVerifier {
+            passcode,
+            salt,
+            iterations,
+        } => crate::ops::pase_verifier(passcode, salt, iterations),
         #[cfg(feature = "ble")]
         Cmd::PairBle {
             node,
@@ -622,6 +644,58 @@ fn parse_admincommissioning(g: &Globals, args: &[String]) -> Result<Cmd, String>
             "usage: smctl admincommissioning <open-window|revoke> ... (see `smctl help`)".into(),
         ),
     }
+}
+
+/// `pase-verifier <passcode> [--salt <hex16-32B>] [--iterations N]`。
+fn parse_pase_verifier(args: &[String]) -> Result<Cmd, String> {
+    const USAGE: &str =
+        "usage: smctl pase-verifier <passcode> [--salt <hex16-32B>] [--iterations N]";
+    let mut passcode: Option<u32> = None;
+    let mut salt: Option<Vec<u8>> = None;
+    let mut iterations: u32 = simple_matter::sc::pase::SPAKE2P_ITERATION_COUNT;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--salt" => {
+                let v = it.next().ok_or("--salt requires a hex value")?;
+                let s = v.strip_prefix("0x").unwrap_or(v);
+                let bytes =
+                    crate::ops::parse_hex(s).map_err(|_| format!("invalid --salt hex: {v:?}"))?;
+                if !(16..=32).contains(&bytes.len()) {
+                    return Err(format!(
+                        "--salt must be 16..=32 bytes, got {} bytes",
+                        bytes.len()
+                    ));
+                }
+                salt = Some(bytes);
+            }
+            "--iterations" => {
+                let v = it.next().ok_or("--iterations requires a value")?;
+                let n: u32 = v
+                    .parse()
+                    .map_err(|_| format!("invalid --iterations: {v:?}"))?;
+                if n == 0 {
+                    return Err("--iterations must be > 0".into());
+                }
+                iterations = n;
+            }
+            other if other.starts_with("--") => {
+                return Err(format!("unknown option {other:?} for pase-verifier"));
+            }
+            _ => {
+                if passcode.is_some() {
+                    return Err(format!("pase-verifier takes a single <passcode>\n{USAGE}"));
+                }
+                passcode = Some(a.parse().map_err(|_| format!("invalid passcode: {a:?}"))?);
+            }
+        }
+    }
+    let passcode = passcode.ok_or(USAGE)?;
+    Ok(Cmd::PaseVerifier {
+        passcode,
+        salt,
+        iterations,
+    })
 }
 
 fn parse_discover(g: &Globals, args: &[String]) -> Result<Cmd, String> {
@@ -1514,6 +1588,39 @@ mod tests {
         assert!(parse_err("--color tty onoff toggle 1 1").contains("invalid color mode"));
         assert!(parse_err("--color").contains("--color requires"));
         assert!(parse_err("--log-file").contains("--log-file requires"));
+    }
+
+    #[test]
+    fn pase_verifier_parsing() {
+        // 既定 iterations、salt は乱数(None)。
+        let (_, cmd) = parse_ok("pase-verifier 20202021");
+        match cmd {
+            Cmd::PaseVerifier {
+                passcode,
+                salt: None,
+                iterations,
+            } => {
+                assert_eq!(passcode, 20202021);
+                assert_eq!(iterations, simple_matter::sc::pase::SPAKE2P_ITERATION_COUNT);
+            }
+            _ => panic!("wrong parse"),
+        }
+        // salt / iterations 明示。
+        let (_, cmd) = parse_ok(
+            "pase-verifier 20202021 --salt 5350414b453250204b65792053616c74 --iterations 1000",
+        );
+        match cmd {
+            Cmd::PaseVerifier {
+                passcode: 20202021,
+                salt: Some(s),
+                iterations: 1000,
+            } => assert_eq!(s.len(), 16),
+            _ => panic!("wrong parse"),
+        }
+        // 短すぎる salt はエラー。
+        assert!(parse_err("pase-verifier 20202021 --salt 0011").contains("16..=32"));
+        // passcode 欠落はusage。
+        assert!(parse_err("pase-verifier --iterations 1000").starts_with("usage:"));
     }
 
     #[test]

@@ -38,13 +38,14 @@ use simple_matter::fabric::FabricTable;
 use simple_matter::im::engine::InteractionModel;
 use simple_matter::im::events::PRIORITY_CRITICAL;
 use simple_matter::kvs::Kvs;
-use simple_matter::sc::{PaseConfig, SecureChannel};
+use simple_matter::sc::SecureChannel;
+
+#[path = "common/pase.rs"]
+mod common_pase;
 use simple_matter::stack::{DefaultStack, MatterStack, SharedFabricCreds};
 use simple_matter::tlv::TlvTag;
 use simple_matter::transport::net::{PeerAddr, MAX_RX_PACKET_SIZE};
 
-const PASSCODE: u32 = 20202021;
-const SALT: [u8; 16] = *b"SPAKE2P Key Salt";
 const NF: usize = 5;
 /// ACL テーブル容量(fabric 5 × per-fabric 上限 4)。
 const NACL: usize = 20;
@@ -293,7 +294,7 @@ fn main() -> std::io::Result<()> {
     let acl: RefCell<AclTable<NACL>> = RefCell::new(AclTable::new());
     let window: RefCell<CommissioningWindow> = RefCell::new(CommissioningWindow::new());
 
-    let config = PaseConfig::from_passcode_default(PASSCODE, &SALT).expect("PASE config");
+    let config = common_pase::config();
     let creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
     let sc = SecureChannel::new(&crypto, DemoRng::from_time(), config, creds);
     let im = InteractionModel::new(build_door_lock(&fabrics, &acl, &window));
@@ -392,7 +393,7 @@ fn main() -> std::io::Result<()> {
         .map(|(_, scope)| SocketAddr::V6(SocketAddrV6::new(MDNS_IPV6, MDNS_PORT, 0, scope)));
 
     println!("simple-matter Door Lock listening on UDP/5540 (dual-stack)");
-    println!("  passcode: {PASSCODE}  discriminator: {DISCRIMINATOR}");
+    println!("  PASE: {}  discriminator: {DISCRIMINATOR}", common_pase::config_labeled().1);
     match &mdns_socket {
         Some(_) => println!("  mDNS advertising on 224.0.0.251:5353 (A record: {local_ipv4})"),
         None => println!("  (mDNS socket unavailable; point a commissioner at this UDP port.)"),
@@ -519,7 +520,7 @@ fn main() -> std::io::Result<()> {
                 println!("[window] initial commissioning done; commissioning window closed");
             } else if !boot_window_open && fabric_count == 0 && !window.borrow().is_open() {
                 boot_window_open = true;
-                let cfg = PaseConfig::from_passcode_default(PASSCODE, &SALT).expect("PASE config");
+                let cfg = common_pase::config();
                 stack.set_pase_config(cfg);
                 stack.set_pase_enabled(true);
                 mdns.set_commissionable(Some(commissionable(
@@ -563,8 +564,7 @@ fn main() -> std::io::Result<()> {
                     }
                 }
                 WindowEvent::OpenedBasic => {
-                    let cfg =
-                        PaseConfig::from_passcode_default(PASSCODE, &SALT).expect("PASE config");
+                    let cfg = common_pase::config();
                     stack.set_pase_config(cfg);
                     stack.set_pase_enabled(true);
                     mdns.set_commissionable(Some(commissionable(

@@ -114,7 +114,11 @@ typedef void (*SmRngFill)(void *ctx, uint8_t *buf, size_t len);
 typedef struct {
   // discriminator(12 ビット)。
   uint16_t discriminator;
-  // PASE パスコード(開発用)。
+  // [非推奨・開発専用] PASE パスコード。**デバイスは passcode を保持してはならない**
+  // (Matter セキュリティ要件)。後方互換のため残すが、製品では `verifier_w0_l` /
+  // `verifier_salt` / `verifier_iterations` で SPAKE2+ verifier を直接渡すこと。
+  // verifier(`verifier_w0_l` 非 NULL かつ `verifier_iterations != 0`)が指定された場合、
+  // 本フィールドは無視される。
   uint32_t passcode;
   // Vendor ID(commissionable 広告に反映)。
   uint16_t vendor_id;
@@ -138,6 +142,18 @@ typedef struct {
   void *rng_ctx;
   // プリセット NetworkCommissioning の種別(0 = SM_NET_ETHERNET = 従来動作。§10.1)。
   sm_network_t network;
+  // SPAKE2+ verifier の iteration count。0 = 未指定(`passcode` からの導出にフォールバック)。
+  // verifier を使う場合は `verifier_w0_l` と併せて非 0 を設定する。
+  uint32_t verifier_iterations;
+  // SPAKE2+ verifier の salt(16..=32 バイト)。NULL の場合は既定 dev salt を使う。
+  const uint8_t *verifier_salt;
+  // `verifier_salt` の長さ(バイト)。
+  size_t verifier_salt_len;
+  // SPAKE2+ verifier 本体 `w0 ‖ L`(97 バイト)。NULL のとき、または
+  // `verifier_iterations == 0` のときは `passcode` から導出する(開発専用フォールバック)。
+  // **推奨: 製品はここに verifier を渡し、passcode をデバイスに置かない**
+  // (`smctl pase-verifier <passcode>` で生成)。
+  const uint8_t *verifier_w0_l;
 } sm_config_t;
 
 // v4/v6 両対応の datagram 宛先/送信元。

@@ -71,9 +71,6 @@ pub type OpCreds<'s, const NF: usize> =
 
 // --- デバイス構成(On/Off ライト。examples/onoff-light.rs の Light を NF で汎用化)----
 
-const PASSCODE: u32 = 20202021;
-const SALT: [u8; 16] = *b"SPAKE2P Key Salt";
-
 static CFG: BasicInfoConfig = BasicInfoConfig {
     vendor_name: "SimpleMatter",
     vendor_id: 0xFFF1,
@@ -206,11 +203,11 @@ pub fn build_light<const NF: usize>(fabrics: &RefCell<FabricTable<Backend, NF>>)
 }
 
 /// PASE コンフィグ(コミッショニング窓)を構築する(`flash-probe` 用)。
+///
+/// デバイスは passcode を保持せず verifier のみを持つ(Matter セキュリティ要件)。
+/// footprint 計測も実機同様に dev verifier 定数([`simple_matter::dev_pase`])から作る。
 pub fn pase_config() -> simple_matter::sc::PaseConfig {
-    match simple_matter::sc::PaseConfig::from_passcode_default(PASSCODE, &SALT) {
-        Ok(c) => c,
-        Err(_) => panic!("PASE config construction failed"),
-    }
+    simple_matter::dev_pase::dev_pase_config()
 }
 
 // --- コンポーネント別 RAM(size_of)計測 -------------------------------------

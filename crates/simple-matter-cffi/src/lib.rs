@@ -240,8 +240,77 @@ const NACL: usize = 20;
 const MAX_EP_TOTAL: usize = 2 + custom::MAX_CUSTOM_ENDPOINTS;
 /// 1 エンドポイントあたりのサーバクラスタ ID 上限(合成 Descriptor 用)。
 const MAX_SERVERS: usize = 16;
-/// SPAKE2+ ソルト(PC example と同じ開発用固定値)。
+/// SPAKE2+ ソルト(PC example と同じ開発用固定値。passcode フォールバック時のみ使用)。
 const SALT: [u8; 16] = *b"SPAKE2P Key Salt";
+/// SPAKE2+ verifier の `w0 ‖ L` 長(97 バイト)。
+const VERIFIER_W0L_LEN: usize = 97;
+
+/// デバイスが保持する PASE 資格情報(**SPAKE2+ verifier のみ**、passcode は保持しない)。
+///
+/// `sm_config_t` の verifier フィールド指定時はそれを、未指定時は後方互換のため
+/// `passcode`(開発専用)から導出した verifier を保持する。いずれの場合もデバイス側は
+/// verifier だけを持ち、コミッショニング窓の再オープンごとに [`PaseConfig`] を再構築する。
+struct DevPase {
+    salt: heapless::Vec<u8, 32>,
+    w0_l: [u8; VERIFIER_W0L_LEN],
+    iterations: u32,
+}
+
+impl DevPase {
+    /// 保持中の verifier から [`PaseConfig`] を構築する。
+    fn build(&self) -> Option<PaseConfig> {
+        let params = simple_matter::dev_pase::verifier_params_from_w0l(&self.w0_l)?;
+        PaseConfig::from_verifier(params, &self.salt, self.iterations).ok()
+    }
+
+    /// `sm_config_t` から PASE 資格情報を組み立てる。
+    ///
+    /// verifier(`verifier_w0_l` 非 NULL かつ `verifier_iterations != 0`)が与えられれば
+    /// それを使う(**推奨。デバイスは passcode を保持しない**)。無ければ後方互換として
+    /// `passcode` から verifier を導出する(開発専用)。
+    ///
+    /// # Safety
+    /// `cfg` の verifier ポインタは、非 NULL のとき有効かつ規定長でなければならない。
+    unsafe fn from_config(cfg: &sm_config_t) -> Option<Self> {
+        if !cfg.verifier_w0_l.is_null() && cfg.verifier_iterations != 0 {
+            let mut w0_l = [0u8; VERIFIER_W0L_LEN];
+            w0_l.copy_from_slice(core::slice::from_raw_parts(cfg.verifier_w0_l, VERIFIER_W0L_LEN));
+            let salt: heapless::Vec<u8, 32> =
+                if !cfg.verifier_salt.is_null() && (16..=32).contains(&cfg.verifier_salt_len) {
+                    heapless::Vec::from_slice(core::slice::from_raw_parts(
+                        cfg.verifier_salt,
+                        cfg.verifier_salt_len,
+                    ))
+                    .ok()?
+                } else {
+                    heapless::Vec::from_slice(&SALT).ok()?
+                };
+            let out = Self {
+                salt,
+                w0_l,
+                iterations: cfg.verifier_iterations,
+            };
+            // verifier / salt / iterations の妥当性をここで確認する。
+            out.build()?;
+            return Some(out);
+        }
+        // 後方互換フォールバック: passcode(開発専用)から verifier を導出する。
+        let v = simple_matter::crypto::spake2p::compute_verifier(
+            cfg.passcode,
+            &SALT,
+            simple_matter::sc::pase::SPAKE2P_ITERATION_COUNT,
+        )
+        .ok()?;
+        let mut w0_l = [0u8; VERIFIER_W0L_LEN];
+        w0_l[..32].copy_from_slice(&v.w0);
+        w0_l[32..].copy_from_slice(&v.l);
+        Some(Self {
+            salt: heapless::Vec::from_slice(&SALT).ok()?,
+            w0_l,
+            iterations: simple_matter::sc::pase::SPAKE2P_ITERATION_COUNT,
+        })
+    }
+}
 /// 期限なしのセンチネル([`sm_next_deadline`] が返す。C 側 `SM_NO_DEADLINE`)。
 pub const SM_NO_DEADLINE: u64 = u64::MAX;
 /// 内部エイリアス。
@@ -302,7 +371,11 @@ pub enum sm_network_t {
 pub struct sm_config_t {
     /// discriminator(12 ビット)。
     pub discriminator: u16,
-    /// PASE パスコード(開発用)。
+    /// [非推奨・開発専用] PASE パスコード。**デバイスは passcode を保持してはならない**
+    /// (Matter セキュリティ要件)。後方互換のため残すが、製品では `verifier_w0_l` /
+    /// `verifier_salt` / `verifier_iterations` で SPAKE2+ verifier を直接渡すこと。
+    /// verifier(`verifier_w0_l` 非 NULL かつ `verifier_iterations != 0`)が指定された場合、
+    /// 本フィールドは無視される。
     pub passcode: u32,
     /// Vendor ID(commissionable 広告に反映)。
     pub vendor_id: u16,
@@ -326,6 +399,18 @@ pub struct sm_config_t {
     pub rng_ctx: *mut c_void,
     /// プリセット NetworkCommissioning の種別(0 = SM_NET_ETHERNET = 従来動作。§10.1)。
     pub network: sm_network_t,
+    /// SPAKE2+ verifier の iteration count。0 = 未指定(`passcode` からの導出にフォールバック)。
+    /// verifier を使う場合は `verifier_w0_l` と併せて非 0 を設定する。
+    pub verifier_iterations: u32,
+    /// SPAKE2+ verifier の salt(16..=32 バイト)。NULL の場合は既定 dev salt を使う。
+    pub verifier_salt: *const u8,
+    /// `verifier_salt` の長さ(バイト)。
+    pub verifier_salt_len: usize,
+    /// SPAKE2+ verifier 本体 `w0 ‖ L`(97 バイト)。NULL のとき、または
+    /// `verifier_iterations == 0` のときは `passcode` から導出する(開発専用フォールバック)。
+    /// **推奨: 製品はここに verifier を渡し、passcode をデバイスに置かない**
+    /// (`smctl pase-verifier <passcode>` で生成)。
+    pub verifier_w0_l: *const u8,
 }
 
 /// v4/v6 両対応の datagram 宛先/送信元。
@@ -860,7 +945,9 @@ struct Shim {
     vendor_id: u16,
     product_id: u16,
     discriminator: u16,
-    passcode: u32,
+    /// デバイスが保持する PASE 資格情報(SPAKE2+ verifier のみ。passcode は保持しない)。
+    /// コミッショニング窓の再オープン時に PaseConfig を再構築するために保持する。
+    dev_pase: DevPase,
     ipv4: Option<[u8; 4]>,
     ipv6_ll: Option<[u8; 16]>,
     last_fabric_gen: u32,
@@ -1036,7 +1123,7 @@ impl Shim {
                 self.mdns.notify_change(now);
             } else if !self.boot_window_open && count == 0 && !self.owned.window.borrow().is_open() {
                 self.boot_window_open = true;
-                if let Ok(cfg) = PaseConfig::from_passcode_default(self.passcode, &SALT) {
+                if let Some(cfg) = self.dev_pase.build() {
                     self.stack.set_pase_config(cfg);
                     self.stack.set_pase_enabled(true);
                 }
@@ -1083,7 +1170,7 @@ impl Shim {
                     }
                 }
                 WindowEvent::OpenedBasic => {
-                    if let Ok(cfg) = PaseConfig::from_passcode_default(self.passcode, &SALT) {
+                    if let Some(cfg) = self.dev_pase.build() {
                         self.stack.set_pase_config(cfg);
                         self.stack.set_pase_enabled(true);
                     }
@@ -1276,9 +1363,14 @@ pub extern "C" fn sm_init(cfg: *const sm_config_t, now_ms: u64) -> i32 {
         addr_of_mut!((*sp).owned).write(owned);
         let o: &'static Owned = &*addr_of!((*sp).owned);
 
-        let config = match PaseConfig::from_passcode_default(cfg.passcode, &SALT) {
-            Ok(c) => c,
-            Err(_) => return -4,
+        // デバイス側 PASE 資格情報(SPAKE2+ verifier のみ。passcode は保持しない)。
+        let dev_pase = match DevPase::from_config(cfg) {
+            Some(d) => d,
+            None => return -4,
+        };
+        let config = match dev_pase.build() {
+            Some(c) => c,
+            None => return -4,
         };
         let creds = SharedFabricCreds::new(&o.fabrics, &o.crypto, 0);
         let sc = SecureChannel::new(&o.crypto, rng, config, creds);
@@ -1298,7 +1390,7 @@ pub extern "C" fn sm_init(cfg: *const sm_config_t, now_ms: u64) -> i32 {
         addr_of_mut!((*sp).vendor_id).write(cfg.vendor_id);
         addr_of_mut!((*sp).product_id).write(cfg.product_id);
         addr_of_mut!((*sp).discriminator).write(cfg.discriminator & 0x0FFF);
-        addr_of_mut!((*sp).passcode).write(cfg.passcode);
+        addr_of_mut!((*sp).dev_pase).write(dev_pase);
         addr_of_mut!((*sp).ipv4).write(None);
         addr_of_mut!((*sp).ipv6_ll).write(None);
         addr_of_mut!((*sp).last_fabric_gen).write(0);

@@ -25,6 +25,9 @@ pub mod cert;
 #[cfg(all(feature = "controller", feature = "rustcrypto"))]
 pub mod controller;
 pub mod crypto;
+/// 開発専用の既定 SPAKE2+ verifier 定数(passcode を保持せずにコミッショニングする)。
+#[cfg(feature = "rustcrypto")]
+pub mod dev_pase;
 pub mod discovery;
 pub mod dm;
 pub mod error;
