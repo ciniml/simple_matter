@@ -1,8 +1,25 @@
 menu "simple-matter onoff_light example"
 
+    choice SM_NETWORK_TYPE
+        prompt "Operational network transport"
+        default SM_NETWORK_WIFI
+        help
+            プリセット NetworkCommissioning の種別(docs/design/c-ffi-shim.md §10)。
+            wifi = pairing ble-wifi(既定)、thread = pairing ble-thread(esp_openthread)。
+            択一。thread は ESP32-C6 の 802.15.4 + BLE coex を使う。
+
+        config SM_NETWORK_WIFI
+            bool "WiFi (pairing ble-wifi)"
+
+        config SM_NETWORK_THREAD
+            bool "Thread (pairing ble-thread, esp_openthread)"
+            depends on IDF_TARGET_ESP32C6
+    endchoice
+
     config SM_WIFI_SSID
         string "WiFi SSID"
         default "my-ssid"
+        depends on SM_NETWORK_WIFI
         help
             接続先 WiFi の SSID。ビルドを通すためのプレースホルダ。実機では
             menuconfig で上書きする。
@@ -10,6 +27,7 @@ menu "simple-matter onoff_light example"
     config SM_WIFI_PASSWORD
         string "WiFi password"
         default "my-password"
+        depends on SM_NETWORK_WIFI
         help
             WiFi パスフレーズ(WPA2-PSK)。
 
@@ -24,12 +42,13 @@ menu "simple-matter onoff_light example"
     config SM_ENABLE_BLE
         bool "Enable BLE (NimBLE) commissioning"
         default y if IDF_TARGET_ESP32C6
+        default y if SM_NETWORK_THREAD
         default n
         help
-            BLE(NimBLE)給餌によるコミッショニング(pairing ble-wifi)を有効にする
-            (docs/design/c-ffi-shim.md §9)。有効時は起動時 WiFi join を止め、
-            ConnectNetwork(sm_take_wifi_request)駆動で join する。BLE コントローラを
-            持つ ESP32-C6 で既定 y。ESP32-S3 は既定 n(従来の UDP 直接 PASE のみ。
-            BLE を使うなら menuconfig で y にし bt を有効化すること)。
+            BLE(NimBLE)給餌によるコミッショニング(pairing ble-wifi / ble-thread)を
+            有効にする(docs/design/c-ffi-shim.md §9・§10)。有効時は起動時 WiFi join を
+            止め、ConnectNetwork 駆動でプロビジョンする。Thread 構成では必須
+            (ble-thread のコミッショニング経路)なので既定 y。ESP32-S3 は既定 n
+            (従来の UDP 直接 PASE のみ)。
 
 endmenu

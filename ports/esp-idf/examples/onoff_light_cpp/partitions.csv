@@ -1,7 +1,8 @@
-# onoff_light_cpp のパーティションテーブル(ESP32-C6、4MB flash 想定)。
-# 既定 1MB の factory では simple-matter staticlib + WiFi/mbedTLS を含む
-# アプリ(~1.1MB)が収まらないため app を 1.875MB に拡張する。
+# onoff_light_cpp のパーティションテーブル(ESP32-C6 / S3、4MB+ flash 想定)。
+# WiFi 構成の app は ~1.5MB だが、Thread 構成は openthread(15.4 スタック + SRP client)が
+# 加わり 1.875MB を超えるため app を 2.5MB に拡張する(docs/design/c-ffi-shim.md §10.2)。
+# WiFi 構成でも同テーブルを使う(単に空きが増えるだけ)。
 # Name,   Type, SubType, Offset,   Size,    Flags
 nvs,      data, nvs,     0x9000,   0x6000,
 phy_init, data, phy,     0xf000,   0x1000,
-factory,  app,  factory, 0x10000,  0x1E0000,
+factory,  app,  factory, 0x10000,  0x280000,

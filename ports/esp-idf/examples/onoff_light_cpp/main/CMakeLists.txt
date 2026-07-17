@@ -2,10 +2,14 @@
 # 無効時(例: ESP32-S3、CONFIG_BT_ENABLED=n)は ble.cpp が #if で空 + bt はスタブに
 # なるため、bt を常に要求しても S3 の BLE 無効ビルドは通る(コンポーネント要求は
 # sdkconfig 展開前に評価されるため条件付き REQUIRES は使えない)。
+# openthread / esp_vfs_eventfd も常時要求する(ble.cpp の bt と同じ方針)。Thread 無効
+# ビルド(CONFIG_SM_NETWORK_THREAD=n)では ot_thread.cpp は #if で空 + openthread は
+# CONFIG_OPENTHREAD_ENABLED=n でスタブになるため、常時要求しても WiFi ビルドは通る
+# (条件付き REQUIRES は sdkconfig 展開前に評価されるため使えない)。
 idf_component_register(
-    SRCS "main.cpp" "ble.cpp"
+    SRCS "main.cpp" "ble.cpp" "ot_thread.cpp"
     INCLUDE_DIRS "."
-    REQUIRES simple_matter nvs_flash esp_wifi esp_netif esp_event lwip driver esp_timer esp_system bt)
+    REQUIRES simple_matter nvs_flash esp_wifi esp_netif esp_event lwip driver esp_timer esp_system bt openthread vfs)
 
 # C FFI シムのラッパは C++17。IDF v5.4 の既定 C++ 標準は C++17 だが明示する。
 target_compile_features(${COMPONENT_LIB} PRIVATE cxx_std_17)

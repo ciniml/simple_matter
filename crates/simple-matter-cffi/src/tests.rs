@@ -87,6 +87,9 @@ fn ffi_lifecycle_roundtrip() {
         kvs_ctx: core::ptr::null_mut(),
         rng_fill: Some(test_rng),
         rng_ctx: core::ptr::null_mut(),
+        // ble ビルドでは WiFi 構成(ble_checks が wifi_driver_mut を使う)。no-ble は
+        // 種別を無視して Ethernet になる(後方互換)。
+        network: sm_network_t::SM_NET_WIFI,
     };
     assert_eq!(sm_init(&cfg, 0), 0);
     // 二重初期化は拒否。
@@ -318,7 +321,8 @@ fn ble_checks() {
         s.stack
             .device_mut()
             .net
-            .driver_mut()
+            .wifi_driver_mut()
+            .expect("wifi netcomm")
             .connect(b"iotap", b"hunter2xx");
     }
     let sn = sm_take_wifi_request(
@@ -371,6 +375,97 @@ fn ble_disabled_returns_sm_err() {
         0
     );
     sm_wifi_status(true, 0); // no-op(panic しない)
+}
+
+// ==========================================================================
+// F6: Thread take 方式ドライバ + ShimNetComm ディスパッチ(グローバル状態非依存)
+// ==========================================================================
+
+#[cfg(feature = "ble")]
+mod thread_shim {
+    use super::super::{new_netcomm, sm_network_t, ShimNetComm};
+    use super::super::thread_driver::ShimThreadDriver;
+    use simple_matter::dm::ServerCluster;
+    use simple_matter::thread::{ThreadDriver, ThreadStatus};
+
+    /// OTBR が払い出す実 dataset(先頭に Ext PAN ID = type 0x02, len 8)。
+    const DATASET: &[u8] = &[
+        0x02, 0x08, 0xc9, 0x33, 0xe1, 0x60, 0xa2, 0x3d, 0x11, 0x43, // Ext PAN ID
+        0x03, 0x0f, b'O', b'p', b'e', b'n', b'T', b'h', b'r', b'e', b'a', b'd', b'-', b'2', b'7',
+        b'0', b'2', // Network Name
+    ];
+
+    /// take 方式の dataset ラウンドトリップ: set_dataset で退避 → connect で pending →
+    /// take_dataset で降ろす → set_status で attach 反映。
+    #[test]
+    fn dataset_take_roundtrip() {
+        let mut d = ShimThreadDriver::new();
+        assert_eq!(d.status(), ThreadStatus::Idle);
+        assert!(!d.has_pending());
+        // dataset 投入は Ext PAN ID を返すが pending は立てない(AddOrUpdate 相当)。
+        let id = d.set_dataset(DATASET).unwrap();
+        assert_eq!(id, [0xc9, 0x33, 0xe1, 0x60, 0xa2, 0x3d, 0x11, 0x43]);
+        assert!(!d.has_pending());
+        assert!(d.take_dataset().is_none());
+        // connect(ConnectNetwork 相当)で attach 要求を立てる。
+        d.connect();
+        assert_eq!(d.status(), ThreadStatus::Attaching);
+        assert!(d.has_pending());
+        // take_dataset で dataset TLV をそのまま降ろす(pending クリア、状態は維持)。
+        let taken = d.take_dataset().unwrap().to_vec();
+        assert_eq!(taken.as_slice(), DATASET);
+        assert!(!d.has_pending());
+        assert_eq!(d.status(), ThreadStatus::Attaching);
+        // 2 度目は None。
+        assert!(d.take_dataset().is_none());
+        // attach 結果報告。
+        d.set_status(true);
+        assert_eq!(d.status(), ThreadStatus::Attached);
+        d.set_status(false);
+        assert!(matches!(d.status(), ThreadStatus::Failed { .. }));
+    }
+
+    /// 不正 dataset(Ext PAN ID 無し)は Err で退避しない。
+    #[test]
+    fn dataset_without_ext_pan_id_rejected() {
+        let mut d = ShimThreadDriver::new();
+        assert!(d.set_dataset(&[0x03, 0x02, b'h', b'i']).is_err());
+    }
+
+    /// network 種別ごとに ShimNetComm のバリアント・FeatureMap・ドライバ有無が対応する。
+    #[test]
+    fn netcomm_variant_selection() {
+        // Ethernet(FeatureMap EN=0x04)。ドライバ無し。
+        let mut eth = new_netcomm(sm_network_t::SM_NET_ETHERNET);
+        assert_eq!(eth.meta().feature_map, 0x04);
+        assert!(eth.wifi_driver_mut().is_none());
+        assert!(eth.thread_driver_mut().is_none());
+        assert!(!eth.has_pending_wifi());
+        assert!(!eth.has_pending_thread());
+
+        // WiFi(FeatureMap WI=0x01)。wifi ドライバのみ。
+        let mut wifi = new_netcomm(sm_network_t::SM_NET_WIFI);
+        assert_eq!(wifi.meta().feature_map, 0x01);
+        assert!(wifi.wifi_driver_mut().is_some());
+        assert!(wifi.thread_driver_mut().is_none());
+
+        // Thread(FeatureMap TH=0x02)。thread ドライバのみ。
+        let mut thr = new_netcomm(sm_network_t::SM_NET_THREAD);
+        assert_eq!(thr.meta().feature_map, 0x02);
+        assert!(thr.thread_driver_mut().is_some());
+        assert!(thr.wifi_driver_mut().is_none());
+
+        // Thread 構成で connect → has_pending_thread が立つ(SM_EV_THREAD_ATTACH_REQUEST 契機)。
+        thr.thread_driver_mut().unwrap().connect();
+        assert!(thr.has_pending_thread());
+        assert!(!thr.has_pending_wifi());
+        // update_from_driver は attach 前は属性を変えないが panic しない。
+        thr.update_from_driver();
+        if let ShimNetComm::Thread(_) = &thr {
+        } else {
+            panic!("expected Thread variant");
+        }
+    }
 }
 
 // ==========================================================================

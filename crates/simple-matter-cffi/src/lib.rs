@@ -42,13 +42,13 @@ use simple_matter::dm::clusters::{
     CommissioningWindow, DescriptorCluster, GeneralCommissioning, GroupKeyManagementCluster,
     GroupsCluster, IdentifyCluster, OnOffCluster, OpCredsCluster, TestDacProvider, WindowEvent,
 };
-// NetworkCommissioning は ble の有無で型を切り替える(§9.2):
-// - ble 有効: WiFi 版(take 方式ドライバ注入)で `pairing ble-wifi` を成立させる。
-// - ble 無効: 従来の Ethernet 版(F2 の固定 SSID を C++ が自力 join)。
-#[cfg(not(feature = "ble"))]
+// NetworkCommissioning クラスタは sm_config.network で実行時に選ぶ(§10.1、ShimNetComm):
+// - SM_NET_ETHERNET: 従来の Ethernet 版(F2 の固定 SSID を C++ が自力 join)。常時利用可。
+// - SM_NET_WIFI: WiFi 版(take 方式ドライバ注入)で `pairing ble-wifi`(ble 必須)。
+// - SM_NET_THREAD: Thread 版(take 方式ドライバ注入)で `pairing ble-thread`(ble 必須)。
 use simple_matter::dm::clusters::NetworkCommissioning;
 #[cfg(feature = "ble")]
-use simple_matter::dm::clusters::NetworkCommissioningWifi;
+use simple_matter::dm::clusters::{NetworkCommissioningThread, NetworkCommissioningWifi};
 use simple_matter::dm::meta::{ClusterId, DeviceType, EndpointId, EndpointMeta, EventId};
 use simple_matter::dm::{tick_clusters, DataModel, ServerCluster};
 use simple_matter::fabric::FabricTable;
@@ -75,12 +75,154 @@ use simple_matter::transport::net::{BtpConnId, MAX_RX_PACKET_SIZE};
 mod wifi_driver;
 #[cfg(feature = "ble")]
 use wifi_driver::ShimWifiDriver;
-
-/// NetworkCommissioning クラスタの実型(§9.2 で ble により切替)。
+// ---- Thread プロビジョン(F6、docs/design/c-ffi-shim.md §10)----
 #[cfg(feature = "ble")]
-type NetCommImpl = NetworkCommissioningWifi<ShimWifiDriver>;
-#[cfg(not(feature = "ble"))]
-type NetCommImpl = NetworkCommissioning;
+mod thread_driver;
+#[cfg(feature = "ble")]
+use thread_driver::ShimThreadDriver;
+
+/// NetworkCommissioning クラスタの実型。sm_config.network で実行時に選ぶ(§10.1)。
+///
+/// WiFi / Thread コミッショニングは BLE(BTP)経由なので、ble 無効ビルドは Ethernet のみ。
+/// Descriptor 合成・IM ディスパッチ側は本 enum を単一 [`ServerCluster`] として扱う。
+enum ShimNetComm {
+    /// Ethernet(固定 SSID を C++ が自力 join、または on-network PASE)。常時利用可。
+    Ethernet(NetworkCommissioning),
+    /// WiFi(take 方式 [`ShimWifiDriver`]、`pairing ble-wifi`)。
+    #[cfg(feature = "ble")]
+    Wifi(NetworkCommissioningWifi<ShimWifiDriver>),
+    /// Thread(take 方式 [`ShimThreadDriver`]、`pairing ble-thread`)。
+    #[cfg(feature = "ble")]
+    Thread(NetworkCommissioningThread<ShimThreadDriver>),
+}
+
+impl ShimNetComm {
+    /// WiFi ドライバへの可変参照(WiFi 構成でなければ `None`)。
+    #[cfg(feature = "ble")]
+    fn wifi_driver_mut(&mut self) -> Option<&mut ShimWifiDriver> {
+        match self {
+            ShimNetComm::Wifi(n) => Some(n.driver_mut()),
+            _ => None,
+        }
+    }
+
+    /// Thread ドライバへの可変参照(Thread 構成でなければ `None`)。
+    #[cfg(feature = "ble")]
+    fn thread_driver_mut(&mut self) -> Option<&mut ShimThreadDriver> {
+        match self {
+            ShimNetComm::Thread(n) => Some(n.driver_mut()),
+            _ => None,
+        }
+    }
+
+    /// ドライバ状態(join / attach 結果)を属性へ反映する(統合層が定期的に呼ぶ)。
+    #[cfg(feature = "ble")]
+    fn update_from_driver(&mut self) {
+        match self {
+            ShimNetComm::Wifi(n) => n.update_from_driver(),
+            ShimNetComm::Thread(n) => n.update_from_driver(),
+            ShimNetComm::Ethernet(_) => {}
+        }
+    }
+
+    /// C++ に渡していない WiFi join 要求があるか。
+    #[cfg(feature = "ble")]
+    fn has_pending_wifi(&self) -> bool {
+        matches!(self, ShimNetComm::Wifi(n) if n.driver().has_pending())
+    }
+
+    /// C++ に渡していない Thread attach 要求があるか。
+    #[cfg(feature = "ble")]
+    fn has_pending_thread(&self) -> bool {
+        matches!(self, ShimNetComm::Thread(n) if n.driver().has_pending())
+    }
+}
+
+impl ServerCluster for ShimNetComm {
+    fn meta(&self) -> &'static simple_matter::dm::meta::ClusterMeta {
+        match self {
+            ShimNetComm::Ethernet(n) => n.meta(),
+            #[cfg(feature = "ble")]
+            ShimNetComm::Wifi(n) => n.meta(),
+            #[cfg(feature = "ble")]
+            ShimNetComm::Thread(n) => n.meta(),
+        }
+    }
+    fn read_attribute(
+        &self,
+        attr: simple_matter::dm::meta::AttributeId,
+        enc: &mut simple_matter::dm::codec::AttrEncoder<'_, '_>,
+        acc: &simple_matter::dm::meta::AccessContext,
+    ) -> Result<(), simple_matter::im::wire::ImStatus> {
+        match self {
+            ShimNetComm::Ethernet(n) => n.read_attribute(attr, enc, acc),
+            #[cfg(feature = "ble")]
+            ShimNetComm::Wifi(n) => n.read_attribute(attr, enc, acc),
+            #[cfg(feature = "ble")]
+            ShimNetComm::Thread(n) => n.read_attribute(attr, enc, acc),
+        }
+    }
+    fn write_attribute(
+        &mut self,
+        attr: simple_matter::dm::meta::AttributeId,
+        data: simple_matter::dm::AttrWrite<'_>,
+        acc: &simple_matter::dm::meta::AccessContext,
+    ) -> Result<(), simple_matter::im::wire::ImStatus> {
+        match self {
+            ShimNetComm::Ethernet(n) => n.write_attribute(attr, data, acc),
+            #[cfg(feature = "ble")]
+            ShimNetComm::Wifi(n) => n.write_attribute(attr, data, acc),
+            #[cfg(feature = "ble")]
+            ShimNetComm::Thread(n) => n.write_attribute(attr, data, acc),
+        }
+    }
+    fn invoke_command(
+        &mut self,
+        cmd: simple_matter::dm::meta::CommandId,
+        fields: &mut simple_matter::tlv::TlvReader<'_>,
+        resp: &mut simple_matter::dm::codec::CmdResponder<'_, '_>,
+        acc: &simple_matter::dm::meta::AccessContext,
+    ) -> Result<(), simple_matter::im::wire::ImStatus> {
+        match self {
+            ShimNetComm::Ethernet(n) => n.invoke_command(cmd, fields, resp, acc),
+            #[cfg(feature = "ble")]
+            ShimNetComm::Wifi(n) => n.invoke_command(cmd, fields, resp, acc),
+            #[cfg(feature = "ble")]
+            ShimNetComm::Thread(n) => n.invoke_command(cmd, fields, resp, acc),
+        }
+    }
+    fn take_dirty(&mut self) -> bool {
+        match self {
+            ShimNetComm::Ethernet(n) => n.take_dirty(),
+            #[cfg(feature = "ble")]
+            ShimNetComm::Wifi(n) => n.take_dirty(),
+            #[cfg(feature = "ble")]
+            ShimNetComm::Thread(n) => n.take_dirty(),
+        }
+    }
+    fn tick(&mut self, now_ms: u64) -> Option<u64> {
+        match self {
+            ShimNetComm::Ethernet(n) => n.tick(now_ms),
+            #[cfg(feature = "ble")]
+            ShimNetComm::Wifi(n) => n.tick(now_ms),
+            #[cfg(feature = "ble")]
+            ShimNetComm::Thread(n) => n.tick(now_ms),
+        }
+    }
+    fn poll_deferred(
+        &mut self,
+        command: simple_matter::dm::meta::CommandId,
+        resp: &mut simple_matter::dm::codec::CmdResponder<'_, '_>,
+    ) -> simple_matter::dm::DeferredPoll {
+        match self {
+            ShimNetComm::Ethernet(n) => n.poll_deferred(command, resp),
+            #[cfg(feature = "ble")]
+            ShimNetComm::Wifi(n) => n.poll_deferred(command, resp),
+            #[cfg(feature = "ble")]
+            ShimNetComm::Thread(n) => n.poll_deferred(command, resp),
+        }
+    }
+}
 
 /// BTP window(コアの参照実装 `ble-onoff-light.rs` と同じ 6)。
 #[cfg(feature = "ble")]
@@ -139,6 +281,22 @@ pub type SmKvsDelete = Option<unsafe extern "C" fn(ctx: *mut c_void, key: *const
 /// RNG コールバック(esp_fill_random 等)。
 pub type SmRngFill = Option<unsafe extern "C" fn(ctx: *mut c_void, buf: *mut u8, len: usize)>;
 
+/// プリセット NetworkCommissioning の種別(`docs/design/c-ffi-shim.md` §10.1)。
+///
+/// C 側が `sm_config_t` を 0 クリアすると `SM_NET_ETHERNET`(従来動作)になる(後方互換)。
+/// WiFi / Thread は BLE コミッショニング前提のため、ble 無効ビルドでは種別によらず
+/// Ethernet として動作する。
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum sm_network_t {
+    /// Ethernet(FeatureMap EN)。既定・後方互換。
+    SM_NET_ETHERNET = 0,
+    /// WiFi(FeatureMap WI)。`pairing ble-wifi`。ble 必須。
+    SM_NET_WIFI = 1,
+    /// Thread(FeatureMap TH)。`pairing ble-thread`。ble 必須。
+    SM_NET_THREAD = 2,
+}
+
 /// 初期化設定(`docs/design/c-ffi-shim.md` §1)。
 #[repr(C)]
 pub struct sm_config_t {
@@ -166,6 +324,8 @@ pub struct sm_config_t {
     pub rng_fill: SmRngFill,
     /// RNG コールバックの ctx。
     pub rng_ctx: *mut c_void,
+    /// プリセット NetworkCommissioning の種別(0 = SM_NET_ETHERNET = 従来動作。§10.1)。
+    pub network: sm_network_t,
 }
 
 /// v4/v6 両対応の datagram 宛先/送信元。
@@ -195,6 +355,9 @@ pub enum sm_event_kind_t {
     SM_EV_BLE_ADV_CHANGED = 5,
     /// ConnectNetwork 受理で WiFi join 要求が立った(`sm_take_wifi_request` で取り出す。§9.1)。
     SM_EV_WIFI_CONNECT_REQUEST = 6,
+    /// ConnectNetwork 受理で Thread attach 要求が立った(`sm_take_thread_dataset` で
+    /// dataset TLV を取り出す。§10.1)。
+    SM_EV_THREAD_ATTACH_REQUEST = 7,
 }
 
 /// BLE(BTP)イベント種別(`sm_ble_event` の引数、`docs/design/c-ffi-shim.md` §9.1)。
@@ -368,7 +531,7 @@ struct Light {
     access_control: AccessControlCluster<'static, NACL>,
     basic: BasicInformationCluster,
     gc: GeneralCommissioning,
-    net: NetCommImpl,
+    net: ShimNetComm,
     admin: AdminCommissioningCluster<'static>,
     opcreds: OpCreds,
     gkm: GroupKeyManagementCluster<'static, Backend, NF, 6, 8, 8>,
@@ -629,17 +792,27 @@ struct Owned {
     groups: RefCell<DefaultGroupStore>,
 }
 
-/// NetworkCommissioning クラスタを ble の有無で作り分ける(§9.2)。
+/// NetworkCommissioning クラスタを sm_config.network から作り分ける(§10.1)。
+///
+/// ble 無効ビルドは Ethernet 固定(WiFi/Thread は BLE コミッショニング前提のため)。
 #[cfg(feature = "ble")]
-fn new_netcomm() -> NetCommImpl {
-    NetworkCommissioningWifi::with_driver(ShimWifiDriver::new())
+fn new_netcomm(network: sm_network_t) -> ShimNetComm {
+    match network {
+        sm_network_t::SM_NET_WIFI => {
+            ShimNetComm::Wifi(NetworkCommissioningWifi::with_driver(ShimWifiDriver::new()))
+        }
+        sm_network_t::SM_NET_THREAD => ShimNetComm::Thread(
+            NetworkCommissioningThread::with_driver(ShimThreadDriver::new()),
+        ),
+        sm_network_t::SM_NET_ETHERNET => ShimNetComm::Ethernet(NetworkCommissioning::new(b"eth0")),
+    }
 }
 #[cfg(not(feature = "ble"))]
-fn new_netcomm() -> NetCommImpl {
-    NetworkCommissioning::new(b"eth0")
+fn new_netcomm(_network: sm_network_t) -> ShimNetComm {
+    ShimNetComm::Ethernet(NetworkCommissioning::new(b"eth0"))
 }
 
-fn build_light(o: &'static Owned, rng: CRng) -> Light {
+fn build_light(o: &'static Owned, rng: CRng, network: sm_network_t) -> Light {
     let dac_crypto = RustCrypto::new(rng);
     let dac = TestDacProvider::new(&dac_crypto).expect("test DAC");
     Light {
@@ -647,7 +820,7 @@ fn build_light(o: &'static Owned, rng: CRng) -> Light {
         access_control: AccessControlCluster::new(&o.acl),
         basic: BasicInformationCluster::new(&CFG),
         gc: GeneralCommissioning::default_config(),
-        net: new_netcomm(),
+        net: new_netcomm(network),
         admin: AdminCommissioningCluster::new(&o.window),
         opcreds: OpCredsCluster::new_shared(&o.fabrics, RustCrypto::new(rng), dac),
         gkm: GroupKeyManagementCluster::new_shared(&o.groups, &o.fabrics, RustCrypto::new(rng)),
@@ -676,6 +849,11 @@ struct Shim {
     owned: Owned,
     stack: Stack,
     mdns: MdnsResponder<NF>,
+    /// C++ 側が一度でも `sm_mdns_rx`/`sm_mdns_poll` を呼んだか。呼ばれない構成
+    /// (Thread = SRP 運用、mDNS ソケット無し)では mDNS announce 期限を
+    /// `sm_next_deadline` に併合しない(過去期限が残り続けて pump が
+    /// 0 タイムアウトでスピンする — NanoC6 実機 F6 で task_wdt 発火を実測)。
+    mdns_used: bool,
     kvs: Option<CKvs>,
     mac: [u8; 6],
     instance_id: u64,
@@ -714,6 +892,9 @@ struct Shim {
     /// WiFi join 要求の SM_EV_WIFI_CONNECT_REQUEST を既に立てたか(多重発火抑止)。
     #[cfg(feature = "ble")]
     wifi_req_signaled: bool,
+    /// Thread attach 要求の SM_EV_THREAD_ATTACH_REQUEST を既に立てたか(多重発火抑止)。
+    #[cfg(feature = "ble")]
+    thread_req_signaled: bool,
 }
 
 /// `MaybeUninit<Shim>` を包む Sync セル(単一インスタンス・単線アクセス契約)。
@@ -934,19 +1115,29 @@ impl Shim {
         self.housekeep_ble(now);
     }
 
-    /// BLE 給餌に伴う定常処理(§9)。ble 無効ビルドでは no-op。
+    /// BLE 給餌に伴う定常処理(§9・§10)。ble 無効ビルドでは no-op。
     #[cfg(feature = "ble")]
     fn housekeep_ble(&mut self, now: u64) {
-        // WiFi driver の join 結果を NetworkCommissioning 属性へ反映(遅延応答の裏付け)。
+        // WiFi/Thread driver の join/attach 結果を NetworkCommissioning 属性へ反映
+        // (遅延 ConnectNetworkResponse の裏付け)。
         self.stack.device_mut().net.update_from_driver();
-        // 未取り出しの join 要求があれば 1 回だけ SM_EV_WIFI_CONNECT_REQUEST を立てる。
-        let pending = self.stack.device().net.driver().has_pending();
-        if pending && !self.wifi_req_signaled {
+        // 未取り出しの WiFi join 要求があれば 1 回だけ SM_EV_WIFI_CONNECT_REQUEST を立てる。
+        let wifi_pending = self.stack.device().net.has_pending_wifi();
+        if wifi_pending && !self.wifi_req_signaled {
             self.wifi_req_signaled = true;
             self.events
                 .push(sm_event_kind_t::SM_EV_WIFI_CONNECT_REQUEST, 0);
-        } else if !pending {
+        } else if !wifi_pending {
             self.wifi_req_signaled = false;
+        }
+        // 未取り出しの Thread attach 要求があれば 1 回だけ SM_EV_THREAD_ATTACH_REQUEST を立てる。
+        let thread_pending = self.stack.device().net.has_pending_thread();
+        if thread_pending && !self.thread_req_signaled {
+            self.thread_req_signaled = true;
+            self.events
+                .push(sm_event_kind_t::SM_EV_THREAD_ATTACH_REQUEST, 0);
+        } else if !thread_pending {
+            self.thread_req_signaled = false;
         }
         // BLE 広告の差分同期(commissionable_disc は上で更新済み)。
         self.sync_ble_adv(now);
@@ -1091,7 +1282,7 @@ pub extern "C" fn sm_init(cfg: *const sm_config_t, now_ms: u64) -> i32 {
         };
         let creds = SharedFabricCreds::new(&o.fabrics, &o.crypto, 0);
         let sc = SecureChannel::new(&o.crypto, rng, config, creds);
-        let im = InteractionModel::new(build_light(o, rng));
+        let im = InteractionModel::new(build_light(o, rng, cfg.network));
         let mut stack: Stack = MatterStack::new(&o.crypto, sc, im);
         stack.set_group_keys(&o.groups);
         let _ = stack.post_startup_event(CFG.software_version, 0);
@@ -1100,6 +1291,7 @@ pub extern "C" fn sm_init(cfg: *const sm_config_t, now_ms: u64) -> i32 {
         // Host は sm_set_addrs 前は A/AAAA 無し(--at ユニキャストで解決可)。
         let host = Host::from_mac(&cfg.mac, None, None);
         addr_of_mut!((*sp).mdns).write(MdnsResponder::new(host, MATTER_PORT));
+        addr_of_mut!((*sp).mdns_used).write(false);
         addr_of_mut!((*sp).kvs).write(kvs);
         addr_of_mut!((*sp).mac).write(cfg.mac);
         addr_of_mut!((*sp).instance_id).write(instance_id);
@@ -1125,6 +1317,7 @@ pub extern "C" fn sm_init(cfg: *const sm_config_t, now_ms: u64) -> i32 {
             addr_of_mut!((*sp).ble_subscribed).write(false);
             addr_of_mut!((*sp).ble_adv).write(None);
             addr_of_mut!((*sp).wifi_req_signaled).write(false);
+            addr_of_mut!((*sp).thread_req_signaled).write(false);
         }
 
         // カスタム登録(sm_init 前にステージング)を最終位置の Light へ取り込む(F4b、§8)。
@@ -1242,7 +1435,14 @@ pub extern "C" fn sm_next_deadline(now_ms: u64) -> u64 {
     // SAFETY: 単線契約。
     let s = unsafe { shim() };
     let stack_dl = s.stack.next_deadline(now_ms).unwrap_or(NO_DEADLINE);
-    let mdns_dl = s.mdns.next_announce_deadline();
+    // mDNS announce 期限は C++ 側が mDNS を実際に駆動している場合のみ併合する
+    // (Thread 構成 = SRP 運用では sm_mdns_* が呼ばれず、期限が過去に固定されて
+    // pump の select が 0 タイムアウトでスピンする。Shim::mdns_used 参照)。
+    let mdns_dl = if s.mdns_used {
+        s.mdns.next_announce_deadline()
+    } else {
+        NO_DEADLINE
+    };
     let dl = stack_dl.min(mdns_dl);
     // BTP の ACK / keep-alive / liveness 期限も併合する(§9.2)。
     #[cfg(feature = "ble")]
@@ -1297,6 +1497,7 @@ pub extern "C" fn sm_mdns_rx(
     }
     // SAFETY: 単線契約 + caller のバッファ。
     let s = unsafe { shim() };
+    s.mdns_used = true;
     let p = unsafe { core::slice::from_raw_parts(pkt, len) };
     let src = unsafe { &*src };
     let tx = unsafe { core::slice::from_raw_parts_mut(tx_out, tx_cap) };
@@ -1327,6 +1528,7 @@ pub extern "C" fn sm_mdns_poll(
     }
     // SAFETY: 単線契約。
     let s = unsafe { shim() };
+    s.mdns_used = true;
     s.housekeep(now_ms);
     let tx = unsafe { core::slice::from_raw_parts_mut(tx_out, tx_cap) };
     let Some(n) = s.mdns.poll_announce(now_ms, tx) else {
@@ -1632,7 +1834,9 @@ pub extern "C" fn sm_take_wifi_request(
         }
         // SAFETY: 単線契約。
         let s = unsafe { shim() };
-        let driver = s.stack.device_mut().net.driver_mut();
+        let Some(driver) = s.stack.device_mut().net.wifi_driver_mut() else {
+            return 0; // WiFi 構成でない(Ethernet/Thread)。
+        };
         let Some((ssid, creds)) = driver.take_request() else {
             return 0;
         };
@@ -1666,9 +1870,116 @@ pub extern "C" fn sm_wifi_status(connected: bool, now_ms: u64) {
         }
         // SAFETY: 単線契約。
         let s = unsafe { shim() };
-        s.stack.device_mut().net.driver_mut().set_status(connected);
+        if let Some(driver) = s.stack.device_mut().net.wifi_driver_mut() {
+            driver.set_status(connected);
+        }
         s.housekeep(now_ms);
     }
+}
+
+// ==========================================================================
+// Thread プロビジョン(F6、docs/design/c-ffi-shim.md §10)
+//
+// WiFi の take 方式(§9)の鏡像。ヘッダは常時宣言し、ble 無効ビルド / Thread 以外の
+// 構成では 0 / no-op を返す(後方互換)。
+// ==========================================================================
+
+/// ConnectNetwork で受理した Thread attach 要求の dataset TLV を取り出す(§10.1)。
+///
+/// 戻り値 = dataset TLV バイト長(0 = 保留要求なし / Thread 構成でない / ble 無効)。
+/// `SM_EV_THREAD_ATTACH_REQUEST` を受けて呼ぶ。取り出したら C++ が esp_openthread へ
+/// `otDatasetSetActiveTlvs` で投入し Thread start → attach を開始し、結果を
+/// [`sm_thread_status`] で報告する。
+#[no_mangle]
+pub extern "C" fn sm_take_thread_dataset(tlv_out: *mut u8, cap: usize) -> usize {
+    #[cfg(not(feature = "ble"))]
+    {
+        let _ = (tlv_out, cap);
+        0
+    }
+    #[cfg(feature = "ble")]
+    {
+        if !INITED.load(Ordering::SeqCst) || tlv_out.is_null() {
+            return 0;
+        }
+        // SAFETY: 単線契約。
+        let s = unsafe { shim() };
+        let Some(driver) = s.stack.device_mut().net.thread_driver_mut() else {
+            return 0; // Thread 構成でない(Ethernet/WiFi)。
+        };
+        let Some(ds) = driver.take_dataset() else {
+            return 0;
+        };
+        let n = ds.len().min(cap);
+        // SAFETY: caller が cap バイトの tlv_out を与える契約。
+        unsafe { core::ptr::copy_nonoverlapping(ds.as_ptr(), tlv_out, n) };
+        n
+    }
+}
+
+/// Thread attach 結果を報告する(§10.1)。遅延 ConnectNetworkResponse がこれで確定する。
+///
+/// `attached`=true で Attached、false で Failed。次の `sm_poll`/`sm_ble_poll` サイクルで
+/// コアが遅延 ConnectNetworkResponse を BTP に積む。Thread 構成でない / ble 無効は no-op。
+#[no_mangle]
+pub extern "C" fn sm_thread_status(attached: bool, now_ms: u64) {
+    #[cfg(not(feature = "ble"))]
+    {
+        let _ = (attached, now_ms);
+    }
+    #[cfg(feature = "ble")]
+    {
+        if !INITED.load(Ordering::SeqCst) {
+            return;
+        }
+        // SAFETY: 単線契約。
+        let s = unsafe { shim() };
+        if let Some(driver) = s.stack.device_mut().net.thread_driver_mut() {
+            driver.set_status(attached);
+        }
+        s.housekeep(now_ms);
+    }
+}
+
+/// `u64` を大文字 16 進 16 桁で `out`(長さ 16)へ書く。
+fn write_hex16_upper(out: &mut [u8], v: u64) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for (i, b) in out.iter_mut().enumerate().take(16) {
+        let nib = (v >> (4 * (15 - i))) & 0xF;
+        *b = HEX[nib as usize];
+    }
+}
+
+/// SRP の運用インスタンス名素材 `<compressedFabricId>-<nodeId>`(各 16 進大文字 16 桁)を
+/// `buf` へ NUL 終端で書く(`docs/design/c-ffi-shim.md` §10.1)。
+///
+/// 戻り値 = NUL を除く名前長(33)。fabric 未確定 / `cap` 不足(< 34)は 0。fabric 複数時は
+/// 最初の 1 つを使う(制約: マルチ fabric では代表 1 つのみ。§10.1)。
+#[no_mangle]
+pub extern "C" fn sm_operational_instance_name(buf: *mut u8, cap: usize) -> usize {
+    if !INITED.load(Ordering::SeqCst) || buf.is_null() {
+        return 0;
+    }
+    // SAFETY: 単線契約。
+    let s = unsafe { shim() };
+    let fb = s.owned.fabrics.borrow();
+    let Some(f) = fb.iter().next() else {
+        return 0; // fabric 未確定(コミッショニング前)。
+    };
+    // "<16 hex>-<16 hex>" = 33 バイト + NUL = 34。
+    let mut name = [0u8; 33];
+    write_hex16_upper(&mut name[0..16], f.compressed_fabric_id());
+    name[16] = b'-';
+    write_hex16_upper(&mut name[17..33], f.node_id());
+    if cap < name.len() + 1 {
+        return 0; // NUL 終端の余地がない。
+    }
+    // SAFETY: cap >= 34 を確認済み。NUL 終端して C 文字列にする。
+    unsafe {
+        core::ptr::copy_nonoverlapping(name.as_ptr(), buf, name.len());
+        *buf.add(name.len()) = 0;
+    }
+    name.len()
 }
 
 // ==========================================================================

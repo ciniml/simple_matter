@@ -20,6 +20,7 @@
 
 #include "app_cmd.hpp"
 #include "ble.hpp"
+#include "ot_thread.hpp"
 
 #include <cstring>
 
@@ -151,6 +152,37 @@ static bool load_wifi_creds(uint8_t *ssid, size_t *sl, uint8_t *pass, size_t *pl
   if (e1 == ESP_OK && e2 == ESP_OK) {
     *sl = s;
     *pl = p;
+    return true;
+  }
+  return false;
+}
+#endif
+
+// ---- Thread dataset の永続化(BLE プロビジョン後の再起動で自動 attach) ----------
+//
+// WiFi 資格情報と同じ流儀(§10.1)。sm_take_thread_dataset で得た dataset TLV を NVS に
+// 保存し、起動時 fabric>0 なら復元して sm_ot_apply_dataset で attach する。
+#if CONFIG_SM_NETWORK_THREAD
+static void save_thread_dataset(const uint8_t *tlv, size_t len) {
+  nvs_handle_t h;
+  if (nvs_open("smthr", NVS_READWRITE, &h) != ESP_OK) {
+    return;
+  }
+  nvs_set_blob(h, "ds", tlv, len);
+  nvs_commit(h);
+  nvs_close(h);
+}
+
+static bool load_thread_dataset(uint8_t *tlv, size_t *len) {
+  nvs_handle_t h;
+  if (nvs_open("smthr", NVS_READONLY, &h) != ESP_OK) {
+    return false;
+  }
+  size_t n = *len;
+  esp_err_t e = nvs_get_blob(h, "ds", tlv, &n);
+  nvs_close(h);
+  if (e == ESP_OK) {
+    *len = n;
     return true;
   }
   return false;
@@ -457,6 +489,25 @@ static void register_custom() {
   sm_cluster_register(&def);
 }
 
+// ---- SRP 登録(Thread 運用広告)-------------------------------------------
+//
+// fabric 確定後、運用インスタンス名 <compressedFabricId>-<nodeId>(shim が生成)で
+// _matter._tcp を SRP 登録する(§10.1)。fresh コミッション(SM_EV_COMMISSIONED)と
+// 再起動後の attach(ThreadRole)の双方から呼ぶ。二重登録は ot_thread 側で抑止。
+#if CONFIG_SM_NETWORK_THREAD
+static void maybe_register_srp() {
+  if (sm_fabric_count() == 0) {
+    return; // fabric 未確定。
+  }
+  char inst[40];
+  size_t n = sm_operational_instance_name((uint8_t *)inst, sizeof(inst));
+  if (n == 0) {
+    return; // インスタンス名がまだ得られない。
+  }
+  sm_ot_srp_register(inst);
+}
+#endif
+
 // ---- pump タスク -----------------------------------------------------------
 
 static void matter_task(void *) {
@@ -475,6 +526,13 @@ static void matter_task(void *) {
   cfg.kvs_ctx = nullptr;
   cfg.rng_fill = rng_fill;
   cfg.rng_ctx = nullptr;
+  // プリセット NetworkCommissioning の種別(§10.1)。ble 無効ビルドは種別によらず
+  // Ethernet にフォールバックする(shim 側。後方互換)。
+#if CONFIG_SM_NETWORK_THREAD
+  cfg.network = SM_NET_THREAD;
+#else
+  cfg.network = SM_NET_WIFI;
+#endif
 
   // カスタムクラスタ(EP2)は sm_init より前に登録する(F4b、§8)。
   register_custom();
@@ -516,6 +574,22 @@ static void matter_task(void *) {
       break;
     }
 #endif
+#if CONFIG_SM_NETWORK_THREAD
+    case SM_EV_THREAD_ATTACH_REQUEST: {
+      // ConnectNetwork 受理 → dataset TLV を取り出して esp_openthread へ投入・attach 開始。
+      uint8_t ds[256];
+      size_t n = sm_take_thread_dataset(ds, sizeof(ds));
+      if (n > 0) {
+        sm_ot_apply_dataset(ds, n);
+        save_thread_dataset(ds, n); // 再起動後の自動 attach 用に永続化。
+      }
+      break;
+    }
+    case SM_EV_COMMISSIONED:
+      // fabric 確定 → SRP 登録(運用発見。attach 済みなら即、未 attach でも OT が queue する)。
+      maybe_register_srp();
+      break;
+#endif
     default:
       break;
     }
@@ -541,9 +615,29 @@ static void matter_task(void *) {
   }
 #endif
 
+#if CONFIG_SM_NETWORK_THREAD
+  // コミッショニング済みなら保存済み dataset で自動 attach(再起動後の運用復帰)。
+  if (stack.fabric_count() > 0) {
+    uint8_t ds[256];
+    size_t n = sizeof(ds);
+    if (load_thread_dataset(ds, &n)) {
+      ESP_LOGI(TAG, "fabric restored; auto-attaching saved Thread dataset (%u B)", (unsigned)n);
+      sm_ot_apply_dataset(ds, n);
+    }
+  }
+#endif
+
   int udp_fd = open_matter_udp();
+#if CONFIG_SM_NETWORK_THREAD
+  // Thread は SRP(OTBR advertising proxy)で運用発見するため mDNS ソケットを開かない
+  // (§10.1)。OT netif は lwIP に統合されるので UDP :5540 はそのまま使える。
+  int mdns_fd = -1;
+  bool socket_ok = (udp_fd >= 0);
+#else
   int mdns_fd = open_mdns_socket();
-  if (udp_fd < 0 || mdns_fd < 0) {
+  bool socket_ok = (udp_fd >= 0 && mdns_fd >= 0);
+#endif
+  if (!socket_ok) {
     ESP_LOGE(TAG, "socket open failed");
     vTaskDelete(nullptr);
     return;
@@ -609,6 +703,15 @@ static void matter_task(void *) {
         sm_wifi_status(false, now); // コアが残リトライで再要求する(SM_EV_WIFI_CONNECT_REQUEST)。
         break;
 #endif
+#if CONFIG_SM_NETWORK_THREAD
+      case CmdKind::ThreadRole:
+        // OT role 変化 → 遅延 ConnectNetworkResponse を確定 + attach 済みなら SRP 登録。
+        sm_thread_status(c.thread_attached, now);
+        if (c.thread_attached) {
+          maybe_register_srp();
+        }
+        break;
+#endif
       default:
         // BLE 無効ビルドでは Ble*/WifiFailed は生成されない(-Werror=switch 対策)。
         break;
@@ -635,9 +738,14 @@ static void matter_task(void *) {
     fd_set rfds;
     FD_ZERO(&rfds);
     FD_SET(udp_fd, &rfds);
-    FD_SET(mdns_fd, &rfds);
-    int maxfd = (udp_fd > mdns_fd ? udp_fd : mdns_fd) + 1;
-    int r = select(maxfd, &rfds, nullptr, nullptr, &tv);
+    int maxfd = udp_fd;
+    if (mdns_fd >= 0) {
+      FD_SET(mdns_fd, &rfds);
+      if (mdns_fd > maxfd) {
+        maxfd = mdns_fd;
+      }
+    }
+    int r = select(maxfd + 1, &rfds, nullptr, nullptr, &tv);
     now = now_ms();
 
     if (r > 0 && FD_ISSET(udp_fd, &rfds)) {
@@ -649,7 +757,7 @@ static void matter_task(void *) {
         stack.udp_rx(rx, (size_t)n, sa, now, udp_send);
       }
     }
-    if (r > 0 && FD_ISSET(mdns_fd, &rfds)) {
+    if (mdns_fd >= 0 && r > 0 && FD_ISSET(mdns_fd, &rfds)) {
       sockaddr_storage src;
       socklen_t sl = sizeof(src);
       int n = recvfrom(mdns_fd, rx, sizeof(rx), 0, (sockaddr *)&src, &sl);
@@ -674,7 +782,9 @@ static void matter_task(void *) {
       }
     }
 #endif
-    stack.mdns_poll(now, mdns_send);
+    if (mdns_fd >= 0) {
+      stack.mdns_poll(now, mdns_send);
+    }
   }
 }
 
@@ -692,7 +802,13 @@ extern "C" void app_main() {
   g_cmd_queue = xQueueCreate(8, sizeof(Cmd));
 
   led_init();
+#if CONFIG_SM_NETWORK_THREAD
+  // esp_openthread(15.4 radio + lwIP 統合 netif + mainloop タスク)。WiFi は使わない。
+  // role 変化は g_cmd_queue 経由で matter_task へ。
+  sm_ot_init(g_cmd_queue);
+#else
   wifi_init_sta();
+#endif
 
 #if CONFIG_SM_ENABLE_BLE
   // NimBLE を起動(GATT 0xFFF6 / 広告)。BLE イベントは g_cmd_queue 経由で matter_task へ。

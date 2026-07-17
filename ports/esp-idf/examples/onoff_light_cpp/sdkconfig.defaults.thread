@@ -1,0 +1,33 @@
+# Thread 構成の追加既定(pairing ble-thread、esp_openthread)。
+# docs/design/c-ffi-shim.md §10。ESP32-C6 のみ(15.4 radio + BLE coex)。
+#
+# 使い方(WiFi 構成の回帰と分けるため -DSDKCONFIG_DEFAULTS を明示合成する):
+#   idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32c6;sdkconfig.defaults.thread" \
+#          set-target esp32c6 build
+# (esp32c6 の NimBLE 設定は sdkconfig.defaults.esp32c6 を併せて読む。)
+
+# example の Kconfig 選択(matter_task が cfg.network=SM_NET_THREAD にする)。
+CONFIG_SM_NETWORK_WIFI=n
+CONFIG_SM_NETWORK_THREAD=y
+
+# 4MB flash(NanoC6)。2.5MB app パーティション(partitions.csv)を収めるため。
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# OpenThread(FTD: router 昇格可。C6 内蔵 802.15.4 native radio)。
+CONFIG_OPENTHREAD_ENABLED=y
+CONFIG_OPENTHREAD_FTD=y
+CONFIG_OPENTHREAD_SRP_CLIENT=y
+CONFIG_OPENTHREAD_DNS_CLIENT=y
+
+# OpenThread は eventfd を使う(radio / netif / task queue の 3 本)。
+CONFIG_VFS_SUPPORT_IO=y
+
+# 802.15.4 radio(C6)。
+CONFIG_IEEE802154_ENABLED=y
+
+# lwIP: OpenThread netif のマルチアドレス + IPv6 forwarding。
+CONFIG_LWIP_IPV6_NUM_ADDRESSES=8
+CONFIG_LWIP_MULTICAST_PING=y
+
+# BLE + 802.15.4 の同時運用(commissioning は BLE、運用は Thread)。
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y

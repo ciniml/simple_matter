@@ -16,13 +16,15 @@ enum class CmdKind {
   BleC1Write,       // C1 write 受信(frag[..frag_len] = 1 BTP フラグメント)
   BleC2Subscribed,  // C2 CCCD subscribe 完了
   WifiFailed,       // WiFi join 失敗(BLE プロビジョン中の再試行契機)
+  ThreadRole,       // OT role 変化(thread_attached = child/router/leader なら true)
 };
 
 struct Cmd {
   CmdKind kind;
   uint8_t v4[4];
   uint8_t v6[16];
-  uint16_t mtu;       // BleConnected
-  uint16_t frag_len;  // BleC1Write の有効バイト数
-  uint8_t frag[256];  // BleC1Write の 1 フラグメント(BTP は ATT_MTU-3 以内)
+  uint16_t mtu;         // BleConnected
+  uint16_t frag_len;    // BleC1Write の有効バイト数
+  bool thread_attached; // ThreadRole: attach 済みか
+  uint8_t frag[256];    // BleC1Write の 1 フラグメント(BTP は ATT_MTU-3 以内)
 };

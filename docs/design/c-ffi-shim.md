@@ -152,6 +152,7 @@ C からも使える。
 | **F4a** | S3/Xtensa 向け .a(esp チャネル + build-std)+ コンポーネントの esp32s3 対応 | esp32s3 の `idf.py build` green(docker、SM_PREBUILT_A 経路) |
 | **F4b** | カスタムクラスタ C vtable(§8。read/write/invoke ハンドラ登録 + dirty 通知) | ホスト ctest E2E(カスタムクラスタを smctl の any read/write/invoke + subscribe で検証) |
 | **F5**(後続) | Zephyr 消費(RW612 doc §4 と合流) | 機材(FRDM-RW612)待ち |
+| **F6** | Thread 対応(§10。take-API + プリセット切替、Thread スタック/SRP は C++ 側 = esp_openthread) | C6 実機で pairing ble-thread → CASE over Thread → toggle + リブート永続化 |
 
 F1 のホスト E2E が本設計の核心ゲート: **C++ から見た API の妥当性をハードウェア無しで
 フル検証できる**(smctl も同一リポジトリ内)。
@@ -525,3 +526,144 @@ flash は `espflash write-bin`(0x0/0x8000/0x10000)。
 static へ move」の一時コピー多段(LTO/opt-z でも解消しない)+コミッショニング中の
 P-256 署名チェーン(ベアメタル実測 ~70KB)。将来の削減案: シム内の完全 in-place
 構築(§2 の MaybeUninit 直書きを構築式の内側まで徹底)。
+
+### F6(完了、Thread 対応 — §10 設計の実装)
+
+`pairing ble-thread`(BLE コミッショニング → Thread プロビジョン → CASE over Thread)を
+シムの take 方式で写像し、esp_openthread(15.4 radio + lwIP 統合 netif + SRP client)を
+C++ 側の責務として onoff_light_cpp に統合した。
+
+追加/変更物:
+- `crates/simple-matter-cffi`:
+  - `src/thread_driver.rs`: take 方式 `ShimThreadDriver`(§10.2、`ShimWifiDriver` の鏡像)。
+    `set_dataset` で dataset TLV を退避 + Ext PAN ID を返す、`connect` で `pending` を立て
+    `Attaching` に、`sm_take_thread_dataset` で dataset を降ろし、`sm_thread_status` で
+    `Attached`/`Failed` を反映 → コアの `poll_deferred` が遅延 ConnectNetworkResponse を確定。
+  - `src/lib.rs`: NetworkCommissioning を **実行時 enum `ShimNetComm`**(Ethernet / Wifi /
+    Thread の 3 バリアント、`ServerCluster` を委譲)に置換し、`sm_config_t.network`
+    (`sm_network_t` = SM_NET_ETHERNET/WIFI/THREAD)で選ぶ。新規 3 API:
+    `sm_take_thread_dataset`/`sm_thread_status`/`sm_operational_instance_name`
+    (SRP インスタンス名 `<compressedFabricId 16hex 大文字>-<nodeId 16hex 大文字>` を
+    fabric 先頭 1 つから NUL 終端で生成)。イベント `SM_EV_THREAD_ATTACH_REQUEST`。
+    `housekeep_ble` を WiFi/Thread 両対応に一般化。**後方互換**: `network` は
+    `sm_config_t` 末尾に追加、0 = SM_NET_ETHERNET = 従来動作。WiFi/Thread は BLE 前提の
+    ため ble 無効ビルドは種別によらず Ethernet(shim フォールバック)。
+  - ヘッダ再生成(冪等)。Rust 単体テスト +3(dataset take ラウンドトリップ、不正
+    dataset 拒否、network 種別毎の enum バリアント/FeatureMap/ドライバ有無)。`ble_checks`
+    と `ffi_lifecycle_roundtrip` は `network = SM_NET_WIFI` に更新(wifi_driver_mut 経由)。
+- `ports/esp-idf/examples/onoff_light_cpp`:
+  - `main/ot_thread.{hpp,cpp}`: esp_openthread 初期化(RADIO_MODE_NATIVE)+ OT netif
+    (`ESP_NETIF_DEFAULT_OPENTHREAD`、lwIP 統合)+ mainloop タスク + eventfd 登録 +
+    role 変化コールバック(→ `CmdKind::ThreadRole`)。`sm_ot_apply_dataset`
+    (`otDatasetSetActiveTlvs` + `otIp6SetEnabled` + `otThreadSetEnabled`)、`sm_ot_srp_register`
+    (host `SM<MAC>` / instance `sm_operational_instance_name` / `_matter._tcp` port 5540 /
+    TXT `SII=10000,SAI=1000,T=0`(thread-port.md T3 実測)+ `otSrpClientEnableAutoStartMode`)。
+  - `main/main.cpp`: Kconfig `SM_NETWORK_TYPE`(wifi/thread 択一、既定 wifi)で分岐。
+    thread 時は WiFi 初期化を止め `sm_ot_init` を起動、`cfg.network = SM_NET_THREAD`、
+    `SM_EV_THREAD_ATTACH_REQUEST` → `sm_take_thread_dataset` → `sm_ot_apply_dataset` +
+    dataset を NVS(namespace `smthr`)へ永続化、`ThreadRole` cmd → `sm_thread_status` +
+    SRP 登録、`SM_EV_COMMISSIONED` → SRP 登録、起動時 fabric>0 なら保存 dataset で
+    auto-attach。mDNS ソケット(5353)は thread 構成では開かない(SRP 運用)。UDP :5540 は
+    OT netif が lwIP 統合のため WiFi と同一コード。
+  - `main/Kconfig.projbuild`: `SM_NETWORK_TYPE` choice(thread は C6 依存、選択で
+    `SM_ENABLE_BLE` 既定 y)。`main/CMakeLists.txt`: `openthread`・`vfs`(eventfd)を常時
+    REQUIRES(条件付き REQUIRES 不可のため。ble.cpp の `bt` と同方針)。
+  - `sdkconfig.defaults.thread`(OPENTHREAD_ENABLED/FTD/SRP_CLIENT + IEEE802154 +
+    coex + `CONFIG_SM_NETWORK_THREAD=y`)、`sdkconfig.defaults` に `FLASHSIZE_4MB`、
+    `partitions.csv` を app 2.5MB(`0x280000`)へ拡張(openthread 分。WiFi 構成でも同一)。
+
+ゲート(実測):
+- **ホスト**: `cargo test --workspace` green(562+13+59+…、新規 3 本込み、回帰なし)。
+  `--no-default-features` も green。clippy 0(default / no-default 両方)。
+  riscv32imac staticlib green(`--features panic-abort`(ble 込み)/ `--features
+  panic-abort --no-default-features`(ble 無効・後方互換)両方、新規 3 シンボルが `T`)。
+  ヘッダ冪等。**ホスト ctest 回帰 green**: memset 既定 = `network=0=Ethernet` で
+  `pairing onnetwork` → COMPLETE → onoff toggle(Success)→ read=true → Sigma2Resume
+  (WiFi/Ethernet 経路が壊れていないことを確認)。
+- **idf.py build(docker `espressif/idf:release-v5.4`、`SM_PREBUILT_A` 経路)**:
+  - **esp32c6 Thread 構成 green**: `Project build complete`、app 1,558,624 B
+    (`0x17c460`、partition 41% free)。sdkconfig に OPENTHREAD_ENABLED/FTD/SRP_CLIENT/
+    IEEE802154/NimBLE/coex/FLASHSIZE_4MB が反映。ELF に `esp_openthread_init` /
+    `otDatasetSetActiveTlvs` / `otThreadSetEnabled` / `otSrpClientAddService` +
+    `sm_take_thread_dataset` / `sm_thread_status` / `sm_operational_instance_name` が `T`。
+  - **esp32c6 WiFi 構成の回帰 green**: app 1,507,200 B(`0x16ff80`、43% free)。
+    `openthread`/`vfs` の常時 REQUIRES + main.cpp の #if 分岐が WiFi ビルドを壊さない。
+  - **esp32s3 の回帰 green**(F4a、xtensa prebuilt): app 1,027,184 B(61% free)。
+    S3 は 15.4 非搭載だが `openthread` の常時 REQUIRES は `CONFIG_OPENTHREAD_ENABLED=n` で
+    スタブ化され configure/リンク成立。
+- 合成に注意した点(prompt 指示): thread は
+  `-DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32c6;sdkconfig.defaults.thread"`、
+  wifi は末尾を `sdkconfig.local` にして明示合成(`-DSDKCONFIG_DEFAULTS` を渡すと IDF の
+  target 自動連結が無効化されるため esp32c6 を明示)。`vfs` コンポーネント(eventfd の
+  提供元。IDF v5.4 で `esp_vfs_eventfd` という独立コンポーネントは無い)を REQUIRES。
+- コア(`crates/simple-matter`)への変更ゼロ(`NetworkCommissioningThread`/`ThreadDriver` は
+  T2 で実装済み。シムは `ShimNetComm` enum + take 方式アダプタで写すのみ)。
+
+**実機 E2E(核心ゲート)は未実施(残)**: DUT フラッシュ + 稼働中ソーク停止/再開 +
+OTBR SRP 掃除を伴う live 操作のため、本実装エージェントでは着手せず親の確認に委ねる。
+ファーム(bootloader/partition-table/app の 3 点)はビルド済みで即 flash 可能。手順は
+§10.2 + prompt のゲート 3(soak-stop → NVS 消去 → 3 点 flash → `ot-ctl srp server
+disable/enable` → get-dataset → `smctl --features ble pairing ble-thread` → attach →
+SRP → CASE over Thread → toggle → リブート auto-attach → soak 再開)。
+
+## 10. Thread 対応(F6 設計)
+
+目的: ESP-IDF C++17 アプリを Thread デバイスにする(`pairing ble-thread`)。
+コアの `ThreadDriver`/`NetworkCommissioningThread`(thread-port.md T2)を
+シムの take 方式で写像する。**Thread スタック・SRP は C++ 側の責務**
+(ESP-IDF 公式 `esp_openthread` + lwIP 統合 netif。ベアメタル Rust 路線と違い
+ESP-IDF には BLE/15.4 の本物の coex があるため、R9 系の radio 問題や
+運用中 BLE 時分割の制約が出ない見込み — 実機で確認するのも F6 の成果)。
+
+### 10.1 C API 追加
+
+```c
+/* sm_config_t に追加 */
+typedef enum { SM_NET_ETHERNET, SM_NET_WIFI, SM_NET_THREAD } sm_network_t;
+/* sm_config_t.network = プリセットの NetworkCommissioning 種別 */
+
+/* ConnectNetwork(Thread)受理で SM_EV_THREAD_ATTACH_REQUEST が立つ →
+   C++ が dataset TLV を取り出して esp_openthread へ投入・attach 開始 */
+size_t sm_take_thread_dataset(uint8_t *tlv_out, size_t cap);
+/* attach 結果の報告(遅延 ConnectNetworkResponse が確定) */
+void   sm_thread_status(bool attached, uint64_t now_ms);
+```
+
+- WiFi の `sm_take_wifi_request`/`sm_wifi_status` の鏡像。dataset の NVS 永続化と
+  起動時 auto-attach は C++ 側(WiFi 資格情報と同じ流儀)。
+- 運用広告: `sm_mdns_*` は Thread では使わない。C++ が ESP-IDF の SRP client API で
+  `_matter._tcp` を登録する(TXT の SII/SAI 推奨値は thread-port.md T3 実測 =
+  SII=10000/SAI=1000。インスタンス名 `<compressedFabricId hex>-<nodeId hex>` の
+  素材はシムが返す: `sm_operational_instance_name(buf, cap)`)。
+- UDP は既存 `sm_udp_rx`/`sm_poll` のまま(OT netif は lwIP に統合されるので
+  C++ のソケットコードは WiFi と同一。dual-stack の v6 経路が本線になるだけ)。
+
+### 10.2 example / ゲート
+
+- onoff_light_cpp に Kconfig で `SM_NETWORK_TYPE`(wifi/thread 択一)。thread 選択時:
+  esp_openthread 初期化 + OT netif + NimBLE(ble-thread)+ SRP client 登録 +
+  dataset NVS 永続化。app パーティションは openthread 分の増加に注意
+  (BLE 版 1.5MB + OT → 1.875MB 上限を超えるなら partitions.csv を拡張)。
+- ゲート: idf.py build green(wifi 構成の回帰込み)→ NanoC6 実機で
+  smctl/chip-tool `pairing ble-thread` → 運用発見(SRP → OTBR proxy)→
+  CASE over Thread → toggle → リブート永続化。既存 OTBR 環境を流用。
+
+### F6 実機検証(NanoC6 + OTBR、2026-07-17)
+
+thread 構成の onoff_light_cpp を NanoC6 実機で E2E green:
+smctl `pairing ble-thread`(BLE/BTP → PASE → AddNOC → dataset take →
+`otDatasetSetActiveTlvs` → attach(detached→child ~2 秒)→ 遅延
+ConnectNetworkResponse → BLE close → SRP 登録(ESP-IDF SRP client)→
+運用解決 → CASE over Thread → **COMPLETE 約 26 秒**)→ toggle。
+リブートで fabric+dataset 復元 → auto-attach(~1 秒、**Router に昇格**)→
+Sigma2Resume 64〜121ms → toggle。
+
+**実機で発見・修正したバグ(シム)**: mDNS を駆動しない構成(Thread = SRP
+運用)では `sm_next_deadline` が mDNS announce の過去期限を返し続け、pump の
+select が 0 タイムアウトでスピン → task_wdt 発火 → abort ループ。
+`Shim::mdns_used`(sm_mdns_rx/poll が一度でも呼ばれたか)で announce 期限の
+併合をゲートして解決(mDNS 不使用の全構成に効く自己構成方式)。
+
+**所見**: ESP-IDF の BLE/15.4 coex は本物で、ベアメタル esp-radio 路線の
+R9 系症状(RX 沈黙・TX イベント喪失)は観測されず。attach・CASE とも
+リトライ不要で安定。C++ 連携経路は Thread の実用品質が既に高い。

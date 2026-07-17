@@ -79,7 +79,24 @@ typedef enum {
   SM_EV_BLE_ADV_CHANGED = 5,
   // ConnectNetwork 受理で WiFi join 要求が立った(`sm_take_wifi_request` で取り出す。§9.1)。
   SM_EV_WIFI_CONNECT_REQUEST = 6,
+  // ConnectNetwork 受理で Thread attach 要求が立った(`sm_take_thread_dataset` で
+  // dataset TLV を取り出す。§10.1)。
+  SM_EV_THREAD_ATTACH_REQUEST = 7,
 } sm_event_kind_t;
+
+// プリセット NetworkCommissioning の種別(`docs/design/c-ffi-shim.md` §10.1)。
+//
+// C 側が `sm_config_t` を 0 クリアすると `SM_NET_ETHERNET`(従来動作)になる(後方互換)。
+// WiFi / Thread は BLE コミッショニング前提のため、ble 無効ビルドでは種別によらず
+// Ethernet として動作する。
+typedef enum {
+  // Ethernet(FeatureMap EN)。既定・後方互換。
+  SM_NET_ETHERNET = 0,
+  // WiFi(FeatureMap WI)。`pairing ble-wifi`。ble 必須。
+  SM_NET_WIFI = 1,
+  // Thread(FeatureMap TH)。`pairing ble-thread`。ble 必須。
+  SM_NET_THREAD = 2,
+} sm_network_t;
 
 // KVS get コールバック: 値を `buf` へ書き実長を返す(無ければ負値)。
 typedef int32_t (*SmKvsGet)(void *ctx, const char *key, uint8_t *buf, size_t cap);
@@ -119,6 +136,8 @@ typedef struct {
   SmRngFill rng_fill;
   // RNG コールバックの ctx。
   void *rng_ctx;
+  // プリセット NetworkCommissioning の種別(0 = SM_NET_ETHERNET = 従来動作。§10.1)。
+  sm_network_t network;
 } sm_config_t;
 
 // v4/v6 両対応の datagram 宛先/送信元。
@@ -348,6 +367,30 @@ size_t sm_take_wifi_request(uint8_t *ssid_out,
 // コアが遅延 ConnectNetworkResponse を BTP に積む。ble 無効ビルドは no-op。
 void sm_wifi_status(bool connected,
                     uint64_t now_ms);
+
+// ConnectNetwork で受理した Thread attach 要求の dataset TLV を取り出す(§10.1)。
+//
+// 戻り値 = dataset TLV バイト長(0 = 保留要求なし / Thread 構成でない / ble 無効)。
+// `SM_EV_THREAD_ATTACH_REQUEST` を受けて呼ぶ。取り出したら C++ が esp_openthread へ
+// `otDatasetSetActiveTlvs` で投入し Thread start → attach を開始し、結果を
+// [`sm_thread_status`] で報告する。
+size_t sm_take_thread_dataset(uint8_t *tlv_out,
+                              size_t cap);
+
+// Thread attach 結果を報告する(§10.1)。遅延 ConnectNetworkResponse がこれで確定する。
+//
+// `attached`=true で Attached、false で Failed。次の `sm_poll`/`sm_ble_poll` サイクルで
+// コアが遅延 ConnectNetworkResponse を BTP に積む。Thread 構成でない / ble 無効は no-op。
+void sm_thread_status(bool attached,
+                      uint64_t now_ms);
+
+// SRP の運用インスタンス名素材 `<compressedFabricId>-<nodeId>`(各 16 進大文字 16 桁)を
+// `buf` へ NUL 終端で書く(`docs/design/c-ffi-shim.md` §10.1)。
+//
+// 戻り値 = NUL を除く名前長(33)。fabric 未確定 / `cap` 不足(< 34)は 0。fabric 複数時は
+// 最初の 1 つを使う(制約: マルチ fabric では代表 1 つのみ。§10.1)。
+size_t sm_operational_instance_name(uint8_t *buf,
+                                    size_t cap);
 
 #ifdef __cplusplus
 } // extern "C"

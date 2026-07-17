@@ -3,8 +3,11 @@
 # ここに固定しない。F4a で S3 対応のため非依存化)。
 
 # カスタムパーティション: 既定 1MB では app が収まらないため拡張(partitions.csv)。
+# 4MB flash(NanoC6)。2.5MB app パーティション(Thread 構成の openthread 分。§10.2)を
+# 収めるため既定 2MB から拡張する(WiFi 構成でも同じ = 空きが増えるだけ)。
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
 # メインタスクは軽い(pump は別タスク)。
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
