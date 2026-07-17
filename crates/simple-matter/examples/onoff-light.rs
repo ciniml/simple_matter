@@ -35,7 +35,7 @@ use simple_matter::discovery::{
 use simple_matter::dm::clusters::{
     AccessControlCluster, AdminCommissioningCluster, BasicInfoConfig, BasicInformationCluster,
     CommissioningWindow, DescriptorCluster, GeneralCommissioning, GroupKeyManagementCluster,
-    GroupsCluster, IcdManagementCluster, IdentifyCluster, NetworkCommissioning, OnOffCluster,
+    GroupsCluster, IcdManagementCipCluster, IdentifyCluster, NetworkCommissioning, OnOffCluster,
     OpCredsCluster, TestDacProvider, WindowEvent,
 };
 use simple_matter::dm::meta::{ClusterId, DeviceType, EndpointId, EndpointMeta, EventId};
@@ -43,7 +43,12 @@ use simple_matter::dm::{tick_clusters, DataModel, ServerCluster};
 use simple_matter::error::{Error, Result as SmResult};
 use simple_matter::fabric::FabricTable;
 use simple_matter::groups::{group_multicast_addr, DefaultGroupStore};
-use simple_matter::icd::{IcdConfig, IcdState};
+use simple_matter::icd::{
+    generate_checkin, IcdConfig, IcdRegistrationTable, IcdRegistryHandle, IcdState,
+    ICD_CLIENTS_PER_FABRIC,
+};
+use simple_matter::transport::header::{DstNodeId, PacketHeader, PayloadHeader, ExchFlags, SecFlags};
+use simple_matter::transport::util::WriteBuf;
 use simple_matter::im::engine::InteractionModel;
 use simple_matter::im::events::PRIORITY_INFO;
 use simple_matter::kvs::Kvs;
@@ -57,6 +62,8 @@ const SALT: [u8; 16] = *b"SPAKE2P Key Salt";
 const NF: usize = 5;
 /// ACL テーブル容量(fabric 5 × per-fabric 上限 4)。
 const NACL: usize = 20;
+/// ICD 登録テーブル容量(fabric 5 × per-fabric 上限)。
+const NICD: usize = NF * ICD_CLIENTS_PER_FABRIC;
 
 /// コミッショニング discriminator(12 ビット)。chip-tool の既定テスト値。
 const DISCRIMINATOR: u16 = 3840;
@@ -209,7 +216,9 @@ struct Light<'s> {
     admin: AdminCommissioningCluster<'s>,
     opcreds: OpCreds<'s>,
     gkm: GroupKeyManagementCluster<'s, Backend, NF, 6, 8, 8>,
-    icd: IcdManagementCluster,
+    icd: IcdManagementCipCluster<'s, NICD>,
+    /// ICD 登録クライアントテーブル(ICDManagement クラスタと RemoveFabric 連動が共有)。
+    icd_table: &'s RefCell<IcdRegistrationTable<NICD>>,
     desc0: DescriptorCluster,
     identify: IdentifyCluster,
     groups_cl: GroupsCluster<'s, 6, 8, 8>,
@@ -315,13 +324,21 @@ impl DataModel for Light<'_> {
         // full ACL(per-entry 照合)を有効化する(docs/design/acl.md §3)。
         Some(self.acl)
     }
+    fn icd_registry(&self) -> Option<&dyn IcdRegistryHandle> {
+        // RemoveFabric 連動で ICD 登録も掃除する(docs/design/icd.md §I1c)。
+        Some(self.icd_table)
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_light<'s>(
     fabrics: &'s RefCell<FabricTable<Backend, NF>>,
     acl: &'s RefCell<AclTable<NACL>>,
     window: &'s RefCell<CommissioningWindow>,
     groups: &'s RefCell<DefaultGroupStore>,
+    icd_table: &'s RefCell<IcdRegistrationTable<NICD>>,
+    icd_state: &'s RefCell<IcdState>,
+    lit: bool,
 ) -> Light<'s> {
     let dac_crypto = RustCrypto::new(DemoRng::from_time());
     // SM_TAMPER_CD=1: CD を 1 バイト改竄した DAC provider(コミッショナ側 CD CMS 検証の
@@ -345,7 +362,8 @@ fn build_light<'s>(
             fabrics,
             RustCrypto::new(DemoRng::from_time()),
         ),
-        icd: IcdManagementCluster::with_config(icd_config()),
+        icd: IcdManagementCipCluster::new(icd_config(), icd_table, icd_state, lit),
+        icd_table,
         desc0: DescriptorCluster::new(EndpointId(0), EP0_DT, EP0_SERVERS, &[], EP0_PARTS),
         // 識別中/終了を println で通知する。
         identify: IdentifyCluster::new().with_listener(|on| {
@@ -372,11 +390,22 @@ fn main() -> std::io::Result<()> {
     let window: RefCell<CommissioningWindow> = RefCell::new(CommissioningWindow::new());
     // group ストア(GroupKeyManagement / Groups クラスタと groupcast 復号が共有)。
     let groups: RefCell<DefaultGroupStore> = RefCell::new(DefaultGroupStore::new());
+    // ICD 登録テーブル(ICDManagement クラスタと RemoveFabric 連動 + app の check-in 送出が共有)。
+    let icd_table: RefCell<IcdRegistrationTable<NICD>> = RefCell::new(IcdRegistrationTable::new());
+    // ICD active/idle 状態機械(ICDManagement クラスタの StayActiveRequest と app ループが共有)。
+    let icd_cfg = icd_config();
+    let icd_state: RefCell<IcdState> = RefCell::new(IcdState::new(icd_cfg));
+    // SM_ICD モード判定: 未設定=無効、"lit"=LIT ICD、それ以外(例 "1"/"sit")=SIT ICD(CIP)。
+    let icd_mode = std::env::var("SM_ICD").ok();
+    let icd_enabled = icd_mode.is_some();
+    let icd_lit = icd_mode.as_deref() == Some("lit");
 
     let config = PaseConfig::from_passcode_default(PASSCODE, &SALT).expect("PASE config");
     let creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
     let sc = SecureChannel::new(&crypto, DemoRng::from_time(), config, creds);
-    let im = InteractionModel::new(build_light(&fabrics, &acl, &window, &groups));
+    let im = InteractionModel::new(build_light(
+        &fabrics, &acl, &window, &groups, &icd_table, &icd_state, icd_lit,
+    ));
     let mut stack: DefaultStack<Backend, DemoRng, Light> = MatterStack::new(&crypto, sc, im);
     // groupcast 受信の復号鍵リゾルバ(group-messaging.md §5.1)。
     stack.set_group_keys(&groups);
@@ -423,6 +452,14 @@ fn main() -> std::io::Result<()> {
             Ok(()) => println!("[kvs] restored group store"),
             Err(e) => println!("[kvs] group store restore failed: {e:?}"),
         }
+        let icd_load = icd_table.borrow_mut().load_from(kvs);
+        match icd_load {
+            Ok(n) => println!(
+                "[kvs] restored {n} ICD registration(s); ICDCounter={}",
+                icd_table.borrow().icd_counter()
+            ),
+            Err(e) => println!("[kvs] ICD table restore failed: {e:?}"),
+        }
         match stack.load_resumptions_from(kvs) {
             Ok(n) => println!("[kvs] restored {n} resumptions"),
             Err(e) => println!("[kvs] resumption restore failed: {e:?}"),
@@ -452,18 +489,28 @@ fn main() -> std::io::Result<()> {
     let mac = MDNS_INSTANCE_ID.to_be_bytes(); // 下位 6 バイトをホスト名(MAC 相当)に使う
     let host = Host::from_mac(&mac[2..8], local_ipv6.map(|(ip, _)| ip), Some(local_ipv4));
     let mut mdns: MdnsResponder<NF> = MdnsResponder::new(host, matter_port());
-    // ICD(SIT)モード: SM_ICD 設定時、SII/SAI を ICD パラメータから導出して広告し、
-    // idle 期間はソケット受信を止める「擬似 sleep」を行う(docs/design/icd.md §4)。
-    let icd_enabled = std::env::var_os("SM_ICD").is_some();
-    let icd_cfg = icd_config();
-    let mut icd = IcdState::new(icd_cfg);
+    // ICD モード: SM_ICD 設定時、SII/SAI を ICD パラメータから導出して広告し、
+    // idle 期間はソケット受信を止める「擬似 sleep」を行う(docs/design/icd.md §4/§I1c)。
+    // LIT(SM_ICD=lit)では加えて登録クライアントへ check-in メッセージを送出する。
     if icd_enabled {
         println!(
-            "[icd] SIT ICD mode ENABLED: IdleModeDuration={}s ActiveModeDuration={}ms ActiveModeThreshold={}ms",
+            "[icd] {} ICD mode ENABLED: IdleModeDuration={}s ActiveModeDuration={}ms ActiveModeThreshold={}ms",
+            if icd_lit { "LIT" } else { "SIT" },
             icd_cfg.idle_mode_duration_s,
             icd_cfg.active_mode_duration_ms,
             icd_cfg.active_mode_threshold_ms
         );
+    }
+    // LIT check-in の宛先(loopback E2E 用。通常は operational discovery で解決するが、
+    // マルチキャストを避けるため env で固定する)。`SM_ICD_CHECKIN_ADDR=[::1]:15541` 等。
+    let checkin_dst: Option<SocketAddr> = std::env::var("SM_ICD_CHECKIN_ADDR")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    if icd_lit {
+        match &checkin_dst {
+            Some(a) => println!("[icd] LIT check-in destination: {a}"),
+            None => println!("[icd] LIT: SM_ICD_CHECKIN_ADDR unset; check-in not sent (register still works)"),
+        }
     }
     // VPN 運用ガイド(matter-over-vpn.md V2): SM_MDNS_SII_MS / SM_MDNS_SAI_MS を
     // TXT の SII/SAI として広告する。DERP リレー経由等で RTT が伸びる環境では
@@ -587,19 +634,41 @@ fn main() -> std::io::Result<()> {
     let mut icd_was_active = false;
     let mut icd_next_poll_ms: u64 = 0;
     let mut icd_listen_until_ms: u64 = 0;
+    // check-in メッセージ用のカウンタ(unsecured メッセージカウンタ / exchange id)。
+    let mut checkin_msg_ctr: u32 = (now_ms(&start) as u32) | 1;
+    let mut checkin_exch_id: u16 = 0x9000;
+    // ICD 登録テーブルの世代(KVS 保存トリガ)。
+    let mut last_icd_gen = icd_table.borrow().generation();
 
     loop {
         let loop_now = now_ms(&start);
         // sleepy 動作はコミッショニング済み(fabric 保有)かつ SM_ICD 時のみ。
         let icd_sleepy = icd_enabled && !fabrics.borrow().is_empty();
         // idle 中で予定ポーリング時刻に達したら listen 窓を開く(次回ポーリングも予約)。
-        if icd_sleepy && !icd.is_active(loop_now) && loop_now >= icd_next_poll_ms {
+        if icd_sleepy && !icd_state.borrow().is_active(loop_now) && loop_now >= icd_next_poll_ms {
             icd_listen_until_ms = loop_now.saturating_add(ICD_LISTEN_MS);
             icd_next_poll_ms =
                 loop_now.saturating_add(u64::from(icd_cfg.idle_mode_duration_s) * 1000);
+            // LIT: idle 周期の起床ごとに登録クライアントへ check-in を送出する
+            // (ICDCounter を 1 増やし、全登録に同一 counter を配る)。
+            if icd_lit {
+                if let Some(dst) = checkin_dst {
+                    emit_checkins(
+                        &socket,
+                        &crypto,
+                        &icd_table,
+                        &fabrics,
+                        dst,
+                        &mut checkin_msg_ctr,
+                        &mut checkin_exch_id,
+                    );
+                }
+            }
         }
         // radio を on にする条件: sleepy でない / active / listen 窓の中。
-        let radio_on = !icd_sleepy || icd.is_active(loop_now) || loop_now < icd_listen_until_ms;
+        let radio_on = !icd_sleepy
+            || icd_state.borrow().is_active(loop_now)
+            || loop_now < icd_listen_until_ms;
 
         // 1) Matter UDP の受信処理(radio が on のときのみ)。
         let recv_result = if radio_on {
@@ -612,7 +681,7 @@ fn main() -> std::io::Result<()> {
                 let now = now_ms(&start);
                 // 受信は ICD の「通信」= active モード延長のトリガ。
                 if icd_enabled {
-                    icd.notify_activity(now);
+                    icd_state.borrow_mut().notify_activity(now);
                 }
                 // MATTER_DEBUG=2: 受信 datagram の hex ダンプ(プロトコル調査用)。
                 let debug = std::env::var("MATTER_DEBUG").ok();
@@ -644,7 +713,7 @@ fn main() -> std::io::Result<()> {
         //     のときだけ「sleep に入る」表現にする。
         if icd_enabled {
             let now = now_ms(&start);
-            let active = icd.is_active(now);
+            let active = icd_state.borrow().is_active(now);
             if active != icd_was_active {
                 icd_was_active = active;
                 let sleepy = !fabrics.borrow().is_empty();
@@ -762,6 +831,23 @@ fn main() -> std::io::Result<()> {
                 }
             }
             sync_group_joins(&socket, &groups, &fabrics, &mut joined_groups, local_ipv6);
+        }
+
+        // 4.6) ICD 登録テーブル / ICDCounter の変化を検知して KVS 保存(icd.md §I1c)。
+        //      register/unregister/RemoveFabric 連動削除・check-in ごとの counter bump で変化。
+        let igen = icd_table.borrow().generation();
+        if igen != last_icd_gen {
+            last_icd_gen = igen;
+            if let Some(kvs) = kvs.as_mut() {
+                match icd_table.borrow().save_to(kvs) {
+                    Ok(()) => println!(
+                        "[kvs] saved ICD table ({} entries, ICDCounter={})",
+                        icd_table.borrow().len(),
+                        icd_table.borrow().icd_counter()
+                    ),
+                    Err(e) => println!("[kvs] ICD table save error: {e:?}"),
+                }
+            }
         }
 
         let rgen = stack.resumption_generation();
@@ -969,6 +1055,83 @@ fn sync_group_joins(
             joined.push(addr);
         } else {
             println!("[groups] multicast join failed for {addr}");
+        }
+    }
+}
+
+/// LIT ICD の check-in ラウンドを送出する(docs/design/icd.md §I1c)。
+///
+/// ICDCounter を 1 増やし、その値を全登録クライアントへ配る。各 check-in は
+/// **非暗号(unsecured)の Secure Channel メッセージ(opcode 0x28 = ICD Check-In)**として
+/// フレーミングし、payload に AES-CCM 保護済みの check-in payload を載せる。宛先は通常
+/// operational discovery で解決するが、loopback E2E ではマルチキャストを避けるため
+/// `dst`(SM_ICD_CHECKIN_ADDR)へユニキャストで送る。
+fn emit_checkins(
+    socket: &UdpSocket,
+    crypto: &Backend,
+    icd_table: &RefCell<IcdRegistrationTable<NICD>>,
+    fabrics: &RefCell<FabricTable<Backend, NF>>,
+    dst: SocketAddr,
+    msg_ctr: &mut u32,
+    exch_id: &mut u16,
+) {
+    // 登録が無ければ counter も進めない(送るものが無い)。
+    if icd_table.borrow().is_empty() {
+        return;
+    }
+    let counter = icd_table.borrow_mut().bump_counter();
+    // (fabric, checkInNodeID, key) を収集(borrow を短く保つ)。
+    let regs: Vec<(core::num::NonZeroU8, u64, [u8; 16])> = icd_table
+        .borrow()
+        .iter()
+        .map(|r| (r.fabric_idx(), r.check_in_node_id(), *r.key()))
+        .collect();
+    for (fabric, check_in_node, key) in regs {
+        let src_node = match fabrics.borrow().get(fabric) {
+            Some(f) => f.node_id(),
+            None => continue,
+        };
+        let mut payload = [0u8; 64];
+        let plen = match generate_checkin(crypto, &key, counter, &[], &mut payload) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let mut frame = [0u8; 128];
+        let flen = {
+            let mut w = match WriteBuf::new(&mut frame, 0) {
+                Ok(w) => w,
+                Err(_) => continue,
+            };
+            let ph = PacketHeader {
+                session_id: 0,
+                sec_flags: SecFlags::from_bits(0),
+                ctr: *msg_ctr,
+                src_node_id: Some(src_node),
+                dst: DstNodeId::Unicast(check_in_node),
+            };
+            let plh = PayloadHeader {
+                exch_flags: ExchFlags::from_bits(ExchFlags::INITIATOR),
+                proto_opcode: 0x28, // Secure Channel: ICD Check-In
+                exch_id: *exch_id,
+                proto_id: 0x0000, // Secure Channel
+                vendor_id: None,
+                ack_ctr: None,
+            };
+            if ph.encode(&mut w).is_err()
+                || plh.encode(&mut w).is_err()
+                || w.append(&payload[..plen]).is_err()
+            {
+                continue;
+            }
+            w.as_slice().len()
+        };
+        *msg_ctr = msg_ctr.wrapping_add(1);
+        *exch_id = exch_id.wrapping_add(1);
+        match socket.send_to(&frame[..flen], dst) {
+            Ok(_) => println!(
+                "[icd] check-in sent (ICDCounter={counter}) to {dst} for node 0x{check_in_node:016x}"
+            ),
+            Err(e) => println!("[icd] check-in send failed: {e}"),
         }
     }
 }

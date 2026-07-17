@@ -297,6 +297,16 @@ pub trait DataModel {
         None
     }
 
+    /// このデバイスの ICD 登録テーブル(`docs/design/icd.md` §I1c)。
+    ///
+    /// `Some` を返すデバイスは、RemoveFabric / fabric 掃引の際に IM エンジンが
+    /// 当該 fabric の登録クライアントを [`IcdRegistryHandle::remove_fabric`] で消す
+    /// (ACL の [`acl`](DataModel::acl) と同じ連動)。既定の `None` は ICD 非対応
+    /// (登録テーブルを持たない)デバイス。
+    fn icd_registry(&self) -> Option<&dyn crate::icd::IcdRegistryHandle> {
+        None
+    }
+
     /// `(fabric, group_id)` に所属する endpoint を `idx` 順に返す
     /// (`docs/design/group-messaging.md` §5.2/§6)。
     ///

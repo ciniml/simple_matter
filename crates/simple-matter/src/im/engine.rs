@@ -1130,6 +1130,12 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
                 acl.remove_fabric(fabric);
             }
         }
+        // RemoveFabric 連動: 当該 fabric の ICD 登録クライアントも消す(icd.md §I1c)。
+        if let Some(fabric) = effects.removed_fabric {
+            if let Some(reg) = self.dm.icd_registry() {
+                reg.remove_fabric(fabric);
+            }
+        }
         // CommissioningComplete: fail-safe 中に追加した fabric を確定する(Core Spec §11.10)。
         if effects.commissioning_complete {
             self.dm.on_commissioning_complete();
@@ -1160,6 +1166,9 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
     ) {
         if let Some(acl) = self.dm.acl() {
             acl.remove_fabric(fabric);
+        }
+        if let Some(reg) = self.dm.icd_registry() {
+            reg.remove_fabric(fabric);
         }
         loop {
             let victim = sessions

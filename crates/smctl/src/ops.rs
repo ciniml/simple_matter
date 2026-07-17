@@ -150,6 +150,97 @@ pub fn discover_operational(g: &Globals, node_id: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// `icd checkin-listen`: 登録した check-in 鍵で受信 check-in を復号し ICDCounter を検証する
+/// (`docs/design/icd.md` §I1c)。
+///
+/// UDP ポート `port`(既定 15541)に bind し、`secs` 秒間、非暗号 Secure Channel の
+/// ICD Check-In メッセージ(opcode 0x28)を待つ。`check_in_node` 宛(unsecured ヘッダの
+/// 宛先 NodeID)のみ受理し、payload を `key` から導出した鍵で復号 + nonce 再検証する。
+/// 受理した ICDCounter が単調増加であることを確認する(後退したら警告)。
+pub fn icd_checkin_listen(
+    g: &Globals,
+    check_in_node: u64,
+    key: [u8; 16],
+    port: u16,
+    secs: f64,
+) -> Result<(), String> {
+    use simple_matter::icd::open_checkin;
+    use simple_matter::transport::header::{DstNodeId, PacketHeader, PayloadHeader};
+    use simple_matter::transport::util::ParseBuf;
+    use std::net::{Ipv6Addr, SocketAddr, UdpSocket};
+
+    crate::json::set_mode(g.json);
+    let crypto = simple_matter::crypto::rustcrypto::RustCrypto::new(OsRng);
+    let sock = UdpSocket::bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)))
+        .map_err(|e| format!("bind udp/{port}: {e}"))?;
+    sock.set_read_timeout(Some(Duration::from_millis(200)))
+        .map_err(|e| format!("set_read_timeout: {e}"))?;
+    info!(
+        "[icd] listening for check-in on udp/{port} for node 0x{check_in_node:016x} ({secs}s)"
+    );
+    let deadline = Instant::now() + Duration::from_secs_f64(secs);
+    let mut rx = [0u8; 512];
+    let mut received = 0u32;
+    let mut last_counter: Option<u32> = None;
+    while Instant::now() < deadline {
+        let (n, src) = match sock.recv_from(&mut rx) {
+            Ok(v) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(e) => return Err(format!("recv: {e}")),
+        };
+        // 非暗号 Secure Channel メッセージ(session_id=0, proto=0x0000, opcode=0x28)をパース。
+        let mut pb = ParseBuf::new(&mut rx[..n]);
+        let Ok(ph) = PacketHeader::decode(&mut pb) else {
+            continue;
+        };
+        if ph.is_encrypted() {
+            continue;
+        }
+        if let DstNodeId::Unicast(dst) = ph.dst {
+            if dst != check_in_node {
+                continue;
+            }
+        }
+        let Ok(plh) = PayloadHeader::decode(&mut pb) else {
+            continue;
+        };
+        if plh.proto_id != 0x0000 || plh.proto_opcode != 0x28 {
+            continue;
+        }
+        let payload = pb.as_slice();
+        let mut app = [0u8; 32];
+        match open_checkin(&crypto, &key, payload, &mut app) {
+            Ok((counter, app_len)) => {
+                received += 1;
+                let mono = match last_counter {
+                    Some(prev) if counter <= prev => " (WARNING: not monotonic!)",
+                    _ => "",
+                };
+                last_counter = Some(counter);
+                info!(
+                    "[icd] check-in #{received} from {src}: ICDCounter={counter} appData={}B{mono}",
+                    app_len
+                );
+                if g.json {
+                    Obj::new("checkin")
+                        .num("icdCounter", counter as u64)
+                        .num("count", received as u64)
+                        .emit();
+                }
+            }
+            Err(_) => {
+                info!("[icd] received a check-in-shaped message that failed to decrypt/verify (wrong key?)");
+            }
+        }
+    }
+    if received == 0 {
+        return Err("no valid check-in received within the listen window".into());
+    }
+    info!("[icd] received {received} valid check-in(s); last ICDCounter={last_counter:?}");
+    Ok(())
+}
+
 // ==========================================================================
 // Exec: 単一プロセス内でスタック / CASE セッション / 購読を共有する実行コンテキスト
 // ==========================================================================
@@ -337,6 +428,12 @@ impl<'a> Exec<'a> {
                  (run it as a standalone command first)"
                 .into()),
             Cmd::Batch { .. } => Err("nested batch is not supported".into()),
+            Cmd::IcdCheckinListen {
+                check_in_node,
+                key,
+                port,
+                secs,
+            } => icd_checkin_listen(&self.g, *check_in_node, *key, *port, *secs),
         }
     }
 

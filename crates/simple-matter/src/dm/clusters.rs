@@ -48,7 +48,7 @@ pub use fan_control::FanControlCluster;
 pub use general_commissioning::{FailSafe, GeneralCommissioning};
 pub use group_key_management::GroupKeyManagementCluster;
 pub use groups::GroupsCluster;
-pub use icd_management::IcdManagementCluster;
+pub use icd_management::{IcdManagementCipCluster, IcdManagementCluster};
 pub use identify::IdentifyCluster;
 pub use level_control::LevelControlCluster;
 pub use measurement::{

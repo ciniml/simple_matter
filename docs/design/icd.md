@@ -281,3 +281,116 @@ chip-tool onoff toggle 1 1
 - **SII/SAI の厳密なマッピング**は最新仕様 PDF で再確認の価値あり(本実装は SII=IdleModeDuration、
   SAI=ActiveModeDuration を採用。参照した chip チェックアウトは v1.1 系で ICDM が旧仕様
   =裏取り不足。定義は Matter 1.3 spec §9.16 の記憶知識に依拠)。
+
+## 6. I1c 完了記録(LIT + check-in protocol、2026-07-17)
+
+### 6.1 追加/変更ファイル
+
+- コア `crates/simple-matter/src/icd.rs`: LIT/CIP を追加。
+  - `OperatingMode`(Sit/Lit)、`feature`(CIP=0x01/UAT=0x02/LITS=0x04)。
+  - `IcdState::stay_active(now, requested) -> promised`(StayActiveRequest の active 延長)。
+  - **check-in protocol**: `generate_checkin` / `open_checkin` / `derive_checkin_keys`
+    (AES-128-CCM + HMAC nonce、下記 §6.2)。
+  - **登録テーブル**: `IcdRegistration` / `IcdRegistrationTable<N>`(fabric-scoped 固定容量 +
+    per-fabric 上限 `ICD_CLIENTS_PER_FABRIC=2` + ICDCounter + KVS 永続化 `save_to`/`load_from`、
+    キー `b"icdr"`)+ `IcdRegistryHandle`(RemoveFabric 連動、ACL の `AclHandle` と同じ流儀)。
+  - 単体テスト +15 本(check-in ラウンドトリップ/改竄・誤鍵拒否、登録 upsert・per-fabric 上限、
+    unregister/clear_fabric、永続化ラウンドトリップ、counter 単調性、handle 経由 RemoveFabric、
+    stay_active)。
+- コア `dm/clusters/icd_management.rs`: `IcdManagementCipCluster<'a, N>`(手書き `ServerCluster`)。
+  FeatureMap=CIP(SIT)or CIP|LITS(LIT)。属性 0x0000..=0x0005 + 0x0008(OperatingMode、LIT のみ)、
+  コマンド RegisterClient(0x00)→RegisterClientResponse(0x01, ICDCounter)/ UnregisterClient(0x02)/
+  StayActiveRequest(0x03)→StayActiveResponse(0x04, promisedActiveDuration)。既存の SIT 最小
+  `IcdManagementCluster`(FeatureMap=0)は**無改造で残す**(I1a のフットプリント基準を保つ)。
+  クラスタテスト +4 本。
+- コア配線: `dm.rs` に `DataModel::icd_registry()`(既定 None)。`im/engine.rs` の
+  `apply_invoke_effects`(removed_fabric)と `purge_fabric` で `icd_registry().remove_fabric()` を
+  呼ぶ(RemoveFabric / fabric 掃引連動)。`dm/clusters.rs` で `IcdManagementCipCluster` を re-export。
+- PC example `examples/onoff-light.rs`: `IcdManagementCipCluster` + 共有
+  `RefCell<IcdRegistrationTable>` / `RefCell<IcdState>`、`DataModel::icd_registry()`、ICD テーブルの
+  KVS load/save、LIT モード(`SM_ICD=lit`)、check-in 送出(idle 周期起床ごとに ICDCounter を bump し
+  全登録へ非暗号 Secure Channel メッセージ opcode 0x28 で送出、宛先 `SM_ICD_CHECKIN_ADDR`)。
+- smctl: `ops::icd_checkin_listen`(UDP で check-in を受信 → 復号 → ICDCounter 単調性検証)+
+  CLI `icd checkin-listen <check-in-node> <key-hex> [port] [secs]`。名前テーブル
+  `clusters/icd_management.rs` に CIP 属性/コマンドを追加(`icd-management register-client` 等が
+  named invoke で使える)。RegisterClient/StayActive の invoke は既存の named/`any invoke` で完結。
+
+### 6.2 check-in メッセージフォーマットの根拠と**検証状態**
+
+**フォーマット**(`icd.rs` の詳細コメント参照):
+`payload = Nonce(13B) || Ciphertext(=Counter u32 LE + appData) || MIC(16B)`。
+Nonce = `HMAC-SHA256(Khmac, plaintext)[0..13]`(counter を nonce に束縛)、
+Ciphertext||MIC = `AES-128-CCM(Kaes, Nonce, aad=∅, plaintext)`。共有鍵(RegisterClient の
+16B key)から `Kaes`/`Khmac` を HKDF-SHA256 で導出。これは Matter 1.3 spec §4.18.6 の
+check-in protocol の構造(counter を AEAD 保護、nonce を HMAC で導出)に忠実。
+
+**テストベクタの有無 = 無し(重要リスク)**。ローカル chip チェックアウト
+(`~/repos/connectedhomeip`)は v1.1 系で `src/protocols/secure_channel/CheckinMessage.{h,cpp}` を
+**持たず**(check-in protocol 未実装、`StayActiveRequest` も TODO)、**upstream のテストベクタが
+取得できない**。そのため:
+- HKDF の info ラベル(`b"SimpleMatter ICD Check-In AES/HMAC Key"`)は**本プロジェクト固有の選択**で、
+  chip との**相互運用は保証しない**(upstream 実装確定後に info ラベル/鍵導出を要再確認)。
+- 正しさは「同一コードによる生成→復号ラウンドトリップ + counter 検証 + 改竄/誤鍵拒否」の
+  **自己テスト**(`icd::tests` 4 本)と、ホスト E2E(デバイス生成 → smctl 復号)で固定した。
+- ワイヤは非暗号 Secure Channel メッセージ(session_id=0、proto=0x0000、opcode=0x28)として
+  spec 準拠にフレーミングするが、check-in の宛先解決(通常は operational discovery)は loopback E2E の
+  制約(マルチキャスト禁止)のため `SM_ICD_CHECKIN_ADDR` によるユニキャスト固定に割り切った。
+
+### 6.3 ゲート 1(自動検査)
+
+- `cargo test --workspace --all-features`: **green**(simple-matter 562 / smctl 59。うち新規:
+  icd 19(既存 8 + 新規 11)/ icd_management 7(既存 3 + 新規 4))。
+- `cargo clippy --all-targets --all-features`: **0 warning**。
+- クロス: `thumbv6m-none-eabi` / `riscv32imc-unknown-none-elf` の `--all-features` /
+  `--no-default-features` すべて **green**。
+- **フットプリント増分**(Cortex-M4F、`flash-probe` / `ram-report`):
+  - flash `flash-probe` Total = **102,531 B(I1a と完全一致)**、`.text` 95,440。参照デバイスは
+    SIT `IcdManagementCluster` を使うため、**CIP/LITS のコード(登録テーブル・check-in・
+    CIP クラスタ)は `--gc-sections` で除去され非 ICD デバイスへの影響はゼロ**。
+  - RAM(`ram-report`)不変(SIT 参照デバイス、IcdManagement=12B のまま)。
+  - controller-probe Total = 87,075 B(`engine.rs` の `icd_registry()` 呼び出し 2 箇所の追加。
+    default None のためデバイス側は不変)。
+
+### 6.4 ゲート 2(ホスト E2E、loopback ユニキャストのみ、実測ログ)
+
+`SM_ICD=lit SM_NO_MDNS=1 SM_MATTER_PORT=15540 SM_ICD_IDLE_S=3 SM_ICD_ACTIVE_MS=1000
+SM_ICD_THRESHOLD_MS=500 SM_ICD_CHECKIN_ADDR=[::1]:15541` の LIT onoff-light に対し、
+`smctl --state-dir ... --timeout 30`(ユニキャスト `pairing address ::1 15540` + キャッシュ
+アドレス CASE、mDNS 一切なし)で全項目 **PASS**:
+
+- **pairing = PASS**: `commissioning COMPLETE. operational CASE session = 0x2`。
+- **RegisterClient = PASS**: `icd-management register-client 5 5 <key> 1 0` → `cmd 0x00 OK`。
+- **属性 = PASS**: `icd-counter=0`(登録直後)、`operating-mode=1`(**LIT**)、
+  `clients-supported-per-fabric=2`。
+- **check-in 配送/復号/counter = PASS**: `smctl icd checkin-listen 5 <key> 15541 12` が
+  `check-in #1..4 ICDCounter=1..4`(単調増加)を復号・検証。デバイス側ログ
+  `[icd] check-in sent (ICDCounter=1..5) to [::1]:15541`。
+- **StayActiveRequest = PASS**: `cmd 0x03 OK` → 直後の `onoff read on-off 1 1` = `false`(active 窓内で read 成立)。
+- **リブート(プロセス再起動)= PASS**: 再起動後 `[kvs] restored 1 ICD registration(s); ICDCounter=5`
+  (登録テーブル + counter 復元)。再起動後の check-in は `ICDCounter=6,7,8` と**単調継続**
+  (再起動を跨いで後退なし)。
+- **UnregisterClient = PASS**: `cmd 0x02 OK`。以降 `icd checkin-listen` は
+  `no valid check-in received within the listen window` = **check-in 停止**を確認。
+- パニック/エラー: デバイスログ 0 件。
+
+### 6.5 ゲート 3(chip-tool 相互)
+
+**未実施(意図的な保留)。** I1a と同じ理由(chip-tool のマルチキャスト mDNS ブラウズが稼働中の
+Thread ソークの otbr-agent を落とす実績、thread-port.md T2)。加えて check-in protocol は
+ローカル chip(v1.1)に未実装のため、chip-tool 側の check-in 受信検証もこのチェックアウトでは
+不可能。`icdmanagement read` 系のユニキャスト検証は次のメンテ窓へ回す(相当の検証は smctl パスで
+全て green)。
+
+### 6.6 発見した問題 / 割り切り
+
+- **check-in テストベクタ不在**(§6.2、最重要)。info ラベル・鍵導出は自己選択、chip 相互運用は未保証。
+- **check-in 宛先解決**: 通常は operational discovery(mDNS)だが、loopback E2E のマルチキャスト
+  禁止制約のため `SM_ICD_CHECKIN_ADDR` によるユニキャスト固定に割り切った(実機 Thread では
+  SRP/mDNS 解決が必要 = I1b/後続)。
+- **ICDCounter の初期値 0**: chip は factory reset 跨ぎの replay 対策で乱数起点にするが、本実装は
+  決定的に 0 起点 + KVS 保存(bump ごとに generation 増 → app が保存)で再起動後の単調性を担保。
+- **RemoveFabric 連動**: `DataModel::icd_registry()`(default None)+ engine の 2 箇所で
+  `remove_fabric` を呼ぶ最小コア変更。ACL の `acl()` と対称。
+- **SIT 最小クラスタ温存**: I1a の `IcdManagementCluster`(FeatureMap=0)は無改造で残し、CIP/LITS は
+  別クラスタ `IcdManagementCipCluster` として追加。bloat-check 参照デバイスは前者を使うため
+  I1a のフットプリント基準を保つ。

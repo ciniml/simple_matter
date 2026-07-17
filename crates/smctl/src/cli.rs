@@ -196,6 +196,14 @@ pub enum Cmd {
     Batch {
         source: String,
     },
+    /// ICD check-in リスナ(`icd checkin-listen <check-in-node> <key-hex> [--port N] [--secs S]`)。
+    /// 登録した check-in 鍵で受信 check-in を復号し ICDCounter を検証する(icd.md §I1c)。
+    IcdCheckinListen {
+        check_in_node: u64,
+        key: [u8; 16],
+        port: u16,
+        secs: f64,
+    },
 }
 
 /// 既定タイムアウト(コミッショニング + 運用往復)。
@@ -339,6 +347,7 @@ pub fn parse(args: &[String], base: &Globals) -> Result<(Globals, Cmd), String> 
                 source: source.to_string(),
             }
         }
+        "icd" => parse_icd(&pos[1..])?,
         name => match clusters::by_name(name) {
             Some(def) => parse_cluster(def, &pos[1..])?,
             None => {
@@ -377,6 +386,12 @@ pub fn dispatch(g: &Globals, cmd: Cmd) -> Result<(), String> {
         }
         Cmd::DiscoverOperational { node } => crate::ops::discover_operational(g, node),
         Cmd::Batch { source } => crate::batch::run(g, &source),
+        Cmd::IcdCheckinListen {
+            check_in_node,
+            key,
+            port,
+            secs,
+        } => crate::ops::icd_checkin_listen(g, check_in_node, key, port, secs),
         Cmd::Wait { .. } => Err("`wait` is a batch built-in (use it inside `smctl batch`)".into()),
         #[cfg(feature = "ble")]
         Cmd::PairBle {
@@ -632,6 +647,55 @@ fn parse_discover(g: &Globals, args: &[String]) -> Result<Cmd, String> {
             Err("usage: smctl discover <commissionable|operational> ... (see `smctl help`)".into())
         }
     }
+}
+
+/// `icd checkin-listen <check-in-node> <key-hex> [--port N] [--secs S]`。
+fn parse_icd(args: &[String]) -> Result<Cmd, String> {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    match sub {
+        "checkin-listen" => {
+            // 位置引数: <check-in-node> <key-hex> [<port>] [<secs>](グローバル `--` 解析に
+            // 奪われないよう位置引数にする)。
+            let rest = &args[1..];
+            if rest.len() < 2 || rest.len() > 4 {
+                return Err(
+                    "usage: smctl icd checkin-listen <check-in-node> <key-hex> [port] [secs]".into(),
+                );
+            }
+            let node = parse_u64(&rest[0])?;
+            let key = parse_key16(&rest[1])?;
+            let port: u16 = match rest.get(2) {
+                Some(p) => p.parse().map_err(|_| format!("invalid port: {p:?}"))?,
+                None => 15541,
+            };
+            let secs: f64 = match rest.get(3) {
+                Some(s) => s.parse().map_err(|_| format!("invalid secs: {s:?}"))?,
+                None => 15.0,
+            };
+            Ok(Cmd::IcdCheckinListen {
+                check_in_node: node,
+                key,
+                port,
+                secs,
+            })
+        }
+        _ => Err(
+            "usage: smctl icd checkin-listen <check-in-node> <key-hex> [port] [secs]".into(),
+        ),
+    }
+}
+
+/// 32 桁の hex を 16 バイト鍵へデコードする。
+fn parse_key16(s: &str) -> Result<[u8; 16], String> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.len() != 32 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("key must be 32 hex chars (16 bytes), got {:?}", s));
+    }
+    let mut out = [0u8; 16];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|_| "invalid key hex")?;
+    }
+    Ok(out)
 }
 
 fn parse_passcode(s: &str) -> Result<u32, String> {
