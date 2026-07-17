@@ -23,6 +23,7 @@ pub mod general_commissioning;
 pub mod general_diagnostics;
 pub mod group_key_management;
 pub mod groups;
+pub mod icd_management;
 pub mod identify;
 pub mod illuminance_measurement;
 pub mod level_control;
@@ -195,6 +196,7 @@ pub static CLUSTERS: &[&ClusterDef] = &[
     &operational_credentials::DEF,       // 0x003E
     &group_key_management::DEF,          // 0x003F
     &boolean_state::DEF,                 // 0x0045
+    &icd_management::DEF,                // 0x0046
     &air_quality::DEF,                   // 0x005B
     &door_lock::DEF,                     // 0x0101
     &window_covering::DEF,               // 0x0102

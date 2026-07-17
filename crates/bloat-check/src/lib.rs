@@ -21,7 +21,7 @@ use simple_matter::crypto::Rng;
 use simple_matter::discovery::MdnsResponder;
 use simple_matter::dm::clusters::{
     BasicInfoConfig, BasicInformationCluster, DescriptorCluster, GeneralCommissioning,
-    NetworkCommissioning, OnOffCluster, OpCredsCluster, TestDacProvider,
+    IcdManagementCluster, NetworkCommissioning, OnOffCluster, OpCredsCluster, TestDacProvider,
 };
 use simple_matter::dm::meta::{ClusterId, DeviceType, EndpointId, EndpointMeta};
 use simple_matter::dm::{DataModel, ServerCluster};
@@ -91,6 +91,7 @@ static EP0_SERVERS: &[ClusterId] = &[
     ClusterId(0x0030),
     ClusterId(0x0031),
     ClusterId(0x003E),
+    ClusterId(0x0046),
     ClusterId(0x001D),
 ];
 static EP1_SERVERS: &[ClusterId] = &[ClusterId(0x0006), ClusterId(0x001D)];
@@ -109,6 +110,8 @@ pub struct Light<'s, const NF: usize> {
     pub net: NetworkCommissioning,
     /// Operational Credentials クラスタ(共有 fabric テーブル参照)。
     pub opcreds: OpCreds<'s, NF>,
+    /// ICD Management クラスタ(SIT 最小)。
+    pub icd: IcdManagementCluster,
     /// EP0 の Descriptor クラスタ。
     pub desc0: DescriptorCluster,
     /// EP1 の On/Off クラスタ。
@@ -140,6 +143,7 @@ impl<const NF: usize> DataModel for Light<'_, NF> {
             (0, 0x0030) => Some(&self.gc),
             (0, 0x0031) => Some(&self.net),
             (0, 0x003E) => Some(&self.opcreds),
+            (0, 0x0046) => Some(&self.icd),
             (0, 0x001D) => Some(&self.desc0),
             (1, 0x0006) => Some(&self.onoff),
             (1, 0x001D) => Some(&self.desc1),
@@ -152,6 +156,7 @@ impl<const NF: usize> DataModel for Light<'_, NF> {
             (0, 0x0030) => Some(&mut self.gc),
             (0, 0x0031) => Some(&mut self.net),
             (0, 0x003E) => Some(&mut self.opcreds),
+            (0, 0x0046) => Some(&mut self.icd),
             (0, 0x001D) => Some(&mut self.desc0),
             (1, 0x0006) => Some(&mut self.onoff),
             (1, 0x001D) => Some(&mut self.desc1),
@@ -192,6 +197,7 @@ pub fn build_light<const NF: usize>(fabrics: &RefCell<FabricTable<Backend, NF>>)
         gc: GeneralCommissioning::default_config(),
         net: NetworkCommissioning::new(b"eth0"),
         opcreds: OpCredsCluster::new_shared(fabrics, RustCrypto::new(DemoRng::new(2)), dac),
+        icd: IcdManagementCluster::new(),
         desc0: DescriptorCluster::new(EndpointId(0), EP0_DT, EP0_SERVERS, &[], EP0_PARTS),
         onoff: OnOffCluster::new(),
         desc1: DescriptorCluster::new(EndpointId(1), EP1_DT, EP1_SERVERS, &[], EP1_PARTS),
@@ -233,7 +239,7 @@ pub enum Kind {
     External,
 }
 
-const N_ROWS: usize = 18;
+const N_ROWS: usize = 19;
 
 /// 指定プロファイル(const generic のサイジング)についてコンポーネント別 `size_of` を集める。
 ///
@@ -348,6 +354,11 @@ pub fn component_sizes<
         Row {
             name: "    OpCreds",
             bytes: size_of::<OpCreds<'static, NF>>(),
+            kind: Kind::Nested,
+        },
+        Row {
+            name: "    IcdManagement",
+            bytes: size_of::<IcdManagementCluster>(),
             kind: Kind::Nested,
         },
         Row {

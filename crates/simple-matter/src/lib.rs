@@ -31,6 +31,7 @@ pub mod error;
 pub mod exchange;
 pub mod fabric;
 pub mod groups;
+pub mod icd;
 pub mod im;
 pub mod kvs;
 pub mod sc;

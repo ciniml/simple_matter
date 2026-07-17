@@ -35,14 +35,15 @@ use simple_matter::discovery::{
 use simple_matter::dm::clusters::{
     AccessControlCluster, AdminCommissioningCluster, BasicInfoConfig, BasicInformationCluster,
     CommissioningWindow, DescriptorCluster, GeneralCommissioning, GroupKeyManagementCluster,
-    GroupsCluster, IdentifyCluster, NetworkCommissioning, OnOffCluster, OpCredsCluster,
-    TestDacProvider, WindowEvent,
+    GroupsCluster, IcdManagementCluster, IdentifyCluster, NetworkCommissioning, OnOffCluster,
+    OpCredsCluster, TestDacProvider, WindowEvent,
 };
 use simple_matter::dm::meta::{ClusterId, DeviceType, EndpointId, EndpointMeta, EventId};
 use simple_matter::dm::{tick_clusters, DataModel, ServerCluster};
 use simple_matter::error::{Error, Result as SmResult};
 use simple_matter::fabric::FabricTable;
 use simple_matter::groups::{group_multicast_addr, DefaultGroupStore};
+use simple_matter::icd::{IcdConfig, IcdState};
 use simple_matter::im::engine::InteractionModel;
 use simple_matter::im::events::PRIORITY_INFO;
 use simple_matter::kvs::Kvs;
@@ -185,6 +186,7 @@ static EP0_SERVERS: &[ClusterId] = &[
     ClusterId(0x003C),
     ClusterId(0x003E),
     ClusterId(0x003F),
+    ClusterId(0x0046), // ICD Management(SIT 最小)
     ClusterId(0x001D),
 ];
 static EP1_SERVERS: &[ClusterId] = &[
@@ -207,6 +209,7 @@ struct Light<'s> {
     admin: AdminCommissioningCluster<'s>,
     opcreds: OpCreds<'s>,
     gkm: GroupKeyManagementCluster<'s, Backend, NF, 6, 8, 8>,
+    icd: IcdManagementCluster,
     desc0: DescriptorCluster,
     identify: IdentifyCluster,
     groups_cl: GroupsCluster<'s, 6, 8, 8>,
@@ -242,6 +245,7 @@ impl DataModel for Light<'_> {
             (0, 0x003C) => Some(&self.admin),
             (0, 0x003E) => Some(&self.opcreds),
             (0, 0x003F) => Some(&self.gkm),
+            (0, 0x0046) => Some(&self.icd),
             (0, 0x001D) => Some(&self.desc0),
             (1, 0x0003) => Some(&self.identify),
             (1, 0x0004) => Some(&self.groups_cl),
@@ -259,6 +263,7 @@ impl DataModel for Light<'_> {
             (0, 0x003C) => Some(&mut self.admin),
             (0, 0x003E) => Some(&mut self.opcreds),
             (0, 0x003F) => Some(&mut self.gkm),
+            (0, 0x0046) => Some(&mut self.icd),
             (0, 0x001D) => Some(&mut self.desc0),
             (1, 0x0003) => Some(&mut self.identify),
             (1, 0x0004) => Some(&mut self.groups_cl),
@@ -340,6 +345,7 @@ fn build_light<'s>(
             fabrics,
             RustCrypto::new(DemoRng::from_time()),
         ),
+        icd: IcdManagementCluster::with_config(icd_config()),
         desc0: DescriptorCluster::new(EndpointId(0), EP0_DT, EP0_SERVERS, &[], EP0_PARTS),
         // 識別中/終了を println で通知する。
         identify: IdentifyCluster::new().with_listener(|on| {
@@ -446,10 +452,32 @@ fn main() -> std::io::Result<()> {
     let mac = MDNS_INSTANCE_ID.to_be_bytes(); // 下位 6 バイトをホスト名(MAC 相当)に使う
     let host = Host::from_mac(&mac[2..8], local_ipv6.map(|(ip, _)| ip), Some(local_ipv4));
     let mut mdns: MdnsResponder<NF> = MdnsResponder::new(host, matter_port());
+    // ICD(SIT)モード: SM_ICD 設定時、SII/SAI を ICD パラメータから導出して広告し、
+    // idle 期間はソケット受信を止める「擬似 sleep」を行う(docs/design/icd.md §4)。
+    let icd_enabled = std::env::var_os("SM_ICD").is_some();
+    let icd_cfg = icd_config();
+    let mut icd = IcdState::new(icd_cfg);
+    if icd_enabled {
+        println!(
+            "[icd] SIT ICD mode ENABLED: IdleModeDuration={}s ActiveModeDuration={}ms ActiveModeThreshold={}ms",
+            icd_cfg.idle_mode_duration_s,
+            icd_cfg.active_mode_duration_ms,
+            icd_cfg.active_mode_threshold_ms
+        );
+    }
     // VPN 運用ガイド(matter-over-vpn.md V2): SM_MDNS_SII_MS / SM_MDNS_SAI_MS を
     // TXT の SII/SAI として広告する。DERP リレー経由等で RTT が伸びる環境では
     // SAI を大きめ(≥500ms 目安)に広告すると MRP の偽再送を抑えられる。
-    let (sii_ms, sai_ms) = mdns_intervals();
+    // ICD モードでは ICD パラメータ由来の SII/SAI を優先する(明示 env 上書きが無い限り)。
+    let (sii_ms, sai_ms) = if icd_enabled {
+        let (s, a) = mdns_intervals();
+        (
+            Some(s.unwrap_or(icd_cfg.advertised_sii_ms())),
+            Some(a.unwrap_or(icd_cfg.advertised_sai_ms())),
+        )
+    } else {
+        mdns_intervals()
+    };
     if sii_ms.is_some() || sai_ms.is_some() {
         println!("  mDNS TXT SII/SAI advertised: SII={sii_ms:?}ms SAI={sai_ms:?}ms");
     }
@@ -486,9 +514,25 @@ fn main() -> std::io::Result<()> {
         mdns.set_operational(ops);
         println!("[kvs] advertising operational for {restored_fabric_count} restored fabric(s)");
     }
-    let mdns_socket = open_mdns_socket();
+    // SM_NO_MDNS: マルチキャスト mDNS を一切開かない(ユニキャスト UDP のみ)。
+    // ホスト E2E を loopback に閉じ、稼働中の Thread ソーク(wpan0/avahi/otbr)へ
+    // マルチキャストを漏らさないための安全弁。`smctl pairing address` + キャッシュ
+    // アドレス運用と組み合わせて完全 loopback E2E にできる。
+    let mdns_disabled = std::env::var_os("SM_NO_MDNS").is_some();
+    if mdns_disabled {
+        println!("  (SM_NO_MDNS set: multicast mDNS disabled; unicast UDP only)");
+    }
+    let mdns_socket = if mdns_disabled {
+        None
+    } else {
+        open_mdns_socket()
+    };
     // IPv6(ff02::fb)側の mDNS ソケット(リンクローカルが取れたときのみ)。
-    let mdns_socket_v6 = local_ipv6.and_then(|(_, scope)| open_mdns_socket_v6(scope));
+    let mdns_socket_v6 = if mdns_disabled {
+        None
+    } else {
+        local_ipv6.and_then(|(_, scope)| open_mdns_socket_v6(scope))
+    };
     // v6 マルチキャスト応答/announce の宛先([ff02::fb%scope]:5353)。
     let mdns_v6_dst: Option<SocketAddr> = local_ipv6
         .map(|(_, scope)| SocketAddr::V6(SocketAddrV6::new(MDNS_IPV6, MDNS_PORT, 0, scope)));
@@ -532,11 +576,44 @@ fn main() -> std::io::Result<()> {
     // KVS 復元済みの group メンバーシップに対する起動時 join。
     sync_group_joins(&socket, &groups, &fabrics, &mut joined_groups, local_ipv6);
 
+    // ICD の擬似 sleep 用状態。active/idle 遷移ログと「idle 中の周期ポーリング」。
+    // SED は idle 中も IdleModeDuration ごとに無線を短時間 on にして親をポーリングするので、
+    // それを模す: 予定時刻 `icd_next_poll_ms` に達したら `icd_listen_until_ms` までの
+    // 短い listen 窓だけ受信する(idle 中の toggle は次のポーリングか MRP 再送で拾う)。
+    // ただし**未コミッショニング中は常時 radio on**(仕様上 ICD はコミッショニング中は
+    // Active Mode を維持する)。
+    /// idle ポーリング時の listen 窓(ミリ秒)。MRP 再送を確実に拾える長さにする。
+    const ICD_LISTEN_MS: u64 = 600;
+    let mut icd_was_active = false;
+    let mut icd_next_poll_ms: u64 = 0;
+    let mut icd_listen_until_ms: u64 = 0;
+
     loop {
-        // 1) Matter UDP の受信処理。
-        match socket.recv_from(&mut rx) {
+        let loop_now = now_ms(&start);
+        // sleepy 動作はコミッショニング済み(fabric 保有)かつ SM_ICD 時のみ。
+        let icd_sleepy = icd_enabled && !fabrics.borrow().is_empty();
+        // idle 中で予定ポーリング時刻に達したら listen 窓を開く(次回ポーリングも予約)。
+        if icd_sleepy && !icd.is_active(loop_now) && loop_now >= icd_next_poll_ms {
+            icd_listen_until_ms = loop_now.saturating_add(ICD_LISTEN_MS);
+            icd_next_poll_ms =
+                loop_now.saturating_add(u64::from(icd_cfg.idle_mode_duration_s) * 1000);
+        }
+        // radio を on にする条件: sleepy でない / active / listen 窓の中。
+        let radio_on = !icd_sleepy || icd.is_active(loop_now) || loop_now < icd_listen_until_ms;
+
+        // 1) Matter UDP の受信処理(radio が on のときのみ)。
+        let recv_result = if radio_on {
+            socket.recv_from(&mut rx)
+        } else {
+            Err(std::io::Error::from(ErrorKind::WouldBlock))
+        };
+        match recv_result {
             Ok((n, src)) => {
                 let now = now_ms(&start);
+                // 受信は ICD の「通信」= active モード延長のトリガ。
+                if icd_enabled {
+                    icd.notify_activity(now);
+                }
                 // MATTER_DEBUG=2: 受信 datagram の hex ダンプ(プロトコル調査用)。
                 let debug = std::env::var("MATTER_DEBUG").ok();
                 if debug.as_deref() == Some("2") {
@@ -561,6 +638,30 @@ fn main() -> std::io::Result<()> {
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
             Err(e) => return Err(e),
+        }
+
+        // 1b) ICD の active/idle 遷移をログに出す(観察用)。sleepy(コミッショニング済み)
+        //     のときだけ「sleep に入る」表現にする。
+        if icd_enabled {
+            let now = now_ms(&start);
+            let active = icd.is_active(now);
+            if active != icd_was_active {
+                icd_was_active = active;
+                let sleepy = !fabrics.borrow().is_empty();
+                if active {
+                    println!("[icd] -> ACTIVE (radio on)");
+                } else if sleepy {
+                    // 次の周期ポーリング時刻を予約して sleep。
+                    icd_next_poll_ms =
+                        now.saturating_add(u64::from(icd_cfg.idle_mode_duration_s) * 1000);
+                    println!(
+                        "[icd] -> IDLE (radio off; next poll in ~{}s)",
+                        icd_cfg.idle_mode_duration_s
+                    );
+                } else {
+                    println!("[icd] -> IDLE (radio stays on until commissioned)");
+                }
+            }
         }
 
         // 2) 時間駆動の送出(MRP 再送・standalone ACK・購読レポート)を排出する。
@@ -792,6 +893,28 @@ fn open_mdns_socket() -> Option<UdpSocket> {
 fn mdns_intervals() -> (Option<u32>, Option<u32>) {
     let read = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u32>().ok());
     (read("SM_MDNS_SII_MS"), read("SM_MDNS_SAI_MS"))
+}
+
+/// ICD Management クラスタの設定を環境変数から読む(未設定は SIT デフォルト)。
+///
+/// `SM_ICD_IDLE_S`(秒)/ `SM_ICD_ACTIVE_MS` / `SM_ICD_THRESHOLD_MS`。ホスト E2E で
+/// idle/active の窓を調整して観察するためのフック。値が仕様レンジ外なら SIT デフォルトへ戻す。
+fn icd_config() -> IcdConfig {
+    let read = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u32>().ok());
+    let base = IcdConfig::sit_default();
+    let cfg = IcdConfig {
+        idle_mode_duration_s: read("SM_ICD_IDLE_S").unwrap_or(base.idle_mode_duration_s),
+        active_mode_duration_ms: read("SM_ICD_ACTIVE_MS").unwrap_or(base.active_mode_duration_ms),
+        active_mode_threshold_ms: read("SM_ICD_THRESHOLD_MS")
+            .map(|v| v.min(u16::MAX as u32) as u16)
+            .unwrap_or(base.active_mode_threshold_ms),
+    };
+    if cfg.validate().is_err() {
+        eprintln!("[icd] configured values out of spec range; falling back to SIT default");
+        base
+    } else {
+        cfg
+    }
 }
 
 /// ローカルの IPv4 アドレスを推定する(外部宛 UDP ソケットの `local_addr` から)。
