@@ -103,12 +103,30 @@ pub struct EspKvs {
 impl EspKvs {
     /// `nvs` 領域を使う KVS を作る(FLASH ペリフェラルを占有する)。
     pub fn new(flash: FLASH<'static>) -> Self {
-        let storage = AsyncFlash(FlashStorage::new(flash));
+        Self::from_flash(FlashStorage::new(flash))
+    }
+
+    /// 既存の [`FlashStorage`] から KVS を作る(工場データを先に読んでから同じ flash を
+    /// KVS へ引き継ぐ用途。`factory-data` 経路が使う)。
+    pub fn from_flash(flash: FlashStorage<'static>) -> Self {
+        let storage = AsyncFlash(flash);
         Self {
             map: MapStorage::new(storage, MapConfig::new(NVS_START..NVS_END), NoCache::new()),
             buf: [0u8; DATA_BUF_LEN],
         }
     }
+}
+
+/// 指定オフセットの flash 領域を `buf` に読み出す(工場データパーティションの読み取り用)。
+///
+/// `docs/design/factory-data.md` §5.2。`buf` 全体を満たす(パーティション先頭から
+/// `buf.len()` バイト)。ESP-IDF NVS 形式の平文パーティションを想定する。
+pub fn read_flash_region(
+    flash: &mut FlashStorage<'static>,
+    offset: u32,
+    buf: &mut [u8],
+) -> core::result::Result<(), <FlashStorage<'static> as BlockingErrorType>::Error> {
+    BlockingReadNorFlash::read(flash, offset, buf)
 }
 
 /// 短いバイト列キー(≤ 7 バイト)を「長さタグ付き u64」へパックする。

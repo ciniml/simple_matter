@@ -60,7 +60,10 @@ pub use network_commissioning::{
 };
 pub use occupancy_sensing::OccupancySensingCluster;
 pub use on_off::OnOffCluster;
-pub use operational_credentials::{DacProvider, OpCredsCluster, TestDacProvider};
+pub use operational_credentials::{
+    BorrowedDacProvider, DacProvider, DacSigner, FnDacSigner, KeypairDacSigner, OpCredsCluster,
+    TestDacProvider,
+};
 pub use switch::{LatchingSwitchCluster, SwitchCluster, SwitchEvent};
 pub use thermostat::ThermostatCluster;
 pub use window_covering::WindowCoveringCluster;

@@ -39,6 +39,25 @@ menu "simple-matter onoff_light example"
             OnOff 状態を反映する LED の GPIO 番号。既定は M5 NanoC6 の GPIO7
             (ESP32-S3 は DevKitC の RGB LED = GPIO48)。
 
+    config SM_FACTORY_DATA
+        bool "Use factory data partition (esp-matter-mfg-tool compatible)"
+        default n
+        help
+            esp-matter-mfg-tool 生成の factory NVS パーティション(chip-factory
+            namespace)から DAC/PAI/DAC 鍵・SPAKE2+ verifier・discriminator・VID/PID を
+            読み、sm_config_t に供給する(docs/design/factory-data.md §5)。
+            パーティションラベルは SM_FACTORY_PARTITION。パーティション未 flash /
+            読み取り失敗時は開発用の dev 定数にフォールバックする(後方互換)。
+            CD(cert-dclrn)が factory に無い場合は埋め込み dev CD を使う。
+
+    config SM_FACTORY_PARTITION
+        string "Factory data partition label"
+        default "nvs_factory"
+        depends on SM_FACTORY_DATA
+        help
+            factory データ NVS パーティションのラベル(partitions.csv のエントリ名)。
+            esp-matter-mfg-tool 生成の *-partition.bin をこのパーティションに flash する。
+
     config SM_ENABLE_BLE
         bool "Enable BLE (NimBLE) commissioning"
         default y if IDF_TARGET_ESP32C6

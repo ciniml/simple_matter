@@ -814,3 +814,123 @@ impl<C: Crypto> DacProvider for TestDacProvider<C> {
         self.dac_keypair.sign(msg, out)
     }
 }
+
+/// DAC 秘密鍵での ECDSA-SHA256 署名を抽象化する(§11.17)。
+///
+/// [`BorrowedDacProvider`] の署名バックエンドの口。工場データの生秘密鍵(32 バイト)を
+/// 鍵ペアに復元する [`KeypairDacSigner`] のほか、秘密鍵をエクスポートできないハードウェア
+/// セキュアエレメント(署名だけを委譲する)を実装できるよう、鍵ペアそのものではなく
+/// 「msg に署名する」操作だけを要求する。
+pub trait DacSigner {
+    /// DAC 秘密鍵で `msg` に ECDSA-SHA256 署名し、生 `r||s`(64 バイト)を `out` に書く。
+    fn sign_with_dac(
+        &self,
+        msg: &[u8],
+        out: &mut [u8; P256_SIGNATURE_LEN],
+    ) -> crate::error::Result<()>;
+}
+
+/// [`P256Keypair`] を [`DacSigner`] として使うラッパ。
+///
+/// 生の DAC 秘密鍵 32 バイトを [`Crypto::p256_keypair_from_bytes`] で復元して包む
+/// ([`BorrowedDacProvider::from_raw_key`] が生成する)。
+pub struct KeypairDacSigner<K: P256Keypair>(pub K);
+
+impl<K: P256Keypair> DacSigner for KeypairDacSigner<K> {
+    fn sign_with_dac(
+        &self,
+        msg: &[u8],
+        out: &mut [u8; P256_SIGNATURE_LEN],
+    ) -> crate::error::Result<()> {
+        self.0.sign(msg, out)
+    }
+}
+
+/// クロージャ / 関数ポインタを [`DacSigner`] として使う。
+///
+/// セキュアエレメントや C FFI の署名コールバックを包むための汎用アダプタ。
+pub struct FnDacSigner<F>(pub F)
+where
+    F: Fn(&[u8], &mut [u8; P256_SIGNATURE_LEN]) -> crate::error::Result<()>;
+
+impl<F> DacSigner for FnDacSigner<F>
+where
+    F: Fn(&[u8], &mut [u8; P256_SIGNATURE_LEN]) -> crate::error::Result<()>,
+{
+    fn sign_with_dac(
+        &self,
+        msg: &[u8],
+        out: &mut [u8; P256_SIGNATURE_LEN],
+    ) -> crate::error::Result<()> {
+        (self.0)(msg, out)
+    }
+}
+
+/// 借用 DER スライス + 署名バックエンドから構築する [`DacProvider`] 実装。
+///
+/// [`TestDacProvider`] と異なり証明書 DER / CD を**所有せず** `&'a [u8]` で借用する
+/// (工場データパーティションのフラッシュ内容やファイル読み込みバッファをそのまま指す
+/// ヒープレス運用向け)。DAC 秘密鍵は [`DacSigner`] に委譲するため、生秘密鍵
+/// ([`Self::from_raw_key`])・署名クロージャ([`FnDacSigner`])・セキュアエレメントの
+/// いずれにも対応する。VID/PID は DAC 証明書内に符号化されているため本型は保持しない
+/// (BasicInformation とは独立)。
+pub struct BorrowedDacProvider<'a, S: DacSigner> {
+    dac_der: &'a [u8],
+    pai_der: &'a [u8],
+    cd: &'a [u8],
+    signer: S,
+}
+
+impl<'a, S: DacSigner> BorrowedDacProvider<'a, S> {
+    /// 借用 DER スライスと任意の署名バックエンドから構築する。
+    ///
+    /// `dac_der` / `pai_der` は X.509 DER、`cd` は CMS(Certification Declaration)。
+    /// いずれも provider が生存する間有効でなければならない。
+    pub fn new(dac_der: &'a [u8], pai_der: &'a [u8], cd: &'a [u8], signer: S) -> Self {
+        Self {
+            dac_der,
+            pai_der,
+            cd,
+            signer,
+        }
+    }
+}
+
+impl<'a, K: P256Keypair> BorrowedDacProvider<'a, KeypairDacSigner<K>> {
+    /// 借用 DER スライスと生 DAC 秘密鍵(32 バイト BE スカラ)から構築する。
+    ///
+    /// `privkey` は crypto backend で鍵ペアに復元する。復元に失敗した場合(スカラが
+    /// 範囲外など)は `Err` を返す。
+    pub fn from_raw_key<C>(
+        crypto: &C,
+        dac_der: &'a [u8],
+        pai_der: &'a [u8],
+        cd: &'a [u8],
+        privkey: &[u8; crate::crypto::P256_SECRET_KEY_LEN],
+    ) -> crate::error::Result<Self>
+    where
+        C: Crypto<Keypair = K>,
+    {
+        let kp = crypto.p256_keypair_from_bytes(privkey)?;
+        Ok(Self::new(dac_der, pai_der, cd, KeypairDacSigner(kp)))
+    }
+}
+
+impl<'a, S: DacSigner> DacProvider for BorrowedDacProvider<'a, S> {
+    fn dac_der(&self) -> &[u8] {
+        self.dac_der
+    }
+    fn pai_der(&self) -> &[u8] {
+        self.pai_der
+    }
+    fn certification_declaration(&self) -> &[u8] {
+        self.cd
+    }
+    fn sign_with_dac(
+        &self,
+        msg: &[u8],
+        out: &mut [u8; P256_SIGNATURE_LEN],
+    ) -> crate::error::Result<()> {
+        self.signer.sign_with_dac(msg, out)
+    }
+}

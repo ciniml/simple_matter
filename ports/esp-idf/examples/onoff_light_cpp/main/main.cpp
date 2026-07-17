@@ -23,6 +23,7 @@
 #include "ot_thread.hpp"
 
 #include <cstring>
+#include <vector>
 
 #include "sdkconfig.h"
 
@@ -54,6 +55,13 @@ static const char *TAG = "onoff_cpp";
 #define SM_WIFI_PASS CONFIG_SM_WIFI_PASSWORD
 #define SM_LED_GPIO CONFIG_SM_LED_GPIO
 #define SM_NVS_NAMESPACE "smatter"
+
+// 工場出荷 factory データパーティションのラベル(未定義時は既定 "nvs_factory")。
+#ifdef CONFIG_SM_FACTORY_PARTITION
+#define SM_FACTORY_PARTITION CONFIG_SM_FACTORY_PARTITION
+#else
+#define SM_FACTORY_PARTITION "nvs_factory"
+#endif
 
 static constexpr uint16_t kMatterPort = 5540;
 static constexpr uint16_t kMdnsPort = 5353;
@@ -188,6 +196,128 @@ static bool load_thread_dataset(uint8_t *tlv, size_t *len) {
   return false;
 }
 #endif
+
+// ---- 工場出荷 factory データ(esp-matter-mfg-tool 互換) --------------------
+//
+// esp-matter-mfg-tool 生成の factory NVS パーティション(namespace "chip-factory")を
+// IDF 標準 nvs API で読み、sm_config_t に DAC/PAI/DAC 鍵・SPAKE2+ verifier・
+// discriminator・VID/PID を供給する(docs/design/factory-data.md §5)。
+//
+// - salt / verifier は **base64 文字列**(mfg-tool の格納形式)なのでデコードして生バイトに戻す。
+// - dac-cert / pai-cert / dac-key は blob。CD は factory に無いのが一般的なので、
+//   cfg.cd_der は NULL のままにして shim 側の埋め込み dev CD を使う。
+// - パーティション未 flash / 読み取り失敗時は false を返し、呼び出し側は dev 定数を使う。
+//
+// バッファ(out_* / dac/pai/key)は sm_init まで生存する呼び出し側所有。
+
+// 標準 base64 デコード(パディング対応)。out に書いた長さを返す。失敗時は -1。
+static int b64_decode(const char *in, size_t in_len, uint8_t *out, size_t out_cap) {
+  auto val = [](char c) -> int {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+  };
+  uint32_t acc = 0;
+  int nbits = 0;
+  size_t w = 0;
+  for (size_t i = 0; i < in_len; i++) {
+    char c = in[i];
+    if (c == '=' || c == '\0') break;
+    int v = val(c);
+    if (v < 0) return -1;
+    acc = (acc << 6) | (uint32_t)v;
+    nbits += 6;
+    if (nbits >= 8) {
+      nbits -= 8;
+      if (w >= out_cap) return -1;
+      out[w++] = (uint8_t)(acc >> nbits);
+    }
+  }
+  return (int)w;
+}
+
+struct FactoryBuffers {
+  std::vector<uint8_t> dac, pai, key;
+  uint8_t salt[32];
+  size_t salt_len = 0;
+  uint8_t w0l[97];
+};
+
+// factory パーティションから cfg を埋める。成功で true(cfg を上書き)。
+[[maybe_unused]] static bool try_load_factory(sm_config_t &cfg, FactoryBuffers &fb) {
+  const char *part = SM_FACTORY_PARTITION;
+  esp_err_t err = nvs_flash_init_partition(part);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "factory: partition '%s' not available (%s); using dev creds", part,
+             esp_err_to_name(err));
+    return false;
+  }
+  nvs_handle_t h;
+  if (nvs_open_from_partition(part, "chip-factory", NVS_READONLY, &h) != ESP_OK) {
+    ESP_LOGW(TAG, "factory: chip-factory namespace not found; using dev creds");
+    return false;
+  }
+
+  bool ok = true;
+  uint32_t u32 = 0;
+  // discriminator / iteration-count / vendor-id / product-id。
+  if (nvs_get_u32(h, "discriminator", &u32) == ESP_OK) cfg.discriminator = (uint16_t)(u32 & 0x0FFF);
+  uint32_t iters = 0;
+  if (nvs_get_u32(h, "iteration-count", &iters) != ESP_OK) ok = false;
+  if (nvs_get_u32(h, "vendor-id", &u32) == ESP_OK) cfg.vendor_id = (uint16_t)u32;
+  if (nvs_get_u32(h, "product-id", &u32) == ESP_OK) cfg.product_id = (uint16_t)u32;
+
+  // salt / verifier は base64 文字列。
+  char b64[256];
+  size_t bl = sizeof(b64);
+  if (nvs_get_str(h, "salt", b64, &bl) == ESP_OK) {
+    int n = b64_decode(b64, bl, fb.salt, sizeof(fb.salt));
+    if (n > 0) fb.salt_len = (size_t)n;
+    else ok = false;
+  } else ok = false;
+  bl = sizeof(b64);
+  if (nvs_get_str(h, "verifier", b64, &bl) == ESP_OK) {
+    int n = b64_decode(b64, bl, fb.w0l, sizeof(fb.w0l));
+    if (n != 97) ok = false;
+  } else ok = false;
+
+  // dac-cert / pai-cert / dac-key(blob)。
+  auto read_blob = [&](const char *key, std::vector<uint8_t> &dst) -> bool {
+    size_t n = 0;
+    if (nvs_get_blob(h, key, nullptr, &n) != ESP_OK || n == 0) return false;
+    dst.resize(n);
+    return nvs_get_blob(h, key, dst.data(), &n) == ESP_OK;
+  };
+  if (!read_blob("dac-cert", fb.dac)) ok = false;
+  if (!read_blob("pai-cert", fb.pai)) ok = false;
+  if (!read_blob("dac-key", fb.key) || fb.key.size() != 32) ok = false;
+  nvs_close(h);
+
+  if (!ok) {
+    ESP_LOGW(TAG, "factory: incomplete chip-factory data; using dev creds");
+    return false;
+  }
+
+  // cfg に供給(verifier + DAC。CD は shim の埋め込み dev CD を使う = cd_der NULL)。
+  cfg.verifier_iterations = iters;
+  cfg.verifier_salt = fb.salt;
+  cfg.verifier_salt_len = fb.salt_len;
+  cfg.verifier_w0_l = fb.w0l;
+  cfg.dac_der = fb.dac.data();
+  cfg.dac_der_len = fb.dac.size();
+  cfg.pai_der = fb.pai.data();
+  cfg.pai_der_len = fb.pai.size();
+  cfg.cd_der = nullptr;
+  cfg.cd_der_len = 0;
+  cfg.dac_privkey = fb.key.data();
+  ESP_LOGI(TAG, "factory: loaded VID=0x%04x PID=0x%04x discriminator=%u (DAC %u B, PAI %u B)",
+           cfg.vendor_id, cfg.product_id, cfg.discriminator, (unsigned)fb.dac.size(),
+           (unsigned)fb.pai.size());
+  return true;
+}
 
 // ---- sockaddr <-> sm_addr_t ------------------------------------------------
 
@@ -555,6 +685,19 @@ static void matter_task(void *) {
   cfg.network = SM_NET_THREAD;
 #else
   cfg.network = SM_NET_WIFI;
+#endif
+
+  // 工場出荷 factory データを有効化していれば、chip-factory パーティションから
+  // DAC/verifier 等を読んで上書きする(未 flash / 失敗時は上の dev 定数のまま)。
+  // buffers は sm_init まで生存させる(この関数スコープ)。
+  FactoryBuffers fb;
+  (void)fb;
+#if CONFIG_SM_FACTORY_DATA
+  if (try_load_factory(cfg, fb)) {
+    ESP_LOGI(TAG, "using factory data credentials");
+  } else {
+    ESP_LOGI(TAG, "using dev credentials (no factory data)");
+  }
 #endif
 
   // カスタムクラスタ(EP2)は sm_init より前に登録する(F4b、§8)。

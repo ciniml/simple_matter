@@ -110,6 +110,12 @@ typedef int32_t (*SmKvsDelete)(void *ctx, const char *key);
 // RNG コールバック(esp_fill_random 等)。
 typedef void (*SmRngFill)(void *ctx, uint8_t *buf, size_t len);
 
+// DAC 秘密鍵署名コールバック(セキュアエレメント委譲用)。
+//
+// `msg`(`msg_len` バイト)に ECDSA-SHA256 署名し、生 `r||s`(64 バイト)を `out` に書く。
+// 0 = 成功、負値 = 失敗。`sm_config_t::dac_privkey` の代わりに使う。
+typedef int32_t (*SmDacSign)(void *ctx, const uint8_t *msg, size_t msg_len, uint8_t *out);
+
 // 初期化設定(`docs/design/c-ffi-shim.md` §1)。
 typedef struct {
   // discriminator(12 ビット)。
@@ -154,6 +160,26 @@ typedef struct {
   // **推奨: 製品はここに verifier を渡し、passcode をデバイスに置かない**
   // (`smctl pase-verifier <passcode>` で生成)。
   const uint8_t *verifier_w0_l;
+  // DAC 証明書(X.509 DER)。`pai_der` / `cd_der` と、`dac_privkey` または
+  // `dac_sign` のいずれかが揃ったときに [`BorrowedDacProvider`] を使う。
+  // いずれかが欠ければ従来の dev テスト DAC(`TestDacProvider`)にフォールバック。
+  const uint8_t *dac_der;
+  // `dac_der` の長さ(バイト、≤ 1024)。
+  size_t dac_der_len;
+  // PAI 証明書(X.509 DER)。
+  const uint8_t *pai_der;
+  // `pai_der` の長さ(バイト、≤ 1024)。
+  size_t pai_der_len;
+  // Certification Declaration(CMS DER)。
+  const uint8_t *cd_der;
+  // `cd_der` の長さ(バイト、≤ 1024)。
+  size_t cd_der_len;
+  // DAC 生秘密鍵(P-256 スカラ 32 バイト、ビッグエンディアン)。NULL なら `dac_sign` を使う。
+  const uint8_t *dac_privkey;
+  // DAC 署名コールバック(セキュアエレメント委譲)。`dac_privkey` が NULL のとき使う。
+  SmDacSign dac_sign;
+  // `dac_sign` の ctx。
+  void *dac_sign_ctx;
 } sm_config_t;
 
 // v4/v6 両対応の datagram 宛先/送信元。

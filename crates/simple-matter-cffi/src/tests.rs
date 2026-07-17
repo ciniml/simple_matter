@@ -96,6 +96,16 @@ fn ffi_lifecycle_roundtrip() {
         verifier_salt: simple_matter::dev_pase::DEV_SALT.as_ptr(),
         verifier_salt_len: simple_matter::dev_pase::DEV_SALT.len(),
         verifier_w0_l: simple_matter::dev_pase::DEV_W0_L.as_ptr(),
+        // DAC 未指定 = dev テスト DAC(後方互換)。
+        dac_der: core::ptr::null(),
+        dac_der_len: 0,
+        pai_der: core::ptr::null(),
+        pai_der_len: 0,
+        cd_der: core::ptr::null(),
+        cd_der_len: 0,
+        dac_privkey: core::ptr::null(),
+        dac_sign: None,
+        dac_sign_ctx: core::ptr::null_mut(),
     };
     assert_eq!(sm_init(&cfg, 0), 0);
     // 二重初期化は拒否。

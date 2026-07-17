@@ -50,6 +50,11 @@ rustcrypto = [
 # 依存クレート追加なし・default 無効。デバイス(responder)専用ビルドのフットプリントに
 # 影響しない(docs/design/controller.md §2.3)。
 controller = []
+# 工場出荷データ(factory data)リーダ(src/factory/)を有効化する additive feature。
+# ESP-IDF NVS パーティション形式の読み取り専用パーサと FactoryData 変換ヘルパを追加する。
+# 依存クレート追加なし・default 無効。無効時はモジュールごとコンパイルされず、
+# 非 factory 構成のフットプリントに一切影響しない(docs/design/factory-data.md)。
+factory-data = []
 # BLE(BTP)トランスポートを有効化する additive feature。sans-IO no_std の BTP コア
 # (src/btp/)と PeerAddr::Ble variant を追加する。依存クレート追加なし・default 無効。
 # 無効時は PeerAddr が UDP のみ = MRP 挙動もフットプリントも既存と完全一致する

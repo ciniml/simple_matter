@@ -32,11 +32,34 @@
 #include <cstring>
 #include <ctime>
 #include <string>
+#include <vector>
 
 namespace {
 
-constexpr uint16_t kMatterPort = 5540;
-constexpr uint16_t kMdnsPort = 5353;
+// ファイル全体を読む(DAC/PAI/CD DER・DAC 生鍵の供給用)。失敗時は空。
+std::vector<uint8_t> read_file(const std::string &path) {
+  std::vector<uint8_t> buf;
+  FILE *f = fopen(path.c_str(), "rb");
+  if (!f) {
+    return buf;
+  }
+  fseek(f, 0, SEEK_END);
+  long n = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (n > 0) {
+    buf.resize(static_cast<size_t>(n));
+    if (fread(buf.data(), 1, buf.size(), f) != buf.size()) {
+      buf.clear();
+    }
+  }
+  fclose(f);
+  return buf;
+}
+
+// 既定は Matter 標準ポート。SM_CTEST_MATTER_PORT / SM_CTEST_MDNS_PORT で上書き可
+// (同一ホストで他デバイスと同居する開発時に衝突を避ける)。main 冒頭で env を反映。
+uint16_t kMatterPort = 5540;
+uint16_t kMdnsPort = 5353;
 
 bool g_verbose = false;
 std::string g_state_dir;
@@ -376,6 +399,12 @@ int main(int argc, char **argv) {
     fprintf(stderr, "error: --state-dir is required\n");
     return 2;
   }
+  if (const char *p = getenv("SM_CTEST_MATTER_PORT")) {
+    kMatterPort = static_cast<uint16_t>(atoi(p));
+  }
+  if (const char *p = getenv("SM_CTEST_MDNS_PORT")) {
+    kMdnsPort = static_cast<uint16_t>(atoi(p));
+  }
   mkdir(g_state_dir.c_str(), 0700);
 
   // 開発用 dev SPAKE2+ verifier(passcode 20202021 相当)。デバイスは passcode を保持せず
@@ -416,6 +445,38 @@ int main(int argc, char **argv) {
   cfg.kvs_ctx = nullptr;
   cfg.rng_fill = rng_fill;
   cfg.rng_ctx = nullptr;
+
+  // 工場出荷 DAC 供給(SM_FACTORY_DIR=<dir>: dac.der/pai.der/cd.der/dac_key.bin)。
+  // 指定時は BorrowedDacProvider 経由で mfg DAC を提供し、attestation を実検証させる。
+  // 未指定なら従来の dev テスト DAC(NULL のまま = 後方互換)。
+  // sm_init が DER/鍵を内部コピーするため、これらのバッファは sm_init まで生存すればよい。
+  std::vector<uint8_t> dac_der, pai_der, cd_der, dac_key;
+  const char *factory_dir = getenv("SM_FACTORY_DIR");
+  if (factory_dir && factory_dir[0]) {
+    std::string dir(factory_dir);
+    if (!dir.empty() && dir.back() == '/') {
+      dir.pop_back();
+    }
+    dac_der = read_file(dir + "/dac.der");
+    pai_der = read_file(dir + "/pai.der");
+    cd_der = read_file(dir + "/cd.der");
+    dac_key = read_file(dir + "/dac_key.bin");
+    if (dac_der.empty() || pai_der.empty() || cd_der.empty() || dac_key.size() != 32) {
+      fprintf(stderr,
+              "SM_FACTORY_DIR: need dac.der/pai.der/cd.der and 32-byte dac_key.bin in %s\n",
+              dir.c_str());
+      return 1;
+    }
+    cfg.dac_der = dac_der.data();
+    cfg.dac_der_len = dac_der.size();
+    cfg.pai_der = pai_der.data();
+    cfg.pai_der_len = pai_der.size();
+    cfg.cd_der = cd_der.data();
+    cfg.cd_der_len = cd_der.size();
+    cfg.dac_privkey = dac_key.data();
+    fprintf(stderr, "[factory] DAC from SM_FACTORY_DIR=%s (DAC %zu B, PAI %zu B, CD %zu B)\n",
+            dir.c_str(), dac_der.size(), pai_der.size(), cd_der.size());
+  }
 
   // カスタムクラスタは sm_init より前に登録する(F4b、§8)。
   register_custom();

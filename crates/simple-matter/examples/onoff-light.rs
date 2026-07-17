@@ -56,6 +56,9 @@ use simple_matter::sc::SecureChannel;
 
 #[path = "common/pase.rs"]
 mod common_pase;
+#[path = "common/factory.rs"]
+mod common_factory;
+use simple_matter::dm::clusters::{BorrowedDacProvider, DacProvider, KeypairDacSigner};
 use simple_matter::stack::{DefaultStack, MatterStack, SharedFabricCreds};
 use simple_matter::tlv::TlvTag;
 use simple_matter::transport::net::{PeerAddr, MAX_RX_PACKET_SIZE};
@@ -69,14 +72,20 @@ const NICD: usize = NF * ICD_CLIENTS_PER_FABRIC;
 /// コミッショニング discriminator(12 ビット)。chip-tool の既定テスト値。
 const DISCRIMINATOR: u16 = 3840;
 
-/// 実効 discriminator(`SM_DISCRIMINATOR` で上書き可)。同一ホストで複数の
-/// example デバイスを同居させるとき(esp32-controller.md K4 の 2 ノードハブ E2E)に
-/// ブラウズの照合が衝突しないようにする。
+/// 工場出荷データ由来の discriminator(`common_factory::load` が設定)。
+static FACTORY_DISCRIMINATOR: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+
+/// 実効 discriminator。優先順位: `SM_DISCRIMINATOR`(明示上書き) > 工場出荷データ >
+/// 既定 [`DISCRIMINATOR`]。同一ホストで複数の example デバイスを同居させるとき
+/// (esp32-controller.md K4 の 2 ノードハブ E2E)にブラウズの照合が衝突しないようにする。
 fn discriminator() -> u16 {
-    std::env::var("SM_DISCRIMINATOR")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DISCRIMINATOR)
+    if let Some(v) = std::env::var("SM_DISCRIMINATOR").ok().and_then(|v| v.parse().ok()) {
+        return v;
+    }
+    if let Some(&d) = FACTORY_DISCRIMINATOR.get() {
+        return d;
+    }
+    DISCRIMINATOR
 }
 
 /// 実効 Matter UDP ポート(`SM_MATTER_PORT` で上書き可)。用途は同上
@@ -91,8 +100,54 @@ fn matter_port() -> u16 {
 const MDNS_INSTANCE_ID: u64 = 0x0011_2233_4455_6677;
 
 type Backend = RustCrypto<DemoRng>;
-type Dac = TestDacProvider<Backend>;
+type Dac = ExampleDac;
 type OpCreds<'s> = OpCredsCluster<Backend, Dac, NF, &'s RefCell<FabricTable<Backend, NF>>>;
+
+/// example の DAC provider: dev テスト DAC か、工場出荷データ由来の [`BorrowedDacProvider`]
+/// のいずれか(実行時選択。`Light` の型を単一に保つための enum ディスパッチ)。
+///
+/// 借用スライスはプロセス生存期間 leak した `&'static`(`common_factory` 参照)。
+///
+/// `Test` 変種は CD(539B)を内包するため大きいが、DAC provider はスタックに 1 個だけ
+/// 常駐する(頻繁な生成なし)ので Box 化(= ヒープ)より値保持が適切。
+#[allow(clippy::large_enum_variant)]
+enum ExampleDac {
+    /// chip 開発用テスト DAC(既定・後方互換)。
+    Test(TestDacProvider<Backend>),
+    /// 工場出荷データ由来の DAC(`SM_FACTORY_DIR` / `SM_FACTORY_NVS`)。
+    Factory(BorrowedDacProvider<'static, KeypairDacSigner<<Backend as simple_matter::crypto::Crypto>::Keypair>>),
+}
+
+impl DacProvider for ExampleDac {
+    fn dac_der(&self) -> &[u8] {
+        match self {
+            Self::Test(d) => d.dac_der(),
+            Self::Factory(d) => d.dac_der(),
+        }
+    }
+    fn pai_der(&self) -> &[u8] {
+        match self {
+            Self::Test(d) => d.pai_der(),
+            Self::Factory(d) => d.pai_der(),
+        }
+    }
+    fn certification_declaration(&self) -> &[u8] {
+        match self {
+            Self::Test(d) => d.certification_declaration(),
+            Self::Factory(d) => d.certification_declaration(),
+        }
+    }
+    fn sign_with_dac(
+        &self,
+        msg: &[u8],
+        out: &mut [u8; 64],
+    ) -> simple_matter::error::Result<()> {
+        match self {
+            Self::Test(d) => d.sign_with_dac(msg, out),
+            Self::Factory(d) => d.sign_with_dac(msg, out),
+        }
+    }
+}
 
 /// デモ用の擬似乱数(SystemTime シードの LCG)。**暗号学的に安全ではない**。
 ///
@@ -340,15 +395,28 @@ fn build_light<'s>(
     icd_table: &'s RefCell<IcdRegistrationTable<NICD>>,
     icd_state: &'s RefCell<IcdState>,
     lit: bool,
+    factory: Option<&common_factory::FactoryMaterials>,
 ) -> Light<'s> {
     let dac_crypto = RustCrypto::new(DemoRng::from_time());
-    // SM_TAMPER_CD=1: CD を 1 バイト改竄した DAC provider(コミッショナ側 CD CMS 検証の
-    // 失敗系 E2E 用。attestation.md §7)。
-    let dac = if std::env::var_os("SM_TAMPER_CD").is_some() {
+    // DAC provider の選択:
+    // - SM_FACTORY_DIR / SM_FACTORY_NVS 指定時: 工場出荷 DAC(BorrowedDacProvider)。
+    // - SM_TAMPER_CD=1: CD を 1 バイト改竄した dev DAC(CD CMS 検証の失敗系 E2E。attestation.md §7)。
+    // - それ以外: chip 開発用テスト DAC(既定・後方互換)。
+    let dac = if let Some(f) = factory {
+        let provider = BorrowedDacProvider::from_raw_key(
+            &dac_crypto,
+            f.dac_der,
+            f.pai_der,
+            f.cd_der,
+            &f.dac_key,
+        )
+        .expect("factory DAC key");
+        ExampleDac::Factory(provider)
+    } else if std::env::var_os("SM_TAMPER_CD").is_some() {
         eprintln!("[dac] SM_TAMPER_CD set: serving a tampered Certification Declaration");
-        TestDacProvider::new_with_tampered_cd(&dac_crypto).expect("test DAC")
+        ExampleDac::Test(TestDacProvider::new_with_tampered_cd(&dac_crypto).expect("test DAC"))
     } else {
-        TestDacProvider::new(&dac_crypto).expect("test DAC")
+        ExampleDac::Test(TestDacProvider::new(&dac_crypto).expect("test DAC"))
     };
     Light {
         acl,
@@ -401,11 +469,28 @@ fn main() -> std::io::Result<()> {
     let icd_enabled = icd_mode.is_some();
     let icd_lit = icd_mode.as_deref() == Some("lit");
 
-    let config = common_pase::config();
+    // 工場出荷データ(SM_FACTORY_DIR / SM_FACTORY_NVS)。未設定なら None = dev 資格情報。
+    let mut factory = common_factory::load();
+    // factory の discriminator を優先させる(SM_DISCRIMINATOR で明示上書き可)。
+    if let Some(d) = factory.as_ref().and_then(|f| f.discriminator) {
+        let _ = FACTORY_DISCRIMINATOR.set(d);
+    }
+    // PASE 設定: factory verifier(NVS モード)を優先、無ければ common_pase(dev / SM_PASE_VERIFIER)。
+    let config = factory
+        .as_mut()
+        .and_then(|f| f.pase.take())
+        .unwrap_or_else(common_pase::config);
     let creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
     let sc = SecureChannel::new(&crypto, DemoRng::from_time(), config, creds);
     let im = InteractionModel::new(build_light(
-        &fabrics, &acl, &window, &groups, &icd_table, &icd_state, icd_lit,
+        &fabrics,
+        &acl,
+        &window,
+        &groups,
+        &icd_table,
+        &icd_state,
+        icd_lit,
+        factory.as_ref(),
     ));
     let mut stack: DefaultStack<Backend, DemoRng, Light> = MatterStack::new(&crypto, sc, im);
     // groupcast 受信の復号鍵リゾルバ(group-messaging.md §5.1)。

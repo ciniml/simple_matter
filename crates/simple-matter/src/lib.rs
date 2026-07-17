@@ -33,6 +33,12 @@ pub mod dm;
 pub mod error;
 pub mod exchange;
 pub mod fabric;
+/// 工場出荷データ(factory data)リーダ。`factory-data` feature 有効時のみ。
+///
+/// 非 factory 構成のフットプリントに影響しないよう feature gate する
+/// (docs/design/factory-data.md)。
+#[cfg(feature = "factory-data")]
+pub mod factory;
 pub mod groups;
 pub mod icd;
 pub mod im;

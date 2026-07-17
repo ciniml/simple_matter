@@ -75,9 +75,10 @@ use simple_matter::discovery::{
     MDNS_IPV6, MDNS_PORT,
 };
 use simple_matter::dm::clusters::{
-    AdminCommissioningCluster, BasicInfoConfig, BasicInformationCluster, CommissioningWindow,
-    DescriptorCluster, GeneralCommissioning, LevelControlCluster, NetworkCommissioningWifi,
-    OnOffCluster, OpCredsCluster, TestDacProvider, WindowEvent,
+    AdminCommissioningCluster, BasicInfoConfig, BasicInformationCluster, BorrowedDacProvider,
+    CommissioningWindow, DacProvider, DescriptorCluster, GeneralCommissioning, KeypairDacSigner,
+    LevelControlCluster, NetworkCommissioningWifi, OnOffCluster, OpCredsCluster, TestDacProvider,
+    WindowEvent,
 };
 use simple_matter::dm::meta::{ClusterId, DeviceType, EndpointId, EndpointMeta};
 use simple_matter::dm::{tick_clusters, DataModel, ServerCluster};
@@ -118,8 +119,69 @@ const BTP_TRACE: bool = false;
 const HCI_SLOTS: usize = 20;
 
 type Backend = RustCrypto<EspRng>;
-type Dac = TestDacProvider<Backend>;
+type Dac = E5Dac;
 type OpCreds<'s> = OpCredsCluster<Backend, Dac, NF, &'s RefCell<FabricTable<Backend, NF>>>;
+
+/// 工場データパーティションの flash オフセットとサイズ(docs/design/factory-data.md §5.2)。
+///
+/// パーティションテーブルに `nvs_factory`(ESP-IDF NVS 形式、平文)を追加し、
+/// esp-matter-mfg-tool 生成の `*-partition.bin` をこのオフセットへ flash する前提。
+/// 既定値は KVS の `nvs`(0x9000..0xF000)と衝突しない領域。実 flash 手順は doc 参照。
+const FACTORY_OFFSET: u32 = 0x3F0000;
+/// 読み出すサイズ(mfg-tool 既定パーティションは 0x6000。ここでは 0x6000 読む)。
+const FACTORY_LEN: usize = 0x6000;
+
+/// 工場データを保持する `'static` バッファ([`BorrowedDacProvider`] がスライスを借用する)。
+static mut FACTORY_BUF: [u8; FACTORY_LEN] = [0u8; FACTORY_LEN];
+
+/// DAC provider: dev テスト DAC(既定)か、工場データ由来の [`BorrowedDacProvider`]。
+///
+/// `Light` の型を単一に保つための enum ディスパッチ(PC example / C FFI シムと同型)。
+#[allow(clippy::large_enum_variant)]
+enum E5Dac {
+    /// chip 開発用テスト DAC(工場データ未 flash 時。後方互換)。
+    Test(TestDacProvider<Backend>),
+    /// 工場データ由来の DAC(`FACTORY_BUF` を借用)。
+    Factory(BorrowedDacProvider<'static, KeypairDacSigner<<Backend as simple_matter::crypto::Crypto>::Keypair>>),
+}
+
+impl DacProvider for E5Dac {
+    fn dac_der(&self) -> &[u8] {
+        match self {
+            Self::Test(d) => d.dac_der(),
+            Self::Factory(d) => d.dac_der(),
+        }
+    }
+    fn pai_der(&self) -> &[u8] {
+        match self {
+            Self::Test(d) => d.pai_der(),
+            Self::Factory(d) => d.pai_der(),
+        }
+    }
+    fn certification_declaration(&self) -> &[u8] {
+        match self {
+            Self::Test(d) => d.certification_declaration(),
+            Self::Factory(d) => d.certification_declaration(),
+        }
+    }
+    fn sign_with_dac(
+        &self,
+        msg: &[u8],
+        out: &mut [u8; 64],
+    ) -> MResult<()> {
+        match self {
+            Self::Test(d) => d.sign_with_dac(msg, out),
+            Self::Factory(d) => d.sign_with_dac(msg, out),
+        }
+    }
+}
+
+/// 工場データ供給の結果(PASE 設定 + DAC provider + discriminator)。
+struct E5Factory {
+    pase: simple_matter::sc::PaseConfig,
+    dac: E5Dac,
+    discriminator: u16,
+}
 /// 本 bin のスタック型(標準プロファイル。R = TRNG 注入の [`EspRng`])。
 type LightStack<'s> = DefaultStack<'s, Backend, EspRng, Light<'s>>;
 
@@ -258,9 +320,8 @@ impl DataModel for Light<'_> {
 fn build_light<'s>(
     fabrics: &'s RefCell<FabricTable<Backend, NF>>,
     window: &'s RefCell<CommissioningWindow>,
+    dac: E5Dac,
 ) -> Light<'s> {
-    let dac_crypto = RustCrypto::new(esp_rng());
-    let dac = TestDacProvider::new(&dac_crypto).expect("test DAC");
     Light {
         basic: BasicInformationCluster::new(&CFG),
         gc: GeneralCommissioning::default_config(),
@@ -278,6 +339,52 @@ fn build_light<'s>(
         desc1: DescriptorCluster::new(EndpointId(1), EP1_DT, EP1_SERVERS, &[], EP1_PARTS),
         removed_fabric: None,
     }
+}
+
+/// dev テスト DAC provider(工場データが無いときの既定)。
+fn dev_dac() -> E5Dac {
+    let dac_crypto = RustCrypto::new(esp_rng());
+    E5Dac::Test(TestDacProvider::new(&dac_crypto).expect("test DAC"))
+}
+
+/// 工場データパーティションを flash から読み、資格情報を取り出す(無効なら `None`)。
+///
+/// `FACTORY_BUF`(`'static`)へ読み込み、[`FactoryData`] でパースする。CD は factory に
+/// 含まれないため埋め込み dev CD を使う(BasicInformation の VID/PID と整合する構成前提)。
+fn load_factory(flash: &mut esp_storage::FlashStorage<'static>) -> Option<E5Factory> {
+    use simple_matter::dm::clusters::operational_credentials::dev_creds::DEV_CD_FOR_ALL_EXAMPLES;
+    use simple_matter::factory::FactoryData;
+
+    // SAFETY: 起動時の単一スレッド初期化中に 1 度だけ触れる `'static` バッファ。
+    let buf: &'static mut [u8; FACTORY_LEN] = unsafe { &mut *core::ptr::addr_of_mut!(FACTORY_BUF) };
+    if esp32c6_firmware::kvs::read_flash_region(flash, FACTORY_OFFSET, buf).is_err() {
+        println!("[factory] flash read failed; using dev credentials");
+        return None;
+    }
+    let fd = match FactoryData::parse(&buf[..]) {
+        Ok(fd) => fd,
+        Err(_) => {
+            println!("[factory] no chip-factory partition; using dev credentials");
+            return None;
+        }
+    };
+    let pase = fd.pase_config().ok()?;
+    let discriminator = fd.discriminator().ok()?;
+    let dac_crypto = RustCrypto::new(esp_rng());
+    let provider = fd
+        .dac_provider(&dac_crypto, &DEV_CD_FOR_ALL_EXAMPLES)
+        .ok()?;
+    println!(
+        "[factory] loaded: discriminator={} (DAC {} B, PAI {} B)",
+        discriminator,
+        fd.dac_cert().map(|c| c.len()).unwrap_or(0),
+        fd.pai_cert().map(|c| c.len()).unwrap_or(0)
+    );
+    Some(E5Factory {
+        pase,
+        dac: E5Dac::Factory(provider),
+        discriminator,
+    })
 }
 
 // ==========================================================================
@@ -1030,8 +1137,13 @@ async fn main(_spawner: Spawner) {
     // コミッショニング窓(AdminCommissioning 0x003C と pump が共有)。
     let window: RefCell<CommissioningWindow> = RefCell::new(CommissioningWindow::new());
 
+    // 工場データパーティションを先に読み(同じ flash を KVS へ引き継ぐ)、資格情報を
+    // 決める。未 flash / 無効なら dev 定数(後方互換、docs/design/factory-data.md §5.2)。
+    let mut flash = esp_storage::FlashStorage::new(peripherals.FLASH);
+    let factory = load_factory(&mut flash);
+
     // flash KVS から fabric テーブルを復元する(E4、doc §E4.4 / §E4.5)。
-    let mut kvs = EspKvs::new(peripherals.FLASH);
+    let mut kvs = EspKvs::from_flash(flash);
     let restore = fabrics.borrow_mut().load_from(&mut kvs, &crypto, 0);
     match restore {
         Ok(n) => println!("[kvs] restored {} fabrics", n),
@@ -1044,14 +1156,31 @@ async fn main(_spawner: Spawner) {
         }
     }
 
+    // PASE 設定 + DAC provider を選ぶ: 工場データがあればそれ、無ければ dev 定数。
     // SPAKE2+ 検証子の導出(PBKDF2)は C6 では数百 ms かかるため進捗を出す。
-    println!("[pase] loading embedded dev SPAKE2+ verifier (device holds no passcode)...");
-    let pase = simple_matter::dev_pase::dev_pase_config();
+    let (pase, dac) = match factory {
+        Some(f) => {
+            println!("[pase] using factory SPAKE2+ verifier (device holds no passcode)");
+            if f.discriminator != DISCRIMINATOR {
+                // 広告 discriminator は DISCRIMINATOR 定数で固定(commissionable())。
+                // factory の値が異なる場合はコミッショナ側で factory の値を使うこと。
+                println!(
+                    "[factory] note: factory discriminator {} != advertised {}",
+                    f.discriminator, DISCRIMINATOR
+                );
+            }
+            (f.pase, f.dac)
+        }
+        None => {
+            println!("[pase] loading embedded dev SPAKE2+ verifier (device holds no passcode)...");
+            (simple_matter::dev_pase::dev_pase_config(), dev_dac())
+        }
+    };
     println!("[pase] verifier ready");
 
     let creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
     let sc = SecureChannel::new(&crypto, esp_rng(), pase, creds);
-    let im = InteractionModel::new(build_light(&fabrics, &window));
+    let im = InteractionModel::new(build_light(&fabrics, &window, dac));
     let mut stack: LightStack<'_> = MatterStack::new(&crypto, sc, im);
     // コミッショニング済みで起動した場合、焼き込みパスコードの PASE は閉じる
     // (管理者追加は OCW 経由のみ。PC example と同じ窓ゲート)。

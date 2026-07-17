@@ -39,9 +39,11 @@ use simple_matter::discovery::{
 };
 use simple_matter::dm::clusters::{
     AccessControlCluster, AdminCommissioningCluster, BasicInfoConfig, BasicInformationCluster,
-    CommissioningWindow, DescriptorCluster, GeneralCommissioning, GroupKeyManagementCluster,
-    GroupsCluster, IdentifyCluster, OnOffCluster, OpCredsCluster, TestDacProvider, WindowEvent,
+    BorrowedDacProvider, CommissioningWindow, DacProvider, DacSigner, DescriptorCluster,
+    GeneralCommissioning, GroupKeyManagementCluster, GroupsCluster, IdentifyCluster, OnOffCluster,
+    OpCredsCluster, TestDacProvider, WindowEvent,
 };
+use simple_matter::crypto::{Crypto, P256Keypair, P256_SIGNATURE_LEN};
 // NetworkCommissioning クラスタは sm_config.network で実行時に選ぶ(§10.1、ShimNetComm):
 // - SM_NET_ETHERNET: 従来の Ethernet 版(F2 の固定 SSID を C++ が自力 join)。常時利用可。
 // - SM_NET_WIFI: WiFi 版(take 方式ドライバ注入)で `pairing ble-wifi`(ble 必須)。
@@ -317,8 +319,176 @@ pub const SM_NO_DEADLINE: u64 = u64::MAX;
 const NO_DEADLINE: u64 = SM_NO_DEADLINE;
 
 type Backend = RustCrypto<CRng>;
-type Dac = TestDacProvider<Backend>;
+type Dac = ShimDac;
 type OpCreds = OpCredsCluster<Backend, Dac, NF, &'static RefCell<FabricTable<Backend, NF>>>;
+
+/// DAC 秘密鍵署名コールバック(セキュアエレメント委譲用)。
+///
+/// `msg`(`msg_len` バイト)に ECDSA-SHA256 署名し、生 `r||s`(64 バイト)を `out` に書く。
+/// 0 = 成功、負値 = 失敗。`sm_config_t::dac_privkey` の代わりに使う。
+pub type SmDacSign = Option<
+    unsafe extern "C" fn(ctx: *mut c_void, msg: *const u8, msg_len: usize, out: *mut u8) -> i32,
+>;
+
+/// [`BorrowedDacProvider`] の署名バックエンド(生鍵 or C コールバック)。
+enum ShimSigner {
+    /// `dac_privkey`(32B)から復元した鍵ペアで署名する。
+    Keypair(<Backend as Crypto>::Keypair),
+    /// C コールバック(セキュアエレメント)に署名を委譲する。
+    Callback { cb: SmDacSign, ctx: *mut c_void },
+}
+
+impl DacSigner for ShimSigner {
+    fn sign_with_dac(
+        &self,
+        msg: &[u8],
+        out: &mut [u8; P256_SIGNATURE_LEN],
+    ) -> simple_matter::error::Result<()> {
+        match self {
+            ShimSigner::Keypair(kp) => kp.sign(msg, out),
+            ShimSigner::Callback { cb, ctx } => {
+                let f = cb.ok_or(simple_matter::error::Error::Crypto)?;
+                // SAFETY: 呼び出し側が有効な署名コールバックを与える契約(sm_config_t)。
+                let rc = unsafe { f(*ctx, msg.as_ptr(), msg.len(), out.as_mut_ptr()) };
+                if rc == 0 {
+                    Ok(())
+                } else {
+                    Err(simple_matter::error::Error::Crypto)
+                }
+            }
+        }
+    }
+}
+
+/// DAC provider: dev テスト DAC(後方互換)か、C 供給の [`BorrowedDacProvider`]。
+///
+/// `Light` の型を単一に保つための enum ディスパッチ。Borrowed の借用スライスは
+/// `Owned::dac_store`(単一 static)を指す `&'static`。
+///
+/// `Test` 変種は CD(539B)を内包するため大きいが、DAC provider は単一 static スタックに
+/// 1 個だけ常駐する(no_std で alloc も無い)ので Box 化せず値保持する。
+#[allow(clippy::large_enum_variant)]
+enum ShimDac {
+    /// chip 開発用テスト DAC(`sm_config_t` に DAC 未指定時。後方互換)。
+    Test(TestDacProvider<Backend>),
+    /// C 供給の DAC/PAI/CD + 鍵(生鍵 or 署名コールバック)。
+    Borrowed(BorrowedDacProvider<'static, ShimSigner>),
+}
+
+impl DacProvider for ShimDac {
+    fn dac_der(&self) -> &[u8] {
+        match self {
+            Self::Test(d) => d.dac_der(),
+            Self::Borrowed(d) => d.dac_der(),
+        }
+    }
+    fn pai_der(&self) -> &[u8] {
+        match self {
+            Self::Test(d) => d.pai_der(),
+            Self::Borrowed(d) => d.pai_der(),
+        }
+    }
+    fn certification_declaration(&self) -> &[u8] {
+        match self {
+            Self::Test(d) => d.certification_declaration(),
+            Self::Borrowed(d) => d.certification_declaration(),
+        }
+    }
+    fn sign_with_dac(
+        &self,
+        msg: &[u8],
+        out: &mut [u8; P256_SIGNATURE_LEN],
+    ) -> simple_matter::error::Result<()> {
+        match self {
+            Self::Test(d) => d.sign_with_dac(msg, out),
+            Self::Borrowed(d) => d.sign_with_dac(msg, out),
+        }
+    }
+}
+
+/// C 供給の DAC/PAI/CD DER を保持するストア(`Owned` が所有 → `&'static` で借用)。
+const DAC_BLOB_CAP: usize = 1024;
+#[derive(Default)]
+struct DacStore {
+    dac: heapless::Vec<u8, DAC_BLOB_CAP>,
+    pai: heapless::Vec<u8, DAC_BLOB_CAP>,
+    cd: heapless::Vec<u8, DAC_BLOB_CAP>,
+}
+
+impl DacStore {
+    /// C 供給の DAC/PAI(+ 任意で CD)をコピーする。
+    ///
+    /// `dac_der` と `pai_der` が両方非 NULL のとき C 供給 DAC を使う。`cd_der` が NULL の
+    /// ときは埋め込み dev CD([`dev_creds::DEV_CD_FOR_ALL_EXAMPLES`])で補う(factory NVS
+    /// に CD が含まれない一般的な構成に対応。VID=0xFFF1/PID=0x8001 向け)。DAC/PAI が
+    /// 揃わなければ dev DAC 扱い(空ストア)。
+    ///
+    /// # Safety
+    /// `cfg` の各 DER ポインタは非 NULL のとき対応 `*_len` バイト有効であること。
+    unsafe fn from_config(cfg: &sm_config_t) -> Result<Self, ()> {
+        use simple_matter::dm::clusters::operational_credentials::dev_creds::DEV_CD_FOR_ALL_EXAMPLES;
+        let mut s = Self::default();
+        // DAC/PAI が揃っていなければ dev DAC 扱い(空ストア)。
+        if cfg.dac_der.is_null() || cfg.pai_der.is_null() {
+            return Ok(s);
+        }
+        let copy = |dst: &mut heapless::Vec<u8, DAC_BLOB_CAP>,
+                    ptr: *const u8,
+                    len: usize|
+         -> Result<(), ()> {
+            if len == 0 || len > DAC_BLOB_CAP {
+                return Err(());
+            }
+            let src = core::slice::from_raw_parts(ptr, len);
+            dst.extend_from_slice(src).map_err(|_| ())
+        };
+        copy(&mut s.dac, cfg.dac_der, cfg.dac_der_len)?;
+        copy(&mut s.pai, cfg.pai_der, cfg.pai_der_len)?;
+        if cfg.cd_der.is_null() {
+            // factory に CD が無い → 埋め込み dev CD で補う。
+            s.cd.extend_from_slice(&DEV_CD_FOR_ALL_EXAMPLES).map_err(|_| ())?;
+        } else {
+            copy(&mut s.cd, cfg.cd_der, cfg.cd_der_len)?;
+        }
+        Ok(s)
+    }
+
+    /// DAC/PAI が揃っているか(= C 供給 DAC を使うか)。
+    fn is_supplied(&self) -> bool {
+        !self.dac.is_empty() && !self.pai.is_empty()
+    }
+}
+
+/// `sm_config_t` から [`ShimDac`] を組み立てる。
+///
+/// DER 3 本 + (生鍵 or 署名コールバック)が揃えば [`BorrowedDacProvider`]、
+/// 揃わなければ dev テスト DAC(後方互換)。鍵復元失敗時は `None`。
+fn build_shim_dac(o: &'static Owned, cfg: &sm_config_t, rng: CRng) -> Option<ShimDac> {
+    let crypto = RustCrypto::new(rng);
+    if o.dac_store.is_supplied() {
+        // 署名バックエンド: dac_privkey(32B)優先、無ければ dac_sign コールバック。
+        let signer = if !cfg.dac_privkey.is_null() {
+            // SAFETY: dac_privkey は非 NULL のとき 32 バイト有効という契約。
+            let raw = unsafe { core::slice::from_raw_parts(cfg.dac_privkey, 32) };
+            let mut key = [0u8; 32];
+            key.copy_from_slice(raw);
+            ShimSigner::Keypair(crypto.p256_keypair_from_bytes(&key).ok()?)
+        } else if cfg.dac_sign.is_some() {
+            ShimSigner::Callback {
+                cb: cfg.dac_sign,
+                ctx: cfg.dac_sign_ctx,
+            }
+        } else {
+            // DER はあるが鍵が無い → 誤設定。dev DAC にフォールバックせず失敗させる。
+            return None;
+        };
+        let provider =
+            BorrowedDacProvider::new(&o.dac_store.dac, &o.dac_store.pai, &o.dac_store.cd, signer);
+        Some(ShimDac::Borrowed(provider))
+    } else {
+        Some(ShimDac::Test(TestDacProvider::new(&crypto).ok()?))
+    }
+}
 type Stack = DefaultStack<'static, Backend, CRng, Light>;
 
 /// BasicInformation の固定設定(プリセットデバイス。VID/PID はテスト DAC = 0xFFF1/0x8001)。
@@ -411,6 +581,28 @@ pub struct sm_config_t {
     /// **推奨: 製品はここに verifier を渡し、passcode をデバイスに置かない**
     /// (`smctl pase-verifier <passcode>` で生成)。
     pub verifier_w0_l: *const u8,
+
+    // --- 工場出荷 DAC 供給(未指定時は dev テスト DAC = 後方互換。§FD1)---
+    /// DAC 証明書(X.509 DER)。`pai_der` / `cd_der` と、`dac_privkey` または
+    /// `dac_sign` のいずれかが揃ったときに [`BorrowedDacProvider`] を使う。
+    /// いずれかが欠ければ従来の dev テスト DAC(`TestDacProvider`)にフォールバック。
+    pub dac_der: *const u8,
+    /// `dac_der` の長さ(バイト、≤ 1024)。
+    pub dac_der_len: usize,
+    /// PAI 証明書(X.509 DER)。
+    pub pai_der: *const u8,
+    /// `pai_der` の長さ(バイト、≤ 1024)。
+    pub pai_der_len: usize,
+    /// Certification Declaration(CMS DER)。
+    pub cd_der: *const u8,
+    /// `cd_der` の長さ(バイト、≤ 1024)。
+    pub cd_der_len: usize,
+    /// DAC 生秘密鍵(P-256 スカラ 32 バイト、ビッグエンディアン)。NULL なら `dac_sign` を使う。
+    pub dac_privkey: *const u8,
+    /// DAC 署名コールバック(セキュアエレメント委譲)。`dac_privkey` が NULL のとき使う。
+    pub dac_sign: SmDacSign,
+    /// `dac_sign` の ctx。
+    pub dac_sign_ctx: *mut c_void,
 }
 
 /// v4/v6 両対応の datagram 宛先/送信元。
@@ -875,6 +1067,8 @@ struct Owned {
     acl: RefCell<AclTable<NACL>>,
     window: RefCell<CommissioningWindow>,
     groups: RefCell<DefaultGroupStore>,
+    /// C 供給の DAC/PAI/CD DER(`ShimDac::Borrowed` が `&'static` で借用)。
+    dac_store: DacStore,
 }
 
 /// NetworkCommissioning クラスタを sm_config.network から作り分ける(§10.1)。
@@ -897,9 +1091,7 @@ fn new_netcomm(_network: sm_network_t) -> ShimNetComm {
     ShimNetComm::Ethernet(NetworkCommissioning::new(b"eth0"))
 }
 
-fn build_light(o: &'static Owned, rng: CRng, network: sm_network_t) -> Light {
-    let dac_crypto = RustCrypto::new(rng);
-    let dac = TestDacProvider::new(&dac_crypto).expect("test DAC");
+fn build_light(o: &'static Owned, rng: CRng, network: sm_network_t, dac: ShimDac) -> Light {
     Light {
         acl: &o.acl,
         access_control: AccessControlCluster::new(&o.acl),
@@ -1348,12 +1540,20 @@ pub extern "C" fn sm_init(cfg: *const sm_config_t, now_ms: u64) -> i32 {
     instance_id_bytes[2..8].copy_from_slice(&cfg.mac);
     let instance_id = u64::from_be_bytes(instance_id_bytes);
 
+    // C 供給の DAC/PAI/CD DER を Owned にコピーする(未指定なら空 = dev DAC)。
+    // SAFETY: cfg の DER ポインタは非 NULL のとき len バイト有効という契約。
+    let dac_store = match unsafe { DacStore::from_config(cfg) } {
+        Ok(s) => s,
+        Err(()) => return -5, // DER が容量超過 / 長さ不整合。
+    };
+
     let owned = Owned {
         crypto: RustCrypto::new(rng),
         fabrics: RefCell::new(FabricTable::new()),
         acl: RefCell::new(AclTable::new()),
         window: RefCell::new(CommissioningWindow::new()),
         groups: RefCell::new(DefaultGroupStore::new()),
+        dac_store,
     };
 
     // SAFETY: 単一インスタンスを in-place 構築する。SHIM は static(不動)なので
@@ -1374,7 +1574,12 @@ pub extern "C" fn sm_init(cfg: *const sm_config_t, now_ms: u64) -> i32 {
         };
         let creds = SharedFabricCreds::new(&o.fabrics, &o.crypto, 0);
         let sc = SecureChannel::new(&o.crypto, rng, config, creds);
-        let im = InteractionModel::new(build_light(o, rng, cfg.network));
+        // DAC provider: C 供給の DER/鍵があれば BorrowedDacProvider、無ければ dev DAC。
+        let dac = match build_shim_dac(o, cfg, rng) {
+            Some(d) => d,
+            None => return -6, // 鍵復元失敗。
+        };
+        let im = InteractionModel::new(build_light(o, rng, cfg.network, dac));
         let mut stack: Stack = MatterStack::new(&o.crypto, sc, im);
         stack.set_group_keys(&o.groups);
         let _ = stack.post_startup_event(CFG.software_version, 0);
