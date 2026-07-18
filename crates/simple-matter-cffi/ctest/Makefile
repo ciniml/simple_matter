@@ -19,7 +19,7 @@ CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -I$(INCDIR)
 LDLIBS   := -lpthread -ldl -lm
 
 .PHONY: all lib run clean
-all: onoff_light
+all: onoff_light controller
 
 lib:
 	cargo build -p simple-matter-cffi --release --features std --target $(TARGET)
@@ -27,8 +27,12 @@ lib:
 onoff_light: onoff_light.cpp lib
 	$(CXX) $(CXXFLAGS) -o $@ onoff_light.cpp $(STATICLIB) $(LDLIBS)
 
+# ホスト C++17 テストコントローラ(F7a、sm_ctrl_* を供給メモリ経路で駆動)。
+controller: controller.cpp lib
+	$(CXX) $(CXXFLAGS) -o $@ controller.cpp $(STATICLIB) $(LDLIBS)
+
 run: onoff_light
 	./onoff_light $(ARGS)
 
 clean:
-	rm -f onoff_light
+	rm -f onoff_light controller

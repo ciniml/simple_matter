@@ -68,6 +68,32 @@ typedef enum {
   SM_BLE_C2_SUBSCRIBED = 3,
 } sm_ble_event_kind_t;
 
+// コントローライベント種別(`sm_ctrl_take_event` で取り出す)。
+typedef enum {
+  // イベント無し(ABI ゼロ値のセンチネル)。
+  SM_CTRL_EV_NONE = 0,
+  // コミッショニングのフェーズが進んだ(`phase` = フェーズコード。§11.1)。
+  SM_CTRL_EV_PAIR_PHASE = 1,
+  // コミッショニング完了(`node_id` = 対象ノード)。以降 invoke/read 可。
+  SM_CTRL_EV_PAIR_COMPLETE = 2,
+  // コミッショニング失敗(`phase` = 失敗フェーズコード)。
+  SM_CTRL_EV_PAIR_FAILED = 3,
+  // 運用 CASE セッションを確立した(`node_id`、`resumed` = Sigma2Resume 経由か)。
+  SM_CTRL_EV_CASE_ESTABLISHED = 4,
+  // 運用 CASE 確立に失敗した(`node_id`)。
+  SM_CTRL_EV_CASE_FAILED = 5,
+  // Invoke 完了(`node_id`、`status` = IM ステータス。0 = 成功)。
+  SM_CTRL_EV_INVOKE_DONE = 6,
+  // Invoke 失敗(`node_id`、`status`)。
+  SM_CTRL_EV_INVOKE_FAILED = 7,
+  // Read 完了(`node_id`、`value_u64` / `value_is_null` にスカラ値)。
+  SM_CTRL_EV_READ_DONE = 8,
+  // Read 失敗(`node_id`)。
+  SM_CTRL_EV_READ_FAILED = 9,
+  // operational 解決成功(`node_id`。アドレスは `sm_ctrl_node_addr` で取得)。
+  SM_CTRL_EV_RESOLVE_DONE = 10,
+} sm_ctrl_event_kind_t;
+
 // アプリイベント種別(`docs/design/c-ffi-shim.md` §1)。
 typedef enum {
   SM_EV_NONE = 0,
@@ -288,6 +314,49 @@ typedef struct {
   void *ctx;
 } sm_cluster_def_t;
 
+// コントローラ初期化設定(`docs/design/c-ffi-shim.md` §11.1)。
+typedef struct {
+  // コントローラ fabric の FabricId(smctl / examples と同値を推奨。例 0xFAB0000000000001)。
+  // KVS に ca-state があればそちらが優先され、本値は無視される。
+  uint64_t fabric_id;
+  // コントローラ自身の運用 NodeId(CaseAdminSubject / CASE identity)。同上。
+  uint64_t controller_node_id;
+  // AdminVendorId(AddNOC に載せる)。
+  uint16_t vendor_id;
+  // KVS get コールバック(NULL 可 = 永続化なし。`b"cast"`/`b"nods"`/`b"rsm*"` を委譲)。
+  SmKvsGet kvs_get;
+  // KVS set コールバック。
+  SmKvsSet kvs_set;
+  // KVS delete コールバック(冪等)。
+  SmKvsDelete kvs_delete;
+  // KVS コールバックの ctx。
+  void *kvs_ctx;
+  // RNG コールバック(必須。esp_fill_random / getrandom 等)。
+  SmRngFill rng_fill;
+  // RNG コールバックの ctx。
+  void *rng_ctx;
+} sm_ctrl_config_t;
+
+// コントローライベント(立った順にリングから取り出す)。
+typedef struct {
+  // 種別。
+  sm_ctrl_event_kind_t kind;
+  // コミッショニングのフェーズコード(PAIR_PHASE / PAIR_FAILED)。
+  // 0=Idle 1=PASE 2=ArmFailSafe 3=Attestation 4=CSR 5=AddTrustedRoot 6=AddNOC
+  // 7=CASE 8=Complete 9=Done 10=AddWiFi 11=ConnectNetwork。
+  uint8_t phase;
+  // IM/SC ステータスコード(INVOKE/READ 系。0 = 成功)。
+  uint8_t status;
+  // 対象ノードの運用 NodeId。
+  uint64_t node_id;
+  // Read スカラ値(READ_DONE。符号付きは 2 の補数ビットパターン)。
+  uint64_t value_u64;
+  // Read 値が null(READ_DONE)。
+  bool value_is_null;
+  // CASE が resumption(Sigma2Resume)経由で確立したか(CASE_ESTABLISHED)。
+  bool resumed;
+} sm_ctrl_event_t;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -433,6 +502,112 @@ void sm_thread_status(bool attached,
 // 最初の 1 つを使う(制約: マルチ fabric では代表 1 つのみ。§10.1)。
 size_t sm_operational_instance_name(uint8_t *buf,
                                     size_t cap);
+
+// 供給メモリに構築する [`CtrlShim`] のバイトサイズ(`sm_ctrl_init` へ渡す `mem_len` の下限)。
+size_t sm_ctrl_context_size(void);
+
+// 供給メモリに要求するアラインメント(バイト)。`mem` はこの倍数でなければならない。
+size_t sm_ctrl_context_align(void);
+
+// コントローラを初期化する(供給メモリに in-place 構築 + KVS から CA/ノード帳/resumption 復元)。
+//
+// 戻り値: 0=OK、-1=NULL 引数、-2=既に初期化済み、-3=`mem_len` 不足、
+// -4=`mem` アラインメント不正、-5=RNG コールバック未設定、-6=CA 生成失敗。
+//
+// `mem` は [`sm_ctrl_context_size`] バイト以上・[`sm_ctrl_context_align`] アラインで、
+// [`sm_ctrl_deinit`] まで移動・解放しないこと(PSRAM 配置可)。
+int32_t sm_ctrl_init(uint8_t *mem,
+                     size_t mem_len,
+                     const sm_ctrl_config_t *cfg,
+                     uint64_t _now_ms);
+
+// コントローラを破棄する(供給メモリの `CtrlShim` を drop。以降 `mem` は解放してよい)。
+//
+// 二重 init 防止フラグを解除する(同一プロセスでの再初期化 = プロセス再起動相当が可能になる)。
+void sm_ctrl_deinit(void);
+
+// コミッショニングを開始する(UDP 直接 PASE。§11.1)。
+//
+// 戻り値: 0=OK、-1=未初期化/NULL、-2=busy(他トランザクション進行中)、-3=commission 拒否。
+// 進行は [`sm_ctrl_take_event`] の PAIR_PHASE / PAIR_COMPLETE / PAIR_FAILED で観測する。
+int32_t sm_ctrl_pair_start(uint64_t node_id,
+                           uint32_t passcode,
+                           const sm_addr_t *addr,
+                           uint64_t now_ms);
+
+// Matter UDP 受信を処理する。戻り値 = tx_out に書いた送信長(0 = 送信なし)。
+//
+// C++ は 0 になるまで [`sm_ctrl_poll`] を続けて残りの送信を排出する。
+size_t sm_ctrl_udp_rx(uint8_t *datagram,
+                      size_t len,
+                      const sm_addr_t *src,
+                      uint64_t now_ms,
+                      uint8_t *tx_out,
+                      size_t tx_cap,
+                      sm_addr_t *tx_dst);
+
+// 時間駆動の送出を 1 件排出する(コミッショナ発行・MRP 再送・standalone ACK)。0 になるまで回す。
+size_t sm_ctrl_poll(uint64_t now_ms,
+                    uint8_t *tx_out,
+                    size_t tx_cap,
+                    sm_addr_t *tx_dst);
+
+// 次に [`sm_ctrl_poll`] を呼ぶべき時刻(ms)。`SM_NO_DEADLINE` = 期限なし。
+//
+// TX キューに未排出があれば即時(`now_ms`)を返す。
+uint64_t sm_ctrl_next_deadline(uint64_t now_ms);
+
+// コントローライベントを立った順に 1 件取り出す。戻り値 = 取り出せたか。
+bool sm_ctrl_take_event(sm_ctrl_event_t *out);
+
+// 運用ノードへ引数なしコマンドを invoke する(OnOff Toggle 等の最小。§11.1)。
+//
+// live セッションが無ければ内部で CASE(resumption 可)を確立してから実行する。
+// 完了は [`sm_ctrl_take_event`] の INVOKE_DONE / INVOKE_FAILED で観測する。
+// 戻り値: 0=OK、-1=未初期化、-3=未知ノード、-4=CASE 開始失敗、-10=busy。
+int32_t sm_ctrl_invoke(uint64_t node_id,
+                       uint16_t endpoint,
+                       uint32_t cluster,
+                       uint32_t command,
+                       uint64_t now_ms);
+
+// 運用ノードのスカラ属性を read する(§11.1)。
+//
+// live セッションが無ければ内部で CASE を確立してから実行する。値は
+// [`sm_ctrl_take_event`] の READ_DONE(`value_u64` / `value_is_null`)で返る。
+// 戻り値: 0=OK、-1=未初期化、-3=未知ノード、-4=CASE 開始失敗、-10=busy。
+int32_t sm_ctrl_read_scalar(uint64_t node_id,
+                            uint16_t endpoint,
+                            uint32_t cluster,
+                            uint32_t attribute,
+                            uint64_t now_ms);
+
+// operational(`_matter._tcp`)解決クエリを生成する(§11.1)。戻り値 = クエリ長(0 = 失敗)。
+//
+// `at` が非 NULL のときはそのアドレス(QU ユニキャスト直指定 = `--at` 相当)へ、NULL なら
+// mDNS マルチキャストへ。宛先ポートは常に 5353 に上書きする。C++ は返ったバイト列を
+// `tx_dst` 宛に mDNS ソケットで送り、応答を [`sm_ctrl_mdns_rx`] へ給餌する。
+size_t sm_ctrl_resolve_start(uint64_t node_id,
+                             const sm_addr_t *at,
+                             uint64_t _now_ms,
+                             uint8_t *tx_out,
+                             size_t tx_cap,
+                             sm_addr_t *tx_dst);
+
+// mDNS 応答を給餌して operational アドレスを解決する。戻り値: 0=解決、-1=未初期化/NULL、-2=不一致。
+//
+// 既知ノード(ノード帳)の運用アドレスを更新し、成功時に RESOLVE_DONE イベントを立てる。
+int32_t sm_ctrl_mdns_rx(const uint8_t *pkt,
+                        size_t len,
+                        const sm_addr_t *_src,
+                        uint64_t _now_ms);
+
+// 既知ノードの現在の運用アドレスを取得する。戻り値 = ノードが存在するか。
+bool sm_ctrl_node_addr(uint64_t node_id,
+                       sm_addr_t *out);
+
+// 現在の管理ノード数(ノード帳のエントリ数)。
+size_t sm_ctrl_node_count(void);
 
 #ifdef __cplusplus
 } // extern "C"

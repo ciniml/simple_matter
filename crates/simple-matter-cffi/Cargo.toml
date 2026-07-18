@@ -22,8 +22,9 @@ simple-matter = { path = "../simple-matter", default-features = false, features 
 heapless = { version = "0.8", default-features = false }
 
 [features]
-# BLE(BTP)給餌 API を既定で有効にする(docs/design/c-ffi-shim.md §9)。
-default = ["ble"]
+# BLE(BTP)給餌 API + コントローラ C FFI を既定で有効にする
+# (docs/design/c-ffi-shim.md §9・§11)。
+default = ["ble", "controller"]
 # ホスト向けビルド(ctest の staticlib・cargo test)で std を有効にし、
 # std のパニックハンドラ・lang item を使う(docs/design/c-ffi-shim.md §2)。
 std = []
@@ -34,3 +35,7 @@ panic-abort = []
 # take 方式)。コアの ble feature(BTP + PeerAddr::Ble)を引き込む。無効ビルドでも
 # C ヘッダは常時宣言し、各 API は SM_ERR / 0 を返す(後方互換。§9.2)。
 ble = ["simple-matter/ble"]
+# コントローラ(commissioner)側 C FFI(sm_ctrl_*、F7a、docs/design/c-ffi-shim.md §11)。
+# コアの controller feature(ControllerStack / Commissioner / MdnsClient)を引き込む。
+# 無効ビルドでは sm_ctrl_* シンボルは出力されない(デバイス専用構成のフットプリント不変)。
+controller = ["simple-matter/controller"]

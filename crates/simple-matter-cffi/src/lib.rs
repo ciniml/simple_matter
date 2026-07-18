@@ -66,6 +66,11 @@ use simple_matter::transport::net::PeerAddr;
 mod custom;
 use custom::{sm_cluster_def_t, CustomCluster, PendingRegistry};
 
+// コントローラ(commissioner)側の C FFI(F7a、docs/design/c-ffi-shim.md §11)。
+// デバイス側スタックとは独立したインスタンス(呼び出し側供給メモリに構築)。
+#[cfg(feature = "controller")]
+mod controller;
+
 // ---- BLE(BTP)+ WiFi プロビジョン(F3、docs/design/c-ffi-shim.md §9)----
 #[cfg(feature = "ble")]
 use simple_matter::btp::gatt::{AdvData, ADV_TOTAL_LEN};
@@ -666,9 +671,9 @@ pub struct sm_event_t {
 
 /// C の rng_fill を [`Rng`] にアダプトする(fn ptr + ctx。単線契約下でのみ使用)。
 #[derive(Clone, Copy)]
-struct CRng {
-    fill: unsafe extern "C" fn(*mut c_void, *mut u8, usize),
-    ctx: *mut c_void,
+pub(crate) struct CRng {
+    pub(crate) fill: unsafe extern "C" fn(*mut c_void, *mut u8, usize),
+    pub(crate) ctx: *mut c_void,
 }
 
 impl Rng for CRng {
@@ -681,15 +686,15 @@ impl Rng for CRng {
 
 /// C の kvs_{get,set,delete} を [`Kvs`] にアダプトする。
 #[derive(Clone, Copy)]
-struct CKvs {
-    get: unsafe extern "C" fn(*mut c_void, *const c_char, *mut u8, usize) -> i32,
-    set: unsafe extern "C" fn(*mut c_void, *const c_char, *const u8, usize) -> i32,
-    del: unsafe extern "C" fn(*mut c_void, *const c_char) -> i32,
-    ctx: *mut c_void,
+pub(crate) struct CKvs {
+    pub(crate) get: unsafe extern "C" fn(*mut c_void, *const c_char, *mut u8, usize) -> i32,
+    pub(crate) set: unsafe extern "C" fn(*mut c_void, *const c_char, *const u8, usize) -> i32,
+    pub(crate) del: unsafe extern "C" fn(*mut c_void, *const c_char) -> i32,
+    pub(crate) ctx: *mut c_void,
 }
 
 /// KVS キーを NUL 終端 C 文字列へ整える一時バッファ(コアのキーは短い ASCII)。
-fn cstr_key(key: &[u8], out: &mut [u8; 64]) -> *const c_char {
+pub(crate) fn cstr_key(key: &[u8], out: &mut [u8; 64]) -> *const c_char {
     let n = key.len().min(out.len() - 1);
     out[..n].copy_from_slice(&key[..n]);
     out[n] = 0;
@@ -1458,7 +1463,7 @@ impl Shim {
 // アドレス変換
 // ==========================================================================
 
-fn addr_to_peer(a: &sm_addr_t) -> PeerAddr {
+pub(crate) fn addr_to_peer(a: &sm_addr_t) -> PeerAddr {
     if a.is_v6 {
         let ip = Ipv6Addr::from(a.ip);
         PeerAddr::Udp(SocketAddr::V6(SocketAddrV6::new(ip, a.port, 0, a.scope_id)))
@@ -1468,7 +1473,7 @@ fn addr_to_peer(a: &sm_addr_t) -> PeerAddr {
     }
 }
 
-fn peer_to_addr(p: PeerAddr) -> sm_addr_t {
+pub(crate) fn peer_to_addr(p: PeerAddr) -> sm_addr_t {
     let mut out = sm_addr_t {
         ip: [0u8; 16],
         is_v6: false,
@@ -1492,7 +1497,7 @@ fn peer_to_addr(p: PeerAddr) -> sm_addr_t {
 }
 
 /// QM(マルチキャスト)応答/announce の宛先を送信元ファミリから決める。
-fn multicast_dst(is_v6: bool, scope_id: u32) -> sm_addr_t {
+pub(crate) fn multicast_dst(is_v6: bool, scope_id: u32) -> sm_addr_t {
     if is_v6 {
         peer_to_addr(PeerAddr::Udp(SocketAddr::V6(SocketAddrV6::new(
             MDNS_IPV6, MDNS_PORT, 0, scope_id,

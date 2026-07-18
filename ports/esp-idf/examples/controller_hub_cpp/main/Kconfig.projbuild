@@ -1,0 +1,37 @@
+menu "controller_hub_cpp configuration"
+
+    config SM_WIFI_SSID
+        string "WiFi SSID"
+        default "iotap"
+        help
+            コントローラハブが接続する WiFi の SSID。
+
+    config SM_WIFI_PASS
+        string "WiFi password"
+        default "hogeFugapiyo"
+        help
+            WiFi パスワード。
+
+    config SM_TARGET_NODE_ID
+        hex "Target node id (operational NodeId)"
+        default 0xAABBCCDD
+        help
+            コミッショニングして管理する固定ノードの運用 NodeId。
+
+    config SM_TARGET_PASSCODE
+        int "Target passcode"
+        default 20202021
+        help
+            対象デバイスの PASE パスコード(QR / ラベル由来)。
+
+    config SM_TARGET_IP
+        string "Target device IPv4 (on-network PASE)"
+        default "192.168.2.129"
+        help
+            UDP 直接 PASE の宛先(対象デバイスの運用 IPv4)。
+
+    config SM_TARGET_PORT
+        int "Target device Matter UDP port"
+        default 5540
+
+endmenu

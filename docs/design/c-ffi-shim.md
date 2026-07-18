@@ -690,3 +690,129 @@ select が 0 タイムアウトでスピン → task_wdt 発火 → abort ルー
 **所見**: ESP-IDF の BLE/15.4 coex は本物で、ベアメタル esp-radio 路線の
 R9 系症状(RX 沈黙・TX イベント喪失)は観測されず。attach・CASE とも
 リトライ不要で安定。C++ 連携経路は Thread の実用品質が既に高い。
+
+## 11. コントローラ C FFI 化(F7 設計)
+
+目的: C++/ESP-IDF アプリからコントローラ(Commissioner/ImClient/MdnsClient)を
+駆動する。ターゲットは ESP32-S3(将来 P4+H2 構成へ展開)。コアのコントローラは
+no_std 実装済み(K1、正味 ~83KB)で、K2-K4 の s3-controller が Rust 側の参照実装。
+
+### 11.1 設計方針
+
+- デバイス側と同じ **out-buffer ポンプ型**の `sm_ctrl_*` API 群(別インスタンス、
+  デバイス側と同居可だが v1 はコントローラ単独動作をゲートとする)。
+- **メモリは呼び出し側供給**: `sm_ctrl_init(mem, mem_len, cfg)` — C++ が
+  `heap_caps_malloc(MALLOC_CAP_SPIRAM)` 等で確保した領域に in-place 構築
+  (PSRAM 配置対応。必要サイズは `sm_ctrl_context_size()` で取得)。
+- CA/ノード帳の永続化は KVS コールバック(デバイス側と同じ contract。
+  ca-state v1 / nodes.tlv 互換 = smctl/s3-controller と持ち運び可)。
+- コミッショニング(F7a は UDP のみ): `sm_ctrl_pair_start(node_id, passcode,
+  addr)` → pump(`sm_ctrl_udp_rx`/`sm_ctrl_poll`/`sm_ctrl_next_deadline`)→
+  `sm_ctrl_take_event`(フェーズ進行/完了/失敗)。
+- 運用操作: `sm_ctrl_invoke`/`sm_ctrl_read`/`sm_ctrl_write`(cluster/attr/cmd
+  ID 直指定 + スカラ値、応答は take イベント + 値バッファ)+ subscribe 最小。
+- 発見: MdnsClient のブラウズ/解決をポンプ写像(`sm_ctrl_mdns_*`。QU 直指定
+  `--at` 相当のモードも)。
+- F7b(後続): BLE central 給餌 API(BTP central を C++ の NimBLE central から
+  駆動 = pairing ble-wifi/ble-thread)。
+
+### 11.2 ゲート
+
+- F7a: ホスト C++ テストコントローラ(POSIX)で既存デバイス example 相手に
+  pairing address → CommissioningComplete → toggle → read → リブート
+  (プロセス再起動)で CA/ノード帳復元 + resumption。S3/Xtensa .a +
+  ESP-IDF S3 ビルド green(実機は S3 ボード接続確認後)。
+
+### 11.3 F7a 完了記録
+
+コントローラ(Commissioner / ControllerStack / MdnsClient)を C++/ESP-IDF から駆動する
+`sm_ctrl_*` API 群を実装した(UDP 経路)。デバイス側スタックとは独立したインスタンスで、
+**呼び出し側供給メモリに in-place 構築**する(PSRAM 配置の核心)。
+
+追加/変更物:
+- `crates/simple-matter-cffi`:
+  - `src/controller.rs`(新規): C ABI 型(`sm_ctrl_config_t` / `sm_ctrl_event_t` /
+    `sm_ctrl_event_kind_t`)+ 供給メモリに構築する `CtrlShim`(`ControllerStack` +
+    `Commissioner` + ノード帳 + イベント/TX リング。owned への `&'static` 自己参照は
+    `sm_init` と同じ addr_of 構築で満たす)+ 15 個の `sm_ctrl_*` 関数。
+    - 供給メモリ: `sm_ctrl_context_size()` / `sm_ctrl_context_align()`(ビルド定数)+
+      `sm_ctrl_init(mem, mem_len, cfg, now)`(サイズ/アラインを検証して in-place 構築)。
+    - ポンプ: `sm_ctrl_udp_rx` / `sm_ctrl_poll` / `sm_ctrl_next_deadline`(デバイス側と
+      同じ out-buffer 契約)。**settle→drive 分離**を守る: `sm_ctrl_udp_rx` は受信処理と
+      ACK 送出のみ(コミッショナ駆動はしない)、`sm_ctrl_poll` は「未達 ACK/再送を先に
+      流し切り(`next_deadline==None` で完全静穏化)→ 次のトランザクションを発行」の順で
+      1 歩進める。これを守らないと、受信応答の遅延 standalone ACK より先に次の exchange を
+      開始してしまい、デバイス IM responder(同時 1 トランザクション)が busy で無応答 →
+      **AddTrustedRoot で Timeout** になる(実装中に実測・修正)。
+    - コミッショニング: `sm_ctrl_pair_start`(UDP 直接 PASE、attestation Skip)→
+      `sm_ctrl_take_event`(PAIR_PHASE / PAIR_COMPLETE / PAIR_FAILED。phase = フェーズ
+      コード、status = 失敗理由コード)。
+    - 運用: `sm_ctrl_invoke`(引数なしコマンド = OnOff Toggle)/ `sm_ctrl_read_scalar`
+      (スカラ属性、値は READ_DONE イベントの `value_u64` + `value_is_null`)。**live
+      セッションが無ければ内部で CASE を自動確立**(resumption 素材があれば Sigma2Resume)
+      してから発行する(Connecting → AwaitOp の内部状態機械)。
+    - 発見: `sm_ctrl_resolve_start`(MdnsClient の operational 解決、QU ユニキャスト直指定
+      `--at` 相当を最優先)+ `sm_ctrl_mdns_rx`(解決結果を RESOLVE_DONE)+
+      `sm_ctrl_node_addr` getter。
+    - 永続化: KVS コールバックで CA 状態(`b"cast"` = ca-state v1)/ ノード帳
+      (`b"nods"` = nodes.tlv v1、smctl / s3-controller 互換)/ CASE resumption 素材
+      (`b"rsm<node16hex>"`、ポートローカル 49B)。init 末尾で復元。
+  - `Cargo.toml`: feature `controller`(default on)= `simple-matter/controller` を引き込む。
+    無効ビルド(`--no-default-features`)では `sm_ctrl_*` シンボルは出力されない
+    (デバイス専用構成のフットプリント不変)。
+  - `lib.rs`: `CRng` / `CKvs` / `cstr_key` / アドレス変換を `pub(crate)` 化して共有。
+  - ヘッダ再生成(冪等)。Rust 単体テスト +1(`ctrl_lifecycle_roundtrip`: context_size/
+    align・供給メモリ init/deinit・二重 init 拒否・pair_start の PASE 発行 + PAIR_PHASE
+    イベント + TX 排出・deinit→再 init での CA/ノード帳復元)。
+- `crates/simple-matter-cffi/ctest/controller.cpp`(新規)+ Makefile / .gitignore:
+  ホスト C++17 テストコントローラ。`aligned_alloc` で供給メモリを確保して `sm_ctrl_init`
+  に渡す(= 供給メモリ経路の実証)。標準入力から `pair` / `toggle` / `read` / `resolve`
+  コマンドを 1 行ずつ実行する。
+- `ports/esp-idf/examples/controller_hub_cpp`(新規、esp32s3): ビルド検証用の最小 main。
+  WiFi 接続 → PSRAM に `heap_caps_aligned_alloc(MALLOC_CAP_SPIRAM)`(無ければ internal)で
+  供給メモリを確保 → `sm_ctrl_init` → 固定ノード 1 台を pairing → 30 秒毎 Toggle。KVS は
+  NVS(namespace `smctl`。resumption キーは NVS 15 文字制限のため短縮)。`sdkconfig.defaults`
+  (partition 2MB / IPv6 / main task 16KB スタック)+ `sdkconfig.defaults.esp32s3`(SPIRAM 有効)。
+
+ゲート(実測):
+- `cargo test --workspace` = 639 pass(564 core + 14 cffi(新規 1 含む)+ 60 smctl 他、
+  0 failed、回帰なし)。clippy 0(default / `--no-default-features` 両方、workspace 全体)。
+  ヘッダ冪等。
+- riscv32imac `--features panic-abort` .a green(`sm_ctrl_*` 15 シンボルが `T`)+
+  `--no-default-features --features panic-abort` .a green(`sm_ctrl_*` 0 = フットプリント不変)。
+  **xtensa** `cargo +esp build … -Zbuild-std=core --features panic-abort` .a green
+  (`sm_ctrl_*` 15 シンボル)。
+- **ホスト E2E(核心)green**: `controller.cpp`(供給メモリ malloc)↔ デバイス側シム
+  `ctest/onoff_light`(シム同士の相互)、127.0.0.1、状態ディレクトリ分離。
+  - `pair 0xAABBCCDD 20202021 127.0.0.1 5540` → PASE→ArmFailSafe→(Attestation skip)→
+    CSR→AddTrustedRoot→AddNOC→CASE→CommissioningComplete = **PAIR OK**。
+  - `toggle` → INVOKE_DONE(デバイス EVENT COMMISSIONED + ONOFF_CHANGED)、`read` → value=1
+    (点灯状態一致)。
+  - **コントローラプロセス再起動** → `nodes=1` 復元(nodes.tlv v1)→ `toggle` が
+    `CASE_ESTABLISHED resumed=1`(**Sigma2Resume**)で確立 → INVOKE_DONE、`read` value=1。
+  - `供給メモリ経路`: `sm_ctrl_context_size()` = 25,816 B(ホスト x86_64、align 8)を
+    `aligned_alloc` で確保して `sm_ctrl_init` に渡す経路で全 E2E を実施。
+- **ESP-IDF docker(`espressif/idf:release-v5.4`、`SM_PREBUILT_A` 経路)**:
+  - **controller_hub_cpp esp32s3 build green**: `Project build complete`、app 947,968 B
+    (`0xe7500`、partition 55% free)。ELF に `sm_ctrl_init` / `sm_ctrl_pair_start` /
+    `sm_ctrl_invoke` ほか 11 シンボルが `T`(main.cpp 参照分。未参照は GC)。
+  - **onoff_light_cpp esp32c6(WiFi/BLE)回帰 build green**(riscv prebuilt、`sm_init` /
+    `sm_udp_rx` / `sm_poll` 健在)。
+  - docker 終了時にコンテナ内で `build/`・`sdkconfig` を rm(root 所有残骸なし)。
+- **デバイス側シム回帰 green**: smctl `pairing address 0x1234 20202021 127.0.0.1 5540` →
+  CommissioningComplete(既存 F1 経路が壊れていないことを確認)。
+
+コア(`crates/simple-matter`)への変更ゼロ(K1 の controller / ca / nodes codec と
+`ControllerStack` / `Commissioner` / `MdnsClient` の pub 契約のみで実装。供給メモリの
+自己参照 `&'static` は `CtrlShim` がシム内で確定して満たす)。
+
+**実機(S3 ボード)E2E は未実施(残)**: 実機接続状況が未確認のため親の確認に委ねる。
+ファーム(controller_hub_cpp)はビルド済みで即 flash 可能。**F7b(BLE central 給餌)は後続**。
+
+差分メモ(§11.1 に対し実装で確定):
+- `sm_ctrl_config_t` は KVS/RNG コールバック + `fabric_id` / `controller_node_id` /
+  `vendor_id`(CA 生成素材。KVS に ca-state があればそちら優先)。verifier は不要
+  (コントローラは passcode を `sm_ctrl_pair_start` 引数で受ける)。
+- 運用操作は「単一トランザクション直列」: 進行中は新規要求を `-10`(busy)で拒否する。
+  `sm_ctrl_resolve_start` は同期的にクエリバイト列を返す方式(TX キューを介さない。
+  デバイス側 `sm_mdns_poll` と同型)。QM マルチキャストは `at=NULL` で対応。

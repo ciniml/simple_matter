@@ -43,6 +43,26 @@ exclude = [
   "PendingCell",
   "EndpointReg",
   "Vec",
+  # コントローラ C FFI(controller.rs)の内部型(extern "C" 署名から参照されない)。
+  "CtrlShim",
+  "CtrlOwned",
+  "Activity",
+  "PendingOp",
+  "NodeEntry",
+  "TxItem",
+  "CtrlBackend",
+  "CCreds",
+  "CStack",
+  "CComm",
+  "Ca",
+  "Commissioner",
+  "ControllerCreds",
+  "ControllerStack",
+  "ScInitiator",
+  "ImClient",
+  "MdnsClient",
+  "Deque",
+  "AtomicPtr",
 ]
 
 [parse]

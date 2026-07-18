@@ -1,0 +1,9 @@
+# ESP32-S3 専用の既定(IDF が sdkconfig.defaults に自動連結する)。
+# 供給メモリ(sm_ctrl context)を PSRAM に確保するため SPIRAM を有効化する
+# (docs/design/c-ffi-shim.md §11.1)。ボードにより mode/speed は要調整だが、
+# ビルド検証(F7a のゲート)には既定で十分。実確保できない場合も main は internal に
+# フォールバックする。
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_QUAD=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y

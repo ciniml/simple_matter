@@ -1,0 +1,20 @@
+# controller_hub_cpp 既定設定(ターゲットは `idf.py set-target esp32s3` で選ぶ)。
+# F7a、docs/design/c-ffi-shim.md §11。
+
+# カスタムパーティション(app が既定 1MB を超えるため拡張)。
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# pump は app_main 内。メインタスクスタックに余裕を持たせる(P-256 署名チェーン)。
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# lwIP: IPv6 + SO_REUSE + ソケット数余裕。
+CONFIG_LWIP_IPV6=y
+CONFIG_LWIP_IPV6_AUTOCONFIG=y
+CONFIG_LWIP_SO_REUSE=y
+CONFIG_LWIP_MAX_SOCKETS=10
+
+# C++: 例外・RTTI は不要。
+CONFIG_COMPILER_CXX_EXCEPTIONS=n
+CONFIG_COMPILER_CXX_RTTI=n
