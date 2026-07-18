@@ -816,3 +816,20 @@ no_std 実装済み(K1、正味 ~83KB)で、K2-K4 の s3-controller が Rust 側
 - 運用操作は「単一トランザクション直列」: 進行中は新規要求を `-10`(busy)で拒否する。
   `sm_ctrl_resolve_start` は同期的にクエリバイト列を返す方式(TX キューを介さない。
   デバイス側 `sm_mdns_poll` と同型)。QM マルチキャストは `at=NULL` で対応。
+
+### F7a 実機検証(AirQ = ESP32-S3、2026-07-18)
+
+controller_hub_cpp を AirQ(S3FN8、PSRAM 非搭載)実機で E2E green:
+WiFi join → 供給メモリ確保(SPIRAM 不在 → 内部 RAM フォールバック、
+context 25,560B)→ ホスト PC のシムデバイスへ **PAIR COMPLETE(~6 秒)** →
+30 秒毎 toggle OK → リブートで CA/ノード帳復元(nodes=1)→ 再 pair なしで
+toggle 成立(resumption)。
+
+実機で直した 2 点(いずれも既知知見の適用漏れ):
+1. `CONFIG_SPIRAM_IGNORE_NOTFOUND=y` — PSRAM 必須設定のままだと非搭載
+   ボードで boot loop("Failed to init external RAM!" abort)。
+2. **メインタスクスタック 128KB**(`CONFIG_ESP_MAIN_TASK_STACK_SIZE=131072`)—
+   16KB では sm_ctrl の in-place 構築 + P-256 署名チェーンでスタック破壊し、
+   LoadProhibited / IntegerDivideByZero のリセットループ(F2 の 128KB 知見と
+   同根。コントローラ側にも同様に必要)。
+PSRAM 実搭載ボードでの SPIRAM 配置確認は P4 等の機材があるときに。

@@ -7,7 +7,10 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
 # pump は app_main 内。メインタスクスタックに余裕を持たせる(P-256 署名チェーン)。
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+# sm_ctrl の in-place 構築 + コミッショニング中の P-256 署名チェーンに必要
+# (デバイス側 example の 128KB 知見と同根。16KB ではスタック破壊で
+#  LoadProhibited/DivideByZero のリセットループになる — AirQ 実機で確認)
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=131072
 
 # lwIP: IPv6 + SO_REUSE + ソケット数余裕。
 CONFIG_LWIP_IPV6=y
@@ -18,3 +21,6 @@ CONFIG_LWIP_MAX_SOCKETS=10
 # C++: 例外・RTTI は不要。
 CONFIG_COMPILER_CXX_EXCEPTIONS=n
 CONFIG_COMPILER_CXX_RTTI=n
+
+# PSRAM 非搭載ボード(例: AirQ の S3FN8)でも起動する(供給メモリは内部 RAM フォールバック)
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
