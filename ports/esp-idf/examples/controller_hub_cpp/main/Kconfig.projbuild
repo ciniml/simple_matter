@@ -2,13 +2,13 @@ menu "controller_hub_cpp configuration"
 
     config SM_WIFI_SSID
         string "WiFi SSID"
-        default "iotap"
+        default "my-ssid"
         help
             コントローラハブが接続する WiFi の SSID。
 
     config SM_WIFI_PASS
         string "WiFi password"
-        default "hogeFugapiyo"
+        default "my-password"
         help
             WiFi パスワード。
 
