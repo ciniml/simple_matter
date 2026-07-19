@@ -13,6 +13,8 @@
 
 #include "simple_matter.h"
 
+#include "ble_central.hpp"
+
 #include <cstdint>
 #include <cstring>
 
@@ -275,6 +277,122 @@ bool term_invoke(const sm_ctrl_event_t &e) {
   return e.kind == SM_CTRL_EV_INVOKE_DONE || e.kind == SM_CTRL_EV_INVOKE_FAILED;
 }
 
+#ifdef CONFIG_SM_HUB_BLE_PAIR
+// ---- BLE pairing(NimBLE central、F7b、docs/design/c-ffi-shim.md §11.4) ----
+
+QueueHandle_t g_ble_q = nullptr;
+
+// 運用 mDNS(_matter._tcp)でデバイスを解決する(QU ユニキャスト + マルチキャスト join)。
+// BLE 切断後、デバイスが WiFi 参加して得た運用アドレスを見つける。成功=true。
+bool resolve_operational(int fd, uint64_t node_id, uint64_t timeout_ms) {
+  struct ip_mreq mreq = {};
+  mreq.imr_multiaddr.s_addr = inet_addr("224.0.0.251");
+  mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+  setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)); // best effort
+
+  uint64_t until = now_ms() + timeout_ms;
+  uint64_t last_q = 0;
+  uint8_t rx[1500];
+  while (now_ms() < until) {
+    if (now_ms() - last_q > 2000) {
+      uint8_t q[512];
+      sm_addr_t qdst;
+      size_t qn = sm_ctrl_resolve_start(node_id, nullptr, now_ms(), q, sizeof(q), &qdst);
+      if (qn > 0) {
+        send_sm(fd, q, qn, qdst);
+      }
+      last_q = now_ms();
+    }
+    struct timeval tv = {0, 200000};
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(fd, &rfds);
+    if (select(fd + 1, &rfds, nullptr, nullptr, &tv) > 0 && FD_ISSET(fd, &rfds)) {
+      struct sockaddr_in6 src;
+      socklen_t sl = sizeof(src);
+      int n = recvfrom(fd, rx, sizeof(rx), 0, (struct sockaddr *)&src, &sl);
+      if (n > 0 && sm_ctrl_mdns_rx(rx, (size_t)n, nullptr, now_ms()) == 0) {
+        sm_ctrl_event_t ev;
+        while (sm_ctrl_take_event(&ev)) {
+          if (ev.kind == SM_CTRL_EV_RESOLVE_DONE) return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+// BLE(BTP)central でコミッショニングを BLE_DONE まで駆動する。成功=true。
+bool ble_pair(uint64_t node_id) {
+  const uint8_t *ssid = (const uint8_t *)CONFIG_SM_WIFI_SSID;
+  const uint8_t *pass = (const uint8_t *)CONFIG_SM_WIFI_PASS;
+  int rc = sm_ctrl_ble_pair_start(node_id, CONFIG_SM_TARGET_PASSCODE, 0 /*wifi*/, ssid,
+                                  strlen(CONFIG_SM_WIFI_SSID), pass, strlen(CONFIG_SM_WIFI_PASS),
+                                  now_ms());
+  if (rc != 0) {
+    ESP_LOGE(TAG, "sm_ctrl_ble_pair_start rc=%d", rc);
+    return false;
+  }
+  ESP_LOGI(TAG, "BLE scan+pair start (discriminator=%d)", CONFIG_SM_TARGET_DISCRIMINATOR);
+  sm_ble_central_start(CONFIG_SM_TARGET_DISCRIMINATOR);
+
+  uint64_t until = now_ms() + 90000;
+  uint8_t frag[256];
+  bool ble_done = false;
+  bool subscribed = false; // C2 subscribe(= C1 発見済み)まで C1 write を保留する。
+  while (now_ms() < until && !ble_done) {
+    // NimBLE central のイベントを sm_ctrl_ble_event へ給餌する。
+    BleCentralMsg m;
+    while (xQueueReceive(g_ble_q, &m, 0) == pdTRUE) {
+      switch (m.kind) {
+      case BleCentralEvent::Connected:
+        sm_ctrl_ble_event(SM_BLE_CONNECTED, m.mtu, nullptr, 0, now_ms());
+        break;
+      case BleCentralEvent::Subscribed:
+        sm_ctrl_ble_event(SM_BLE_C2_SUBSCRIBED, 0, nullptr, 0, now_ms());
+        subscribed = true;
+        break;
+      case BleCentralEvent::Indication:
+        sm_ctrl_ble_event(SM_BLE_C1_WRITE, 0, m.frag, m.frag_len, now_ms());
+        break;
+      case BleCentralEvent::Disconnected:
+        sm_ctrl_ble_event(SM_BLE_DISCONNECTED, 0, nullptr, 0, now_ms());
+        break;
+      }
+    }
+    // コントローラが積んだ BTP フラグメントを C1 write で送る(C1 handle 確定 =
+    // C2 subscribe 完了後のみ。CONNECTED 直後の handshake request は shim が退避しており、
+    // subscribe 前に排出すると C1 handle 未確定で write が落ちるため)。
+    size_t n;
+    while (subscribed && (n = sm_ctrl_ble_poll(now_ms(), frag, sizeof(frag))) > 0) {
+      sm_ble_central_write_c1(frag, n);
+    }
+    // フェーズイベント確認。
+    sm_ctrl_event_t ev;
+    while (sm_ctrl_take_event(&ev)) {
+      if (ev.kind == SM_CTRL_EV_PAIR_PHASE) {
+        ESP_LOGI(TAG, "  BLE phase %u", ev.phase);
+      } else if (ev.kind == SM_CTRL_EV_BLE_DONE) {
+        ESP_LOGI(TAG, "BLE_DONE (AddNOC + WiFi + ConnectNetwork over BTP)");
+        ble_done = true;
+      } else if (ev.kind == SM_CTRL_EV_PAIR_FAILED) {
+        ESP_LOGW(TAG, "BLE pairing FAILED phase=%u status=%u", ev.phase, ev.status);
+        return false;
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  if (!ble_done) {
+    ESP_LOGW(TAG, "BLE phase timed out");
+    return false;
+  }
+  // BLE 切断 → 運用 UDP へ handoff。
+  sm_ble_central_disconnect();
+  sm_ctrl_ble_event(SM_BLE_DISCONNECTED, 0, nullptr, 0, now_ms());
+  return true;
+}
+#endif // CONFIG_SM_HUB_BLE_PAIR
+
 } // namespace
 
 extern "C" void app_main(void) {
@@ -330,14 +448,37 @@ extern "C" void app_main(void) {
 
   const uint64_t node_id = CONFIG_SM_TARGET_NODE_ID;
 
-  // 対象アドレス(Kconfig の固定 IPv4)。
-  sm_addr_t addr = {};
-  addr.is_v6 = false;
-  inet_pton(AF_INET, CONFIG_SM_TARGET_IP, addr.ip);
-  addr.port = CONFIG_SM_TARGET_PORT;
-
   // 未コミッショニングなら pairing、済みなら以降 toggle が resumption で CASE 確立する。
   if (sm_ctrl_node_count() == 0) {
+#ifdef CONFIG_SM_HUB_BLE_PAIR
+    // --- BLE pairing(F7b): BLE で AddNOC/WiFi 投入 → BLE 切断 → mDNS 解決 → CASE over UDP ---
+    g_ble_q = xQueueCreate(8, sizeof(BleCentralMsg));
+    sm_ble_central_init(g_ble_q);
+    if (ble_pair(node_id)) {
+      ESP_LOGI(TAG, "resolving operational node %#llx via mDNS ...", (unsigned long long)node_id);
+      if (resolve_operational(g_udp, node_id, 30000)) {
+        sm_addr_t na;
+        if (sm_ctrl_node_addr(node_id, &na)) {
+          char ip[48] = {0};
+          inet_ntop(na.is_v6 ? AF_INET6 : AF_INET, na.ip, ip, sizeof(ip));
+          ESP_LOGI(TAG, "resolved %s:%u -> CASE over UDP", ip, na.port);
+        }
+        sm_ctrl_event_t ev;
+        if (run_until(g_udp, 60000, ev, term_pair) && ev.kind == SM_CTRL_EV_PAIR_COMPLETE) {
+          ESP_LOGI(TAG, "PAIR COMPLETE (BLE→UDP handoff) node=%#llx", (unsigned long long)node_id);
+        } else {
+          ESP_LOGW(TAG, "handoff CASE failed (phase=%u)", ev.phase);
+        }
+      } else {
+        ESP_LOGW(TAG, "operational mDNS resolve failed");
+      }
+    }
+#else
+    // --- UDP 直接 PASE(F7a、回帰維持): 対象アドレスは Kconfig の固定 IPv4 ---
+    sm_addr_t addr = {};
+    addr.is_v6 = false;
+    inet_pton(AF_INET, CONFIG_SM_TARGET_IP, addr.ip);
+    addr.port = CONFIG_SM_TARGET_PORT;
     ESP_LOGI(TAG, "pairing node %#llx at %s:%d ...", (unsigned long long)node_id,
              CONFIG_SM_TARGET_IP, CONFIG_SM_TARGET_PORT);
     if (sm_ctrl_pair_start(node_id, CONFIG_SM_TARGET_PASSCODE, &addr, now_ms()) == 0) {
@@ -348,6 +489,7 @@ extern "C" void app_main(void) {
         ESP_LOGW(TAG, "pairing failed (phase=%u)", ev.phase);
       }
     }
+#endif
   }
 
   // 定常: 30 秒毎に OnOff Toggle(live セッションが無ければ内部で CASE = resumption)。

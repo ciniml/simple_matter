@@ -19,7 +19,7 @@ CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -I$(INCDIR)
 LDLIBS   := -lpthread -ldl -lm
 
 .PHONY: all lib run clean
-all: onoff_light controller
+all: onoff_light controller ble_loopback
 
 lib:
 	cargo build -p simple-matter-cffi --release --features std --target $(TARGET)
@@ -31,8 +31,12 @@ onoff_light: onoff_light.cpp lib
 controller: controller.cpp lib
 	$(CXX) $(CXXFLAGS) -o $@ controller.cpp $(STATICLIB) $(LDLIBS)
 
+# ホスト BLE ループバックハーネス(F7b、デバイスシム↔コントローラを 1 プロセスで直結)。
+ble_loopback: ble_loopback.cpp lib
+	$(CXX) $(CXXFLAGS) -o $@ ble_loopback.cpp $(STATICLIB) $(LDLIBS)
+
 run: onoff_light
 	./onoff_light $(ARGS)
 
 clean:
-	rm -f onoff_light controller
+	rm -f onoff_light controller ble_loopback

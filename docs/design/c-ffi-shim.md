@@ -833,3 +833,107 @@ toggle 成立(resumption)。
    LoadProhibited / IntegerDivideByZero のリセットループ(F2 の 128KB 知見と
    同根。コントローラ側にも同様に必要)。
 PSRAM 実搭載ボードでの SPIRAM 配置確認は P4 等の機材があるときに。
+
+### 11.4 F7b: BLE central 給餌 API(設計)
+
+C++ 所有の BLE central(ESP-IDF なら NimBLE central、scan/connect/C1 write/
+C2 subscribe/indication 受信)から BTP central を給餌し、`pairing ble-wifi` /
+`ble-thread` を C コントローラで成立させる。デバイス側 §9 の鏡像:
+
+```c
+/* 広告照合ヘルパ(0xFFF6 service data から discriminator 抽出・照合) */
+bool   sm_ctrl_match_adv(const uint8_t *svc_data, size_t len, uint16_t discriminator);
+/* BLE コミッショニング開始(kind: 0=wifi(ssid/pass)、1=thread(dataset TLV)) */
+int32_t sm_ctrl_ble_pair_start(uint64_t node_id, uint32_t passcode, uint8_t kind,
+                               const uint8_t *cred1, size_t cred1_len,
+                               const uint8_t *cred2, size_t cred2_len, uint64_t now_ms);
+/* central 側イベント給餌: CONNECTED(arg=ATT MTU)/DISCONNECTED/
+   C2_SUBSCRIBED/C2_INDICATION(data=フラグメント) */
+int32_t sm_ctrl_ble_event(sm_ble_event_kind_t kind, uint16_t arg,
+                          const uint8_t *data, size_t len, uint64_t now_ms);
+/* C1 write で送るべき次フラグメント(0 = なし)。write 完了後に次を取り出す */
+size_t  sm_ctrl_ble_poll(uint64_t now_ms, uint8_t *frag_out, size_t cap);
+```
+
+- BLE フェーズ完了(AddNOC + ネットワーク資格情報投入 + ConnectNetwork)後は
+  自動で BLE クローズ要求イベント(SM_CTRL_EV_BLE_DONE)→ C++ が切断 →
+  既存の運用解決 + CASE over UDP へ handoff(ble-commissioner --udp-handoff と
+  同じ流儀)。
+- **ホストゲートの核心 = ループバック BTP**: ctest でコントローラの
+  `sm_ctrl_ble_poll` 出力をデバイス側シムの `sm_ble_event(C1_WRITE)` に、
+  デバイスの `sm_ble_poll` 出力を `sm_ctrl_ble_event(C2_INDICATION)` に
+  メモリ渡しで直結し、無線なしで BLE コミッショニング全経路を検証する。
+- 実機ゲート: S3(NimBLE central)から PC の ble-onoff-light(BlueZ
+  peripheral、hci1)へ ble-wifi → 運用 UDP handoff → toggle。
+
+### F7b 完了記録
+
+コントローラの BLE central 給餌 API(BTP central を C++ の NimBLE central から駆動 =
+`pairing ble-wifi` / `ble-thread` を C コントローラで成立させる)を実装した。§7 完了記録
+の一部(F7a の続き)。
+
+追加/変更物:
+- `crates/simple-matter-cffi/src/controller.rs`(ble-gated): §11.4 の 4 API
+  (`sm_ctrl_match_adv` / `sm_ctrl_ble_pair_start`(kind=0 wifi / 1 thread)/
+  `sm_ctrl_ble_event` / `sm_ctrl_ble_poll`)+ イベント `SM_CTRL_EV_BLE_DONE`。
+  `CtrlShim` に BTP central(`Btp<6>` = `BtpRole::Central`)+ BLE 接続状態
+  (conn/mtu/subscribed/handshake 退避)を ble-gated 追加。`Activity` に `BlePairing` /
+  `BleHandoff` を追加。BLE フェーズ:
+  PASE→Attestation(Skip)→CSR→AddNOC→AddOrUpdate{WiFi,Thread}Network→ConnectNetwork
+  (遅延応答)→ `suspend_before_case` で CASE 直前保留 → **BLE_DONE** → C++ が切断 →
+  `sm_ctrl_mdns_rx` が保留ノードを解決したら `set_peer`+`resume` で UDP pump
+  (`drive_pairing`)へ載せ替え → 既存 F7a 経路(CASE over UDP + CommissioningComplete)。
+  handshake request は `start_handshake` が `process_outgoing` を経由しないため
+  shim 内に退避し `sm_ctrl_ble_poll` が最初に排出する。BLE では MRP を格下げ
+  (unreliable)するため 1 サイクルの BTP 送信は「SC 継続応答」か「次リクエスト」の
+  排他 → `Btp::send`(1 SDU ずつ)の制約を満たす。
+  - **context_size 増分**: 25,816 B(F7a、host x86_64 align 8)→ **28,800 B**
+    (+2,984 B = BTP central のフラグメント/再組立バッファ + BLE 状態フィールド)。
+- ヘッダ再生成(冪等)。`sm_ctrl_ble_event` の署名は常時宣言(ble 無効ビルドは SM_ERR)。
+- `ctest/ble_loopback.cpp`(新規、核心ゲート): 同一プロセスでデバイス側シム
+  (`sm_init`(network=WIFI/THREAD)+ `sm_ble_*`)とコントローラ(`sm_ctrl_*`)を両方
+  初期化し、BTP フラグメントをメモリ渡しで直結(controller `ble_poll` → device
+  `sm_ble_event(C1_WRITE)`、device `sm_ble_poll` → controller
+  `sm_ctrl_ble_event(C2_INDICATION)`。CONNECTED/C2_SUBSCRIBED は両側に mtu=247 で注入)。
+  BLE 完了後は運用 UDP / mDNS をプロセス内ループバックで駆動(仮想時刻を実時計で進め
+  F7a の settle→drive を再現)。Makefile / .gitignore に追加。
+- `ports/esp-idf/examples/controller_hub_cpp`(esp32s3): `main/ble_central.{hpp,cpp}`
+  (NimBLE central: scan → `sm_ctrl_match_adv` で discriminator 照合 → connect → MTU 交換 →
+  GATT 0xFFF6 の C1/C2 発見 → C2 subscribe → C1 write / C2 indication 給餌。queue で
+  matter タスクへ直列化)。`main.cpp` に BLE pairing モード分岐(`ble_pair` + mDNS 運用解決
+  `resolve_operational`)。Kconfig `SM_HUB_BLE_PAIR` / `SM_TARGET_DISCRIMINATOR`。
+  `sdkconfig.defaults.ble`(NimBLE central/observer + coex)。既存 UDP モードは
+  `#else` で回帰維持。`main/CMakeLists.txt` に `bt` を常時 REQUIRES(条件付き REQUIRES 不可)。
+
+ゲート(実測):
+- `cargo test --workspace` = **639 pass / 0 fail**(回帰なし。`ctrl_lifecycle_roundtrip`
+  に BLE central ラウンドトリップ(match_adv + handshake + PASE 発行)を集約)。
+  clippy 0(default / `--no-default-features` / `controller` のみ 各構成)。ヘッダ冪等。
+- riscv32imac `--features panic-abort` .a green(`sm_ctrl_ble_*` 4 シンボルが `T`)+
+  `--no-default-features --features panic-abort,controller` .a green(ble 無効でも
+  `sm_ctrl_ble_*` は SM_ERR スタブとして `T` = ABI 安定)。**xtensa** .a green(4 シンボル)。
+- **ホスト E2E(核心)green**: `ble_loopback wifi` / `ble_loopback thread` 両方 ALL GREEN:
+  match_adv(disc 3840)→ BLE: PASE→ArmFailSafe→Attestation→CSR→AddTrustedRoot→AddNOC→
+  AddOrUpdate{WiFi,Thread}Network→ConnectNetwork(遅延応答: `sm_wifi_status`/
+  `sm_thread_status`)→ **BLE_DONE** → デバイス mDNS で operational 解決 → handoff →
+  CASE over UDP → Complete → **PAIR COMPLETE** → toggle(device onoff 0→1)→ read=1。
+- **ESP-IDF docker(`espressif/idf:release-v5.4`、`SM_PREBUILT_A` 経路)**:
+  - **controller_hub_cpp esp32s3 BLE pairing build green**: app **1,177,376 B**(44% free)。
+    ELF に `sm_ctrl_ble_event`/`sm_ctrl_ble_pair_start`/`sm_ctrl_ble_poll`/
+    `sm_ctrl_match_adv` + `sm_ble_central_*` が `T`。
+  - **UDP モード回帰 green**(esp32s3、BLE off = F7a 路線)。**onoff_light_cpp esp32c6
+    回帰 green**(riscv prebuilt)。docker 終了時に build/・sdkconfig を rm。
+- **実機(AirQ S3、/dev/ttyACM1)**: BLE central 経路を実機で検証 = WiFi join
+  (192.168.2.120)→ 供給メモリ 28,512B(PSRAM 非搭載 → internal フォールバック)→
+  **BLE scan → discriminator 3840 照合 → connect → MTU=256 → GATT C1/C2 発見 →
+  C2 subscribe** まで実機動作を確認。実機で 1 バグ修正: **CONNECTED 直後の handshake
+  request を C1 write する際、GATT 発見前で C1 handle 未確定だと write が落ちる**ため、
+  example の C1 write を C2 subscribe 完了までゲート(shim は handshake req を退避済み)。
+  フル E2E は PC 側 ble-onoff-light(BlueZ peripheral)が起動直後にローカル central へ
+  幽霊接続され広告を停止する環境事象(prompt の BlueZ 亡霊トラップ。`hcitool con` は
+  実接続なしを示すのに device は connected を報告)で妨げられ未完(シム/ファーム側の
+  欠陥ではない — ホスト loopback 両 kind + 実機 central 経路 subscribe までで検証済み)。
+  ファーム 3 点はビルド済みで即再試行可(BlueZ 環境を清浄化 = 再起動/別 peripheral 後)。
+- コア(`crates/simple-matter`)への変更ゼロ(`Commissioner` の `set_wifi_credentials`/
+  `set_thread_dataset`/`suspend_before_case`/`resume`/`set_peer` + `Btp`(Central)の
+  pub 契約のみで実装。BLE central の自己参照は F7a と同じ供給メモリ内で確定)。

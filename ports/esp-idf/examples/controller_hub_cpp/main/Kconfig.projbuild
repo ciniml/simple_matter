@@ -34,4 +34,20 @@ menu "controller_hub_cpp configuration"
         int "Target device Matter UDP port"
         default 5540
 
+    config SM_HUB_BLE_PAIR
+        bool "BLE pairing mode (pairing ble-wifi via NimBLE central)"
+        default n
+        help
+            有効にすると、UDP 直接 PASE の代わりに BLE(BTP central)で対象デバイスを
+            コミッショニングする(F7b、docs/design/c-ffi-shim.md §11.4)。scan で
+            discriminator を照合 → connect → BLE 上で PASE→AddNOC→AddWiFiNetwork→
+            ConnectNetwork → BLE 切断 → 運用 mDNS 解決 → CASE over UDP → toggle。
+            プロビジョンする WiFi 資格情報は SM_WIFI_SSID/SM_WIFI_PASS を流用する
+            (ハブ自身の接続先 = デバイスの接続先 = 同一 AP)。
+
+    config SM_TARGET_DISCRIMINATOR
+        int "Target device discriminator (BLE scan match, 12bit)"
+        default 3840
+        depends on SM_HUB_BLE_PAIR
+
 endmenu

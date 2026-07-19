@@ -92,6 +92,13 @@ typedef enum {
   SM_CTRL_EV_READ_FAILED = 9,
   // operational 解決成功(`node_id`。アドレスは `sm_ctrl_node_addr` で取得)。
   SM_CTRL_EV_RESOLVE_DONE = 10,
+  // BLE コミッショニングフェーズ完了(§11.4)。`node_id` = 対象ノード。
+  //
+  // AddNOC + ネットワーク資格情報投入 + ConnectNetwork まで BTP 上で完了した。C++ は
+  // BLE を切断(`sm_ctrl_ble_event(DISCONNECTED)`)し、運用アドレスを解決
+  // ([`sm_ctrl_resolve_start`] / [`sm_ctrl_mdns_rx`])してから運用 UDP で pump を回す
+  // (CASE → CommissioningComplete → PAIR_COMPLETE。ble-commissioner `--udp-handoff` の流儀)。
+  SM_CTRL_EV_BLE_DONE = 11,
 } sm_ctrl_event_kind_t;
 
 // アプリイベント種別(`docs/design/c-ffi-shim.md` §1)。
@@ -600,7 +607,7 @@ size_t sm_ctrl_resolve_start(uint64_t node_id,
 int32_t sm_ctrl_mdns_rx(const uint8_t *pkt,
                         size_t len,
                         const sm_addr_t *_src,
-                        uint64_t _now_ms);
+                        uint64_t now_ms);
 
 // 既知ノードの現在の運用アドレスを取得する。戻り値 = ノードが存在するか。
 bool sm_ctrl_node_addr(uint64_t node_id,
@@ -608,6 +615,58 @@ bool sm_ctrl_node_addr(uint64_t node_id,
 
 // 現在の管理ノード数(ノード帳のエントリ数)。
 size_t sm_ctrl_node_count(void);
+
+// commissionable 広告の service data(0xFFF6、8 バイト)から discriminator を照合する(§11.4)。
+//
+// `svc_data` は BlueZ/NimBLE が届ける 0xFFF6 service data payload(先頭 8 バイトを使う)。
+// 一致で `true`。ble 無効ビルドは常に `false`。初期化不要(純関数)。
+bool sm_ctrl_match_adv(const uint8_t *svc_data,
+                       size_t len,
+                       uint16_t discriminator);
+
+// BLE(BTP)コミッショニングを開始する(§11.4)。
+//
+// `kind`: 0=WiFi(`cred1`=SSID、`cred2`=パスフレーズ)、1=Thread(`cred1`=dataset TLV、
+// `cred2` 未使用)。AddNOC 後にネットワーク資格情報を投入し ConnectNetwork まで BTP 上で
+// 進め、CASE 直前で保留して [`SM_CTRL_EV_BLE_DONE`] を立てる(以降 §11.4 の handoff)。
+//
+// 呼び出し前に C++ は scan([`sm_ctrl_match_adv`])→ connect 済みであること。以降
+// CONNECTED/C2_SUBSCRIBED/C2_INDICATION を [`sm_ctrl_ble_event`] で、C1 write を
+// [`sm_ctrl_ble_poll`] で給餌する。
+//
+// 戻り値: 0=OK、-1=未初期化/ble 無効、-2=busy、-3=資格情報不正、-4=commission 拒否。
+int32_t sm_ctrl_ble_pair_start(uint64_t node_id,
+                               uint32_t passcode,
+                               uint8_t kind,
+                               const uint8_t *cred1,
+                               size_t cred1_len,
+                               const uint8_t *cred2,
+                               size_t cred2_len,
+                               uint64_t now_ms);
+
+// BLE central のイベントを給餌する(§11.4)。デバイス側 [`sm_ble_event`] の鏡像。
+//
+// - `SM_BLE_CONNECTED`(arg=ATT MTU): BTP handshake を能動開始する(Capabilities Request は
+//   `sm_ctrl_ble_poll` が排出する)。
+// - `SM_BLE_C2_SUBSCRIBED`: C2 indication の購読完了(central 自身の購読状態)。
+// - `SM_BLE_C2_INDICATION`(= `SM_BLE_C1_WRITE` の ABI 値を流用): 受信 1 フラグメント。
+// - `SM_BLE_DISCONNECTED`: 切断。BTP をリセットする(handoff は継続)。
+//
+// 戻り値: 0=OK、-1=未初期化/NULL/ble 無効、-2=2 本目の接続拒否、-3=BTP 給餌失敗。
+int32_t sm_ctrl_ble_event(sm_ble_event_kind_t kind,
+                          uint16_t arg,
+                          const uint8_t *data,
+                          size_t len,
+                          uint64_t now_ms);
+
+// C1 write で送るべき次の BTP フラグメントを取り出す(§11.4)。0 = なし。
+//
+// 最初に handshake request(Capabilities Request)を、以降は `process_outgoing` の
+// データセグメント / standalone ACK を排出する。C++ は 0 になるまで呼んで C1 write する。
+// BTP の再送・keep-alive ACK もここから産まれる。ble 無効ビルドは常に 0。
+size_t sm_ctrl_ble_poll(uint64_t now_ms,
+                        uint8_t *frag_out,
+                        size_t cap);
 
 #ifdef __cplusplus
 } // extern "C"

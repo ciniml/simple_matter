@@ -59,6 +59,17 @@ use crate::{
     SmKvsSet, SmRngFill, SM_NO_DEADLINE,
 };
 
+// BLE central 給餌(F7b、§11.4)。BTP central を C++ の NimBLE central から駆動する。
+#[cfg(feature = "ble")]
+use simple_matter::btp::gatt::AdvData;
+#[cfg(feature = "ble")]
+use simple_matter::btp::{Btp, BtpRole};
+#[cfg(feature = "ble")]
+use simple_matter::transport::net::{BtpConnId, MAX_RX_PACKET_SIZE};
+// デバイス側と共有する BLE イベント種別(`sm_ble_event` と同じ ABI)。ble 無効ビルドでも
+// `sm_ctrl_ble_event` の署名に現れるため無条件で import する(本体は SM_ERR を返す)。
+use crate::sm_ble_event_kind_t;
+
 // ==========================================================================
 // サイジング(単一ノード運用 + コミッショニング時の揺らぎ。s3-controller と同値)
 // ==========================================================================
@@ -77,6 +88,12 @@ const MAX_NODES: usize = 8;
 const TX_Q_CAP: usize = 4;
 /// イベントリング容量(コミッショニングはフェーズごとにイベントを積む)。
 const EV_CAP: usize = 16;
+/// BTP central の window(コアの参照実装 `ble-commissioner.rs` / デバイス側シムと同じ 6)。
+#[cfg(feature = "ble")]
+const CTRL_BTP_WINDOW: usize = 6;
+/// 保留中の BTP handshake request(central の Capabilities Request)を退避する上限。
+#[cfg(feature = "ble")]
+const HS_REQ_MAX: usize = 40;
 
 /// 暗号バックエンド(C コールバック RNG)。
 type CtrlBackend = RustCrypto<CRng>;
@@ -148,6 +165,13 @@ pub enum sm_ctrl_event_kind_t {
     SM_CTRL_EV_READ_FAILED = 9,
     /// operational 解決成功(`node_id`。アドレスは `sm_ctrl_node_addr` で取得)。
     SM_CTRL_EV_RESOLVE_DONE = 10,
+    /// BLE コミッショニングフェーズ完了(§11.4)。`node_id` = 対象ノード。
+    ///
+    /// AddNOC + ネットワーク資格情報投入 + ConnectNetwork まで BTP 上で完了した。C++ は
+    /// BLE を切断(`sm_ctrl_ble_event(DISCONNECTED)`)し、運用アドレスを解決
+    /// ([`sm_ctrl_resolve_start`] / [`sm_ctrl_mdns_rx`])してから運用 UDP で pump を回す
+    /// (CASE → CommissioningComplete → PAIR_COMPLETE。ble-commissioner `--udp-handoff` の流儀)。
+    SM_CTRL_EV_BLE_DONE = 11,
 }
 
 /// コントローライベント(立った順にリングから取り出す)。
@@ -198,6 +222,13 @@ enum Activity {
     },
     /// 運用トランザクション(invoke/read)の応答待ち。
     AwaitOp { node_id: u64, op: PendingOp },
+    /// BLE(BTP)コミッショニング進行中(§11.4)。PASE→AddNOC→ネットワーク投入→ConnectNetwork
+    /// を BTP 上で駆動し、Phase::Case 直前で保留して [`SM_CTRL_EV_BLE_DONE`] を立てる。
+    #[cfg(feature = "ble")]
+    BlePairing { node_id: u64 },
+    /// BLE フェーズ完了後、運用アドレス解決 → UDP 遷移(`set_peer` + `resume`)待ち(§11.4)。
+    #[cfg(feature = "ble")]
+    BleHandoff { node_id: u64 },
 }
 
 /// 管理ノード 1 台の実行時状態。
@@ -235,6 +266,23 @@ struct CtrlShim {
     compressed_fabric: [u8; 8],
     /// 直近に PAIR_PHASE として通知したフェーズコード(重複通知の抑止。pump は毎回呼ばれる)。
     last_pair_phase: u8,
+    // --- BLE central(F7b、§11.4)。BTP central を C++ の NimBLE central から給餌する ---
+    /// BTP central 状態機械(同時 1 接続。デバイス側シムの鏡像)。
+    #[cfg(feature = "ble")]
+    btp: Btp<CTRL_BTP_WINDOW>,
+    /// 現在の BLE 接続(1 本のみ)。
+    #[cfg(feature = "ble")]
+    ble_conn: Option<BtpConnId>,
+    /// CONNECTED で渡された ATT MTU(0 = 不明)。
+    #[cfg(feature = "ble")]
+    ble_mtu: Option<u16>,
+    /// C2 indication の subscribe が完了したか(central 自身の購読状態。情報用)。
+    #[cfg(feature = "ble")]
+    ble_subscribed: bool,
+    /// 保留中の BTP handshake request(central の Capabilities Request)。`sm_ctrl_ble_poll`
+    /// が最初に排出する(`start_handshake` は `process_outgoing` を経由しないため退避が要る)。
+    #[cfg(feature = "ble")]
+    ble_hs_out: heapless::Vec<u8, HS_REQ_MAX>,
 }
 
 // ==========================================================================
@@ -449,6 +497,10 @@ fn pump(s: &mut CtrlShim, now: u64) {
         Activity::Pairing { node_id, addr } => drive_pairing(s, node_id, addr, now),
         Activity::Connecting { node_id, addr, op } => drive_connecting(s, node_id, addr, op, now),
         Activity::AwaitOp { node_id, op } => drive_awaitop(s, node_id, op),
+        // BLE フェーズは BTP イベント駆動(`sm_ctrl_ble_event` 内の `ble_service`)。
+        // UDP pump では進めない。handoff 後は Activity::Pairing に遷移し上の Pairing 腕が担う。
+        #[cfg(feature = "ble")]
+        Activity::BlePairing { .. } | Activity::BleHandoff { .. } => {}
     }
 }
 
@@ -852,6 +904,14 @@ pub extern "C" fn sm_ctrl_init(
         let compressed = (*sp).owned.ca.compressed_fabric_id_bytes();
         addr_of_mut!((*sp).compressed_fabric).write(compressed);
         addr_of_mut!((*sp).last_pair_phase).write(u8::MAX);
+        #[cfg(feature = "ble")]
+        {
+            addr_of_mut!((*sp).btp).write(Btp::new(BtpRole::Central));
+            addr_of_mut!((*sp).ble_conn).write(None);
+            addr_of_mut!((*sp).ble_mtu).write(None);
+            addr_of_mut!((*sp).ble_subscribed).write(false);
+            addr_of_mut!((*sp).ble_hs_out).write(heapless::Vec::new());
+        }
 
         CTRL.store(sp, Ordering::SeqCst);
         CTRL_INITED.store(true, Ordering::SeqCst);
@@ -1040,13 +1100,26 @@ pub extern "C" fn sm_ctrl_next_deadline(now_ms: u64) -> u64 {
     if !s.txq.is_empty() {
         return now_ms;
     }
-    match s.stack.next_deadline(now_ms) {
+    // UDP トランザクション進行中(BLE フェーズは除く)= コミッショナが次を発行できる状態。
+    let udp_active = match s.activity {
+        Activity::Idle => false,
+        #[cfg(feature = "ble")]
+        Activity::BlePairing { .. } | Activity::BleHandoff { .. } => false,
+        _ => true,
+    };
+    let dl = match s.stack.next_deadline(now_ms) {
         Some(dl) => dl,
-        // 静穏(ACK/再送なし)かつトランザクション進行中 = コミッショナが次を発行できる状態。
-        // 即時に poll させて次のリクエストを積ませる(そうでなければアイドル = 期限なし)。
-        None if !matches!(s.activity, Activity::Idle) => now_ms,
+        // 静穏(ACK/再送なし)かつ UDP トランザクション進行中 = 即時に poll させて次を積ませる。
+        None if udp_active => now_ms,
         None => SM_NO_DEADLINE,
-    }
+    };
+    // BTP の ACK / keep-alive / liveness 期限も併合する(§11.4、デバイス側 sm_next_deadline と同型)。
+    #[cfg(feature = "ble")]
+    let dl = match s.btp.next_deadline() {
+        Some(btp_dl) => dl.min(btp_dl),
+        None => dl,
+    };
+    dl
 }
 
 /// コントローライベントを立った順に 1 件取り出す。戻り値 = 取り出せたか。
@@ -1186,11 +1259,13 @@ pub extern "C" fn sm_ctrl_mdns_rx(
     pkt: *const u8,
     len: usize,
     _src: *const sm_addr_t,
-    _now_ms: u64,
+    now_ms: u64,
 ) -> i32 {
     if !CTRL_INITED.load(Ordering::SeqCst) || pkt.is_null() {
         return -1;
     }
+    #[cfg(not(feature = "ble"))]
+    let _ = now_ms; // handoff(now_ms 使用)は ble 有効時のみ。
     // SAFETY: 単線契約。
     let s = unsafe { ctrl_shim() };
     let p = unsafe { core::slice::from_raw_parts(pkt, len) };
@@ -1207,10 +1282,24 @@ pub extern "C" fn sm_ctrl_mdns_rx(
                 .copied();
             if let Some(ip) = ip {
                 let port = if node.port != 0 { node.port } else { MATTER_PORT };
-                s.nodes[i].addr = SocketAddr::new(ip, port);
+                let addr = SocketAddr::new(ip, port);
+                s.nodes[i].addr = addr;
                 let mut ev = CtrlShim::ev(sm_ctrl_event_kind_t::SM_CTRL_EV_RESOLVE_DONE);
                 ev.node_id = node_id;
                 s.push_event(ev);
+                // BLE→UDP handoff(§11.4): BLE フェーズ完了後にこのノードを解決したら、
+                // コミッショナのピアを運用 UDP に差し替え・保留解除し、UDP pump(drive_pairing)
+                // に載せ替える。以降 C++ は sm_ctrl_udp_rx / sm_ctrl_poll で CASE→Complete を回す。
+                #[cfg(feature = "ble")]
+                if matches!(s.activity, Activity::BleHandoff { node_id: n } if n == node_id) {
+                    if let Some(comm) = s.comm.as_mut() {
+                        comm.set_peer(PeerAddr::Udp(addr));
+                        comm.resume();
+                    }
+                    s.activity = Activity::Pairing { node_id, addr };
+                    s.last_pair_phase = u8::MAX;
+                    pump(s, now_ms); // sigma1(start_case)を TX キューへ積む。
+                }
                 return 0;
             }
         }
@@ -1245,6 +1334,366 @@ pub extern "C" fn sm_ctrl_node_count() -> usize {
     // SAFETY: 単線契約。
     let s = unsafe { ctrl_shim() };
     s.nodes.len()
+}
+
+// ==========================================================================
+// BLE central 給餌(F7b、docs/design/c-ffi-shim.md §11.4)
+//
+// C++ 所有の BLE central(NimBLE central: scan/connect/C1 write/C2 subscribe/indication)
+// から BTP central を給餌し、`pairing ble-wifi` / `ble-thread` を C コントローラで成立させる。
+// デバイス側シム(§9)の鏡像。ヘッダは常時宣言し、ble 無効ビルドでは SM_ERR / 0 を返す。
+// ==========================================================================
+
+/// 再組立済み 1 SDU を `out` にコピーして長さを返す(`Btp::recv` の借用を切る)。
+#[cfg(feature = "ble")]
+fn take_sdu_ctrl(btp: &mut Btp<CTRL_BTP_WINDOW>, out: &mut [u8]) -> Option<usize> {
+    let sdu = btp.recv()?;
+    let n = sdu.len();
+    out[..n].copy_from_slice(sdu);
+    Some(n)
+}
+
+/// BTP 上でコミッショナを進捗が止まるまで駆動する(BLE 版 [`drive_pairing`])。
+///
+/// 送信は BTP へ載せる(排出は `sm_ctrl_ble_poll`)。AddNOC + ネットワーク投入 +
+/// ConnectNetwork を経て Phase::Case 直前で保留(`suspend_before_case`)されると
+/// [`SM_CTRL_EV_BLE_DONE`] を立て、`Activity::BleHandoff` へ遷移する(§11.4)。
+#[cfg(feature = "ble")]
+fn drive_ble_commission(s: &mut CtrlShim, node_id: u64, now: u64) {
+    loop {
+        let mut scratch = [0u8; MAX_PACKET_SIZE];
+        // comm / stack は別フィールド(disjoint borrow)。out は Copy でブロック外へ返す。
+        let (out, prev) = {
+            let Some(comm) = s.comm.as_mut() else {
+                s.activity = Activity::Idle;
+                return;
+            };
+            let prev = comm.phase();
+            let out = comm.drive(&mut s.stack, now, &mut scratch);
+            (out, prev)
+        };
+        if let Some(dir) = out.send {
+            // BLE フェーズの送信はすべて BTP 宛(commissioner の peer = Ble)。
+            if matches!(dir.addr, PeerAddr::Ble(_)) {
+                let _ = s.btp.send(&scratch[..dir.len], now);
+            }
+        }
+        let code = phase_code(out.phase);
+        if code != s.last_pair_phase {
+            s.last_pair_phase = code;
+            let mut ev = CtrlShim::ev(sm_ctrl_event_kind_t::SM_CTRL_EV_PAIR_PHASE);
+            ev.phase = code;
+            ev.node_id = node_id;
+            s.push_event(ev);
+        }
+        match out.phase {
+            // AddNOC + ネットワーク資格情報投入 + ConnectNetwork まで完了し、CASE を保留した。
+            // BLE フェーズ完了。ノードを帳へ暫定登録(handoff の resolve/handle 対象)して
+            // BLE_DONE を立てる。運用アドレスは handoff 後に確定する。
+            Phase::Case if out.send.is_none() => {
+                let placeholder = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MATTER_PORT));
+                s.set_node(node_id, placeholder, None);
+                let mut ev = CtrlShim::ev(sm_ctrl_event_kind_t::SM_CTRL_EV_BLE_DONE);
+                ev.node_id = node_id;
+                s.push_event(ev);
+                s.activity = Activity::BleHandoff { node_id };
+                // issue_noc で next_serial が進んだ CA を永続化(クラッシュ耐性)。
+                s.persist_ca();
+                return;
+            }
+            Phase::Done { session } => {
+                // 稀: suspend 無しで CASE まで BLE 上で完走したケース(防御的に完了扱い)。
+                let addr = s
+                    .node_index(node_id)
+                    .map(|i| s.nodes[i].addr)
+                    .unwrap_or(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MATTER_PORT)));
+                s.set_node(node_id, addr, Some(session));
+                let mut ev = CtrlShim::ev(sm_ctrl_event_kind_t::SM_CTRL_EV_PAIR_COMPLETE);
+                ev.node_id = node_id;
+                s.push_event(ev);
+                s.comm = None;
+                s.activity = Activity::Idle;
+                s.persist_ca();
+                s.persist_nodes();
+                s.persist_resumption(node_id);
+                return;
+            }
+            Phase::Failed { stage, reason } => {
+                let mut ev = CtrlShim::ev(sm_ctrl_event_kind_t::SM_CTRL_EV_PAIR_FAILED);
+                ev.phase = stage;
+                ev.status = commission_error_code(reason);
+                ev.node_id = node_id;
+                s.push_event(ev);
+                s.comm = None;
+                s.activity = Activity::Idle;
+                return;
+            }
+            _ => {}
+        }
+        if out.send.is_none() && out.phase == prev {
+            return; // 次はイベント待ち(indication が来るまで進めない)。
+        }
+    }
+}
+
+/// BTP で受けた応答を捌き、コミッショナを進める(`sm_ctrl_ble_event(C2_INDICATION)` の後段)。
+///
+/// 1. 再組立済み SDU を `handle_rx` に配り、SC 継続応答を BTP へ載せる。
+/// 2. BTP 確立後はコミッショナを駆動する(次のリクエストを BTP へ載せる)。
+///
+/// BLE では MRP を格下げ(unreliable)するため handle_rx は Matter 層 ACK を産まない。
+/// よって 1 サイクルの BTP 送信は「SC 継続 応答」か「次リクエスト」のどちらか一方(排他)で、
+/// `Btp::send`(1 SDU ずつ)の制約を満たす。
+#[cfg(feature = "ble")]
+fn ble_service(s: &mut CtrlShim, node_id: u64, now: u64) {
+    let Some(conn) = s.ble_conn else {
+        return;
+    };
+    let mut sdu = [0u8; MAX_RX_PACKET_SIZE];
+    let mut txc = [0u8; MAX_RX_PACKET_SIZE];
+    // take_sdu_ctrl は s.btp の借用を都度切る(次行で s.stack を可変借用するため)。
+    while let Some(slen) = take_sdu_ctrl(&mut s.btp, &mut sdu) {
+        if let Some(d) = s
+            .stack
+            .handle_rx(&mut sdu[..slen], PeerAddr::Ble(conn), now, &mut txc)
+        {
+            if matches!(d.addr, PeerAddr::Ble(_)) {
+                let _ = s.btp.send(&txc[..d.len], now);
+            }
+        }
+    }
+    if s.btp.is_established() {
+        drive_ble_commission(s, node_id, now);
+    }
+}
+
+/// commissionable 広告の service data(0xFFF6、8 バイト)から discriminator を照合する(§11.4)。
+///
+/// `svc_data` は BlueZ/NimBLE が届ける 0xFFF6 service data payload(先頭 8 バイトを使う)。
+/// 一致で `true`。ble 無効ビルドは常に `false`。初期化不要(純関数)。
+#[no_mangle]
+pub extern "C" fn sm_ctrl_match_adv(svc_data: *const u8, len: usize, discriminator: u16) -> bool {
+    #[cfg(not(feature = "ble"))]
+    {
+        let _ = (svc_data, len, discriminator);
+        false
+    }
+    #[cfg(feature = "ble")]
+    {
+        if svc_data.is_null() || len < 8 {
+            return false;
+        }
+        // SAFETY: caller が len バイトの svc_data を与える契約。
+        let b = unsafe { core::slice::from_raw_parts(svc_data, len) };
+        let mut sd = [0u8; 8];
+        sd.copy_from_slice(&b[..8]);
+        match AdvData::parse_service_data(&sd) {
+            Ok(ad) => ad.discriminator == (discriminator & 0x0FFF),
+            Err(_) => false,
+        }
+    }
+}
+
+/// BLE(BTP)コミッショニングを開始する(§11.4)。
+///
+/// `kind`: 0=WiFi(`cred1`=SSID、`cred2`=パスフレーズ)、1=Thread(`cred1`=dataset TLV、
+/// `cred2` 未使用)。AddNOC 後にネットワーク資格情報を投入し ConnectNetwork まで BTP 上で
+/// 進め、CASE 直前で保留して [`SM_CTRL_EV_BLE_DONE`] を立てる(以降 §11.4 の handoff)。
+///
+/// 呼び出し前に C++ は scan([`sm_ctrl_match_adv`])→ connect 済みであること。以降
+/// CONNECTED/C2_SUBSCRIBED/C2_INDICATION を [`sm_ctrl_ble_event`] で、C1 write を
+/// [`sm_ctrl_ble_poll`] で給餌する。
+///
+/// 戻り値: 0=OK、-1=未初期化/ble 無効、-2=busy、-3=資格情報不正、-4=commission 拒否。
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn sm_ctrl_ble_pair_start(
+    node_id: u64,
+    passcode: u32,
+    kind: u8,
+    cred1: *const u8,
+    cred1_len: usize,
+    cred2: *const u8,
+    cred2_len: usize,
+    now_ms: u64,
+) -> i32 {
+    #[cfg(not(feature = "ble"))]
+    {
+        let _ = (node_id, passcode, kind, cred1, cred1_len, cred2, cred2_len, now_ms);
+        -1
+    }
+    #[cfg(feature = "ble")]
+    {
+        if !CTRL_INITED.load(Ordering::SeqCst) {
+            return -1;
+        }
+        // SAFETY: 単線契約。
+        let s = unsafe { ctrl_shim() };
+        if !matches!(s.activity, Activity::Idle) {
+            return -2;
+        }
+        // 供給メモリは不動 → owned への &'static は健全(sm_ctrl_pair_start と同じ根拠)。
+        let owned: &'static CtrlOwned = unsafe { &*(addr_of!(s.owned)) };
+        let mut comm = Commissioner::new(&owned.ca, &owned.crypto, AttestationPolicy::Skip);
+        // ネットワーク資格情報を設定する(kind で WiFi / Thread を選ぶ)。
+        match kind {
+            0 => {
+                if cred1.is_null() || cred2.is_null() {
+                    return -3;
+                }
+                // SAFETY: caller が len バイトの cred1/cred2 を与える契約。
+                let ssid = unsafe { core::slice::from_raw_parts(cred1, cred1_len) };
+                let pass = unsafe { core::slice::from_raw_parts(cred2, cred2_len) };
+                if comm.set_wifi_credentials(ssid, pass).is_err() {
+                    return -3;
+                }
+            }
+            1 => {
+                if cred1.is_null() {
+                    return -3;
+                }
+                // SAFETY: 同上(cred1 = dataset TLV)。
+                let ds = unsafe { core::slice::from_raw_parts(cred1, cred1_len) };
+                if comm.set_thread_dataset(ds).is_err() {
+                    return -3;
+                }
+            }
+            _ => return -3,
+        }
+        comm.suspend_before_case(); // AddNOC 後に CASE を保留(handoff で運用 UDP へ)。
+        if comm
+            .commission(PeerAddr::Ble(BtpConnId(0)), passcode, node_id, now_ms)
+            .is_err()
+        {
+            return -4;
+        }
+        s.comm = Some(comm);
+        s.last_pair_phase = u8::MAX;
+        // BTP central をリセットし、接続待ちに入る(CONNECTED で handshake を開始する)。
+        s.btp.reset();
+        s.ble_conn = None;
+        s.ble_mtu = None;
+        s.ble_subscribed = false;
+        s.ble_hs_out.clear();
+        s.activity = Activity::BlePairing { node_id };
+        0
+    }
+}
+
+/// BLE central のイベントを給餌する(§11.4)。デバイス側 [`sm_ble_event`] の鏡像。
+///
+/// - `SM_BLE_CONNECTED`(arg=ATT MTU): BTP handshake を能動開始する(Capabilities Request は
+///   `sm_ctrl_ble_poll` が排出する)。
+/// - `SM_BLE_C2_SUBSCRIBED`: C2 indication の購読完了(central 自身の購読状態)。
+/// - `SM_BLE_C2_INDICATION`(= `SM_BLE_C1_WRITE` の ABI 値を流用): 受信 1 フラグメント。
+/// - `SM_BLE_DISCONNECTED`: 切断。BTP をリセットする(handoff は継続)。
+///
+/// 戻り値: 0=OK、-1=未初期化/NULL/ble 無効、-2=2 本目の接続拒否、-3=BTP 給餌失敗。
+#[no_mangle]
+pub extern "C" fn sm_ctrl_ble_event(
+    kind: sm_ble_event_kind_t,
+    arg: u16,
+    data: *const u8,
+    len: usize,
+    now_ms: u64,
+) -> i32 {
+    #[cfg(not(feature = "ble"))]
+    {
+        let _ = (kind, arg, data, len, now_ms);
+        -1
+    }
+    #[cfg(feature = "ble")]
+    {
+        if !CTRL_INITED.load(Ordering::SeqCst) {
+            return -1;
+        }
+        // SAFETY: 単線契約。
+        let s = unsafe { ctrl_shim() };
+        match kind {
+            sm_ble_event_kind_t::SM_BLE_CONNECTED => {
+                if s.ble_conn.is_some() {
+                    return -2; // 同時 1 接続。C++ は 2 本目を切断する。
+                }
+                s.ble_conn = Some(BtpConnId(0));
+                s.ble_mtu = if arg == 0 { None } else { Some(arg) };
+                s.ble_subscribed = false;
+                s.btp.reset();
+                // central: handshake を能動開始し、Capabilities Request を退避する
+                //(sm_ctrl_ble_poll が最初に C1 write として排出する)。
+                let mut hs = [0u8; HS_REQ_MAX];
+                s.ble_hs_out.clear();
+                if let Ok(n) = s.btp.start_handshake(&mut hs, s.ble_mtu, now_ms) {
+                    let _ = s.ble_hs_out.extend_from_slice(&hs[..n.min(HS_REQ_MAX)]);
+                }
+                0
+            }
+            sm_ble_event_kind_t::SM_BLE_DISCONNECTED => {
+                s.ble_conn = None;
+                s.ble_subscribed = false;
+                s.ble_hs_out.clear();
+                s.btp.reset();
+                0
+            }
+            sm_ble_event_kind_t::SM_BLE_C2_SUBSCRIBED => {
+                s.ble_subscribed = true;
+                0
+            }
+            // C2 indication(central 受信)。ABI 値はデバイス側 C1_WRITE と共有する(§11.4)。
+            sm_ble_event_kind_t::SM_BLE_C1_WRITE => {
+                if data.is_null() || s.ble_conn.is_none() {
+                    return -1;
+                }
+                // SAFETY: caller が有効な data/len を与える契約。
+                let frag = unsafe { core::slice::from_raw_parts(data, len) };
+                if s.btp.process_incoming(frag, s.ble_mtu, now_ms).is_err() {
+                    return -3;
+                }
+                let node_id = match s.activity {
+                    Activity::BlePairing { node_id } => node_id,
+                    _ => 0,
+                };
+                ble_service(s, node_id, now_ms);
+                0
+            }
+        }
+    }
+}
+
+/// C1 write で送るべき次の BTP フラグメントを取り出す(§11.4)。0 = なし。
+///
+/// 最初に handshake request(Capabilities Request)を、以降は `process_outgoing` の
+/// データセグメント / standalone ACK を排出する。C++ は 0 になるまで呼んで C1 write する。
+/// BTP の再送・keep-alive ACK もここから産まれる。ble 無効ビルドは常に 0。
+#[no_mangle]
+pub extern "C" fn sm_ctrl_ble_poll(now_ms: u64, frag_out: *mut u8, cap: usize) -> usize {
+    #[cfg(not(feature = "ble"))]
+    {
+        let _ = (now_ms, frag_out, cap);
+        0
+    }
+    #[cfg(feature = "ble")]
+    {
+        if !CTRL_INITED.load(Ordering::SeqCst) || frag_out.is_null() {
+            return 0;
+        }
+        // SAFETY: 単線契約。
+        let s = unsafe { ctrl_shim() };
+        let out = unsafe { core::slice::from_raw_parts_mut(frag_out, cap) };
+        // 1) 保留中の handshake request を先に排出する。
+        if !s.ble_hs_out.is_empty() {
+            let n = s.ble_hs_out.len();
+            if n > cap {
+                return 0;
+            }
+            out[..n].copy_from_slice(&s.ble_hs_out);
+            s.ble_hs_out.clear();
+            return n;
+        }
+        if s.ble_conn.is_none() {
+            return 0;
+        }
+        s.btp.process_outgoing(out, s.ble_mtu, now_ms).unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
@@ -1448,6 +1897,114 @@ mod tests {
         // ノード帳は空(コミッショニング完了していないため保存されていない)。
         assert_eq!(sm_ctrl_node_count(), 0);
         sm_ctrl_deinit();
+
+        // --- BLE central(F7b、§11.4)ハンドシェイク + PASE 発行のラウンドトリップ ---
+        // 単一 static 契約のため本テストに集約する(device tests.rs と同方針)。
+        #[cfg(feature = "ble")]
+        {
+            use simple_matter::btp::gatt::AdvData;
+            use simple_matter::btp::{Btp, BtpRole};
+
+            assert_eq!(sm_ctrl_init(mem, size, &cfg, 0), 0);
+
+            // (1) match_adv: 0xFFF6 service data から discriminator を照合する。
+            let ad = AdvData {
+                discriminator: 3840,
+                vendor_id: 0xFFF1,
+                product_id: 0x8000,
+                additional_data: false,
+                ext_announcement: false,
+            };
+            let sd = ad.service_data();
+            assert!(sm_ctrl_match_adv(sd.as_ptr(), sd.len(), 3840));
+            assert!(!sm_ctrl_match_adv(sd.as_ptr(), sd.len(), 1234));
+            assert!(!sm_ctrl_match_adv(sd.as_ptr(), 4, 3840)); // 短すぎ。
+            let bad = [0xFFu8; 8]; // OpCode 不正。
+            assert!(!sm_ctrl_match_adv(bad.as_ptr(), bad.len(), 3840));
+
+            // (2) BLE コミッショニング開始(WiFi 資格情報)。
+            let ssid = b"iotap";
+            let pass = b"hogeFugapiyo";
+            let node_id = 0x0000_0000_AABB_CCDD;
+            assert_eq!(
+                sm_ctrl_ble_pair_start(
+                    node_id,
+                    20202021,
+                    0, // wifi
+                    ssid.as_ptr(),
+                    ssid.len(),
+                    pass.as_ptr(),
+                    pass.len(),
+                    1000,
+                ),
+                0
+            );
+            // busy 中の 2 本目は拒否。
+            assert_eq!(
+                sm_ctrl_ble_pair_start(node_id, 20202021, 0, ssid.as_ptr(), ssid.len(), pass.as_ptr(), pass.len(), 1000),
+                -2
+            );
+
+            // (3) CONNECTED(mtu=247)→ handshake request を ble_poll で排出する。
+            let mtu: u16 = 247;
+            assert_eq!(
+                sm_ctrl_ble_event(sm_ble_event_kind_t::SM_BLE_CONNECTED, mtu, core::ptr::null(), 0, 1000),
+                0
+            );
+            // 2 本目の接続は拒否。
+            assert_eq!(
+                sm_ctrl_ble_event(sm_ble_event_kind_t::SM_BLE_CONNECTED, mtu, core::ptr::null(), 0, 1000),
+                -2
+            );
+            let mut frag = [0u8; 512];
+            let hlen = sm_ctrl_ble_poll(1000, frag.as_mut_ptr(), frag.len());
+            assert!(hlen > 0, "handshake request expected");
+
+            // (4) peripheral 側 BTP で handshake を受けて応答を返す。
+            let mut peripheral = Btp::<6>::new(BtpRole::Peripheral);
+            peripheral
+                .process_incoming(&frag[..hlen], Some(mtu), 1000)
+                .unwrap();
+            let mut resp = [0u8; 512];
+            let rlen = peripheral.process_outgoing(&mut resp, Some(mtu), 1000).unwrap();
+            assert!(rlen > 0, "handshake response expected");
+
+            // (5) central が subscribe 済みとして handshake response を給餌 → BTP 確立 →
+            //     PASE 第 1 メッセージ(PBKDFParamRequest)が生成される。
+            assert_eq!(
+                sm_ctrl_ble_event(sm_ble_event_kind_t::SM_BLE_C2_SUBSCRIBED, 0, core::ptr::null(), 0, 1000),
+                0
+            );
+            assert_eq!(
+                sm_ctrl_ble_event(
+                    sm_ble_event_kind_t::SM_BLE_C1_WRITE, // ABI 値を C2_INDICATION に流用(§11.4)
+                    0,
+                    resp.as_ptr(),
+                    rlen,
+                    1000,
+                ),
+                0
+            );
+            // PAIR_PHASE(PASE)イベントが立つ。
+            let mut ev = sm_ctrl_event_t {
+                kind: sm_ctrl_event_kind_t::SM_CTRL_EV_NONE,
+                phase: 0,
+                status: 0,
+                node_id: 0,
+                value_u64: 0,
+                value_is_null: false,
+                resumed: false,
+            };
+            assert!(sm_ctrl_take_event(&mut ev));
+            assert_eq!(ev.kind, sm_ctrl_event_kind_t::SM_CTRL_EV_PAIR_PHASE);
+            assert_eq!(ev.phase, phase_code(Phase::Pase));
+            assert_eq!(ev.node_id, node_id);
+            // PASE 第 1 フラグメントが ble_poll で取り出せる。
+            let plen = sm_ctrl_ble_poll(1000, frag.as_mut_ptr(), frag.len());
+            assert!(plen > 0, "PBKDFParamRequest fragment expected");
+
+            sm_ctrl_deinit();
+        }
 
         // SAFETY: alloc と同じ layout で解放する。
         unsafe { dealloc(mem, layout) };
