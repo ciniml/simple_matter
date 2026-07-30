@@ -1,0 +1,32 @@
+# F8e: TBR(border routing)構成の追加既定。ベストエフォート(既定ビルドには含めない)。
+# docs/design/p4-thread-controller.md §3 F8e。明示合成で使う:
+#   idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.br" set-target esp32p4 build
+#
+# 追加で必要なもの(このリポジトリには入れていない = 実機フェーズ送り):
+#   - `espressif/mdns` managed component(border agent の meshcop mDNS 公開に必要。
+#     main/idf_component.yml に dependencies: espressif/mdns を追加する)
+#   - backbone netif の実体。P4 は radio 非搭載なので WiFi なら
+#     `espressif/esp_wifi_remote` + esp-hosted(例: M5Stack Tab5 = P4+C6)、
+#     または Ethernet。app 側で netif を上げてから OT を起動する
+#     (ot_hub.cpp が WIFI_STA_DEF / ETH_DEF を探して backbone に設定する)。
+
+CONFIG_SM_THREAD_BR=y
+
+# border router 本体(SRP サーバ・border agent・routing manager 一式)。
+CONFIG_OPENTHREAD_BORDER_ROUTER=y
+# BR 構成では OT 側の config が SRP サーバを有効にするため custom header は不要。
+CONFIG_OPENTHREAD_HEADER_CUSTOM=n
+
+# OT の MeshCoP(border agent の DTLS)は ECJPAKE を使う(ot_br example と同じ)。
+CONFIG_MBEDTLS_CMAC_C=y
+CONFIG_MBEDTLS_SSL_PROTO_DTLS=y
+CONFIG_MBEDTLS_KEY_EXCHANGE_ECJPAKE=y
+CONFIG_MBEDTLS_ECJPAKE_C=y
+
+# lwIP: backbone ↔ Thread の IPv6 forwarding とフック(ot_br example と同じ)。
+CONFIG_LWIP_IPV6_FORWARD=y
+CONFIG_LWIP_NETIF_STATUS_CALLBACK=y
+CONFIG_LWIP_HOOK_IP6_ROUTE_DEFAULT=y
+CONFIG_LWIP_HOOK_ND6_GET_GW_DEFAULT=y
+CONFIG_LWIP_HOOK_IP6_INPUT_CUSTOM=y
+CONFIG_LWIP_HOOK_IP6_SELECT_SRC_ADDR_CUSTOM=y

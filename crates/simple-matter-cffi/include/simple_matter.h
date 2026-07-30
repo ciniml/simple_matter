@@ -613,6 +613,17 @@ int32_t sm_ctrl_mdns_rx(const uint8_t *pkt,
 bool sm_ctrl_node_addr(uint64_t node_id,
                        sm_addr_t *out);
 
+// 既知ノードの運用アドレスを直接設定する(Thread/SRP 等、mDNS 以外の解決経路用)。
+//
+// Thread では運用アドレス解決が mDNS ではなく SRP(ボーダー/ハブ自身が SRP サーバ)に
+// なるため、C++ 側が `otSrpServerGetNextHost()` 列挙などで得たアドレスをノード帳へ
+// 反映するための入口(F8b、docs/design/p4-thread-controller.md §3)。
+// 内部処理は [`sm_ctrl_mdns_rx`] の解決成功時と同じ(ノード帳更新 + RESOLVE_DONE)。
+//
+// 戻り値: 0=OK、-1=未初期化/NULL、-2=ノード帳に `node_id` なし。
+int32_t sm_ctrl_set_node_addr(uint64_t node_id,
+                              const sm_addr_t *addr);
+
 // 現在の管理ノード数(ノード帳のエントリ数)。
 size_t sm_ctrl_node_count(void);
 

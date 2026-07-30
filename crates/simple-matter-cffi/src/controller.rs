@@ -1325,6 +1325,37 @@ pub extern "C" fn sm_ctrl_node_addr(node_id: u64, out: *mut sm_addr_t) -> bool {
     }
 }
 
+/// 既知ノードの運用アドレスを直接設定する(Thread/SRP 等、mDNS 以外の解決経路用)。
+///
+/// Thread では運用アドレス解決が mDNS ではなく SRP(ボーダー/ハブ自身が SRP サーバ)に
+/// なるため、C++ 側が `otSrpServerGetNextHost()` 列挙などで得たアドレスをノード帳へ
+/// 反映するための入口(F8b、docs/design/p4-thread-controller.md §3)。
+/// 内部処理は [`sm_ctrl_mdns_rx`] の解決成功時と同じ(ノード帳更新 + RESOLVE_DONE)。
+///
+/// 戻り値: 0=OK、-1=未初期化/NULL、-2=ノード帳に `node_id` なし。
+#[no_mangle]
+pub extern "C" fn sm_ctrl_set_node_addr(node_id: u64, addr: *const sm_addr_t) -> i32 {
+    if !CTRL_INITED.load(Ordering::SeqCst) || addr.is_null() {
+        return -1;
+    }
+    // SAFETY: 単線契約。
+    let s = unsafe { ctrl_shim() };
+    let Some(i) = s.node_index(node_id) else {
+        return -2;
+    };
+    // SAFETY: caller が有効な sm_addr_t を与える契約。
+    let mut a = unsafe { *addr };
+    if a.port == 0 {
+        a.port = MATTER_PORT; // port 省略は運用ポート 5540 とみなす。
+    }
+    s.nodes[i].addr = smaddr_to_socket(&a);
+    let mut ev = CtrlShim::ev(sm_ctrl_event_kind_t::SM_CTRL_EV_RESOLVE_DONE);
+    ev.node_id = node_id;
+    s.push_event(ev);
+    s.persist_nodes();
+    0
+}
+
 /// 現在の管理ノード数(ノード帳のエントリ数)。
 #[no_mangle]
 pub extern "C" fn sm_ctrl_node_count() -> usize {
@@ -1896,7 +1927,63 @@ mod tests {
         assert_eq!(sm_ctrl_init(mem, size, &cfg, 0), 0);
         // ノード帳は空(コミッショニング完了していないため保存されていない)。
         assert_eq!(sm_ctrl_node_count(), 0);
+
+        // --- F8b: sm_ctrl_set_node_addr(Thread/SRP 由来のアドレス直接設定) ---
+        // 未知ノード / NULL の防御(この時点でノード帳は空)。
+        assert_eq!(sm_ctrl_set_node_addr(node_id, &dst), -2);
+        assert_eq!(sm_ctrl_set_node_addr(node_id, core::ptr::null()), -1);
         sm_ctrl_deinit();
+
+        // ノード帳(b"nods")を仕込んで再 init → 既知ノードのアドレスを差し替える。
+        {
+            let mut recs: heapless::Vec<nodes_codec::NodeRecord, MAX_NODES> = heapless::Vec::new();
+            let old = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 5540));
+            recs.push(nodes_codec::NodeRecord::new(node_id, old, "").unwrap())
+                .unwrap();
+            let mut buf = [0u8; nodes_codec::nodes_max_len(MAX_NODES)];
+            let len = nodes_codec::encode_nodes(&mut buf, &recs).unwrap();
+            // NOTE: `c"nods"` リテラルは cbindgen の parser が読めない(ヘッダ生成が
+            // 落ちる)ため、NUL 終端バイト列 + キャストで書く。
+            #[allow(clippy::manual_c_str_literals)]
+            t_kvs_set(
+                core::ptr::null_mut(),
+                b"nods\0".as_ptr() as *const core::ffi::c_char,
+                buf.as_ptr(),
+                len,
+            );
+        }
+        assert_eq!(sm_ctrl_init(mem, size, &cfg, 0), 0);
+        assert_eq!(sm_ctrl_node_count(), 1);
+        // Thread の ML-EID 相当(IPv6 + scope_id、port は 0 = 既定 5540 とみなす)。
+        let mut ip6 = [0u8; 16];
+        ip6[0] = 0xfd;
+        ip6[15] = 0x02;
+        let thread_addr = sm_addr_t {
+            ip: ip6,
+            is_v6: true,
+            port: 0,
+            scope_id: 3,
+        };
+        assert_eq!(sm_ctrl_set_node_addr(node_id, &thread_addr), 0);
+        assert_eq!(sm_ctrl_set_node_addr(0xDEAD, &thread_addr), -2);
+        // ノード帳に反映され、port は 5540 に補完されている。
+        let mut got = sm_addr_t {
+            ip: [0; 16],
+            is_v6: false,
+            port: 0,
+            scope_id: 0,
+        };
+        assert!(sm_ctrl_node_addr(node_id, &mut got));
+        assert!(got.is_v6);
+        assert_eq!(got.ip, ip6);
+        assert_eq!(got.port, MATTER_PORT);
+        // RESOLVE_DONE イベント(mDNS 解決成功時と同じ通知)。
+        assert!(sm_ctrl_take_event(&mut ev));
+        assert_eq!(ev.kind, sm_ctrl_event_kind_t::SM_CTRL_EV_RESOLVE_DONE);
+        assert_eq!(ev.node_id, node_id);
+        sm_ctrl_deinit();
+        // 後続(BLE)ブロックのためにノード帳を消す。
+        KVS.lock().unwrap().retain(|(k, _)| k != b"nods");
 
         // --- BLE central(F7b、§11.4)ハンドシェイク + PASE 発行のラウンドトリップ ---
         // 単一 static 契約のため本テストに集約する(device tests.rs と同方針)。

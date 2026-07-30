@@ -1,0 +1,84 @@
+menu "thread_ctrl_hub_cpp configuration"
+
+    comment "RCP (ESP32-H2) connection"
+
+    config SM_OT_UART_PORT
+        int "UART port to the 802.15.4 RCP"
+        default 1
+        help
+            H2(ot_rcp)と spinel をやり取りする P4 側の UART ポート番号。
+            UART0 はコンソールに使うため既定は 1。
+
+    config SM_OT_UART_RX_PIN
+        int "UART RX pin (P4 side, connect to RCP TX)"
+        default 4
+
+    config SM_OT_UART_TX_PIN
+        int "UART TX pin (P4 side, connect to RCP RX)"
+        default 5
+
+    config SM_OT_UART_BAUD
+        int "UART baud rate to the RCP"
+        default 460800
+        help
+            scripts/otbr/build-ot-rcp-h2.sh でビルドする RCP 側の設定と一致させること。
+
+    comment "Thread network"
+
+    config SM_THREAD_DATASET_TLV_HEX
+        string "Active dataset TLV (hex, empty = create a new network)"
+        default ""
+        help
+            空にすると起動時に otDatasetCreateNewNetwork で新規ネットワークを生成する
+            (生成された TLV は起動ログに hex で出るので、デバイス側にプリセットする)。
+            既存の Thread ネットワークに合わせる場合はその active dataset TLV を hex で
+            指定する。NVS に保存済みの dataset があればそちらが優先される。
+
+    config SM_THREAD_BR
+        bool "Enable border routing over a backbone netif (F8e, best effort)"
+        default n
+        help
+            有効にすると backbone(WiFi/Ethernet)側と Thread の間で border routing を
+            行う(esp_openthread_border_router_init)。P4 は radio 非搭載のため backbone
+            WiFi は esp_wifi_remote / esp-hosted(例: M5Stack Tab5 = P4+C6)が要る。
+            既定 n = 自己完結 Thread ハブ(Matter 通信に border routing は不要)。
+
+    config SM_BACKBONE_WIFI_SSID
+        string "Backbone WiFi SSID"
+        depends on SM_THREAD_BR
+        default "CHANGE-ME"
+        help
+            秘密はコミットしない。sdkconfig.local で上書きすること。
+
+    config SM_BACKBONE_WIFI_PASS
+        string "Backbone WiFi password"
+        depends on SM_THREAD_BR
+        default "CHANGE-ME"
+        help
+            秘密はコミットしない。sdkconfig.local で上書きすること。
+
+    comment "Target device (Matter)"
+
+    config SM_TARGET_NODE_ID
+        hex "Target node id (operational NodeId)"
+        default 0xAABBCCDD
+        help
+            コミッショニングして管理する固定ノードの運用 NodeId。
+
+    config SM_TARGET_PASSCODE
+        int "Target passcode"
+        default 20202021
+
+    config SM_TARGET_IPV6
+        string "Target device IPv6 (on-network PASE over Thread)"
+        default "fd00:db8:a0:0::1"
+        help
+            未コミッショニング時に PASE を張る宛先。デバイスを同じ dataset で Thread に
+            参加させ、そのログに出る ML-EID / OMR アドレスを転記する。
+            BLE を使わない構成のため、コミッショニングは on-network PASE で行う。
+
+    config SM_TARGET_PORT
+        int "Target device Matter UDP port"
+        default 5540
+
+endmenu

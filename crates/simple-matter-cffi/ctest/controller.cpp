@@ -498,6 +498,45 @@ int exec_command(const std::string &line) {
       }
     }
   }
+  if (cmd == "setaddr") {
+    // F8b: mDNS 以外(Thread/SRP 列挙)で得たアドレスをノード帳へ直接設定する。
+    //   setaddr <node_hex> <ip> [port]   port 省略 = 0 = シム側で 5540 に補完。
+    std::string node, ip, port;
+    iss >> node >> ip >> port;
+    if (ip.empty()) {
+      fprintf(stderr, "usage: setaddr <node_hex> <ip> [port]\n");
+      return 2;
+    }
+    uint64_t node_id = parse_u64(node);
+    sm_addr_t addr;
+    if (!parse_ip(ip, port.empty() ? 0 : (uint16_t)parse_u64(port), addr)) {
+      fprintf(stderr, "bad ip %s\n", ip.c_str());
+      return 2;
+    }
+    int rc = sm_ctrl_set_node_addr(node_id, &addr);
+    if (rc != 0) {
+      fprintf(stderr, "sm_ctrl_set_node_addr rc=%d\n", rc);
+      return 1;
+    }
+    // RESOLVE_DONE が立ち、ノード帳が更新されていること。
+    sm_ctrl_event_t ev;
+    bool resolved = false;
+    while (sm_ctrl_take_event(&ev)) {
+      if (term_resolve(ev) && ev.node_id == node_id) {
+        resolved = true;
+      }
+    }
+    sm_addr_t a;
+    if (!resolved || !sm_ctrl_node_addr(node_id, &a)) {
+      fprintf(stderr, "SETADDR: no RESOLVE_DONE / node missing\n");
+      return 1;
+    }
+    char ipbuf[64] = {0};
+    inet_ntop(a.is_v6 ? AF_INET6 : AF_INET, a.ip, ipbuf, sizeof(ipbuf));
+    printf("SETADDR OK node=%#llx addr=%s:%u\n", (unsigned long long)node_id, ipbuf, a.port);
+    fflush(stdout);
+    return 0;
+  }
   fprintf(stderr, "unknown command: %s\n", cmd.c_str());
   return 2;
 }

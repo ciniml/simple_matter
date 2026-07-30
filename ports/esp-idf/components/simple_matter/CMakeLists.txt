@@ -21,9 +21,14 @@ set(SM_INCLUDE_DIR "${SM_CRATE_DIR}/include")
 #   Xtensa(S3)   = xtensa-esp32s3-none-elf(esp channel + -Zbuild-std=core が必須。
 #                  経路 (b) の素朴な `cargo build` では通らないため S3 は経路 (a)
 #                  = SM_PREBUILT_A のみサポート。F4a、docs/design/c-ffi-shim.md §4)
+#   ESP32-P4    = riscv32imafc-unknown-none-elf(stable rustc。P4 の GCC は hard-float
+#                  = ilp32f ABI なので imac(soft-float ilp32)の .a はリンクできない。
+#                  docs/design/p4-thread-controller.md §3 F8a / リスク R-P4-2)
 set(SM_TARGET_XTENSA FALSE)
 if(IDF_TARGET STREQUAL "esp32c6" OR IDF_TARGET STREQUAL "esp32c3")
     set(SM_RUST_TARGET "riscv32imac-unknown-none-elf")
+elseif(IDF_TARGET STREQUAL "esp32p4")
+    set(SM_RUST_TARGET "riscv32imafc-unknown-none-elf")
 elseif(IDF_TARGET STREQUAL "esp32s3")
     set(SM_RUST_TARGET "xtensa-esp32s3-none-elf")
     set(SM_TARGET_XTENSA TRUE)
@@ -31,6 +36,7 @@ else()
     message(FATAL_ERROR
         "simple_matter: unsupported IDF_TARGET '${IDF_TARGET}'. "
         "Supported: esp32c6/esp32c3 (riscv32imac-unknown-none-elf), "
+        "esp32p4 (riscv32imafc-unknown-none-elf), "
         "esp32s3 (xtensa-esp32s3-none-elf). See docs/design/c-ffi-shim.md §4.")
 endif()
 
@@ -49,8 +55,7 @@ if(DEFINED SM_PREBUILT_A AND NOT "${SM_PREBUILT_A}" STREQUAL "")
         message(FATAL_ERROR "simple_matter: SM_PREBUILT_A='${SM_STATICLIB}' does not exist")
     endif()
     message(STATUS "simple_matter: using prebuilt staticlib ${SM_STATICLIB}")
-    add_prebuilt_library(simple_matter_rust "${SM_STATICLIB}")
-    target_link_libraries(${COMPONENT_LIB} PUBLIC simple_matter_rust)
+    set(SM_STATICLIB_DEP "")
 elseif(SM_TARGET_XTENSA)
     # S3/Xtensa は esp channel + `-Zbuild-std=core` が要るため、経路 (b) の素朴な
     # `cargo build` では通らない。SM_PREBUILT_A(経路 (a))を必須とする(F4a)。
@@ -81,8 +86,38 @@ else()
         COMMENT "Building simple-matter-cffi staticlib (${SM_RUST_TARGET})"
         VERBATIM)
     add_custom_target(simple_matter_cargo DEPENDS "${SM_STATICLIB}")
-    add_prebuilt_library(simple_matter_rust "${SM_STATICLIB}")
     # COMPONENT_LIB のリンク前に cargo を走らせる。
-    add_dependencies(${COMPONENT_LIB} simple_matter_cargo)
-    target_link_libraries(${COMPONENT_LIB} PUBLIC simple_matter_rust)
+    set(SM_STATICLIB_DEP simple_matter_cargo)
 endif()
+
+# --- ESP32-P4(ilp32f): staticlib から soft-float の .o を取り除く(R-P4-2)---
+# rustup の compiler_builtins rlib に同梱される cc ビルド済み C ルーチン
+# (popcountsi2 等)は soft-float ABI のままで、参照されると riscv ld が
+# "can't link soft-float modules with single-float modules" で最終リンクを拒否する。
+# 同じルーチンは IDF が常にリンクする libgcc(ilp32f)が持つため、削除して逃がす。
+# 詳細は strip_softfloat_objs.cmake のコメント。
+if(IDF_TARGET STREQUAL "esp32p4")
+    string(REGEX REPLACE "-gcc(\\.exe)?$" "-readelf" SM_READELF "${CMAKE_C_COMPILER}")
+    set(SM_LINK_A "${CMAKE_CURRENT_BINARY_DIR}/libsimple_matter_cffi_ilp32f.a")
+    add_custom_command(
+        OUTPUT "${SM_LINK_A}"
+        COMMAND "${CMAKE_COMMAND}"
+                "-DIN_A=${SM_STATICLIB}" "-DOUT_A=${SM_LINK_A}"
+                "-DAR_TOOL=${CMAKE_AR}" "-DREADELF_TOOL=${SM_READELF}"
+                -P "${CMAKE_CURRENT_LIST_DIR}/strip_softfloat_objs.cmake"
+        DEPENDS "${SM_STATICLIB}"
+        COMMENT "simple_matter: stripping soft-float objects for esp32p4 (ilp32f)"
+        VERBATIM)
+    add_custom_target(simple_matter_ilp32f DEPENDS "${SM_LINK_A}")
+    if(SM_STATICLIB_DEP)
+        add_dependencies(simple_matter_ilp32f ${SM_STATICLIB_DEP})
+    endif()
+    set(SM_STATICLIB "${SM_LINK_A}")
+    set(SM_STATICLIB_DEP simple_matter_ilp32f)
+endif()
+
+add_prebuilt_library(simple_matter_rust "${SM_STATICLIB}")
+if(SM_STATICLIB_DEP)
+    add_dependencies(${COMPONENT_LIB} ${SM_STATICLIB_DEP})
+endif()
+target_link_libraries(${COMPONENT_LIB} PUBLIC simple_matter_rust)

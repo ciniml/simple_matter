@@ -1,0 +1,7 @@
+# thread_ctrl_hub_cpp のパーティションテーブル(ESP32-P4、4MB flash 前提)。
+# openthread(FTD + border router lib)+ コントローラ .a で app は 2MB を超えるため
+# 2.5MB を割り当てる(onoff_light_cpp の Thread 構成と同じ勘定)。
+# Name,   Type, SubType, Offset,   Size,    Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+factory,  app,  factory, 0x10000,  0x2C0000,

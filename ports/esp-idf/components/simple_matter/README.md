@@ -11,9 +11,17 @@ Rust staticlib `libsimple_matter_cffi.a` を `add_prebuilt_library` で最終 EL
 | IDF_TARGET | Rust target | 状態 |
 |---|---|---|
 | esp32c6 / esp32c3 | `riscv32imac-unknown-none-elf` | F2(経路 (a)/(b) 両対応) |
+| esp32p4 | `riscv32imafc-unknown-none-elf` | F8a(経路 (a)/(b) 両対応) |
 | esp32s3 | `xtensa-esp32s3-none-elf` | F4a(経路 (a) = `SM_PREBUILT_A` のみ) |
 
 非対応の `IDF_TARGET` を選ぶと configure 時に `FATAL_ERROR` になる。
+
+**P4 の注意**: ESP32-P4 の GCC は hard-float(`ilp32f` ABI)。soft-float の
+`riscv32imac-unknown-none-elf` の .a を渡すと最終 ELF リンクで
+`can't link soft-float modules with single-float modules` になるため、
+**必ず `riscv32imafc-unknown-none-elf`** を使う(`rustup target add
+riscv32imafc-unknown-none-elf`。stable rustc に有る)。
+docs/design/p4-thread-controller.md §3 F8a。
 
 **S3/Xtensa の注意**: `xtensa-esp32s3-none-elf` は upstream rustc に無く、esp channel
 (espup)+ `-Zbuild-std=core` が要る。コンポーネントの経路 (b)(cargo 自動ビルド)は
@@ -75,7 +83,7 @@ idf.py -DSM_PREBUILT_A=$A build
 ```
 
 `SM_PREBUILT_A` は存在しないと `FATAL_ERROR`。ターゲットに合った .a を渡すこと
-(C6/C3 = `riscv32imac-unknown-none-elf`)。
+(C6/C3 = `riscv32imac-unknown-none-elf`、P4 = `riscv32imafc-unknown-none-elf`)。
 
 注意: **`set-target` も CMake configure を走らせる**ため、`-DSM_PREBUILT_A` は
 `set-target` 時にも必要(付けないと cargo 不在環境では configure が

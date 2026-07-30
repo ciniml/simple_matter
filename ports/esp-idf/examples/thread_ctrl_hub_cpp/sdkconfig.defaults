@@ -1,0 +1,52 @@
+# thread_ctrl_hub_cpp 既定設定(ターゲットは `idf.py set-target esp32p4`)。
+# docs/design/p4-thread-controller.md §3 F8c。
+
+# カスタムパーティション(app が既定 1MB / 2MB を超えるため拡張)。
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# pump は app_main 内。メインタスクスタック 128KB(sm_ctrl の in-place 構築 +
+# P-256 署名チェーン。F7a の AirQ 実機で確定した値)。
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=131072
+
+# --- OpenThread(FTD。radio は H2 の RCP に spinel over UART で繋ぐ)---
+CONFIG_OPENTHREAD_ENABLED=y
+CONFIG_OPENTHREAD_FTD=y
+CONFIG_OPENTHREAD_RADIO_SPINEL_UART=y
+CONFIG_OPENTHREAD_DNS_CLIENT=y
+# SRP サーバ(このハブがデバイスの _matter._tcp 登録を受ける)。IDF v5.4 では
+# OPENTHREAD_CONFIG_SRP_SERVER_ENABLE が CONFIG_OPENTHREAD_BORDER_ROUTER の中でしか
+# 1 にならないが、BORDER_ROUTER=y は border agent の meshcop mDNS(espressif/mdns
+# managed component)まで引き込む。既定ビルドは custom header で SRP サーバだけを
+# 有効化する(main/esp_ot_custom_config.h)。BR 一式は F8e = sdkconfig.defaults.br。
+CONFIG_OPENTHREAD_HEADER_CUSTOM=y
+CONFIG_OPENTHREAD_CUSTOM_HEADER_PATH="main"
+CONFIG_OPENTHREAD_CUSTOM_HEADER_FILE_NAME="esp_ot_custom_config.h"
+# SRP クライアントは不要(このハブは自分でサービス登録しない)。
+CONFIG_OPENTHREAD_SRP_CLIENT=n
+# OT のコンソール(CLI)は使わない。
+CONFIG_OPENTHREAD_CLI=n
+CONFIG_OPENTHREAD_CONSOLE_ENABLE=n
+
+# OpenThread は eventfd を使う(radio / netif / task queue の 3 本)。
+CONFIG_VFS_SUPPORT_IO=y
+
+# lwIP: IPv6(Thread は IPv6 のみ)。OT netif は複数アドレスを持つ。
+CONFIG_LWIP_IPV6=y
+CONFIG_LWIP_IPV6_AUTOCONFIG=y
+# openthread の lwIP netif は 12 を要求する(v5.4: esp_openthread_lwip_netif.c の #error)。
+CONFIG_LWIP_IPV6_NUM_ADDRESSES=12
+CONFIG_LWIP_MULTICAST_PING=y
+CONFIG_LWIP_SO_REUSE=y
+CONFIG_LWIP_MAX_SOCKETS=10
+
+# C++: 例外・RTTI は不要。
+CONFIG_COMPILER_CXX_EXCEPTIONS=n
+CONFIG_COMPILER_CXX_RTTI=n
+
+# PSRAM: 搭載ボードでは供給メモリ(sm_ctrl context)を PSRAM に置く。非搭載ボードでも
+# 起動する(main は internal RAM にフォールバックする)。
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+CONFIG_SPIRAM_USE_MALLOC=y
