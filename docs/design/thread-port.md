@@ -628,6 +628,45 @@ chip-tool 相互検証はコア/ファーム無改造 — ツール運用と OTB
 **リスク表更新**: R6 は **解決**(write-back + idle flush で顕在化を根治)。R9 は RX 再キックの
 1s 化で運用安定性が実用域に改善(根本は esp-radio、upstream 報告候補のまま)。
 
+### T3 持ち越し: OCW(AdminCommissioning 0x003C)搭載 + SRP 再同期の実機ゲート(2026-07-31)
+
+T3 で 2 件が持ち越されていた: (a) t2-light への OCW(2 人目管理者追加経路)搭載、(b)
+`resync_srp`(fabric 増減時の SRP 再登録、item 2)の実機ゲート。
+
+- **item 8: OCW(0x003C)を t2-light に搭載 = DONE(コード。build/clippy/riscv/コアテスト green)。**
+  e5-light(Wi-Fi、コミット 6609b6b)の窓管理配線を Thread 版へ写像した: 外部所有
+  `RefCell<CommissioningWindow>` を `AdminCommissioningCluster`(EP0)と pump が共有し、
+  `on_tick` で窓タイムアウト自動クローズ、pump が `take_event()` で `WindowEvent` を拾って
+  PASE 設定と BLE 広告へ反映する。PASE 窓ゲート: **fabric 保有起動で焼き込み(dev)PASE を
+  無効化**(main で `set_pase_enabled(false)`)、**OCW でのみ受付**、fabric 増加/タイムアウトで
+  自動閉窓、全 fabric 削除で初期窓へ復帰。
+  - **Thread 流の設計判断(採用方式)**: commissionable 発見は Wi-Fi 版と異なり **mDNS
+    (`_matterc._udp`)を使えない**(SRP は運用広告のみ。§3.1/§5.2 と整合)。そこで **窓オープン
+    中のみ BLE 広告を時分割で一時再開**する(commissioned で起動した t2-light は R2 時分割で
+    BLE 広告を停止しているため、OCW の `WindowEvent::OpenedEnhanced` で `channels.set_adv_enabled(true)`
+    + 新 discriminator の `AdvData` を `start_advertising` で再送出 = gatt_worker が再広告)。
+    同時に、デバイスは既に Thread 上にあるので **Thread UDP 直接 PASE** も開く。両経路とも
+    コアの PASE ハンドシェイクはトランスポート非依存なので、`set_pase_enabled(true)` 一つで
+    BLE(BTP)と Thread UDP の両方を同時に開き、`Closed` で両方を閉じる(窓外は
+    `PBKDFParamRequest` に Busy)。窓中の commissionable SRP(`_matterc._udp`)登録は
+    採らない(§3.1 の「commissionable は BLE のみ」方針を維持。窓は BLE 広告 + 直接 PASE で足りる)。
+    → 新コントローラは別 state-dir smctl で BLE 経由、または OMR アドレス直指定の
+    Thread UDP PASE で 2 人目 fabric に入る。
+  - 変更は **port の bin(`t2-light.rs`)のみ**。コアは無改造(AdminCommissioning クラスタ・
+    CommissioningWindow は既存。e5/airq で実証済みのものを流用)。
+
+- **item 2 実機ゲート(SRP 再同期)= carried-over(ハード未接続で今セッション実行不能)。**
+  2026-07-31 時点で **RCP ボード(`/dev/ttyACM5`)がホストから物理的に外れており**
+  (デバイスノード消失)、OTBR agent は停止(`ot-ctl` = connection refused)、T3 の 24h ソークも
+  ~2 週間前(2026-07-17 23:12)に停止済み。RCP 不在では Thread ネットワークが存在せず、
+  BLE コミッショニング → attach → OTBR SRP server の運用インスタンス観測 → 2 fabric 目追加 →
+  `srp server service` での compressed-fabric 別インスタンス確認 → RemoveFabric での消滅確認、
+  という手順を実測できない。`resync_srp` のコードは T3 で done(build/clippy green)。
+  **再開条件**: RCP を再接続(`OTBR_RADIO_DEV=/dev/ttyACM5 start-otbr.sh`)+ DUT(ttyACM1)へ
+  app のみ再フラッシュ(NVS 温存で fabric 復元)。OCW 搭載により 2 fabric 目は BLE 再広告
+  経由でも入れる(T3 item 6 ゲート B が「ECM commissionable 広告未実装」で省略していた
+  制約は item 8 で解消 — ゲート B / item 2 実機を次のハード稼働時に一括実測可能)。
+
 ### I1(将来): ICD / Sleepy End Device
 
 - openthread クレート側の sleepy 対応は「予定」段階(upstream)。`set_link_mode` で

@@ -99,6 +99,17 @@ Write に拡張する:
 - `WindowEvent::Opened { discriminator, enhanced }` で `Commissionable`(CM=2、新
   discriminator)を再設定し `notify_change`。`Closed` で `set_commissionable(None)`。
 
+### 5b. Thread ポートでの窓連動(mDNS commissionable が使えない場合)
+
+Thread 版(`ports/esp32/esp32c6-thread` の `t2-light`)は commissionable 発見に mDNS
+(`_matterc._udp`)を出せない(SRP は運用広告のみ。`thread-port.md` §3.1/§5.2)。このため
+app ループは mDNS commissionable の代わりに **窓オープン中のみ BLE 広告を時分割で一時再開**
+する: `OpenedEnhanced` で `GattChannels::set_adv_enabled(true)` + 新 discriminator の
+`AdvData` を `start_advertising`(gatt_worker が再広告)、`Closed` で `set_adv_enabled(false)`。
+PASE 注入(`set_pase_config`/`set_pase_enabled`)はトランスポート非依存なので、BLE(BTP)と
+**Thread UDP 直接 PASE**(デバイスは既に Thread 上)の両経路を単一の `set_pase_enabled(true)` で
+同時に開き、`Closed` で両方を閉じる。詳細と設計判断は `thread-port.md` §T3 持ち越し item 8。
+
 ## 6. smctl(コントローラ側)
 
 ```
