@@ -61,8 +61,9 @@ use simple_matter::btp::{Btp, BtpRole};
 use simple_matter::crypto::rustcrypto::RustCrypto;
 use simple_matter::crypto::Rng as _;
 use simple_matter::dm::clusters::{
-    BasicInfoConfig, BasicInformationCluster, DescriptorCluster, GeneralCommissioning,
-    NetworkCommissioningThread, OnOffCluster, OpCredsCluster, TestDacProvider,
+    AdminCommissioningCluster, BasicInfoConfig, BasicInformationCluster, CommissioningWindow,
+    DescriptorCluster, GeneralCommissioning, NetworkCommissioningThread, OnOffCluster,
+    OpCredsCluster, TestDacProvider, WindowEvent,
 };
 use simple_matter::dm::meta::{ClusterId, DeviceType, EndpointId, EndpointMeta};
 use simple_matter::dm::{DataModel, ServerCluster};
@@ -146,6 +147,7 @@ static EP0_SERVERS: &[ClusterId] = &[
     ClusterId(0x0028),
     ClusterId(0x0030),
     ClusterId(0x0031),
+    ClusterId(0x003C),
     ClusterId(0x003E),
     ClusterId(0x001D),
 ];
@@ -160,6 +162,7 @@ struct Light<'s> {
     basic: BasicInformationCluster,
     gc: GeneralCommissioning,
     net: NetworkCommissioningThread<OtThreadDriver<'static>>,
+    admin: AdminCommissioningCluster<'s>,
     opcreds: OpCreds<'s>,
     desc0: DescriptorCluster,
     onoff: OnOffCluster,
@@ -188,6 +191,7 @@ impl DataModel for Light<'_> {
             (0, 0x0028) => Some(&self.basic),
             (0, 0x0030) => Some(&self.gc),
             (0, 0x0031) => Some(&self.net),
+            (0, 0x003C) => Some(&self.admin),
             (0, 0x003E) => Some(&self.opcreds),
             (0, 0x001D) => Some(&self.desc0),
             (1, 0x0006) => Some(&self.onoff),
@@ -200,6 +204,7 @@ impl DataModel for Light<'_> {
             (0, 0x0028) => Some(&mut self.basic),
             (0, 0x0030) => Some(&mut self.gc),
             (0, 0x0031) => Some(&mut self.net),
+            (0, 0x003C) => Some(&mut self.admin),
             (0, 0x003E) => Some(&mut self.opcreds),
             (0, 0x001D) => Some(&mut self.desc0),
             (1, 0x0006) => Some(&mut self.onoff),
@@ -213,6 +218,8 @@ impl DataModel for Light<'_> {
                 self.removed_fabric = Some(idx);
             }
         }
+        // コミッショニング窓のタイムアウト自動クローズ(WindowEvent は pump が拾う)。
+        let _ = self.admin.on_tick(now_ms);
         None
     }
     fn on_failsafe_cleanup(&mut self) -> Option<core::num::NonZeroU8> {
@@ -229,6 +236,7 @@ impl DataModel for Light<'_> {
 
 fn build_light<'s>(
     fabrics: &'s RefCell<FabricTable<Backend, NF>>,
+    window: &'s RefCell<CommissioningWindow>,
     thread_driver: OtThreadDriver<'static>,
 ) -> Light<'s> {
     let dac_crypto = RustCrypto::new(esp_rng());
@@ -237,6 +245,7 @@ fn build_light<'s>(
         basic: BasicInformationCluster::new(&CFG),
         gc: GeneralCommissioning::default_config(),
         net: NetworkCommissioningThread::with_driver(thread_driver),
+        admin: AdminCommissioningCluster::new(window),
         opcreds: OpCredsCluster::new_shared(fabrics, RustCrypto::new(esp_rng()), dac),
         desc0: DescriptorCluster::new(EndpointId(0), EP0_DT, EP0_SERVERS, &[], EP0_PARTS),
         onoff: OnOffCluster::new().with_listener(|on| {
@@ -488,6 +497,25 @@ fn srp_status_log(ot: &OpenThread<'_>) {
     );
 }
 
+/// BLE commissionable 広告データ(0xFFF6 service data)を生成する。
+///
+/// Thread 版の OCW(AdminCommissioning)では commissionable 発見に mDNS
+/// (`_matterc._udp`)を使えない(SRP は運用広告のみ。未参加時は SRP に出せず、
+/// 参加後も advertising proxy が流すのは運用系 = `_matter._tcp`)。そこで **窓オープン中
+/// のみ BLE 広告を時分割で一時再開**し、新コントローラは BLE(BTP)経由 PASE、または
+/// デバイスが既に Thread 上にあることを利用した **Thread UDP 直接 PASE** のいずれかで
+/// 入る(どちらも `set_pase_enabled(true)` で開いた PASE を共有する)。詳細は
+/// `docs/design/thread-port.md` §T3 item 8(OCW の Thread 流)。
+fn adv_data(discriminator: u16) -> AdvData {
+    AdvData {
+        discriminator,
+        vendor_id: CFG.vendor_id,
+        product_id: CFG.product_id,
+        additional_data: false,
+        ext_announcement: false,
+    }
+}
+
 // ==========================================================================
 // 統合層(pump): BTP + OT UDP ⇔ MatterStack、SRP 登録、dataset 永続化
 // ==========================================================================
@@ -499,6 +527,7 @@ async fn pump(
     stack: &mut LightStack<'_>,
     led: &mut Output<'_>,
     fabrics: &RefCell<FabricTable<Backend, NF>>,
+    window: &RefCell<CommissioningWindow>,
     kvs: &RefCell<EspKvs>,
     settings_store: &'static RefCell<SettingsStore>,
     matter_udp: &mut OtUdp<'_>,
@@ -513,6 +542,10 @@ async fn pump(
     let mut led_on = false;
     let mut saved_gen = fabrics.borrow().generation();
     let mut saved_resumption_gen = stack.resumption_generation();
+    // 初回コミッショニング窓(fabric 0 個で起動 = 焼き込みパスコードの PASE が有効)。
+    // fabric 保有で起動した場合は false(PASE は main で無効化済み。OCW でのみ受付)。
+    let mut boot_window_open = fabrics.borrow().is_empty();
+    let mut last_fabric_count = fabrics.borrow().len();
     // SRP 登録は fabric が存在した時点で 1 回だけ発行する(attach 前でも SRP client が
     // netdata 監視で自動開始する。fabric 変更時の再登録はリブートで吸収 = T2 割り切り)。
     let mut srp_submitted = false;
@@ -888,6 +921,84 @@ async fn pump(
             }
         }
 
+        // --- コミッショニング窓ゲート(fabric 数ベース。§admin-commissioning §4/§5)---
+        //
+        // 焼き込みパスコードの PASE は「fabric 0 個」の間だけ有効(初回コミッショニング)。
+        // 窓経由でコミッショニングが成功(fabric 増加)したら窓を閉じ、以降の管理者追加は
+        // OCW(AdminCommissioning)経由のみとする。Thread では commissionable 発見に mDNS を
+        // 使えないため、窓オープン中のみ BLE 広告を再開 + PASE を開き、新コントローラは BLE
+        // または Thread UDP 直接 PASE で入る(adv_data のドキュメント参照)。
+        let fabric_count = fabrics.borrow().len();
+        if fabric_count > last_fabric_count && window.borrow().is_open() {
+            // 窓経由のコミッショニング成功 → 窓を閉じる(§11.19.5)。Closed イベントが積まれ、
+            // 次周の WindowEvent 処理で PASE/BLE 広告が畳まれる。
+            window.borrow_mut().close_window();
+            println!("[window] commissioning succeeded; closing window");
+        }
+        if boot_window_open && fabric_count > 0 && !window.borrow().is_open() {
+            // 初回コミッショニング完了: 焼き込みパスコードの PASE を閉じる。
+            boot_window_open = false;
+            stack.set_pase_enabled(false);
+            println!("[window] initial commissioning done; PASE disabled");
+        } else if !boot_window_open && fabric_count == 0 && !window.borrow().is_open() {
+            // 全 fabric 削除(工場出荷相当): 初期状態(焼き込みパスコード)へ戻す。
+            boot_window_open = true;
+            let cfg = simple_matter::dev_pase::dev_pase_config();
+            stack.set_pase_config(cfg);
+            stack.set_pase_enabled(true);
+            channels.set_adv_enabled(true);
+            let _ = gatt.start_advertising(&adv_data(DISCRIMINATOR)).await;
+            println!("[window] all fabrics removed; reopening initial commissioning window");
+        }
+        last_fabric_count = fabric_count;
+
+        // --- コミッショニング窓イベントを PASE 設定と BLE 広告へ反映する(§admin-commissioning §4)---
+        // borrow を窓イベント取り出しと後続利用で分ける(borrow がボディ全体で生存する罠)。
+        let window_event = window.borrow_mut().take_event();
+        if let Some(ev) = window_event {
+            match ev {
+                WindowEvent::OpenedEnhanced { discriminator } => {
+                    // borrow を await 手前で落とすため所有値へ取り出す(clippy: await_holding_refcell_ref)。
+                    let pase = window.borrow().pase_config();
+                    if let Some(cfg) = pase {
+                        stack.set_pase_config(cfg);
+                        stack.set_pase_enabled(true);
+                        // Thread 時分割: 窓オープン中のみ BLE 広告(CM=2、新 discriminator)を
+                        // 再開する。Thread UDP 直接 PASE も set_pase_enabled(true) で同時に開く。
+                        channels.set_adv_enabled(true);
+                        let _ = gatt.start_advertising(&adv_data(discriminator)).await;
+                        println!(
+                            "[window] enhanced window open (CM=2, discriminator {}); PASE enabled, BLE re-advertising",
+                            discriminator
+                        );
+                    }
+                }
+                WindowEvent::OpenedBasic => {
+                    // 焼き込み(dev)verifier で BC 窓を開く(§FeatureMap bit0)。
+                    let cfg = simple_matter::dev_pase::dev_pase_config();
+                    stack.set_pase_config(cfg);
+                    stack.set_pase_enabled(true);
+                    channels.set_adv_enabled(true);
+                    let _ = gatt.start_advertising(&adv_data(DISCRIMINATOR)).await;
+                    println!("[window] basic window open (CM=1); PASE enabled, BLE re-advertising");
+                }
+                WindowEvent::Closed => {
+                    stack.set_pase_enabled(false);
+                    // BLE 広告を止めて 2.4GHz を 15.4 に明け渡す(接続中なら切断後に効く)。
+                    channels.set_adv_enabled(false);
+                    println!("[window] commissioning window closed; PASE disabled, BLE advertising off");
+                }
+            }
+            // AdminVendorId は fabric テーブルから解決して書き戻す(admin-commissioning §7)。
+            let admin_idx = window.borrow().admin_fabric_index();
+            if let Some(idx) = admin_idx {
+                let vid = fabrics.borrow().get(idx).map(|f| f.vendor_id());
+                if let Some(vid) = vid {
+                    window.borrow_mut().set_admin_vendor_id(vid);
+                }
+            }
+        }
+
         // --- OT settings の idle 時 flush(item 1 / R6)---
         //
         // OT の settings 書き込みは RAM 権威([`SettingsStore`])で即応し flash に触れない。
@@ -1036,6 +1147,8 @@ async fn main(spawner: Spawner) {
     // --- MatterStack 構築 ---
     let crypto = RustCrypto::new(esp_rng());
     let fabrics: RefCell<FabricTable<Backend, NF>> = RefCell::new(FabricTable::new());
+    // コミッショニング窓(AdminCommissioning 0x003C と pump が共有)。
+    let window: RefCell<CommissioningWindow> = RefCell::new(CommissioningWindow::new());
 
     // flash KVS から fabric テーブルを復元する。
     let restore = fabrics
@@ -1081,8 +1194,16 @@ async fn main(spawner: Spawner) {
 
     let creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
     let sc = SecureChannel::new(&crypto, esp_rng(), pase, creds);
-    let im = InteractionModel::new(build_light(&fabrics, thread_driver));
+    let im = InteractionModel::new(build_light(&fabrics, &window, thread_driver));
     let mut stack: LightStack<'_> = MatterStack::new(&crypto, sc, im);
+    // コミッショニング済みで起動した場合、焼き込みパスコードの PASE は閉じる
+    // (管理者追加は OCW 経由のみ。§admin-commissioning の窓ゲート)。BLE 広告も
+    // 既に抑止済み(下の start_advertising 分岐)なので、Thread UDP 直接 PASE も含めて
+    // 未認可のコミッショニングを封じる。
+    if !fabrics.borrow().is_empty() {
+        stack.set_pase_enabled(false);
+        println!("[pase] disabled at boot (already commissioned; use OCW to add admins)");
+    }
     let _ = stack.post_startup_event(CFG.software_version, 0);
     println!(
         "[stack] DefaultStack ready ({} bytes, on main stack)",
@@ -1162,6 +1283,7 @@ async fn main(spawner: Spawner) {
             &mut stack,
             &mut led,
             &fabrics,
+            &window,
             kvs,
             settings_store,
             &mut matter_udp,
