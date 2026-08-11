@@ -399,8 +399,8 @@ fn ble_disabled_returns_sm_err() {
 
 #[cfg(feature = "ble")]
 mod thread_shim {
-    use super::super::{new_netcomm, sm_network_t, ShimNetComm};
     use super::super::thread_driver::ShimThreadDriver;
+    use super::super::{new_netcomm, sm_network_t, ShimNetComm};
     use simple_matter::dm::ServerCluster;
     use simple_matter::thread::{ThreadDriver, ThreadStatus};
 
@@ -491,14 +491,12 @@ mod thread_shim {
 mod custom_cluster {
     use super::super::custom::*;
     use core::ffi::c_void;
+    use core::num::NonZeroU8;
     use simple_matter::dm::codec::{AttrEncoder, CmdResponder};
-    use simple_matter::dm::meta::{
-        AccessContext, AttributeId, CommandId, Privilege, SessionKind,
-    };
+    use simple_matter::dm::meta::{AccessContext, AttributeId, CommandId, Privilege, SessionKind};
     use simple_matter::dm::{AttrWrite, ServerCluster};
     use simple_matter::im::wire::ImStatus;
     use simple_matter::tlv::{ContainerType, TlvReader, TlvTag, TlvValue, TlvWriter};
-    use core::num::NonZeroU8;
 
     /// C++ 側の値所有を模した状態(ctx 経由で read/write/invoke が触る)。
     #[repr(C)]
@@ -630,8 +628,13 @@ mod custom_cluster {
     }
 
     fn acc() -> AccessContext {
-        AccessContext::new(SessionKind::Case, NonZeroU8::new(1), 0, Privilege::Administer)
-            .with_env(1234, [0u8; 16])
+        AccessContext::new(
+            SessionKind::Case,
+            NonZeroU8::new(1),
+            0,
+            Privilege::Administer,
+        )
+        .with_env(1234, [0u8; 16])
     }
 
     fn read_attr(c: &CustomCluster, id: u32, buf: &mut [u8]) -> Result<usize, ImStatus> {
@@ -674,7 +677,10 @@ mod custom_cluster {
         assert_eq!(decode_first(&buf[..n]).as_signed().unwrap(), -100);
 
         // 未知属性は UnsupportedAttribute。
-        assert_eq!(read_attr(&c, 0x00FF, &mut buf), Err(ImStatus::UnsupportedAttribute));
+        assert_eq!(
+            read_attr(&c, 0x00FF, &mut buf),
+            Err(ImStatus::UnsupportedAttribute)
+        );
     }
 
     #[test]

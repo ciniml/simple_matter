@@ -344,7 +344,10 @@ async fn main() -> std::result::Result<(), String> {
     let mut subscribed = false;
 
     println!("simple-matter BLE+UDP On/Off light (dual-transport)");
-    println!("  PASE: {}  discriminator: {DISCRIMINATOR}", common_pase::config_labeled().1);
+    println!(
+        "  PASE: {}  discriminator: {DISCRIMINATOR}",
+        common_pase::config_labeled().1
+    );
     println!("  BLE: 0xFFF6 service data advertising  |  UDP: 0.0.0.0:{MATTER_PORT}");
     match &mdns_socket {
         Some(_) => println!("  mDNS advertising on 224.0.0.251:5353 (A record: {local_ipv4})"),

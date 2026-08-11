@@ -307,7 +307,12 @@ unsafe fn ctrl_shim() -> &'static mut CtrlShim {
 /// `sm_addr_t` を [`SocketAddr`] へ変換する。
 fn smaddr_to_socket(a: &sm_addr_t) -> SocketAddr {
     if a.is_v6 {
-        SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(a.ip), a.port, 0, a.scope_id))
+        SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::from(a.ip),
+            a.port,
+            0,
+            a.scope_id,
+        ))
     } else {
         SocketAddr::V4(SocketAddrV4::new(
             Ipv4Addr::new(a.ip[0], a.ip[1], a.ip[2], a.ip[3]),
@@ -1011,10 +1016,7 @@ pub extern "C" fn sm_ctrl_pair_start(
     }
     s.comm = Some(comm);
     s.last_pair_phase = u8::MAX;
-    s.activity = Activity::Pairing {
-        node_id,
-        addr: sa,
-    };
+    s.activity = Activity::Pairing { node_id, addr: sa };
     pump(s, now_ms); // 最初の PBKDFParamRequest を TX キューへ積む。
     0
 }
@@ -1032,7 +1034,10 @@ pub extern "C" fn sm_ctrl_udp_rx(
     tx_cap: usize,
     tx_dst: *mut sm_addr_t,
 ) -> usize {
-    if !CTRL_INITED.load(Ordering::SeqCst) || datagram.is_null() || src.is_null() || tx_out.is_null()
+    if !CTRL_INITED.load(Ordering::SeqCst)
+        || datagram.is_null()
+        || src.is_null()
+        || tx_out.is_null()
     {
         return 0;
     }
@@ -1228,7 +1233,8 @@ pub extern "C" fn sm_ctrl_resolve_start(
     // SAFETY: 単線契約。
     let s = unsafe { ctrl_shim() };
     let mut q = [0u8; 256];
-    let Ok(len) = MdnsClient::build_resolve_operational(&mut q, &s.compressed_fabric, node_id, true)
+    let Ok(len) =
+        MdnsClient::build_resolve_operational(&mut q, &s.compressed_fabric, node_id, true)
     else {
         return 0;
     };
@@ -1266,7 +1272,7 @@ pub extern "C" fn sm_ctrl_mdns_rx(
     }
     #[cfg(not(feature = "ble"))]
     let _ = now_ms; // handoff(now_ms 使用)は ble 有効時のみ。
-    // SAFETY: 単線契約。
+                    // SAFETY: 単線契約。
     let s = unsafe { ctrl_shim() };
     let p = unsafe { core::slice::from_raw_parts(pkt, len) };
     let compressed = s.compressed_fabric;
@@ -1281,7 +1287,11 @@ pub extern "C" fn sm_ctrl_mdns_rx(
                 .or_else(|| node.addrs.iter().next())
                 .copied();
             if let Some(ip) = ip {
-                let port = if node.port != 0 { node.port } else { MATTER_PORT };
+                let port = if node.port != 0 {
+                    node.port
+                } else {
+                    MATTER_PORT
+                };
                 let addr = SocketAddr::new(ip, port);
                 s.nodes[i].addr = addr;
                 let mut ev = CtrlShim::ev(sm_ctrl_event_kind_t::SM_CTRL_EV_RESOLVE_DONE);
@@ -1422,7 +1432,8 @@ fn drive_ble_commission(s: &mut CtrlShim, node_id: u64, now: u64) {
             // BLE フェーズ完了。ノードを帳へ暫定登録(handoff の resolve/handle 対象)して
             // BLE_DONE を立てる。運用アドレスは handoff 後に確定する。
             Phase::Case if out.send.is_none() => {
-                let placeholder = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MATTER_PORT));
+                let placeholder =
+                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MATTER_PORT));
                 s.set_node(node_id, placeholder, None);
                 let mut ev = CtrlShim::ev(sm_ctrl_event_kind_t::SM_CTRL_EV_BLE_DONE);
                 ev.node_id = node_id;
@@ -1434,10 +1445,13 @@ fn drive_ble_commission(s: &mut CtrlShim, node_id: u64, now: u64) {
             }
             Phase::Done { session } => {
                 // 稀: suspend 無しで CASE まで BLE 上で完走したケース(防御的に完了扱い)。
-                let addr = s
-                    .node_index(node_id)
-                    .map(|i| s.nodes[i].addr)
-                    .unwrap_or(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MATTER_PORT)));
+                let addr =
+                    s.node_index(node_id)
+                        .map(|i| s.nodes[i].addr)
+                        .unwrap_or(SocketAddr::V4(SocketAddrV4::new(
+                            Ipv4Addr::UNSPECIFIED,
+                            MATTER_PORT,
+                        )));
                 s.set_node(node_id, addr, Some(session));
                 let mut ev = CtrlShim::ev(sm_ctrl_event_kind_t::SM_CTRL_EV_PAIR_COMPLETE);
                 ev.node_id = node_id;
@@ -1550,7 +1564,9 @@ pub extern "C" fn sm_ctrl_ble_pair_start(
 ) -> i32 {
     #[cfg(not(feature = "ble"))]
     {
-        let _ = (node_id, passcode, kind, cred1, cred1_len, cred2, cred2_len, now_ms);
+        let _ = (
+            node_id, passcode, kind, cred1, cred1_len, cred2, cred2_len, now_ms,
+        );
         -1
     }
     #[cfg(feature = "ble")]
@@ -1794,10 +1810,7 @@ mod tests {
         0
     }
 
-    extern "C" fn t_kvs_delete(
-        _ctx: *mut core::ffi::c_void,
-        key: *const core::ffi::c_char,
-    ) -> i32 {
+    extern "C" fn t_kvs_delete(_ctx: *mut core::ffi::c_void, key: *const core::ffi::c_char) -> i32 {
         let k = key_of(key);
         let mut store = KVS.lock().unwrap();
         store.retain(|(kk, _)| *kk != k);
@@ -1856,7 +1869,10 @@ mod tests {
         assert!(!mem.is_null());
 
         // アラインメント/サイズ不足の防御を確認(仮初期化はまだしない)。
-        assert_eq!(sm_ctrl_init(core::ptr::null_mut(), size, core::ptr::null(), 0), -1);
+        assert_eq!(
+            sm_ctrl_init(core::ptr::null_mut(), size, core::ptr::null(), 0),
+            -1
+        );
         let cfg = make_cfg();
         assert_eq!(sm_ctrl_init(mem, size - 1, &cfg, 0), -3);
 
@@ -2028,19 +2044,40 @@ mod tests {
             );
             // busy 中の 2 本目は拒否。
             assert_eq!(
-                sm_ctrl_ble_pair_start(node_id, 20202021, 0, ssid.as_ptr(), ssid.len(), pass.as_ptr(), pass.len(), 1000),
+                sm_ctrl_ble_pair_start(
+                    node_id,
+                    20202021,
+                    0,
+                    ssid.as_ptr(),
+                    ssid.len(),
+                    pass.as_ptr(),
+                    pass.len(),
+                    1000
+                ),
                 -2
             );
 
             // (3) CONNECTED(mtu=247)→ handshake request を ble_poll で排出する。
             let mtu: u16 = 247;
             assert_eq!(
-                sm_ctrl_ble_event(sm_ble_event_kind_t::SM_BLE_CONNECTED, mtu, core::ptr::null(), 0, 1000),
+                sm_ctrl_ble_event(
+                    sm_ble_event_kind_t::SM_BLE_CONNECTED,
+                    mtu,
+                    core::ptr::null(),
+                    0,
+                    1000
+                ),
                 0
             );
             // 2 本目の接続は拒否。
             assert_eq!(
-                sm_ctrl_ble_event(sm_ble_event_kind_t::SM_BLE_CONNECTED, mtu, core::ptr::null(), 0, 1000),
+                sm_ctrl_ble_event(
+                    sm_ble_event_kind_t::SM_BLE_CONNECTED,
+                    mtu,
+                    core::ptr::null(),
+                    0,
+                    1000
+                ),
                 -2
             );
             let mut frag = [0u8; 512];
@@ -2053,13 +2090,21 @@ mod tests {
                 .process_incoming(&frag[..hlen], Some(mtu), 1000)
                 .unwrap();
             let mut resp = [0u8; 512];
-            let rlen = peripheral.process_outgoing(&mut resp, Some(mtu), 1000).unwrap();
+            let rlen = peripheral
+                .process_outgoing(&mut resp, Some(mtu), 1000)
+                .unwrap();
             assert!(rlen > 0, "handshake response expected");
 
             // (5) central が subscribe 済みとして handshake response を給餌 → BTP 確立 →
             //     PASE 第 1 メッセージ(PBKDFParamRequest)が生成される。
             assert_eq!(
-                sm_ctrl_ble_event(sm_ble_event_kind_t::SM_BLE_C2_SUBSCRIBED, 0, core::ptr::null(), 0, 1000),
+                sm_ctrl_ble_event(
+                    sm_ble_event_kind_t::SM_BLE_C2_SUBSCRIBED,
+                    0,
+                    core::ptr::null(),
+                    0,
+                    1000
+                ),
                 0
             );
             assert_eq!(

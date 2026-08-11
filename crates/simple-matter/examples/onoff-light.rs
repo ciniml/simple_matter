@@ -47,17 +47,19 @@ use simple_matter::icd::{
     generate_checkin, IcdConfig, IcdRegistrationTable, IcdRegistryHandle, IcdState,
     ICD_CLIENTS_PER_FABRIC,
 };
-use simple_matter::transport::header::{DstNodeId, PacketHeader, PayloadHeader, ExchFlags, SecFlags};
-use simple_matter::transport::util::WriteBuf;
 use simple_matter::im::engine::InteractionModel;
 use simple_matter::im::events::PRIORITY_INFO;
 use simple_matter::kvs::Kvs;
 use simple_matter::sc::SecureChannel;
+use simple_matter::transport::header::{
+    DstNodeId, ExchFlags, PacketHeader, PayloadHeader, SecFlags,
+};
+use simple_matter::transport::util::WriteBuf;
 
-#[path = "common/pase.rs"]
-mod common_pase;
 #[path = "common/factory.rs"]
 mod common_factory;
+#[path = "common/pase.rs"]
+mod common_pase;
 use simple_matter::dm::clusters::{BorrowedDacProvider, DacProvider, KeypairDacSigner};
 use simple_matter::stack::{DefaultStack, MatterStack, SharedFabricCreds};
 use simple_matter::tlv::TlvTag;
@@ -79,7 +81,10 @@ static FACTORY_DISCRIMINATOR: std::sync::OnceLock<u16> = std::sync::OnceLock::ne
 /// 既定 [`DISCRIMINATOR`]。同一ホストで複数の example デバイスを同居させるとき
 /// (esp32-controller.md K4 の 2 ノードハブ E2E)にブラウズの照合が衝突しないようにする。
 fn discriminator() -> u16 {
-    if let Some(v) = std::env::var("SM_DISCRIMINATOR").ok().and_then(|v| v.parse().ok()) {
+    if let Some(v) = std::env::var("SM_DISCRIMINATOR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
         return v;
     }
     if let Some(&d) = FACTORY_DISCRIMINATOR.get() {
@@ -115,7 +120,12 @@ enum ExampleDac {
     /// chip 開発用テスト DAC(既定・後方互換)。
     Test(TestDacProvider<Backend>),
     /// 工場出荷データ由来の DAC(`SM_FACTORY_DIR` / `SM_FACTORY_NVS`)。
-    Factory(BorrowedDacProvider<'static, KeypairDacSigner<<Backend as simple_matter::crypto::Crypto>::Keypair>>),
+    Factory(
+        BorrowedDacProvider<
+            'static,
+            KeypairDacSigner<<Backend as simple_matter::crypto::Crypto>::Keypair>,
+        >,
+    ),
 }
 
 impl DacProvider for ExampleDac {
@@ -137,11 +147,7 @@ impl DacProvider for ExampleDac {
             Self::Factory(d) => d.certification_declaration(),
         }
     }
-    fn sign_with_dac(
-        &self,
-        msg: &[u8],
-        out: &mut [u8; 64],
-    ) -> simple_matter::error::Result<()> {
+    fn sign_with_dac(&self, msg: &[u8], out: &mut [u8; 64]) -> simple_matter::error::Result<()> {
         match self {
             Self::Test(d) => d.sign_with_dac(msg, out),
             Self::Factory(d) => d.sign_with_dac(msg, out),
@@ -595,7 +601,9 @@ fn main() -> std::io::Result<()> {
     if icd_lit {
         match &checkin_dst {
             Some(a) => println!("[icd] LIT check-in destination: {a}"),
-            None => println!("[icd] LIT: SM_ICD_CHECKIN_ADDR unset; check-in not sent (register still works)"),
+            None => println!(
+                "[icd] LIT: SM_ICD_CHECKIN_ADDR unset; check-in not sent (register still works)"
+            ),
         }
     }
     // VPN 運用ガイド(matter-over-vpn.md V2): SM_MDNS_SII_MS / SM_MDNS_SAI_MS を
@@ -674,7 +682,11 @@ fn main() -> std::io::Result<()> {
         "simple-matter On/Off light listening on UDP/{} (dual-stack)",
         matter_port()
     );
-    println!("  PASE: {}  discriminator: {}", common_pase::config_labeled().1, discriminator());
+    println!(
+        "  PASE: {}  discriminator: {}",
+        common_pase::config_labeled().1,
+        discriminator()
+    );
     match &mdns_socket {
         Some(_) => println!("  mDNS advertising on 224.0.0.251:5353 (A record: {local_ipv4})"),
         None => println!("  (mDNS socket unavailable; point a commissioner at this UDP port.)"),
@@ -752,9 +764,8 @@ fn main() -> std::io::Result<()> {
             }
         }
         // radio を on にする条件: sleepy でない / active / listen 窓の中。
-        let radio_on = !icd_sleepy
-            || icd_state.borrow().is_active(loop_now)
-            || loop_now < icd_listen_until_ms;
+        let radio_on =
+            !icd_sleepy || icd_state.borrow().is_active(loop_now) || loop_now < icd_listen_until_ms;
 
         // 1) Matter UDP の受信処理(radio が on のときのみ)。
         let recv_result = if radio_on {

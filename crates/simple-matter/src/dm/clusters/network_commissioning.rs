@@ -412,11 +412,7 @@ impl<W: WifiDriver> NetworkCommissioningWifi<W> {
                     self.connected = false;
                     write_network_config_response(resp, net_status::SUCCESS, Some(0))
                 } else {
-                    write_network_config_response(
-                        resp,
-                        net_status::NETWORK_ID_NOT_FOUND,
-                        None,
-                    )
+                    write_network_config_response(resp, net_status::NETWORK_ID_NOT_FOUND, None)
                 }
             }
             // ConnectNetwork(0x06): ドライバの join を **開始** し、応答は **保留(遅延)** する
@@ -839,11 +835,7 @@ impl<D: ThreadDriver> NetworkCommissioningThread<D> {
                             self.has_network = true;
                             self.connected = false;
                             self.last_status = Some(net_status::SUCCESS);
-                            write_network_config_response(
-                                resp,
-                                net_status::SUCCESS,
-                                Some(0),
-                            )
+                            write_network_config_response(resp, net_status::SUCCESS, Some(0))
                         }
                         Err(_) => {
                             self.last_status = Some(net_status::OTHER_CONNECTION_FAILURE);
@@ -869,17 +861,9 @@ impl<D: ThreadDriver> NetworkCommissioningThread<D> {
                 if matches {
                     self.has_network = false;
                     self.connected = false;
-                    write_network_config_response(
-                        resp,
-                        net_status::SUCCESS,
-                        Some(0),
-                    )
+                    write_network_config_response(resp, net_status::SUCCESS, Some(0))
                 } else {
-                    write_network_config_response(
-                        resp,
-                        net_status::NETWORK_ID_NOT_FOUND,
-                        None,
-                    )
+                    write_network_config_response(resp, net_status::NETWORK_ID_NOT_FOUND, None)
                 }
             }
             // ConnectNetwork(0x06): driver の attach を **開始** し、応答は **保留(遅延)**。
@@ -895,19 +879,11 @@ impl<D: ThreadDriver> NetworkCommissioningThread<D> {
                     Ok(())
                 } else {
                     self.last_status = Some(net_status::NETWORK_ID_NOT_FOUND);
-                    write_connect_response(
-                        resp,
-                        net_status::NETWORK_ID_NOT_FOUND,
-                        None,
-                    )
+                    write_connect_response(resp, net_status::NETWORK_ID_NOT_FOUND, None)
                 }
             }
             // ReorderNetwork(0x08): 単一ネットワークなので常に Success。
-            0x08 => write_network_config_response(
-                resp,
-                net_status::SUCCESS,
-                Some(0),
-            ),
+            0x08 => write_network_config_response(resp, net_status::SUCCESS, Some(0)),
             _ => Err(ImStatus::UnsupportedCommand),
         }
     }
@@ -1090,11 +1066,7 @@ impl<D: ThreadDriver> ServerCluster for NetworkCommissioningThread<D> {
                 self.connected = true;
                 self.last_status = Some(net_status::SUCCESS);
                 self.last_connect_error = None;
-                match write_connect_response(
-                    resp,
-                    net_status::SUCCESS,
-                    None,
-                ) {
+                match write_connect_response(resp, net_status::SUCCESS, None) {
                     Ok(()) => DeferredPoll::Ready(Ok(())),
                     Err(s) => DeferredPoll::Ready(Err(s)),
                 }

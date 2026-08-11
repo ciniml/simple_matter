@@ -132,7 +132,10 @@ impl<'a> NvsReader<'a> {
             let span = e[2].max(1) as usize;
             let chunk_index = e[3];
             let key_full = &e[8..24];
-            let key_len = key_full.iter().position(|&b| b == 0).unwrap_or(key_full.len());
+            let key_len = key_full
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(key_full.len());
             let data_field = &e[24..32];
 
             // 可変長型は Data[0..2] がサイズ。本体は後続エントリ領域に連続配置。

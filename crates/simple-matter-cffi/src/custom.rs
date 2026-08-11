@@ -126,9 +126,8 @@ pub struct sm_cmd_def_t {
 pub type SmClusterRead =
     Option<unsafe extern "C" fn(ctx: *mut c_void, attr_id: u32, out: *mut sm_attr_value_t) -> u8>;
 /// write コールバック(戻り値 = IM ステータス)。
-pub type SmClusterWrite = Option<
-    unsafe extern "C" fn(ctx: *mut c_void, attr_id: u32, val: *const sm_attr_value_t) -> u8,
->;
+pub type SmClusterWrite =
+    Option<unsafe extern "C" fn(ctx: *mut c_void, attr_id: u32, val: *const sm_attr_value_t) -> u8>;
 /// invoke コールバック(引数はスカラ列に平坦化。戻り値 = IM ステータス)。
 pub type SmClusterInvoke = Option<
     unsafe extern "C" fn(
@@ -303,9 +302,16 @@ impl CustomCluster {
                 let writable = a.flags & SM_ATTR_WRITABLE != 0;
                 let timed = a.flags & SM_ATTR_TIMED != 0;
                 // read=View、write=Operate、全属性 subscribe 可(§8.2)。
-                let m = AttributeMeta::new(AttributeId(a.attr_id), Privilege::View, q, true, writable, true)
-                    .with_write_access(Privilege::Operate)
-                    .with_timed(timed);
+                let m = AttributeMeta::new(
+                    AttributeId(a.attr_id),
+                    Privilege::View,
+                    q,
+                    true,
+                    writable,
+                    true,
+                )
+                .with_write_access(Privilege::Operate)
+                .with_timed(timed);
                 attr_metas.push(m).map_err(|_| ())?;
                 attr_types.push(a.r#type).map_err(|_| ())?;
             }
@@ -331,7 +337,14 @@ impl CustomCluster {
             attr_metas,
             attr_types,
             cmd_metas,
-            meta: ClusterMeta::new(ClusterId(def.cluster_id), def.revision, def.feature_map, &[], &[], &[]),
+            meta: ClusterMeta::new(
+                ClusterId(def.cluster_id),
+                def.revision,
+                def.feature_map,
+                &[],
+                &[],
+                &[],
+            ),
             read: def.read,
             write: def.write,
             invoke: def.invoke,
@@ -375,7 +388,11 @@ impl CustomCluster {
     }
 
     /// read コールバックの返り値を TLV へエンコードする。
-    fn encode_value(&self, v: &sm_attr_value_t, enc: &mut AttrEncoder<'_, '_>) -> Result<(), ImStatus> {
+    fn encode_value(
+        &self,
+        v: &sm_attr_value_t,
+        enc: &mut AttrEncoder<'_, '_>,
+    ) -> Result<(), ImStatus> {
         if v.is_null {
             return enc.write_null();
         }
@@ -394,7 +411,8 @@ impl CustomCluster {
                 sm_attr_type_t::SM_T_F32 => enc.write_f32(v.v.f),
                 sm_attr_type_t::SM_T_STRING => {
                     let n = (v.v.bytes.len as usize).min(STR_CAP);
-                    let s = core::str::from_utf8(&v.v.bytes.buf[..n]).map_err(|_| ImStatus::Failure)?;
+                    let s =
+                        core::str::from_utf8(&v.v.bytes.buf[..n]).map_err(|_| ImStatus::Failure)?;
                     enc.write_str(s)
                 }
                 sm_attr_type_t::SM_T_OCTETS => {

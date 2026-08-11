@@ -175,9 +175,7 @@ pub fn icd_checkin_listen(
         .map_err(|e| format!("bind udp/{port}: {e}"))?;
     sock.set_read_timeout(Some(Duration::from_millis(200)))
         .map_err(|e| format!("set_read_timeout: {e}"))?;
-    info!(
-        "[icd] listening for check-in on udp/{port} for node 0x{check_in_node:016x} ({secs}s)"
-    );
+    info!("[icd] listening for check-in on udp/{port} for node 0x{check_in_node:016x} ({secs}s)");
     let deadline = Instant::now() + Duration::from_secs_f64(secs);
     let mut rx = [0u8; 512];
     let mut received = 0u32;
@@ -1717,7 +1715,9 @@ pub fn pase_verifier(passcode: u32, salt: Option<Vec<u8>>, iterations: u32) -> R
         Some(s) => s,
         None => {
             let mut s = [0u8; 16];
-            OsRng.fill_bytes(&mut s).map_err(|e| format!("rng: {e:?}"))?;
+            OsRng
+                .fill_bytes(&mut s)
+                .map_err(|e| format!("rng: {e:?}"))?;
             s.to_vec()
         }
     };

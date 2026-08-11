@@ -33,6 +33,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use simple_matter::acl::{AclHandle, AclTable};
 use simple_matter::crypto::rustcrypto::RustCrypto;
 use simple_matter::crypto::Rng;
+use simple_matter::crypto::{Crypto, P256Keypair, P256_SIGNATURE_LEN};
 use simple_matter::discovery::{
     Commissionable, CommissioningMode, Host, MdnsResponder, Operational, MATTER_PORT, MDNS_IPV4,
     MDNS_IPV6, MDNS_PORT,
@@ -43,7 +44,6 @@ use simple_matter::dm::clusters::{
     GeneralCommissioning, GroupKeyManagementCluster, GroupsCluster, IdentifyCluster, OnOffCluster,
     OpCredsCluster, TestDacProvider, WindowEvent,
 };
-use simple_matter::crypto::{Crypto, P256Keypair, P256_SIGNATURE_LEN};
 // NetworkCommissioning クラスタは sm_config.network で実行時に選ぶ(§10.1、ShimNetComm):
 // - SM_NET_ETHERNET: 従来の Ethernet 版(F2 の固定 SSID を C++ が自力 join)。常時利用可。
 // - SM_NET_WIFI: WiFi 版(take 方式ドライバ注入)で `pairing ble-wifi`(ble 必須)。
@@ -281,7 +281,10 @@ impl DevPase {
     unsafe fn from_config(cfg: &sm_config_t) -> Option<Self> {
         if !cfg.verifier_w0_l.is_null() && cfg.verifier_iterations != 0 {
             let mut w0_l = [0u8; VERIFIER_W0L_LEN];
-            w0_l.copy_from_slice(core::slice::from_raw_parts(cfg.verifier_w0_l, VERIFIER_W0L_LEN));
+            w0_l.copy_from_slice(core::slice::from_raw_parts(
+                cfg.verifier_w0_l,
+                VERIFIER_W0L_LEN,
+            ));
             let salt: heapless::Vec<u8, 32> =
                 if !cfg.verifier_salt.is_null() && (16..=32).contains(&cfg.verifier_salt_len) {
                     heapless::Vec::from_slice(core::slice::from_raw_parts(
@@ -451,7 +454,8 @@ impl DacStore {
         copy(&mut s.pai, cfg.pai_der, cfg.pai_der_len)?;
         if cfg.cd_der.is_null() {
             // factory に CD が無い → 埋め込み dev CD で補う。
-            s.cd.extend_from_slice(&DEV_CD_FOR_ALL_EXAMPLES).map_err(|_| ())?;
+            s.cd.extend_from_slice(&DEV_CD_FOR_ALL_EXAMPLES)
+                .map_err(|_| ())?;
         } else {
             copy(&mut s.cd, cfg.cd_der, cfg.cd_der_len)?;
         }
@@ -514,8 +518,9 @@ static CFG: BasicInfoConfig = BasicInfoConfig {
 // ==========================================================================
 
 /// KVS get コールバック: 値を `buf` へ書き実長を返す(無ければ負値)。
-pub type SmKvsGet =
-    Option<unsafe extern "C" fn(ctx: *mut c_void, key: *const c_char, buf: *mut u8, cap: usize) -> i32>;
+pub type SmKvsGet = Option<
+    unsafe extern "C" fn(ctx: *mut c_void, key: *const c_char, buf: *mut u8, cap: usize) -> i32,
+>;
 /// KVS set コールバック。
 pub type SmKvsSet = Option<
     unsafe extern "C" fn(ctx: *mut c_void, key: *const c_char, val: *const u8, len: usize) -> i32,
@@ -1318,7 +1323,8 @@ impl Shim {
                 self.mdns.set_commissionable(None);
                 self.commissionable_disc = None;
                 self.mdns.notify_change(now);
-            } else if !self.boot_window_open && count == 0 && !self.owned.window.borrow().is_open() {
+            } else if !self.boot_window_open && count == 0 && !self.owned.window.borrow().is_open()
+            {
                 self.boot_window_open = true;
                 if let Some(cfg) = self.dev_pase.build() {
                     self.stack.set_pase_config(cfg);
@@ -1358,8 +1364,7 @@ impl Shim {
                     if let Some(cfg) = self.owned.window.borrow().pase_config() {
                         self.stack.set_pase_config(cfg);
                         self.stack.set_pase_enabled(true);
-                        let ad =
-                            self.commissionable_ad(discriminator, CommissioningMode::Enhanced);
+                        let ad = self.commissionable_ad(discriminator, CommissioningMode::Enhanced);
                         self.mdns.set_commissionable(Some(ad));
                         self.commissionable_disc = Some(discriminator);
                         self.mdns.notify_change(now);
@@ -1704,7 +1709,11 @@ pub extern "C" fn sm_poll(
 /// SendDirective の宛先で振り分ける。UDP なら `Some(len)`(そのまま返す)、BLE なら
 /// BTP に載せて `None`(sm_ble_poll が排出する)。ble 無効時は常に UDP 扱い。
 #[cfg(feature = "ble")]
-fn route_directive(s: &mut Shim, d: &simple_matter::stack::SendDirective, tx: &[u8]) -> Option<usize> {
+fn route_directive(
+    s: &mut Shim,
+    d: &simple_matter::stack::SendDirective,
+    tx: &[u8],
+) -> Option<usize> {
     match d.addr {
         PeerAddr::Ble(_) => {
             let _ = s.btp.send(&tx[..d.len], 0);
@@ -1715,7 +1724,11 @@ fn route_directive(s: &mut Shim, d: &simple_matter::stack::SendDirective, tx: &[
 }
 #[cfg(not(feature = "ble"))]
 #[inline]
-fn route_directive(_s: &mut Shim, d: &simple_matter::stack::SendDirective, _tx: &[u8]) -> Option<usize> {
+fn route_directive(
+    _s: &mut Shim,
+    d: &simple_matter::stack::SendDirective,
+    _tx: &[u8],
+) -> Option<usize> {
     Some(d.len)
 }
 

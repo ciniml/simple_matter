@@ -215,7 +215,9 @@ impl IcdState {
             self.active_until_ms = target;
         }
         // 約束時間 = 現在からの active 窓終端までの残り(既存の窓が長ければそれ)。
-        self.active_until_ms.saturating_sub(now_ms).min(u64::from(u32::MAX)) as u32
+        self.active_until_ms
+            .saturating_sub(now_ms)
+            .min(u64::from(u32::MAX)) as u32
     }
 }
 
@@ -260,7 +262,8 @@ pub const CHECKIN_MAX_APP_DATA: usize = 16;
 /// Check-In payload の最小長(nonce + counter + MIC、appData 空)。
 pub const CHECKIN_MIN_LEN: usize = CHECKIN_NONCE_LEN + CHECKIN_COUNTER_LEN + CHECKIN_MIC_LEN;
 /// Check-In payload の最大長。
-pub const CHECKIN_MAX_LEN: usize = CHECKIN_NONCE_LEN + CHECKIN_COUNTER_LEN + CHECKIN_MAX_APP_DATA + CHECKIN_MIC_LEN;
+pub const CHECKIN_MAX_LEN: usize =
+    CHECKIN_NONCE_LEN + CHECKIN_COUNTER_LEN + CHECKIN_MAX_APP_DATA + CHECKIN_MIC_LEN;
 
 /// 共有鍵(RegisterClient の key、16B)から AES 鍵を導出する HKDF info。
 ///
@@ -947,13 +950,18 @@ mod tests {
     #[test]
     fn register_upsert_and_per_fabric_limit() {
         let mut t: IcdRegistrationTable<8> = IcdRegistrationTable::new();
-        t.register(IcdRegistration::new(f(1), 100, 100, [1; 16])).unwrap();
-        t.register(IcdRegistration::new(f(1), 101, 101, [2; 16])).unwrap();
+        t.register(IcdRegistration::new(f(1), 100, 100, [1; 16]))
+            .unwrap();
+        t.register(IcdRegistration::new(f(1), 101, 101, [2; 16]))
+            .unwrap();
         assert_eq!(t.fabric_len(f(1)), ICD_CLIENTS_PER_FABRIC);
         // 3 つ目(異なる node)は per-fabric 上限で拒否。
-        assert!(t.register(IcdRegistration::new(f(1), 102, 102, [3; 16])).is_err());
+        assert!(t
+            .register(IcdRegistration::new(f(1), 102, 102, [3; 16]))
+            .is_err());
         // 既存 node の upsert は許容(鍵更新)。
-        t.register(IcdRegistration::new(f(1), 100, 100, [9; 16])).unwrap();
+        t.register(IcdRegistration::new(f(1), 100, 100, [9; 16]))
+            .unwrap();
         assert_eq!(t.key_of(f(1), 100), Some([9; 16]));
         assert_eq!(t.fabric_len(f(1)), ICD_CLIENTS_PER_FABRIC);
     }
@@ -961,8 +969,10 @@ mod tests {
     #[test]
     fn unregister_and_clear_fabric() {
         let mut t: IcdRegistrationTable<8> = IcdRegistrationTable::new();
-        t.register(IcdRegistration::new(f(1), 100, 100, [1; 16])).unwrap();
-        t.register(IcdRegistration::new(f(2), 200, 200, [2; 16])).unwrap();
+        t.register(IcdRegistration::new(f(1), 100, 100, [1; 16]))
+            .unwrap();
+        t.register(IcdRegistration::new(f(2), 200, 200, [2; 16]))
+            .unwrap();
         assert!(t.unregister(f(1), 999).is_err()); // 未登録
         t.unregister(f(1), 100).unwrap();
         assert_eq!(t.fabric_len(f(1)), 0);
@@ -974,8 +984,10 @@ mod tests {
     fn persistence_round_trip_preserves_entries_and_counter() {
         let mut kvs = MemKvs::new();
         let mut t: IcdRegistrationTable<8> = IcdRegistrationTable::new();
-        t.register(IcdRegistration::new(f(1), 0xAABB, 0xCCDD, [7; 16])).unwrap();
-        t.register(IcdRegistration::new(f(2), 0x1234, 0x5678, [8; 16])).unwrap();
+        t.register(IcdRegistration::new(f(1), 0xAABB, 0xCCDD, [7; 16]))
+            .unwrap();
+        t.register(IcdRegistration::new(f(2), 0x1234, 0x5678, [8; 16]))
+            .unwrap();
         assert_eq!(t.bump_counter(), 1);
         assert_eq!(t.bump_counter(), 2);
         t.save_to(&mut kvs).unwrap();
@@ -1008,8 +1020,10 @@ mod tests {
     fn remove_fabric_via_handle() {
         let cell = RefCell::new({
             let mut t: IcdRegistrationTable<8> = IcdRegistrationTable::new();
-            t.register(IcdRegistration::new(f(1), 100, 100, [1; 16])).unwrap();
-            t.register(IcdRegistration::new(f(2), 200, 200, [2; 16])).unwrap();
+            t.register(IcdRegistration::new(f(1), 100, 100, [1; 16]))
+                .unwrap();
+            t.register(IcdRegistration::new(f(2), 200, 200, [2; 16]))
+                .unwrap();
             t
         });
         IcdRegistryHandle::remove_fabric(&cell, f(1));

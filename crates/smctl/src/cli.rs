@@ -733,7 +733,8 @@ fn parse_icd(args: &[String]) -> Result<Cmd, String> {
             let rest = &args[1..];
             if rest.len() < 2 || rest.len() > 4 {
                 return Err(
-                    "usage: smctl icd checkin-listen <check-in-node> <key-hex> [port] [secs]".into(),
+                    "usage: smctl icd checkin-listen <check-in-node> <key-hex> [port] [secs]"
+                        .into(),
                 );
             }
             let node = parse_u64(&rest[0])?;
@@ -753,9 +754,7 @@ fn parse_icd(args: &[String]) -> Result<Cmd, String> {
                 secs,
             })
         }
-        _ => Err(
-            "usage: smctl icd checkin-listen <check-in-node> <key-hex> [port] [secs]".into(),
-        ),
+        _ => Err("usage: smctl icd checkin-listen <check-in-node> <key-hex> [port] [secs]".into()),
     }
 }
 

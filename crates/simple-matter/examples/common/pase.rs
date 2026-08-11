@@ -22,8 +22,7 @@ pub fn config() -> PaseConfig {
 pub fn config_labeled() -> (PaseConfig, String) {
     match std::env::var("SM_PASE_VERIFIER") {
         Ok(s) if !s.trim().is_empty() => {
-            let cfg =
-                parse_env(&s).unwrap_or_else(|e| panic!("invalid SM_PASE_VERIFIER: {e}"));
+            let cfg = parse_env(&s).unwrap_or_else(|e| panic!("invalid SM_PASE_VERIFIER: {e}"));
             (cfg, "(verifier from SM_PASE_VERIFIER)".to_string())
         }
         _ => (

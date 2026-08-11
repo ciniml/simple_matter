@@ -102,27 +102,118 @@ use crate::tlv::{TlvReader, TlvTag};
 
 /// CIP(CheckInProtocolSupport)対応クラスタの共通属性メタ(0x0000..=0x0005)。
 static ICD_CIP_ATTRS: &[AttributeMeta] = &[
-    AttributeMeta::new(AttributeId(0x0000), Privilege::View, Quality::FIXED, true, false, false),
-    AttributeMeta::new(AttributeId(0x0001), Privilege::View, Quality::FIXED, true, false, false),
-    AttributeMeta::new(AttributeId(0x0002), Privilege::View, Quality::FIXED, true, false, false),
+    AttributeMeta::new(
+        AttributeId(0x0000),
+        Privilege::View,
+        Quality::FIXED,
+        true,
+        false,
+        false,
+    ),
+    AttributeMeta::new(
+        AttributeId(0x0001),
+        Privilege::View,
+        Quality::FIXED,
+        true,
+        false,
+        false,
+    ),
+    AttributeMeta::new(
+        AttributeId(0x0002),
+        Privilege::View,
+        Quality::FIXED,
+        true,
+        false,
+        false,
+    ),
     // RegisteredClients: fabric-scoped list、read のみ(管理はコマンド経由)。
-    AttributeMeta::new(AttributeId(0x0003), Privilege::Administer, Quality::NONE, true, false, false),
+    AttributeMeta::new(
+        AttributeId(0x0003),
+        Privilege::Administer,
+        Quality::NONE,
+        true,
+        false,
+        false,
+    ),
     // ICDCounter。
-    AttributeMeta::new(AttributeId(0x0004), Privilege::Administer, Quality::NONE, true, false, false),
+    AttributeMeta::new(
+        AttributeId(0x0004),
+        Privilege::Administer,
+        Quality::NONE,
+        true,
+        false,
+        false,
+    ),
     // ClientsSupportedPerFabric。
-    AttributeMeta::new(AttributeId(0x0005), Privilege::View, Quality::FIXED, true, false, false),
+    AttributeMeta::new(
+        AttributeId(0x0005),
+        Privilege::View,
+        Quality::FIXED,
+        true,
+        false,
+        false,
+    ),
 ];
 
 /// LITS(LongIdleTimeSupport)対応クラスタの属性メタ(CIP + OperatingMode 0x0008)。
 static ICD_LIT_ATTRS: &[AttributeMeta] = &[
-    AttributeMeta::new(AttributeId(0x0000), Privilege::View, Quality::FIXED, true, false, false),
-    AttributeMeta::new(AttributeId(0x0001), Privilege::View, Quality::FIXED, true, false, false),
-    AttributeMeta::new(AttributeId(0x0002), Privilege::View, Quality::FIXED, true, false, false),
-    AttributeMeta::new(AttributeId(0x0003), Privilege::Administer, Quality::NONE, true, false, false),
-    AttributeMeta::new(AttributeId(0x0004), Privilege::Administer, Quality::NONE, true, false, false),
-    AttributeMeta::new(AttributeId(0x0005), Privilege::View, Quality::FIXED, true, false, false),
+    AttributeMeta::new(
+        AttributeId(0x0000),
+        Privilege::View,
+        Quality::FIXED,
+        true,
+        false,
+        false,
+    ),
+    AttributeMeta::new(
+        AttributeId(0x0001),
+        Privilege::View,
+        Quality::FIXED,
+        true,
+        false,
+        false,
+    ),
+    AttributeMeta::new(
+        AttributeId(0x0002),
+        Privilege::View,
+        Quality::FIXED,
+        true,
+        false,
+        false,
+    ),
+    AttributeMeta::new(
+        AttributeId(0x0003),
+        Privilege::Administer,
+        Quality::NONE,
+        true,
+        false,
+        false,
+    ),
+    AttributeMeta::new(
+        AttributeId(0x0004),
+        Privilege::Administer,
+        Quality::NONE,
+        true,
+        false,
+        false,
+    ),
+    AttributeMeta::new(
+        AttributeId(0x0005),
+        Privilege::View,
+        Quality::FIXED,
+        true,
+        false,
+        false,
+    ),
     // OperatingMode(SIT=0/LIT=1)。
-    AttributeMeta::new(AttributeId(0x0008), Privilege::View, Quality::FIXED, true, false, false),
+    AttributeMeta::new(
+        AttributeId(0x0008),
+        Privilege::View,
+        Quality::FIXED,
+        true,
+        false,
+        false,
+    ),
 ];
 
 /// 受理コマンド(RegisterClient / UnregisterClient / StayActiveRequest、いずれも Manage)。
@@ -135,8 +226,14 @@ static ICD_CMDS: &[CommandMeta] = &[
 static ICD_GEN: &[CommandId] = &[CommandId(0x01), CommandId(0x04)];
 
 /// CIP のみ(SIT ICD + check-in)の静的メタ。
-static ICD_CIP_META: ClusterMeta =
-    ClusterMeta::new(ClusterId(0x0046), 3, feature::CIP, ICD_CIP_ATTRS, ICD_CMDS, ICD_GEN);
+static ICD_CIP_META: ClusterMeta = ClusterMeta::new(
+    ClusterId(0x0046),
+    3,
+    feature::CIP,
+    ICD_CIP_ATTRS,
+    ICD_CMDS,
+    ICD_GEN,
+);
 /// CIP + LITS(LIT ICD)の静的メタ。
 static ICD_LIT_META: ClusterMeta = ClusterMeta::new(
     ClusterId(0x0046),
@@ -315,7 +412,10 @@ impl<'a, const N: usize> IcdManagementCipCluster<'a, N> {
                 requested = v.as_unsigned().unwrap_or(0) as u32;
             }
         }
-        let promised = self.icd_state.borrow_mut().stay_active(acc.now_ms, requested);
+        let promised = self
+            .icd_state
+            .borrow_mut()
+            .stay_active(acc.now_ms, requested);
         let w = open_response(resp, 0x04)?;
         w.write_u32(&TlvTag::ContextSpecific(0), promised)
             .map_err(map_tlv)?;
@@ -352,8 +452,9 @@ impl<const N: usize> ServerCluster for IcdManagementCipCluster<'_, N> {
             0x0003 => self.read_registered(enc, acc),
             0x0004 => enc.write_u32(self.table.borrow().icd_counter()),
             0x0005 => enc.write_u16(ICD_CLIENTS_PER_FABRIC as u16),
-            0x0008 if matches!(self.operating_mode, OperatingMode::Lit)
-                || self.meta.feature_map & feature::LITS != 0 =>
+            0x0008
+                if matches!(self.operating_mode, OperatingMode::Lit)
+                    || self.meta.feature_map & feature::LITS != 0 =>
             {
                 enc.write_u8(self.operating_mode as u8)
             }
@@ -459,8 +560,13 @@ mod tests {
     use core::cell::RefCell;
 
     fn admin_acc(now_ms: u64) -> AccessContext {
-        AccessContext::new(SessionKind::Case, NonZeroU8::new(1), 0, Privilege::Administer)
-            .with_env(now_ms, [0u8; 16])
+        AccessContext::new(
+            SessionKind::Case,
+            NonZeroU8::new(1),
+            0,
+            Privilege::Administer,
+        )
+        .with_env(now_ms, [0u8; 16])
     }
 
     /// RegisterClient のフィールド struct を組んで返す。

@@ -393,7 +393,10 @@ fn main() -> std::io::Result<()> {
         .map(|(_, scope)| SocketAddr::V6(SocketAddrV6::new(MDNS_IPV6, MDNS_PORT, 0, scope)));
 
     println!("simple-matter Door Lock listening on UDP/5540 (dual-stack)");
-    println!("  PASE: {}  discriminator: {DISCRIMINATOR}", common_pase::config_labeled().1);
+    println!(
+        "  PASE: {}  discriminator: {DISCRIMINATOR}",
+        common_pase::config_labeled().1
+    );
     match &mdns_socket {
         Some(_) => println!("  mDNS advertising on 224.0.0.251:5353 (A record: {local_ipv4})"),
         None => println!("  (mDNS socket unavailable; point a commissioner at this UDP port.)"),
