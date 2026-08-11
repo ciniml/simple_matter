@@ -17,6 +17,9 @@ jobs:
         with:
           components: clippy, rustfmt
           targets: thumbv6m-none-eabi, riscv32imc-unknown-none-elf, thumbv7em-none-eabihf
+      # --all-features は bluer(BlueZ/D-Bus)を含むため libdbus のヘッダが要る。
+      - name: Install libdbus
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - name: Format
         run: cargo fmt --check
       - name: Clippy
@@ -100,12 +103,17 @@ jobs:
   # ble-onoff-light(デバイス側 BLE)は bluer = Linux 専用のため Linux のみ。
   demo-binaries:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # bluer / btleplug(BlueZ)は D-Bus 経由なので libdbus のヘッダが要る。
+      - name: Install libdbus (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - name: Build smctl (BLE)
         run: cargo build -p smctl --release --features ble
       - name: Build cluster demos + commissioner

@@ -164,7 +164,7 @@ impl GattCentral for BtleplugCentral {
                     if trace {
                         eprintln!(
                             "[ble-trace] {} fff6 parse failed: {:02x?}",
-                            props.address, &b
+                            props.address, b
                         );
                     }
                     continue;
