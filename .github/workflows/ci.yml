@@ -94,3 +94,45 @@ jobs:
         run: cargo test -p smctl --features ble
       - name: Clippy smctl (BLE feature)
         run: cargo clippy -p smctl --features ble -- -D warnings
+
+  # デモバイナリの配布ビルド(Linux / Windows)。smctl(BLE 有効)+ クラスターデモ
+  # examples を release でビルドし、artifact として保存する(手元で試せる「便利セット」)。
+  # ble-onoff-light(デバイス側 BLE)は bluer = Linux 専用のため Linux のみ。
+  demo-binaries:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build smctl (BLE)
+        run: cargo build -p smctl --release --features ble
+      - name: Build cluster demos + commissioner
+        run: cargo build -p simple-matter --release --examples --features controller
+      - name: Build BLE commissioner demo
+        run: cargo build -p simple-matter-ble --release --features commissioner --example ble-commissioner
+      - name: Build BLE device demo (Linux only, bluer)
+        if: runner.os == 'Linux'
+        run: cargo build -p simple-matter-ble --release --features device --example ble-onoff-light
+      # ハッシュ付き中間物や .d を拾わないよう、名前を明示して staging する。
+      - name: Stage binaries
+        shell: bash
+        run: |
+          ext=""
+          if [ "$RUNNER_OS" = "Windows" ]; then ext=".exe"; fi
+          mkdir -p dist
+          cp "target/release/smctl${ext}" dist/
+          for ex in onoff-light dimmable-light color-light door-lock thermostat \
+                    air-quality-sensor sensor-hub switch-demo commissioner ble-commissioner; do
+            cp "target/release/examples/${ex}${ext}" dist/
+          done
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            cp target/release/examples/ble-onoff-light dist/
+          fi
+          ls -la dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: demos-${{ runner.os == 'Windows' && 'windows' || 'linux' }}
+          path: dist/
+          if-no-files-found: error

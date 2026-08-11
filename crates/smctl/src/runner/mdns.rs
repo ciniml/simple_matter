@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use simple_matter::controller::ca::Ca;
 use simple_matter::discovery::client::{CommissionableSet, Ingest, MdnsClient};
-use simple_matter::discovery::{MATTER_PORT, MDNS_IPV4, MDNS_IPV6, MDNS_PORT};
+#[cfg(unix)]
+use simple_matter::discovery::MDNS_IPV6;
+use simple_matter::discovery::{MATTER_PORT, MDNS_IPV4, MDNS_PORT};
 
 use super::Backend;
 
@@ -97,6 +99,8 @@ impl MdnsSockets {
     /// v4(+ unix は v6)ソケットを開く。1 本も開けなければ `None`。
     fn open() -> Option<Self> {
         let mut socks = Vec::new();
+        // v6 は unix のみ(下の cfg ブロック)。Windows では再代入されず mut が余る。
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut v6_scope = None;
         if let Some((sock, qu)) = open_mdns_browse_socket() {
             socks.push(MdnsSock {
@@ -602,9 +606,12 @@ pub fn resolve_operational_at(
                 }
                 // SRV のみの応答(OTBR native publisher)→ 2 段目(AAAA)へ移行。
                 if srv.is_none() {
-                    if let Some((hlen, port)) =
-                        MdnsClient::parse_operational_srv(&rx[..n], &compressed, node_id, &mut srv_host)
-                    {
+                    if let Some((hlen, port)) = MdnsClient::parse_operational_srv(
+                        &rx[..n],
+                        &compressed,
+                        node_id,
+                        &mut srv_host,
+                    ) {
                         srv = Some((hlen, port));
                         dis_info!(
                             "(at) SRV-only answer: target={}.local port={port}; resolving AAAA...",
