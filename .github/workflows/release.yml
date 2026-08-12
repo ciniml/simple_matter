@@ -1,0 +1,86 @@
+# タグ push(v*)でデモバイナリをビルドし GitHub Release に添付する。
+# 内容物は CI の demo-binaries ジョブ(ci.yml)と同じ「便利セット」:
+#   smctl(--features ble)+ クラスターデモ examples + commissioner/ble-commissioner
+#   (ble-onoff-light = bluer デバイス側は Linux のみ)
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x86_64
+          - os: windows-latest
+            label: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # bluer / btleplug(BlueZ)は D-Bus 経由なので libdbus のヘッダが要る。
+      - name: Install libdbus (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Build smctl (BLE)
+        run: cargo build -p smctl --release --features ble
+      - name: Build cluster demos + commissioner
+        run: cargo build -p simple-matter --release --examples --features controller
+      - name: Build BLE commissioner demo
+        run: cargo build -p simple-matter-ble --release --features commissioner --example ble-commissioner
+      - name: Build BLE device demo (Linux only, bluer)
+        if: runner.os == 'Linux'
+        run: cargo build -p simple-matter-ble --release --features device --example ble-onoff-light
+      - name: Package
+        shell: bash
+        run: |
+          ext=""
+          if [ "$RUNNER_OS" = "Windows" ]; then ext=".exe"; fi
+          name="simple-matter-demos-${GITHUB_REF_NAME}-${{ matrix.label }}"
+          mkdir -p "stage/${name}"
+          cp "target/release/smctl${ext}" "stage/${name}/"
+          for ex in onoff-light dimmable-light color-light door-lock thermostat \
+                    air-quality-sensor sensor-hub switch-demo commissioner ble-commissioner; do
+            cp "target/release/examples/${ex}${ext}" "stage/${name}/"
+          done
+          mkdir -p out
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            cp target/release/examples/ble-onoff-light "stage/${name}/"
+            tar -C stage -czf "out/${name}.tar.gz" "${name}"
+          else
+            (cd stage && 7z a "../out/${name}.zip" "${name}") > /dev/null
+          fi
+          ls -la out/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.label }}
+          path: out/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: out
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la out/
+          gh release create "$GITHUB_REF_NAME" out/* \
+            --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
