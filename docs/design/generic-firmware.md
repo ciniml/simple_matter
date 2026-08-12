@@ -302,4 +302,127 @@ G4(ScriptStore OTA)にも依存しない。
 
 ## 10. 実装進捗
 
-- (フェーズ完了ごとに追記)
+### Phase A(完了、2026-08-12): シム composition モード + 汎用値アクセス FFI
+
+§9.1 の実装。**コア(`crates/simple-matter`)はアクセサ 1 個の追加のみ**(理由は下記「罠 3」)。
+既存 API/ABI は後方互換(`composition=NULL` で従来の固定 OnOff ライト構成)。
+
+#### 変更ファイル
+
+- `crates/simple-matter-cffi/src/compose.rs`(新規、約 900 行): composition TLV パーサ +
+  実装済みクラスタの static プール `Composed` + 汎用値アクセス(get/set)+ 変化監視
+  (`poll_changes`)+ LevelControl/ColorControl ⇔ OnOff 連動 + Identify→Groups 伝播。
+- `src/lib.rs`: `sm_config_t` に `composition` / `composition_len` / `on_cluster_change` /
+  `cluster_change_ctx` を**末尾追加**(memset 済み構造体は従来動作)。`Light` に
+  `composed: Composed` を持たせ、`cluster()`/`cluster_mut()`/`on_tick()`/`install_custom()`
+  を合成モード対応に分岐。新 FFI `sm_attr_set_value` / `sm_attr_get_value`。`sm_onoff_get/set`
+  は合成時「最小 EP の OnOff」を対象にする。`custom` は非公開のまま C ABI 型だけ crate
+  ルートへ再輸出、`compose` / `controller` は `pub mod`(統合テストから叩くため)。
+- `src/custom.rs`: `CustomCluster::call_read` / `call_write`(`sm_attr_*_value` が
+  F4b カスタムクラスタへもフォールバックする)+ `write_value`(値 → 生 TLV。controller gated)。
+- `src/controller.rs`: テスト用に必要だった 3 API を追加(いずれも additive)。
+  `sm_ctrl_invoke_args`(引数付き invoke = MoveToLevel)/ `sm_ctrl_write_scalar`(IM write)/
+  `sm_ctrl_subscribe`(単一属性 subscribe)+ イベント `SM_CTRL_EV_WRITE_DONE`(12)/
+  `WRITE_FAILED`(13)/ `SUBSCRIBE_DONE`(14)/ `SUBSCRIBE_FAILED`(15)/ `REPORT`(16)。
+  `op_args`(引数 4 個まで)と `sub_path` を `CtrlShim` に追加。
+- `crates/simple-matter/src/controller/mod.rs`: **コア唯一の変更** =
+  `ControllerStack::transport_deadline()`(`mgr.next_deadline()` を返すだけの 3 行アクセサ)。
+- テスト: `src/tests.rs`(composition 単体 9 本)、`tests/composed_e2e.rs`(新規統合テスト =
+  デバイス+コントローラ同一プロセス UDP ループバック E2E)、
+  `ctest/composed_loopback.cpp`(新規 C レベル E2E)、`ctest/Makefile` に
+  `composed_loopback` と `make check`(ble_loopback wifi/thread + composed を一括実行)。
+- `cbindgen.toml`: `compose` の Rust 内部定数/型を除外(`CL_*` 等を C の名前空間に
+  漏らさない)。`include/simple_matter.h` 再生成。
+
+#### composition TLV スキーマ(最終形)
+
+```
+anonymous list|array of endpoint structs:      ← struct 直書き(単一 EP)も受理
+  {
+    0: endpoint-id     u16   必須。1..=8(0 = システム EP は予約 → Decode エラー)
+    1: device-type     u32   DeviceTypeList に載る
+    2: device-type-rev u8    既定 1
+    3: cluster list    [u32, ...]   array|list。合成可能クラスタ ID(重複と 0x001D は無視)
+    4: options         [ {0: cluster u32, 1: attr u32, 2: value(scalar|null)}, ... ]  optional
+  }
+```
+
+- Descriptor(0x001D)は各 EP に**自動付与**、DeviceTypeList / ServerList / EP0 PartsList は
+  合成結果から自動整合(blob には書かない)。
+- options は起動時に `sm_attr_set_value` と同じ経路で適用する(未対応属性は黙って無視)。
+- 合成可能クラスタ(初期プール、括弧内 = 個数上限): Identify(8)/ Groups(8)/ OnOff(8)/
+  LevelControl(4)/ ColorControl(2)/ BooleanState(4)/ OccupancySensing(2)/
+  Temperature・RelativeHumidity・Illuminance・Pressure・Flow(各 4)/ Switch(4)/
+  FanControl(2)/ DoorLock(1)/ Thermostat(1)。最大 EP 8・EP あたり 12 クラスタ・
+  slot 総数 40・options 16。上限超過は `sm_init` が `-8`、TLV 不正/未対応クラスタは `-7`。
+- 汎用値アクセス: get は上記 16 クラスタの主要属性、set は**コアが setter を公開している
+  もの**のみ(OnOff / BooleanState / Occupancy / 5 計測 / Thermostat LocalTemperature /
+  Switch CurrentPosition)。LevelControl CurrentLevel 等のコマンド駆動属性は get のみで、
+  set は `-3` を返す(Phase B で必要なら core に setter を足す判断)。
+- `on_cluster_change` は IM write / コマンド由来の変化でのみ発火する。`sm_attr_set_value`
+  由来(= アプリ発)では発火しない(HAL バインディングの無限ループ防止。スナップショットを
+  書き込み時に同期する実装)。
+
+#### ゲート実測
+
+| ゲート | 結果 |
+|---|---|
+| `cargo test --workspace` | **649 pass / 0 fail**(既存 639 + 新規 10: composition 単体 8 + Descriptor 合成 1 + E2E 1) |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | 0(`--no-default-features` / `+controller` / `+ble` / `+ble,controller` の各構成も 0) |
+| `cargo fmt --all --check` | クリーン |
+| `scripts/gen-cffi-header.sh --check` | 冪等(再生成差分ゼロ) |
+| ctest `make check` | **ALL GREEN ×3**: `ble_loopback wifi` / `ble_loopback thread`(F7b 回帰)/ **`composed_loopback`**(下記) |
+| ctest 従来経路の回帰 | `onoff_light`(composition=NULL)↔ `controller`: PAIR OK → TOGGLE OK → READ value=1 |
+| riscv32imac `--features panic-abort` | build green。`sm_attr_set_value` / `sm_attr_get_value` / `sm_ctrl_invoke_args` / `sm_ctrl_write_scalar` / `sm_ctrl_subscribe` が `T`。`--no-default-features --features panic-abort` も green(`sm_ctrl_*` は出力されない) |
+
+`composed_loopback`(C レベル E2E、composition blob 89 バイトを素の TLV で C から組み立て):
+pairing(UDP PASE→CASE→CommissioningComplete)→ **OnOff Toggle**(`sm_ctrl_invoke`)→
+**LevelControl MoveToLevel(level=200)**(`sm_ctrl_invoke_args`)→ CurrentLevel read=200 +
+`sm_attr_get_value`=200 + `on_cluster_change` 発火 → **EP2 温度 read**
+(`sm_attr_set_value` で push した 18.75℃ が IM read で返る)。
+
+Rust ホスト E2E(`tests/composed_e2e.rs`、3.6 秒): 上記に加えて
+**IM write**(LevelControl OnOffTransitionTime=20 → WRITE_DONE → read で確認)と
+**subscribe**(EP2 温度 min=0/max=5 → `sm_attr_set_value` push → `SM_CTRL_EV_REPORT` で
+新値 12.34℃ を受信 = 購読反映)、`on_cluster_change` がアプリ発 set では鳴らないことを検証。
+
+#### `.a` サイズ増分(riscv32imac-unknown-none-elf、release、`--features panic-abort`)
+
+| | before(HEAD) | after | 差分 |
+|---|---|---|---|
+| `.text` | 936,391 B | 954,897 B | **+18,506 B** |
+| `.bss` | 39,873 B | 45,129 B | **+5,256 B**(合成クラスタ static プール + EP テーブル拡張) |
+| アーカイブ全体 | 15,073,474 B | 15,483,456 B | +409,982 B(大半は rlib メタデータ) |
+
+コントローラの供給メモリ `sm_ctrl_context_size()`: 28,800 B → **29,144 B**(+344 B =
+`op_args` 4 個 + `sub_path`)。
+
+#### 発見した罠
+
+1. **デバイスシムは単一 static インスタンス** → `sm_init` はプロセス 1 回。既存
+   `src/tests.rs`(composition=NULL 経路)と合成 E2E は同居できないため、E2E は
+   **独立した統合テストバイナリ**(`tests/composed_e2e.rs` = 別プロセス = 別 static)に置いた。
+   Descriptor 合成の検証は `Light` を `Box::leak` でヒープに固定して行う(不動なら
+   `install` の `&'static` 自己参照の前提を満たす)。
+2. **`Composed::cluster_mut` の借用**: slot 検索(`&self`)の戻り値を保持したまま
+   プールを可変借用できない。index を先に取り出して借用を切る 2 段構えが要る
+   (`let i = self.slot(..)?.idx;` の形)。
+3. **購読を張ると `ControllerStack::next_deadline` が永久に `Some`**(keep-alive 途絶検出の
+   期限が常駐する)。F7a の settle→drive 分離は「`next_deadline == None` で完全静穏化」を
+   pump の発火条件にしていたため、**subscribe 後に pump へ到達しなくなり SUBSCRIBE_DONE も
+   レポートも永久に上がらない**(実測: 25 秒タイムアウト)。対処としてコアに
+   `transport_deadline()`(MRP 由来の期限だけ)を足し、シムの静穏化判定をそちらへ切り替えた
+   = **コア変更はこれだけ**。
+   なお「イベント取り込みだけ静穏化ゲートの前でやる」案は **不可**: 完了イベントが早く
+   上がるとアプリが standalone ACK 送出前に次の exchange を始めてしまい、デバイス IM
+   responder(同時 1 トランザクション)が無応答になる(F7a と同じ罠を再現した)。
+4. **`pub mod` 化で clippy が増える**: モジュールを公開すると `result_unit_err` /
+   `new_without_default` が公開 API に対して発火する。`custom` は非公開のまま C ABI 型だけ
+   crate ルートへ `pub use` する形に落ち着けた。cbindgen も同様で、`compose` を公開すると
+   `CL_ONOFF` / `MAX_SLOTS` / `RC_TYPE` のような**汎用名の `#define` が C ヘッダに漏れる**
+   → `cbindgen.toml` の `export.exclude` に列挙して抑止。
+5. **LevelControl ⇔ OnOff 連動はアプリの責務**(コアは `take_on_off_request` /
+   `notify_on_off` を出すだけ)。合成モードでは同一 EP の組を `couple_on_off()` で橋渡しし、
+   `housekeep`(コマンド直後)と `on_tick`(遷移完了時)の両方で呼ぶ必要がある。
+6. **`sm_config_t` の拡張は末尾追加限定**。既存 example/ctest は `memset` + 個別代入なので
+   NULL 埋め = 従来動作になる(位置指定初期化をしている利用者がいれば壊れる)。

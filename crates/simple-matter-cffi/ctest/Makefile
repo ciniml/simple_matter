@@ -18,8 +18,11 @@ CXX      := g++
 CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -I$(INCDIR)
 LDLIBS   := -lpthread -ldl -lm
 
-.PHONY: all lib run clean
-all: onoff_light controller ble_loopback
+.PHONY: all lib run check clean
+
+# `make check` の作業ディレクトリ(状態ディレクトリを分離する)。
+RUNDIR := ./run
+all: onoff_light controller ble_loopback composed_loopback
 
 lib:
 	cargo build -p simple-matter-cffi --release --features std --target $(TARGET)
@@ -35,8 +38,21 @@ controller: controller.cpp lib
 ble_loopback: ble_loopback.cpp lib
 	$(CXX) $(CXXFLAGS) -o $@ ble_loopback.cpp $(STATICLIB) $(LDLIBS)
 
+# composition モード(Phase A)のループバックハーネス(合成デバイス ↔ コントローラ)。
+composed_loopback: composed_loopback.cpp lib
+	$(CXX) $(CXXFLAGS) -o $@ composed_loopback.cpp $(STATICLIB) $(LDLIBS)
+
 run: onoff_light
 	./onoff_light $(ARGS)
 
+# 自己完結ハーネスの一括実行(ネットワーク・無線なしで green/red が決まる)。
+#   make check
+check: ble_loopback composed_loopback
+	rm -rf $(RUNDIR) && mkdir -p $(RUNDIR)
+	./ble_loopback wifi --dev-dir $(RUNDIR)/ble-wifi-dev --ctrl-dir $(RUNDIR)/ble-wifi-ctrl
+	./ble_loopback thread --dev-dir $(RUNDIR)/ble-thr-dev --ctrl-dir $(RUNDIR)/ble-thr-ctrl
+	./composed_loopback --dev-dir $(RUNDIR)/comp-dev --ctrl-dir $(RUNDIR)/comp-ctrl
+
 clean:
-	rm -f onoff_light controller ble_loopback
+	rm -f onoff_light controller ble_loopback composed_loopback
+	rm -rf $(RUNDIR)

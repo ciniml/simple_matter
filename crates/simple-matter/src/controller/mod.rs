@@ -287,6 +287,15 @@ impl<
         }
     }
 
+    /// **MRP(再送 / standalone ACK)由来の期限だけ**を返す(購読 keep-alive を含まない)。
+    ///
+    /// [`next_deadline`](Self::next_deadline) は購読確立後に常に `Some` になるため、
+    /// 「未達の ACK / 再送が無い(= 静穏化した)」ことだけを判定したい呼び出し側
+    /// (C FFI シムの settle→drive 分離、`docs/design/c-ffi-shim.md` §11.1)が使う。
+    pub fn transport_deadline(&self) -> Option<u64> {
+        self.mgr.next_deadline()
+    }
+
     /// 時間駆動の内部掃引(ハンドシェイク/トランザクションのタイムアウト掃除)。
     fn drive_ticks(&mut self, now_ms: u64) {
         self.mgr

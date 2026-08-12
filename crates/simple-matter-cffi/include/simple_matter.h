@@ -99,6 +99,16 @@ typedef enum {
   // ([`sm_ctrl_resolve_start`] / [`sm_ctrl_mdns_rx`])してから運用 UDP で pump を回す
   // (CASE → CommissioningComplete → PAIR_COMPLETE。ble-commissioner `--udp-handoff` の流儀)。
   SM_CTRL_EV_BLE_DONE = 11,
+  // Write 完了(`node_id`、`status` = IM ステータス。0 = 成功)。
+  SM_CTRL_EV_WRITE_DONE = 12,
+  // Write 失敗(`node_id`、`status`)。
+  SM_CTRL_EV_WRITE_FAILED = 13,
+  // Subscribe のプライミングが完了した(`node_id`、`value_u64` = 購読 ID)。
+  SM_CTRL_EV_SUBSCRIBE_DONE = 14,
+  // Subscribe 開始に失敗した(`node_id`)。
+  SM_CTRL_EV_SUBSCRIBE_FAILED = 15,
+  // 購読レポートを受理した(`node_id`、`value_u64` / `value_is_null` に最新スカラ値)。
+  SM_CTRL_EV_REPORT = 16,
 } sm_ctrl_event_kind_t;
 
 // アプリイベント種別(`docs/design/c-ffi-shim.md` §1)。
@@ -148,6 +158,43 @@ typedef void (*SmRngFill)(void *ctx, uint8_t *buf, size_t len);
 // `msg`(`msg_len` バイト)に ECDSA-SHA256 署名し、生 `r||s`(64 バイト)を `out` に書く。
 // 0 = 成功、負値 = 失敗。`sm_config_t::dac_privkey` の代わりに使う。
 typedef int32_t (*SmDacSign)(void *ctx, const uint8_t *msg, size_t msg_len, uint8_t *out);
+
+// 短いバイト列/文字列(64B 上限。§8.2)。
+typedef struct {
+  // バイト内容(STRING は UTF-8、末尾 NUL 不要)。
+  uint8_t buf[STR_CAP];
+  // 有効バイト数。
+  uint8_t len;
+} sm_attr_bytes;
+
+// スカラ + 短いバイト列の tagged union の値部(§8.1)。
+typedef union {
+  // 真偽値。
+  bool b;
+  // 符号なし整数。
+  uint64_t u;
+  // 符号付き整数。
+  int64_t i;
+  // 単精度浮動小数点数。
+  float f;
+  // 文字列/オクテット列。
+  sm_attr_bytes bytes;
+} sm_attr_value_data;
+
+// スカラ + 短いバイト列の tagged union(§8.1)。
+typedef struct {
+  // 値の型。
+  sm_attr_type_t type;
+  // NULLABLE 属性のみ有効(true = null)。
+  bool is_null;
+  // 値本体(`type` で解釈)。
+  sm_attr_value_data v;
+} sm_attr_value_t;
+
+// 属性値変化コールバック(composition モードの汎用フック。§9.1)。
+//
+// IM write / コマンドでクラスタの状態が変わると、変化した属性ごとに 1 回呼ばれる。
+typedef void (*SmClusterChange)(void *ctx, uint16_t endpoint, uint32_t cluster_id, uint32_t attr_id, const sm_attr_value_t *value);
 
 // 初期化設定(`docs/design/c-ffi-shim.md` §1)。
 typedef struct {
@@ -213,6 +260,22 @@ typedef struct {
   SmDacSign dac_sign;
   // `dac_sign` の ctx。
   void *dac_sign_ctx;
+  // エンドポイント構成 blob(Matter TLV)。**NULL = 従来の固定 OnOff ライト構成**
+  // (EP1 = Identify/Groups/OnOff/Descriptor。既存 example と完全互換)。
+  //
+  // 非 NULL のときは EP1 以降を blob の宣言どおりに合成する(EP0 のシステムクラスタは
+  // 固定)。スキーマは `crate::compose` のモジュールドキュメント。パース失敗は
+  // `sm_init` が `-7`、容量超過/未対応クラスタは `-8` を返す。
+  const uint8_t *composition;
+  // `composition` の長さ(バイト)。
+  size_t composition_len;
+  // 属性値が IM write / コマンドで変化したときのコールバック(NULL 可)。
+  //
+  // 合成クラスタ(および従来構成の EP1 OnOff)の監視対象属性が変化すると発火する。
+  // `sm_attr_set_value` による**アプリ発の変化では発火しない**(HAL のループを避けるため)。
+  SmClusterChange on_cluster_change;
+  // `on_cluster_change` の ctx。
+  void *cluster_change_ctx;
 } sm_config_t;
 
 // v4/v6 両対応の datagram 宛先/送信元。
@@ -251,38 +314,6 @@ typedef struct {
   // `SM_CMD_*` フラグ。
   uint32_t flags;
 } sm_cmd_def_t;
-
-// 短いバイト列/文字列(64B 上限。§8.2)。
-typedef struct {
-  // バイト内容(STRING は UTF-8、末尾 NUL 不要)。
-  uint8_t buf[STR_CAP];
-  // 有効バイト数。
-  uint8_t len;
-} sm_attr_bytes;
-
-// スカラ + 短いバイト列の tagged union の値部(§8.1)。
-typedef union {
-  // 真偽値。
-  bool b;
-  // 符号なし整数。
-  uint64_t u;
-  // 符号付き整数。
-  int64_t i;
-  // 単精度浮動小数点数。
-  float f;
-  // 文字列/オクテット列。
-  sm_attr_bytes bytes;
-} sm_attr_value_data;
-
-// スカラ + 短いバイト列の tagged union(§8.1)。
-typedef struct {
-  // 値の型。
-  sm_attr_type_t type;
-  // NULLABLE 属性のみ有効(true = null)。
-  bool is_null;
-  // 値本体(`type` で解釈)。
-  sm_attr_value_data v;
-} sm_attr_value_t;
 
 // read コールバック(値を `out` へ。戻り値 = IM ステータス、0=Success)。
 typedef uint8_t (*SmClusterRead)(void *ctx, uint32_t attr_id, sm_attr_value_t *out);
@@ -411,10 +442,33 @@ size_t sm_mdns_poll(uint64_t now_ms,
 bool sm_take_event(sm_event_t *out);
 
 // ローカル操作の OnOff 書き戻し(物理スイッチ等)。
+//
+// composition モードでは**最小 EP の OnOff クラスタ**が対象(無ければ no-op)。
 void sm_onoff_set(bool on, uint64_t now_ms);
 
-// 現在の OnOff 状態。
+// 現在の OnOff 状態(composition モードは最小 EP の OnOff。無ければ false)。
 bool sm_onoff_get(void);
+
+// 属性値を書く(センサ値 push・ローカル操作の書き戻し)。
+//
+// 対象は composition で合成したクラスタ、従来構成の EP1 OnOff、および F4b の
+// CustomCluster(登録された write ハンドラへ委譲)。書き込みは購読へ反映される
+// (クラスタが dirty になる)が、`on_cluster_change` は**発火しない**
+// (アプリ発の変化で HAL がループしないため)。
+//
+// 戻り値: 0=OK、-1=未初期化/NULL、-2=対象クラスタ無し、-3=属性が非対応、-4=型不一致。
+int32_t sm_attr_set_value(uint16_t endpoint,
+                          uint32_t cluster_id,
+                          uint32_t attr_id,
+                          const sm_attr_value_t *value);
+
+// 属性値を読む(HAL / スクリプトからの状態取得)。
+//
+// 対象は [`sm_attr_set_value`] と同じ。戻り値の意味も同じ(-3 = 属性が非対応)。
+int32_t sm_attr_get_value(uint16_t endpoint,
+                          uint32_t cluster_id,
+                          uint32_t attr_id,
+                          sm_attr_value_t *out);
 
 // コミッション済み fabric 数。
 uint8_t sm_fabric_count(void);
@@ -588,6 +642,46 @@ int32_t sm_ctrl_read_scalar(uint64_t node_id,
                             uint32_t cluster,
                             uint32_t attribute,
                             uint64_t now_ms);
+
+// 引数付きコマンドを invoke する(LevelControl MoveToLevel 等。§11.1 の拡張)。
+//
+// `args` は context tag 0..`n_args`-1 の順に平坦化されたスカラ列
+// ([`sm_attr_value_t`]。`sm_cluster_def_t` の invoke ハンドラと同じ表現)。`n_args` の
+// 上限は 4。`args` が NULL / `n_args` = 0 なら [`sm_ctrl_invoke`] と等価。
+// 完了は INVOKE_DONE / INVOKE_FAILED。
+//
+// 戻り値: 0=OK、-1=未初期化、-3=未知ノード、-4=CASE 開始失敗、-5=引数過多、-10=busy。
+int32_t sm_ctrl_invoke_args(uint64_t node_id,
+                            uint16_t endpoint,
+                            uint32_t cluster,
+                            uint32_t command,
+                            const sm_attr_value_t *args,
+                            size_t n_args,
+                            uint64_t now_ms);
+
+// 運用ノードのスカラ属性へ write する(§11.1 の拡張)。
+//
+// 完了は [`sm_ctrl_take_event`] の WRITE_DONE / WRITE_FAILED(`status` = IM ステータス)。
+// 戻り値: 0=OK、-1=未初期化/NULL、-3=未知ノード、-4=CASE 開始失敗、-10=busy。
+int32_t sm_ctrl_write_scalar(uint64_t node_id,
+                             uint16_t endpoint,
+                             uint32_t cluster,
+                             uint32_t attribute,
+                             const sm_attr_value_t *value,
+                             uint64_t now_ms);
+
+// 運用ノードのスカラ属性を subscribe する(§11.1 の拡張)。
+//
+// プライミング完了で SUBSCRIBE_DONE(`value_u64` = 購読 ID)、以降デバイス発レポートごとに
+// SM_CTRL_EV_REPORT(`value_u64` / `value_is_null` = 最新値)。購読は 1 本のみ保持する。
+// 戻り値: 0=OK、-1=未初期化、-3=未知ノード、-4=CASE 開始失敗、-10=busy。
+int32_t sm_ctrl_subscribe(uint64_t node_id,
+                          uint16_t endpoint,
+                          uint32_t cluster,
+                          uint32_t attribute,
+                          uint16_t min_interval_s,
+                          uint16_t max_interval_s,
+                          uint64_t now_ms);
 
 // operational(`_matter._tcp`)解決クエリを生成する(§11.1)。戻り値 = クエリ長(0 = 失敗)。
 //
