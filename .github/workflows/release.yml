@@ -48,6 +48,10 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then ext=".exe"; fi
           name="simple-matter-demos-${GITHUB_REF_NAME}-${{ matrix.label }}"
           mkdir -p "stage/${name}"
+          # README: バンドルの使い方(docs/README-demos.md)を README.md として同梱し、
+          # リポジトリ全体の README は README-repo.md として添付する。
+          cp docs/README-demos.md "stage/${name}/README.md"
+          cp README.md "stage/${name}/README-repo.md"
           cp "target/release/smctl${ext}" "stage/${name}/"
           for ex in onoff-light dimmable-light color-light door-lock thermostat \
                     air-quality-sensor sensor-hub switch-demo commissioner ble-commissioner; do
