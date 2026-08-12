@@ -125,6 +125,14 @@ Python を書かせる」ことが製品価値になる場合のみ(S3/P4 の fl
 サーバサイドコンパイルが要る。よって WASM 採用時のスクリプト言語は
 AssemblyScript を第一候補とする。
 
+**オフライン開発なら Rust も第一級**: ブラウザ内コンパイル不可なだけで、ローカルでは
+`wasm32-unknown-unknown` ターゲット + ホスト API の extern 宣言クレート
+(`sm-script-api`、フックは `#[no_mangle] extern "C"` export)で普通の cargo
+プロジェクトとして書ける。`#![no_std]` + panic-abort + opt-z + wasm-opt で数 KB 級。
+デバイス側 VM は言語非依存なので、**ブラウザ AssemblyScript(カジュアル)と
+オフライン Rust(本格・テスト付き)が同一 ABI で共存**する。API クレートの型は
+コアの ClusterId 等から生成でき、simple-matter 本体との相性も良い。
+
 注: 純 Rust(esp-hal)経路に載せる場合は C ランタイム持ち込みが苦しいため
 `wasmi`(Rust 製 WASM interp)がほぼ一択になる。汎用 FW は ESP-IDF 経路を主とし、
 Rust 経路は対象外とする(必要になった時点で wasmi で再検討)。
@@ -152,6 +160,30 @@ Rust 経路は対象外とする(必要になった時点で wasmi で再検討)
 - 署名: 短期は Matter セッション(CASE+ACL Administer)を投入経路の認可として
   信頼。配布物署名(公開鍵を factory data に置く)は WASM 採用時 or 配布
   エコシステムを作る段階で導入。
+
+## 6.3 Web Configurator(ブラウザ配布・プロビジョニングツール)
+
+構成選択 → 書き込み → 個体プロビジョニングまでを**静的ページ 1 枚(サーバ無し)**で行う:
+
+1. **構成選択 UI** → 設定 blob(CBOR)生成。FW はチップ別ビルド済みイメージ
+   (静的アセット)なのでコンパイル不要(ESPHome との差別化点)。
+2. **書き込み**: esptool-js(Web Serial、Espressif 公式)で app + 設定 + スクリプト +
+   factory の各パーティションを一括 flash。Chrome/Edge 系限定。
+3. **個体情報生成**(全てクライアントサイド): discriminator/salt/passcode 乱数 →
+   SPAKE2+ verifier(PBKDF2 = WebCrypto、P-256 = noble-curves)→
+   **mfg_tool 互換 NVS バイナリ**にエンコード(nvs_partition_gen の JS 移植)。
+   simple-matter の factory-data パーサがそのまま読むため FW 側無改造。
+   デバイスへは verifier のみ(規格準拠)。JS 実装の正しさは smctl `pase-verifier`
+   出力とのベクタ照合で担保する。
+4. **QR + MPC 表示**: onboarding payload TLV → Base38(`MT:`)、Manual Pairing Code
+   (11/21 桁 + Verhoeff チェックディジット)。ラベル印刷まで同ページで。
+5. **スクリプト**: WASM 採用時は AssemblyScript エディタ+ブラウザ内コンパイル(§6 補足)を
+   同居させ、.wasm をスクリプトパーティションに含めて一括書き込み。Lua 採用時は
+   テキストをそのまま同梱(さらに単純)。
+6. DAC はテスト PAI 鍵同梱の開発用(テスト鍵は公開物 = 開発専用と明記。R-G5)。
+
+前提はG1(設定 blob)のみ。初回書き込みはパーティション直書きなので
+G4(ScriptStore OTA)にも依存しない。
 
 ## 7. 段階計画(実装フェーズ案)
 
