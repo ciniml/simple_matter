@@ -862,3 +862,138 @@ RAM は増えない。
 7. **`sm_endpoint_register` は EP0/EP1 に使えない**(`-5`)が、**カスタムクラスタは
    合成 EP へ足せる**。ScriptStore を EP1 に載せると新規 EP を消費せず、
    Descriptor の ServerList もシムが合成してくれる(F4b の install_custom)。
+
+### Phase E(完了、2026-08-12): Web Configurator(`web/configurator/`)
+
+§9.5 の実装。**コア / シム / 既存 example は無改造**。Rust 側の変更は
+`crates/simple-matter/src/factory/tests.rs` への**検証テスト 3 本の追加のみ**
+(JS 生成 NVS を実パーサに食わせるゲート)。
+
+#### 追加ファイル
+
+- `web/configurator/`(新規、静的サイト = ビルドステップ無し・CDN 参照無し):
+  - `index.html` / `css/app.css` — 5 節構成(構成 / 個体情報 / QR・MPC / スクリプト / 書き込み)。
+  - `js/util.js` — hex / base64 / **CRC32**(zlib = `binascii.crc32(data, prev)` と同一
+    セマンティクス。ESP-IDF の `crc32_le(crc, buf, len)` もこれと同値)。
+  - `js/tlv.js` — Matter TLV ライタ + `encodeComposition` / `encodeBindings`
+    (`scripts/smgen-tlv.py` の JS 移植。`DRIVERS` / `PARAMS` の tag 割り当ても 1 対 1)。
+  - `js/catalog.js` — 合成可能クラスタ 16 種(個数上限つき)/ デバイスタイプ 17 種の
+    代表マッピング / ドライバ 5 種のパラメータフォーム定義 / プリセット 2 種 /
+    §9.1 の上限検査(EP 8・EP あたり 12・slot 40)。
+  - `js/spake2p.js` — PBKDF2-SHA256(WebCrypto)+ P-256 スカラ倍(vendor noble)で
+    `w0‖L`(97B)。
+  - `js/nvs.js` — **ESP-IDF NVS v2 パーティションライタ**(`NvsBuilder`)+ 検算用リーダ
+    (`NvsReader`)+ `buildFactoryNvs`(mfg_tool 互換 `chip-factory`)+ `buildSmgenNvs`
+    (`smgen` の `comp` / `bind` blob)。
+  - `js/onboarding.js` — passcode/discriminator 乱数(無効値除外)、Verhoeff、
+    11 桁 MPC、88 ビット payload、Base38、`MT:` 文字列。
+  - `js/smscript.js` — SMWS イメージ(`scripts/smscript-img.py` と同一バイト列)。
+  - `js/flash.js` — パーティションオフセット表 + プラン検証(はみ出し / 重なり)+
+    esptool-js ラッパ + URL 取得。
+  - `js/dev-dac.js` — 開発用テスト DAC/PAI/鍵(base64 定数、公開テスト鍵)。
+  - `js/app.js` — DOM 配線のみ(ロジックは持たない)。
+  - `vendor/` — esptool-js / noble-p256 / qrcode-generator(下表)。
+  - `test/*.test.js` + `test/index.js` — Node 単体テスト 35 本。
+  - `tools/gen-test-fixture.js` — Rust 側フィクスチャの生成(決定的)。
+  - `package.json`(`{"type":"module"}` だけ。**ビルド用ではなく** `node --test` に
+    ESM と解釈させるためのもの)、`README.md`。
+- `crates/simple-matter/tests/fixtures/factory-webconfig.bin`(新規、24 KiB)—
+  Configurator が生成した factory NVS(discriminator=2748 / passcode=43708557 /
+  iteration-count=10000 / salt 32B / 開発用 DAC 入り)。
+
+#### vendor 構成と版(合計 322,597 B = 約 315 KiB)
+
+| ディレクトリ | 版 | 取得元(npm) | 同梱物 | サイズ |
+|---|---|---|---|---|
+| `vendor/esptool-js/` | **0.6.1** | `node_modules/esptool-js/bundle.js` | `esptool-js.bundle.js` + LICENSE(Apache-2.0) | 218,551 B |
+| `vendor/noble/` | **@noble/curves 2.3.0**(+ @noble/hashes 2.3.0) | `@noble/curves/nist.js` を esbuild 0.28.2 で単一 ESM 化 | `noble-p256.js` + LICENSE(MIT) | 39,665 B |
+| `vendor/qrcode-generator/` | **2.0.4** | `node_modules/qrcode-generator/dist/qrcode.mjs` | `qrcode.mjs` + LICENSE(MIT) | 51,907 B |
+
+サイト全体(js 79KB + test 27KB + css 4KB + vendor 315KB)で **445 KiB**。
+`npm install` はスクラッチパッドで行い、`node_modules` はリポジトリに入れていない。
+
+- esptool-js の `bundle.js` は rollup 済みの**自己完結 ESM**で、pako / tslib / atob-lite と
+  **全チップの flasher stub JSON を内包**する(`getStubJsonByChipName('ESP32-C6')` が
+  そのまま解決する = importmap も追加フェッチも不要)。
+- `@noble/curves` は `nist.js` から frost / oprf / hash-to-curve / `@noble/hashes` へ
+  bare specifier で辿るためブラウザで素読みできない。P-256 だけを esbuild で
+  1 ファイルに固めた(コマンドは README に記録)。生 `node_modules` の 2.5 MB に対し 39 KB。
+
+#### asc(ブラウザ内 AssemblyScript コンパイル)は Phase E' へ分離 — 判断と根拠
+
+`assemblyscript` 0.28.20 の web 経路は **binaryen `index.js` 13.6 MB** を必須依存とし、
+加えて `asc.js` 880 KB + `assemblyscript.js` 756 KB + `long` 160 KB + stdlib 約 1 MB =
+**約 16 MB**。vendor 本体(315 KiB)の 50 倍で、リポジトリ肥大が許容外と判断した。
+**本フェーズでは同梱せず**、④ は「`.wasm` アップロード → SMWS 化 → 書き込み対象に追加」+
+「AssemblyScript 下書きエディタ(`.ts` ダウンロードのみ、コンパイルしない)」に留めた。
+ローカルコンパイル手順(`npx asc ... --runtime stub --use abort=`)はエディタ内コメントに埋めた。
+Phase E' で入れるなら「別ページ + 遅延 import + Cache Storage」で初回のみ取得する形が現実的
+(CDN 禁止方針との調整が別途必要)。
+
+#### 検算ベクタ(すべて自動テスト化)
+
+| 対象 | 突き合わせ先 | ベクタ |
+|---|---|---|
+| composition / binding TLV | `scripts/smgen-tlv.py examples` | プリセット ①(comp 35B / bind 25B)② (comp 68B / bind 60B)の hex 完全一致。加えて `decode-comp` / `decode-bind` 往復と、options 付き(温度 2350)の 1 件 |
+| SPAKE2+ verifier | `cargo run -p smctl -- pase-verifier` | 4 ベクタ埋め込み(公知 `20202021` / `SPAKE2P Key Salt` / 1000 → `b96170aa…66cf` ほか)+ **実行時に smctl を呼んで比較**(cargo が無ければ skip) |
+| QR payload | Matter 仕様の公知値 | `MT:-24J0AFN00KA0648G00`(VID 0xFFF1 / PID 0x8001 / disc 3840 / passcode 20202021 / on-network)。固定部 11B = `88ff0f008400e04b846802`。BLE/SoftAP 版も一致 |
+| Manual Pairing Code | `smctl` の `manual_pairing_code` | `34970112332`。Verhoeff 単体 `236`→3 / `12345`→1 |
+| **NVS ライタ** | `esp-matter-mfg-tool 1.0.24` 実生成物 | `factory-fff1-8001.bin`(24 KiB)を同じ入力から **バイト単位で完全再現**(ページヘッダ CRC・エントリ CRC・本体 CRC・状態ビットマップ・span まで一致) |
+| SMWS イメージ | `scripts/smscript-img.py pack` / `show` | 同一バイト列 + `show` が受理 |
+| オフセット表 | `generic_matter_cpp/partitions.csv` | CSV を実際に読んで突き合わせ |
+| **JS 生成 NVS の実パーサ読込** | `factory::FactoryData` | `factory-webconfig.bin` から discriminator/iter/VID/PID/salt/verifier/DAC を読み、**verifier がコアの `compute_verifier(43708557, salt, 10000)` と一致**、`PaseConfig` と `BorrowedDacProvider` が構築でき署名が `dac-pub-key` で検証できる |
+
+#### ゲート実測
+
+| ゲート | 結果 |
+|---|---|
+| `node --test web/configurator/test/` | **35 pass / 0 fail**(TLV 5 / verifier 3 / onboarding 9 / NVS 7 / SMWS 8 / flash 3) |
+| `cargo test --workspace` | **655 pass / 0 fail**(Phase D と同数 = 回帰なし。新規 3 本は `factory-data` feature gate) |
+| `cargo test --workspace --all-features` | **667 pass / 0 fail**(= 664 + `web_configurator_*` 3 本) |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | 0 |
+| `cargo fmt --all --check` | クリーン |
+| `scripts/smgen-tlv.py selftest` / `smscript-img.py selftest` | PASS / PASS(回帰) |
+| vendor 合計 | **322,597 B**(esptool-js 218,551 / noble 39,665 / qrcode 51,907 + LICENSE 3 本) |
+| ヘッドレス DOM スモーク(jsdom、スクラッチパッド限り) | プリセット ①→② 切替で TLV が smgen-tlv.py と一致、QR/MPC 描画、verifier + factory NVS 生成、書き込みプラン更新まで通ることを確認 |
+
+**ブラウザ実操作(Web Serial / 実 flash / QR 読み取り)は未実施** = ユーザ確認事項。
+`web/configurator/README.md` 末尾にチェックリスト 10 項目として置いた。
+
+#### 発見した罠
+
+1. **ESP-IDF NVS のエントリ CRC は `entry[0..4]` + `entry[8..32]`**(= `chunkIndex` を**含み**、
+   CRC フィールド自身の 4 バイトを飛ばす)を初期値 `0xFFFFFFFF` で連結して計算する。
+   `factory-data.md` の記述だけでは決まらないので、**実 mfg_tool 生成物で総当たり照合**して
+   確定した。可変長本体の CRC も同じ初期値 `0xFFFFFFFF`。一方 SMWS の CRC は初期値 `0`
+   (`binascii.crc32(body)`)で、**同じ CRC32 でも初期値が違う** — 混ぜると通らない。
+2. **ESP-IDF の `crc32_le(crc, buf, len)` は zlib の `crc32(buf, crc)` そのもの**。
+   「初期値を反転して最後に反転」という自前補正を入れると合わない(最初にそれで外した)。
+3. **`salt` / `verifier` は SZ(文字列)型 + base64 テキスト + 末尾 NUL 込みのサイズ**。
+   salt 32B → base64 44 文字 → `size=45`、verifier 97B → 132 文字 → `size=133`。
+   生バイトを BLOB で入れると FW 側の base64 デコードが失敗する。
+4. **`generic_matter_cpp` は DAC が無いと factory データを丸ごと捨てる**
+   (`main.cpp` の `read_blob("dac-cert"/"pai-cert"/"dac-key")` が 1 つでも欠けると
+   `ok=false` → dev 定数へフォールバック)。「個体別 passcode だけの factory NVS」は
+   **実機で無視される**ので、開発用テスト DAC(fixture 由来、VID 0xFFF1/PID 0x8001)を
+   `js/dev-dac.js` に同梱して既定にした。VID/PID を変えるなら DAC も差し替えが要る(R-G5)。
+5. **BLOB は `BLOB_DATA`(chunkIndex=0)+ `BLOB_IDX`(data = 総サイズ u32 / chunkCount 1 /
+   chunkStart 0 / 予約 0xFFFF)の 2 エントリ**。IDX を書かないと IDF の `nvs_get_blob` が
+   見つけられない(simple-matter のリーダは DATA だけで読めてしまうので、
+   **Rust テストだけでは検出できない**種類の非互換)。mfg_tool 出力との
+   バイト一致テストがこの穴を塞いでいる。
+6. **`node --test <dir>` は Node 22 以降**。手元(v21.7.1)ではディレクトリ引数を
+   モジュールとして解決しようとして `Cannot find module .../test` で落ちる。
+   `test/index.js` を置いてディレクトリ解決の入口にした(Node 22 以降では
+   各 `*.test.js` と二重に走るだけで失敗しない)。
+7. **`nvs`(0x9000)を焼くとコア KVS(`smatter` = fabric/ACL)も消える**。設定 blob
+   (`smgen`)と同居しているため。構成変更は factory reset が望ましい(§8 R-G1)ので
+   既定は「焼く」にしつつ、UI でチェックを外せるようにして README に明記した。
+8. **QR の Base38 は 3 バイト → 5 文字 / 2 バイト → 4 文字 / 1 バイト → 2 文字**で、
+   各チャンクは**リトルエンディアンの整数を 38 進で下位から**出す。11 バイトの payload は
+   3+3+3+2 = 19 文字になる。`qrcode-generator` は `MT:` 込みの文字列を英数字モードで
+   符号化する(`:` `-` `.` はいずれも英数字モードの文字集合内)。
+9. **GitHub Release asset は CORS が無く `fetch` できないことがある**。URL 入力欄は
+   残しつつ、失敗時に「ダウンロードしてローカル指定へ」と誘導するログを出す。
+10. **bootloader オフセットはチップ依存**(C6/H2/S3/C3/C2 = 0x0、ESP32/S2 = 0x1000、
+    P4/C5 = 0x2000)。esptool-js の `loader.chip.CHIP_NAME` を見て決める設計にした
+    (接続前はプランに出せない)。

@@ -1,0 +1,9 @@
+{
+  "name": "simple-matter-configurator",
+  "private": true,
+  "type": "module",
+  "description": "Web Configurator for the simple-matter generic Matter firmware (static site, no build step). This file exists only so that `node --test` treats the ES modules under js/ and test/ as ESM.",
+  "scripts": {
+    "test": "node --test test/"
+  }
+}
