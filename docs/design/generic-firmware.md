@@ -1,6 +1,7 @@
 # 汎用 Matter ファームウェア構想(設定駆動 + スクリプト)
 
-Status: 検討(G0)。実装フェーズ未着手。
+Status: 実装中。**決定(2026-08-12、ユーザ確定): 実行系 = WASM(WAMR)、
+スコープ = G1-G4 + Web Configurator**。実装仕様は §9、進捗は §10。
 Depends: docs/design/c-ffi-shim.md(§8 F4b CustomCluster、§10 Thread)、docs/design/factory-data.md
 
 ## 1. ゴール
@@ -210,3 +211,95 @@ G4(ScriptStore OTA)にも依存しない。
   (esp_partition 直 or littlefs)へ。
 - **R-G5**: 汎用 FW は attestation と相性が悪い(VID/PID が設定次第)。開発・自家用
   前提とし、製品化時はクラスタ構成ごとに CD/DAC を焼き分ける前提を明記する。
+
+## 9. 実装仕様(フェーズ A〜E)
+
+### 9.1 Phase A: シム composition モード(G1 の実体)
+
+現行デバイスシムは「OnOff ライト固定 + CustomCluster 追加」なので、コア実装済み
+クラスタの**任意合成**をシムに追加する。コア(crates/simple-matter)は無改造。
+
+- **FFI**: `sm_config_t` に `composition`/`composition_len`(NULL = 従来の固定
+  ライト構成 → 既存 example 完全互換)。composition は **Matter TLV**
+  (コアの tlv モジュールを流用。JSON/CBOR は使わない):
+  ```
+  anonymous list of endpoint structs:
+    { 0: endpoint-id u16, 1: device-type u32, 2: device-type-rev u8,
+      3: cluster list [u32...], 4: options(cluster ごとの初期値, optional) }
+  ```
+- **合成可能クラスタの初期プール**(static、コンパイル時上限): OnOff×8、
+  LevelControl×4、ColorControl×2、BooleanState×4、OccupancySensing×2、
+  Temperature/RelativeHumidity/Illuminance/Pressure/FlowMeasurement×各 4、
+  Switch×4、FanControl×2、DoorLock×1、Thermostat×1。EP0(システムクラスタ)は
+  固定のまま。最大 EP 8。CustomCluster(F4b)は併用可(WASM 実装クラスタ用)。
+- **汎用値アクセス FFI**(HAL バインディングとスクリプトの共通口):
+  - `sm_attr_set_value(ep, cluster, attr, const sm_attr_value_t*)`(センサ値 push 等)
+  - `sm_attr_get_value(ep, cluster, attr, sm_attr_value_t*)`
+  - `sm_config_t.on_cluster_change(user, ep, cluster, attr, const sm_attr_value_t*)`
+    (IM write / コマンドで状態が変わったら発火。既存の個別 callback は互換維持)
+  - 値表現は custom.rs の `sm_attr_value_t`(型付きスカラ)を流用。
+- ゲート: ホストテスト(composed 構成の commissioning+read/write/subscribe E2E)、
+  ctest(composed light を controller とペア)、ヘッダ再生成冪等、riscv32imac ビルド。
+
+### 9.2 Phase B: `generic_matter_cpp` example(G1+G2)
+
+- NVS namespace `smgen`: `comp`(composition TLV)/ `bind`(binding TLV)。
+  無ければ既定(EP1 OnOff light + gpio)。変更は再起動反映。
+- binding TLV: `[{ 0: ep, 1: cluster, 2: drv-id u8, 3: params(drv 固有) }]`。
+  初期ドライバ: `gpio_out`(OnOff→pin/invert)、`gpio_in`(BooleanState/Switch、
+  ポーリング+デバウンス)、`ledc`(LevelControl→ch/pin/freq、ガンマ)、
+  `i2c_sht30`(Temp/Humidity poll_ms)、`script`(Phase C のフックへ委譲)。
+- esp_console: `cfg-comp <hex>` / `cfg-bind <hex>` / `cfg-show` / `restart`
+  (Configurator 完成前のテスト経路)。
+- ベース: onoff_light_cpp(WiFi/BLE/128KB スタック/KVS 配線を踏襲)。
+- パーティション: app 2.5MB / nvs / factory(NVS 形式)/ `smscript`(raw 256KB)。
+- ゲート: docker esp32c6 ビルド green + 既存 2 example 回帰。実機はユーザ。
+
+### 9.3 Phase C: WASM(WAMR)統合(G3)
+
+- WAMR は ESP Registry の公式 component を第一候補(不可なら interp-only を vendor)。
+  interp モード、線形メモリ既定 64KB、`smscript` パーティションの active slot から
+  ロード。暴走対策: FreeRTOS タイマから `wasm_runtime_terminate`(壁時計上限
+  既定 50ms/フック)+ esp_task_wdt。フックは Matter ポンプと同一タスクで同期実行。
+- **フック ABI(export、いずれも optional)**: `on_boot()`、`on_timer(id: i32)`、
+  `on_attr_write(ep: i32, cluster: i32, attr: i32) -> i32`(0=承認)、
+  `on_command(ep: i32, cluster: i32, cmd: i32) -> i32`、`on_sensor(bind: i32)`。
+  値の受け渡しはホスト関数経由(引数に生ポインタを渡さない)。
+- **ホスト import(module "sm")**: `attr_get(ep,cluster,attr, out_ptr,cap)->len` /
+  `attr_set(ep,cluster,attr, ptr,len)->rc`(値は sm_attr_value_t の 16B 固定
+  バイナリ表現)、`gpio_write(pin,v)` / `gpio_read(pin)->v` / `pwm_set(ch,duty)`、
+  `timer_after(ms,id)` / `timer_every(ms,id)` / `timer_cancel(id)`、
+  `log(ptr,len)`、`kvs_get/set(key_ptr,key_len, ...)`(名前空間 `smscr`)。
+- **SDK**: `crates/sm-script-api`(`#![no_std]`、wasm32-unknown-unknown、extern 宣言
+  + safe wrapper + サンプル)と `web/sdk/sm.d.ts` + AssemblyScript サンプル。
+- ゲート: Linux ホストで WAMR を cmake ビルドし、モック sm import でフック
+  ラウンドトリップ(Rust 製サンプル .wasm)+ C6 ビルド green。
+
+### 9.4 Phase D: ScriptStore クラスタ(G4)
+
+- vendor cluster `0xFFF1FC01`(CustomCluster/F4b で C++ 側実装 = シム無改造)。
+  - commands: `Begin(size u32, crc32 u32)` / `Data(offset u32, bytes octstr≤512)` /
+    `Commit()` / `Abort()`、attributes: `State u8`, `ActiveSlot u8`, `Version u32`。
+  - 格納: `smscript` パーティション 2 スロット(ヘッダ magic "SMWS" + ver + len +
+    crc32)。Commit = CRC 検証 → active 切替 → VM 再ロード。ロード失敗は旧スロットへ
+    ロールバック。認可は CASE + ACL(Administer)。
+- smctl `any invoke` / batch での転送手順を README に記載(チャンク分割スクリプト付き)。
+- ゲート: ループバック(ctest or ホスト)で Begin→Data→Commit→リロード、C6 ビルド。
+
+### 9.5 Phase E: Web Configurator
+
+- `web/configurator/`: ビルドステップ無しの静的サイト(ES modules)。依存は vendor
+  同梱(esptool-js、noble-curves、qrcode、assemblyscript web 版。CDN 参照しない)。
+- 機能: ①構成/バインディング UI → TLV(§9.1/9.2 と同一スキーマ)、②個体情報生成
+  (SPAKE2+ verifier = WebCrypto PBKDF2 + noble P-256。**mfg_tool 互換 NVS
+  バイナリ**を生成)、③QR(`MT:` Base38)+ MPC(Verhoeff)表示・印刷、
+  ④AssemblyScript エディタ→ .wasm → smscript イメージ(slot A)、
+  ⑤esptool-js で app+nvs(smgen)+factory+smscript を一括 flash(FW イメージは
+  Release asset 取得 or ローカルファイル指定)。
+- 検証ゲート(自動化可能分): Node で単体テスト — verifier が `smctl pase-verifier`
+  出力と一致、生成 NVS を Rust factory パーサ(fixtures 経由の cargo test)が読める、
+  MPC/QR が仕様テストベクタと一致。ブラウザ実操作はユーザ確認。
+
+## 10. 実装進捗
+
+- (フェーズ完了ごとに追記)
