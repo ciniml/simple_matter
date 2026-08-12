@@ -1,0 +1,77 @@
+menu "simple-matter generic_matter example"
+
+    choice SM_NETWORK_TYPE
+        prompt "Operational network transport"
+        default SM_NETWORK_WIFI
+        help
+            プリセット NetworkCommissioning の種別(docs/design/c-ffi-shim.md §10)。
+            wifi = pairing ble-wifi(既定)、thread = pairing ble-thread(esp_openthread)。
+            択一。thread は ESP32-C6 の 802.15.4 + BLE coex を使う。
+
+        config SM_NETWORK_WIFI
+            bool "WiFi (pairing ble-wifi)"
+
+        config SM_NETWORK_THREAD
+            bool "Thread (pairing ble-thread, esp_openthread)"
+            depends on IDF_TARGET_ESP32C6
+    endchoice
+
+    config SM_WIFI_SSID
+        string "WiFi SSID"
+        default "my-ssid"
+        depends on SM_NETWORK_WIFI
+        help
+            接続先 WiFi の SSID。ビルドを通すためのプレースホルダ。実機では
+            menuconfig / sdkconfig.local で上書きする(秘密は default に書かない)。
+
+    config SM_WIFI_PASSWORD
+        string "WiFi password"
+        default "my-password"
+        depends on SM_NETWORK_WIFI
+        help
+            WiFi パスフレーズ(WPA2-PSK)。プレースホルダ。
+
+    config SM_DEFAULT_GPIO
+        int "Default gpio_out pin (used when NVS smgen/bind is unset)"
+        default 48 if IDF_TARGET_ESP32S3
+        default 7
+        help
+            NVS に binding TLV(smgen/bind)が無いときの既定バインディング
+            「EP1 OnOff -> gpio_out」のピン番号。既定は M5 NanoC6 の GPIO7
+            (ESP32-S3 は DevKitC の RGB LED = GPIO48)。運用では cfg-bind で
+            上書きする(再ビルド不要)。
+
+    config SM_SCRIPT_PARTITION
+        string "Script partition label (reserved for Phase C/D)"
+        default "smscript"
+        help
+            スクリプト(WASM)格納用 raw パーティションのラベル。Phase B では
+            partitions.csv に定義するだけで未使用。
+
+    config SM_FACTORY_DATA
+        bool "Use factory data partition (esp-matter-mfg-tool compatible)"
+        default n
+        help
+            esp-matter-mfg-tool 生成の factory NVS パーティション(chip-factory
+            namespace)から DAC/PAI/DAC 鍵・SPAKE2+ verifier・discriminator・VID/PID を
+            読み、sm_config_t に供給する(docs/design/factory-data.md §5)。
+            パーティション未 flash / 読み取り失敗時は開発用の dev 定数にフォールバックする。
+
+    config SM_FACTORY_PARTITION
+        string "Factory data partition label"
+        default "nvs_factory"
+        depends on SM_FACTORY_DATA
+        help
+            factory データ NVS パーティションのラベル(partitions.csv のエントリ名)。
+
+    config SM_ENABLE_BLE
+        bool "Enable BLE (NimBLE) commissioning"
+        default y if IDF_TARGET_ESP32C6
+        default y if SM_NETWORK_THREAD
+        default n
+        help
+            BLE(NimBLE)給餌によるコミッショニング(pairing ble-wifi / ble-thread)を
+            有効にする(docs/design/c-ffi-shim.md §9・§10)。有効時は起動時 WiFi join を
+            止め、ConnectNetwork 駆動でプロビジョンする。ESP32-S3 は既定 n。
+
+endmenu

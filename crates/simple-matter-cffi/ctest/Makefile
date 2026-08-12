@@ -18,11 +18,11 @@ CXX      := g++
 CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -I$(INCDIR)
 LDLIBS   := -lpthread -ldl -lm
 
-.PHONY: all lib run check clean
+.PHONY: all lib run check check-generic clean
 
 # `make check` の作業ディレクトリ(状態ディレクトリを分離する)。
 RUNDIR := ./run
-all: onoff_light controller ble_loopback composed_loopback
+all: onoff_light controller ble_loopback composed_loopback compose_check
 
 lib:
 	cargo build -p simple-matter-cffi --release --features std --target $(TARGET)
@@ -42,17 +42,36 @@ ble_loopback: ble_loopback.cpp lib
 composed_loopback: composed_loopback.cpp lib
 	$(CXX) $(CXXFLAGS) -o $@ composed_loopback.cpp $(STATICLIB) $(LDLIBS)
 
+# composition / binding blob のホスト検算(Phase B、generic_matter_cpp の README hex 例)。
+# binding パーサはファームと同一ヘッダ(generic_matter_cpp/main/bind_tlv.hpp)を使う。
+GENDIR := $(ROOT)/ports/esp-idf/examples/generic_matter_cpp/main
+compose_check: compose_check.cpp lib $(GENDIR)/bind_tlv.hpp
+	$(CXX) $(CXXFLAGS) -I$(GENDIR) -o $@ compose_check.cpp $(STATICLIB) $(LDLIBS)
+
 run: onoff_light
 	./onoff_light $(ARGS)
 
 # 自己完結ハーネスの一括実行(ネットワーク・無線なしで green/red が決まる)。
 #   make check
-check: ble_loopback composed_loopback
+check: ble_loopback composed_loopback compose_check
 	rm -rf $(RUNDIR) && mkdir -p $(RUNDIR)
 	./ble_loopback wifi --dev-dir $(RUNDIR)/ble-wifi-dev --ctrl-dir $(RUNDIR)/ble-wifi-ctrl
 	./ble_loopback thread --dev-dir $(RUNDIR)/ble-thr-dev --ctrl-dir $(RUNDIR)/ble-thr-ctrl
 	./composed_loopback --dev-dir $(RUNDIR)/comp-dev --ctrl-dir $(RUNDIR)/comp-ctrl
+	$(MAKE) check-generic
+
+# generic_matter_cpp README の設定例(scripts/smgen-tlv.py examples の出力)を検算する。
+# sm_init はプロセス 1 回きりなので、例ごとに別プロセスで走らせる。
+check-generic: compose_check
+	./compose_check \
+	  --comp 1715250001002601000100002402023603060300000006040000000606000000181818 \
+	  --bind 17152500010026010600000024020135032400072801181818 \
+	  --expect 1:0003,1:0004,1:0006
+	./compose_check \
+	  --comp 1715250001002601010100002402033603060300000006040000000606000000060800000018181525000200260102030000240202360306020400000605040000181818 \
+	  --bind 17152500010026010800000024020335032400002401062602e803000018181525000200260102040000240204350324000824010925028813181818 \
+	  --expect 1:0003,1:0004,1:0006,1:0008,2:0402,2:0405
 
 clean:
-	rm -f onoff_light controller ble_loopback composed_loopback
+	rm -f onoff_light controller ble_loopback composed_loopback compose_check
 	rm -rf $(RUNDIR)

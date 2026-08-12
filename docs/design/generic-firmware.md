@@ -426,3 +426,110 @@ Rust ホスト E2E(`tests/composed_e2e.rs`、3.6 秒): 上記に加えて
    `housekeep`(コマンド直後)と `on_tick`(遷移完了時)の両方で呼ぶ必要がある。
 6. **`sm_config_t` の拡張は末尾追加限定**。既存 example/ctest は `memset` + 個別代入なので
    NULL 埋め = 従来動作になる(位置指定初期化をしている利用者がいれば壊れる)。
+
+### Phase B(完了、2026-08-12): `generic_matter_cpp` example(G1 設定駆動 + G2 HAL バインディング)
+
+§9.2 の実装。**コア(`crates/simple-matter`)とシム(`crates/simple-matter-cffi/src`)は
+無改造**(Phase A の `sm_config_t.composition` / `on_cluster_change` / `sm_attr_set_value` /
+`sm_attr_get_value` だけで成立した)。既存 example 3 つも無変更。
+
+#### 変更ファイル
+
+- `ports/esp-idf/examples/generic_matter_cpp/`(新規):
+  - `main/main.cpp` — onoff_light_cpp をベースに 3 点だけ差し替え: ①起動時に NVS
+    namespace `smgen` の `comp` / `bind` を読み `sm_config_t.composition` へ渡す
+    (無ければ既定 blob)、②`on_cluster_change` を HAL へ配線、③pump ループで
+    `bindings_poll`。カスタムクラスタ(EP2)と LED 直叩きは削除。
+  - `main/bind_tlv.hpp`(新規)— binding TLV スキーマ + パーサ。**ESP-IDF 非依存の
+    ヘッダオンリー**にして、ホスト検算プログラムとファームで同一コードを使う。
+  - `main/bindings.{hpp,cpp}`(新規)— ドライバ表 gpio_out / gpio_in / ledc /
+    i2c_sht30 / script と dispatch・ポーリング。
+  - `main/cfg_store.{hpp,cpp}`(新規)— NVS `smgen` の読み書き + esp_console REPL
+    (USB-Serial-JTAG)`cfg-comp` / `cfg-bind` / `cfg-show` / `cfg-clear` / `restart`。
+  - `main/{ble,ot_thread}.{hpp,cpp}` / `app_cmd.hpp` — onoff_light_cpp からのコピー(無改変)。
+  - `main/Kconfig.projbuild` / `CMakeLists.txt` / `partitions.csv` /
+    `sdkconfig.defaults{,.esp32c6,.thread}` / `README.md`。
+- `scripts/smgen-tlv.py`(新規)— composition / binding TLV のエンコーダ + デコーダ
+  + `examples`(README 掲載 hex の生成元)+ `selftest`(ラウンドトリップ)。
+- `crates/simple-matter-cffi/ctest/compose_check.cpp`(新規)+ `Makefile` の
+  `compose_check` / `check-generic` ターゲット — README の hex 例を**実際に `sm_init` へ
+  食わせて**合成結果を検証するホストハーネス(下記ゲート)。シム本体は無改造。
+
+#### binding TLV スキーマ(最終形)
+
+```
+anonymous list|array of binding structs:      ← struct 直書き(単一 binding)も受理
+  {
+    0: endpoint u16   必須(1..)
+    1: cluster  u32   必須(ドライバを結び付けるクラスタ ID)
+    2: drv-id   u8    必須(1=gpio_out 2=gpio_in 3=ledc 4=i2c_sht30 5=script)
+    3: params   struct(ドライバ固有。context tag → スカラ)。省略可
+  }
+```
+
+| drv | id | params(context tag) | 対象クラスタ | 動作 |
+|---|---|---|---|---|
+| `gpio_out` | 1 | 0=pin u8、1=invert bool | OnOff(0x0006) | 変化 → GPIO 出力 |
+| `gpio_in` | 2 | 0=pin、1=invert、2=poll_ms u16(既定 50)、3=pull u8(0/1=up 既定/2) | BooleanState(0x0045)/ Switch(0x003B) | ポーリング + 2 連続一致デバウンス → `sm_attr_set_value` |
+| `ledc` | 3 | 0=ch、1=pin、2=freq u32(既定 1000)、3=invert bool | LevelControl(0x0008) | CurrentLevel(0..254)→ duty(10bit)。同一 EP の OnOff が off なら duty 0 |
+| `i2c_sht30` | 4 | 0=sda、1=scl、2=poll_ms u16(既定 5000)、3=port u8 | Temperature(0x0402) | 0x2C06 単発測定 + CRC8 検証 → 0x0402 と同一 EP の 0x0405 へ push |
+| `script` | 5 | (予約) | 任意 | Phase C の WASM フックへ委譲(現状 no-op) |
+
+パーサは params を「context tag → u64」の疎な表として持つだけなので、**ドライバ追加で
+パーサを触る必要はない**(ドライバ側が `param(tag, default)` で読む)。上限は
+バインディング 16 / params tag 0..7。tag 割り当ては `scripts/smgen-tlv.py` の `PARAMS` と 1 対 1。
+
+#### 既定構成(NVS に `comp` / `bind` が無いとき)
+
+- composition = EP1 / device type `0x0100`(On/Off Light)rev 2 / Identify + Groups + OnOff。
+  **`main.cpp` に 35 バイトの生 TLV を直書き**(TLV エンコーダをファームに持ち込まないため)。
+  この 35 バイトは `scripts/smgen-tlv.py examples` の例 ① と同一バイト列。
+- binding = EP1 OnOff → `gpio_out`(pin = `CONFIG_SM_DEFAULT_GPIO`、既定 7 / S3 は 48、invert=false)。
+
+パーティション(`partitions.csv`、4MB): `nvs` 24KB / `factory`(app)2.5MB /
+`nvs_factory` 24KB(mfg-tool 互換 factory データ)/ **`smscript` 256KB(data, subtype 0x40。
+Phase D 用に予約、Phase B では未使用)**。
+
+#### ゲート実測
+
+| ゲート | 結果 |
+|---|---|
+| docker `espressif/idf:release-v5.4` esp32c6(WiFi+BLE、経路 (b) cargo) | **build green**。app **1,594,688 B**(`0x185140`、partition 39% free) |
+| 同 esp32c6 Thread 構成(`sdkconfig.defaults.thread`) | **build green**。app **1,622,096 B**(`0x18c050`、38% free)= Thread 経路も維持 |
+| ELF シンボル | `sm_init` / `sm_udp_rx` / `sm_poll` / `sm_attr_set_value` / `sm_attr_get_value` / `sm_onoff_set` / `sm_ble_*` が `T`。`smgen::parse_bindings` ほか example 側シンボルも健在 |
+| README hex 例の検算(ctest `make check-generic`) | **COMPOSE CHECK OK ×2**。例 ①(comp 35B / bind 25B)→ EP1{Identify,Groups,OnOff}、例 ②(comp 68B / bind 60B)→ EP1{Identify,Groups,OnOff,LevelControl} + EP2{Temperature,RelativeHumidity}。`--expect` と**過不足なく一致** |
+| `scripts/smgen-tlv.py selftest` | PASS(encode→decode ラウンドトリップ) |
+| ctest `make check` | **ALL GREEN ×3 + COMPOSE CHECK OK ×2**(`ble_loopback wifi` / `ble_loopback thread` / `composed_loopback` の回帰込み) |
+| `cargo test --workspace` | **649 pass / 0 fail**(Phase A と同数 = 回帰なし) |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` / `cargo fmt --all --check` | 0 / クリーン(ワークスペースへの Rust 追加は無し) |
+| onoff_light_cpp esp32c6 回帰 | **build green**(app `0x176c50`)。既存 example 3 つは無変更 |
+
+実機検証はユーザの機材で行う(未実施)。
+
+#### 発見した罠
+
+1. **ESP-IDF docker を `-u $(id -u)` で回すと ccache が `Permission denied` で全 C
+   コンパイルが FAILED になる**(ccache のキャッシュディレクトリがコンテナ内 root 所有)。
+   `-e CCACHE_DISABLE=1` を足すと通る。root で回して後片付けする従来手順の代わりに、
+   **非 root + CCACHE_DISABLE** なら `build/` が user 所有で生成されるので後片付けが楽。
+2. **`esp_console_new_repl_usb_serial_jtag` は `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG`
+   (または SECONDARY)でしかコンパイルされない**。C6 の IDF 既定は UART なので
+   `sdkconfig.defaults` に明示が要る。REPL の `max_cmdline_length` も既定(256)では
+   composition hex(例 ② は 136 文字、EP 8 構成なら数百文字)が切れるので 2048 にした。
+3. **コンソールタスクから `sm_*` を呼ばない**設計にすれば単線契約を壊さずに済む
+   (`cfg-*` は NVS のみ、反映は `restart`)。設定変更 = 再起動という §4 の割り切りが
+   そのままタスク分離の根拠になる。
+4. **binding パーサをファーム専用にすると hex 例を検証できない**。`bind_tlv.hpp` を
+   ESP-IDF 非依存のヘッダオンリーにして ctest から `-I` で取り込む形にしたことで、
+   README の hex を**ファームと同一コード**で検算できるようになった(`compose_check`)。
+5. **`sm_attr_get_value` の戻り値で「クラスタの有無」を判定できる**(-2 = クラスタ無し、
+   -3 = クラスタはあるが属性が非公開)。Groups のように値アクセス非対応のクラスタでも
+   -3 が返るので、合成結果の走査(`compose_check` の EP×クラスタ探索)に使える。
+6. **LevelControl の CurrentLevel は `sm_attr_set_value` では書けない**(Phase A の
+   既知制約)。よって `ledc` ドライバは「`on_cluster_change` で通知された値」ではなく
+   **毎回 `sm_attr_get_value` で CurrentLevel と OnOff を読み直して duty を決める**方式に
+   した(OnOff 変化・Level 変化のどちらの通知でも同じ計算に合流する)。
+7. **`gpio_in` / `i2c_sht30` の push は `sm_attr_set_value` 経由なので `on_cluster_change` が
+   鳴らない**(§9.1 の設計どおり)= HAL の無限ループが構造的に起きない。逆に
+   ローカル操作(`CmdKind::LocalToggle` → `sm_onoff_set`)も通知が来ないため、
+   出力への反映はアプリ側で明示的に呼ぶ必要がある(`bindings_apply_initial` を再利用)。

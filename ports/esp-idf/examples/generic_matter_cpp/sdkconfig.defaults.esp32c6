@@ -1,0 +1,13 @@
+# ESP32-C6 専用の既定(sdkconfig.defaults に加えて IDF が自動連結する)。
+# BLE(NimBLE)コミッショニング(pairing ble-wifi)= onoff_light_cpp と同一。
+
+# Bluetooth LE + NimBLE ホスト(peripheral のみ。central/observer は不要 = RAM 削減)。
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+
+# WiFi/BLE 同時運用(coex)。commissioning 中は BLE、その後 WiFi 運用へ遷移する。
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
