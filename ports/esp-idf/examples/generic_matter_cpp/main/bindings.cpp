@@ -2,6 +2,8 @@
 
 #include "bindings.hpp"
 
+#include "script_host.hpp"
+
 #include <cstring>
 
 #include "esp_err.h"
@@ -166,7 +168,7 @@ void gpio_in_commit(const Binding &b, bool logical) {
   }
 }
 
-void gpio_in_poll(Binding &b, uint64_t now_ms) {
+void gpio_in_poll(Binding &b, size_t index, uint64_t now_ms) {
   const uint32_t period = (uint32_t)b.param(2, 50);
   if (now_ms < b.next_ms) {
     return;
@@ -184,6 +186,8 @@ void gpio_in_poll(Binding &b, uint64_t now_ms) {
     gpio_in_commit(b, sample != 0);
     ESP_LOGI(TAG, "gpio_in pin=%d -> ep=%u cluster=0x%04x value=%d", (int)pin, b.ep,
              (unsigned)b.cluster, sample);
+    // 入力の確定 = センサ更新。スクリプトの on_sensor(bind index)へ通知する(§9.3)。
+    script_notify_sensor((int32_t)index);
   }
 }
 
@@ -237,7 +241,7 @@ void sht30_init(Binding &b) {
   b.next_ms = 0;
 }
 
-void sht30_poll(Binding &b, uint64_t now_ms) {
+void sht30_poll(Binding &b, size_t index, uint64_t now_ms) {
   if (b.handle == nullptr) {
     return;
   }
@@ -273,6 +277,20 @@ void sht30_poll(Binding &b, uint64_t now_ms) {
   ESP_LOGI(TAG, "sht30 ep=%u %d.%02d C / %d.%02d %%RH", b.ep, (int)(centi_c / 100),
            (int)(centi_c < 0 ? -centi_c : centi_c) % 100, (int)(centi_rh / 100),
            (int)(centi_rh % 100));
+  script_notify_sensor((int32_t)index);
+}
+
+// ---- script(drv=5)-----------------------------------------------------------
+//
+// params 0 = poll_ms(u32。0 = 周期発火しない)。周期が来たら on_sensor(bind index)を
+// 呼ぶ(変則ハードをスクリプトで吸収するための定期フック。§5「script」ドライバ)。
+void script_poll_binding(Binding &b, size_t index, uint64_t now_ms) {
+  const uint32_t period = (uint32_t)b.param(0, 0);
+  if (period == 0 || now_ms < b.next_ms) {
+    return;
+  }
+  b.next_ms = now_ms + period;
+  script_notify_sensor((int32_t)index);
 }
 
 } // namespace
@@ -297,9 +315,10 @@ void bindings_init(const BindingTable &table) {
       sht30_init(b);
       break;
     case DRV_SCRIPT:
-      // Phase C(WASM フック)で接続する。現状は no-op プレースホルダ。
-      ESP_LOGI(TAG, "binding ep=%u cluster=0x%04x drv=script (no-op until Phase C)", b.ep,
-               (unsigned)b.cluster);
+      // WASM フックへの委譲(§9.3)。params 0 = poll_ms(0 = 周期発火しない)。
+      b.next_ms = 0;
+      ESP_LOGI(TAG, "binding ep=%u cluster=0x%04x drv=script (poll_ms=%u)", b.ep,
+               (unsigned)b.cluster, (unsigned)b.param(0, 0));
       break;
     default:
       ESP_LOGW(TAG, "binding ep=%u cluster=0x%04x: unknown drv %u", b.ep, (unsigned)b.cluster,
@@ -342,7 +361,8 @@ void bindings_on_change(uint16_t ep, uint32_t cluster, uint32_t attr,
       }
       break;
     case DRV_SCRIPT:
-      // Phase C: on_attr_write フックへ委譲する。現状はログのみ。
+      // on_attr_write は main.cpp の on_cluster_change から一括で発火する(二重呼び出しを
+      // 避けるためここでは何もしない)。
       ESP_LOGD(TAG, "script binding: ep=%u cluster=0x%04x attr=0x%04x", ep, (unsigned)cluster,
                (unsigned)attr);
       break;
@@ -356,9 +376,11 @@ void bindings_poll(uint64_t now_ms) {
   for (size_t i = 0; i < g_table.n; i++) {
     Binding &b = g_table.items[i];
     if (b.drv == DRV_GPIO_IN) {
-      gpio_in_poll(b, now_ms);
+      gpio_in_poll(b, i, now_ms);
     } else if (b.drv == DRV_I2C_SHT30) {
-      sht30_poll(b, now_ms);
+      sht30_poll(b, i, now_ms);
+    } else if (b.drv == DRV_SCRIPT) {
+      script_poll_binding(b, i, now_ms);
     }
   }
 }

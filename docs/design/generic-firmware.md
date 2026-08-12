@@ -533,3 +533,176 @@ Phase D 用に予約、Phase B では未使用)**。
    鳴らない**(§9.1 の設計どおり)= HAL の無限ループが構造的に起きない。逆に
    ローカル操作(`CmdKind::LocalToggle` → `sm_onoff_set`)も通知が来ないため、
    出力への反映はアプリ側で明示的に呼ぶ必要がある(`bindings_apply_initial` を再利用)。
+
+### Phase C(完了、2026-08-12): WASM(WAMR)スクリプト統合(G3)
+
+§9.3 の実装。**コア(`crates/simple-matter`)と C FFI シム(`crates/simple-matter-cffi/src`)は
+無改造**(Phase A の `sm_attr_get_value` / `sm_attr_set_value` / `on_cluster_change` だけで
+成立した)。既存 example 3 つ(onoff_light_cpp / controller_hub_cpp / thread_ctrl_hub_cpp)も無変更。
+
+#### WAMR の入手形態と版
+
+**ESP Component Registry の公式 component をそのまま使う(vendor しない)**:
+
+- `espressif/wasm-micro-runtime` **2.4.0~1**(upstream WAMR 2.4.0、
+  `repository_info.commit_sha = 8f806e0f2c02a768d2c35044f2964f769612d9bc`)。
+  targets に `esp32c6` / `esp32p4` / `esp32s3` などを含む。
+- 宣言は `ports/esp-idf/examples/generic_matter_cpp/main/idf_component.yml`
+  (`espressif/wasm-micro-runtime: "~2.4.0"`)。CMake の `REQUIRES` は
+  **`espressif__wasm-micro-runtime`**(managed component の完全名)。
+- 機能選択は `sdkconfig.defaults` の `CONFIG_WAMR_*`:
+  **classic interpreter のみ**(`WAMR_INTERP_CLASSIC`)、AOT / LIBC_WASI / LIBC_BUILTIN /
+  APP_FRAMEWORK / MULTI_MODULE / SHARED_MEMORY / REF_TYPES は無効、
+  **LIB_PTHREAD は有効**(理由は罠 1)。
+- ホスト検証ハーネスは `tools/wasm-harness/fetch-wamr.sh` が**同じ zip**を取得して
+  Linux 用に cmake ビルドする(`.wamr/` は gitignore)。リポジトリのサイズ増は 0 バイト。
+
+#### 追加ファイル
+
+- `ports/esp-idf/examples/generic_matter_cpp/main/`:
+  - `script_abi.hpp`(新規)— **16B 値表現**・フック名・import 名・エラーコード。
+    ESP-IDF 非依存(ファーム/ハーネス共用)。
+  - `script_img.hpp`(新規)— `smscript` の `SMWS` ヘッダ + CRC-32 + スロット計算。
+    **Phase D(ScriptStore)と共用**する小さなヘッダオンリーモジュール。
+  - `script_vm.{hpp,cpp}`(新規、約 460 行)— WAMR ラッパ。**ESP-IDF 非依存**
+    (`wasm_export.h` + libc のみ)。ホスト機能は `ScriptHostOps` の関数ポインタで注入。
+    ホスト import 11 本の実装(線形メモリ範囲検証込み)、フック呼び出し、
+    スクリプトタイマ 8 本、統計。
+  - `script_host.{hpp,cpp}`(新規)— ESP 実体。パーティションからの active slot ロード、
+    `sm_attr_*` ⇔ 16B 変換、gpio/ledc、NVS `smscr`、esp_timer 暴走監視。
+  - `main.cpp` / `bindings.cpp` — 呼び出し 4 箇所の追加のみ(`script_init` /
+    `script_poll` / `script_notify_attr_write` / `script_notify_sensor`)。
+  - `Kconfig.projbuild` — `SM_SCRIPT_ENABLE`(既定 y)/ `SM_SCRIPT_POOL_KB`(96)/
+    `SM_SCRIPT_POOL_STATIC`(既定 n)/ `SM_SCRIPT_MAX_KB`(24)/ `SM_SCRIPT_STACK_KB`(8)/
+    `SM_SCRIPT_BUDGET_MS`(50)。
+- `crates/sm-script-api/`(新規、ワークスペースメンバ)— `#![no_std]` の Rust SDK。
+  wasm32 では実 import、それ以外では「未対応」スタブ(= `cargo test --workspace` が壊れない)。
+  `examples-wasm/momentary-toggle/` は**独立ワークスペース**(ルートの `exclude`)。
+- `tools/wasm-harness/`(新規)— Linux ホストハーネス(`run.sh` / `fetch-wamr.sh` /
+  `CMakeLists.txt` / `harness.cpp`)。`make -C crates/simple-matter-cffi/ctest check-wasm`。
+- `scripts/smscript-img.py`(新規)— `.wasm` → `SMWS` イメージの pack / show / selftest。
+- `web/sdk/sm.d.ts` + `web/sdk/momentary-toggle.ts`(新規)— AssemblyScript 用の宣言と
+  サンプル(**コンパイルはしない**。Phase E で使う)。
+
+#### フック ABI(最終形)
+
+| export | 発火元 | 戻り値 |
+|---|---|---|
+| `on_boot()` | `script_init()`(sm_init + bindings 初期化の直後) | — |
+| `on_timer(id: i32)` | pump ループの `script_poll`(`timer_after` / `timer_every`) | — |
+| `on_attr_write(ep,cluster,attr) -> i32` | `on_cluster_change`(HAL dispatch の後) | 0 = 承認。**非 0 は観測のみ** |
+| `on_command(ep,cluster,cmd) -> i32` | **未接続**(シムにコマンドフックが無い。Phase D で繋ぐ) | 0 = 承認 |
+| `on_sensor(bind: i32)` | `gpio_in` の確定変化 / `i2c_sht30` の push / `script` binding の周期(`poll_ms`) | — |
+
+未 export のフックは no-op(`on_attr_write` / `on_command` は 0 扱い)。全フックは
+Matter ポンプと同一タスクで同期実行(単線契約)。フック内からフックは呼ばない(再入抑止)。
+
+**拒否が「観測のみ」な理由**: `on_cluster_change` は**既に適用された**変化の通知で、
+現行シムに IM write を却下する口(write ハンドラの戻り値)が無い。ファームは非 0 を
+警告ログに出すだけで書き込みを取り消さない。スクリプト側で拒否したいときは
+`attr_set` で元の値へ書き戻す(README に明記)。
+
+#### ホスト import(module `"sm"`、最終形)
+
+`attr_get(ep,cluster,attr,out_ptr,cap)->len` / `attr_set(ep,cluster,attr,ptr,len)->rc` /
+`gpio_write(pin,v)` / `gpio_read(pin)` / `pwm_set(ch,duty)` /
+`timer_after(ms,id)` / `timer_every(ms,id)` / `timer_cancel(id)` / `log(ptr,len)` /
+`kvs_get(key,key_len,out,cap)` / `kvs_set(key,key_len,val,len)`。
+引数は全て i32(ポインタも i32 オフセット)。**ポインタは必ず
+`wasm_runtime_validate_app_addr` で範囲検証してから native ポインタへ変換する**。
+エラーは負値(-1 ARG / -2 NOTFOUND / -3 UNSUPPORTED / -4 TYPE / -5 NOSPACE / -6 HW)。
+KVS は NVS namespace `smscr`(キーは 15 バイトまで)。タイマは同時 8 本、
+ホスト側(`script_vm.cpp`)で管理し pump の `script_poll(now_ms)` で満了させる。
+
+#### 値の 16B 固定バイナリ表現
+
+| offset | size | 内容 |
+|---|---|---|
+| 0 | 1 | `type`(`sm_attr_type_t` と同一: 0=BOOL 1=U8 2=U16 3=U32 4=U64 5=I8 6=I16 7=I32 8=I64 9=F32 10=STRING 11=OCTETS) |
+| 1 | 1 | `flags`(bit0 = is_null) |
+| 2 | 2 | `len`(STRING/OCTETS の**後続**バイト数、u16 LE。スカラは 0) |
+| 4 | 4 | 予約(0) |
+| 8 | 8 | `val`(u64 LE。BOOL=0/1、U\*=ゼロ拡張、I\*=符号拡張、F32=下位 32bit にビットパターン) |
+
+**スカラはちょうど 16B**、STRING/OCTETS は `16+len` B(本体が 16B の直後に続く)。
+定義は `main/script_abi.hpp` / `crates/sm-script-api`(`Value::encode_into`)/
+`web/sdk/sm.d.ts` の 3 箇所に同じものを書き、ハーネスが両実装のラウンドトリップを検証する。
+
+#### スクリプトイメージ(`smscript` パーティション、Phase D と共通)
+
+128KB × 2 スロット(slot A = +0x00000、slot B = +0x20000)。各スロット先頭 16B:
+`"SMWS"` + `ver u16` + `flags u16` + `len u32` + `crc32 u32`(CRC-32/IEEE)。
+active slot = ヘッダ妥当 + CRC 一致のうち **ver 最大**(同値なら A)。両方無効 =
+スクリプト無し(従来動作)。ツールは `scripts/smscript-img.py`
+(`pack` は `esptool.py write_flash 0x296000 slotA.bin` にそのまま渡せる)。
+
+#### ゲート実測
+
+| ゲート | 結果 |
+|---|---|
+| docker `espressif/idf:release-v5.4` esp32c6(WiFi+BLE+WAMR) | **build green**。app **0x1a1ca0 = 1,711,264 B**(partition 35% free) |
+| 同(`CONFIG_SM_SCRIPT_ENABLE=n`) | **build green**。app 0x185340 = 1,595,200 B(= Phase B + 512 B) |
+| ホストハーネス `make check-wasm` | **WASM HARNESS OK**(下記) |
+| `cargo test --workspace` | **655 pass / 0 fail**(Phase B の 649 + sm-script-api 6) |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | 0(サンプル wasm クレートも `--target wasm32-unknown-unknown` で 0) |
+| `cargo fmt --all --check` | クリーン(サンプル wasm クレートも) |
+| ctest `make check` | **ALL GREEN ×3 + COMPOSE CHECK OK ×2**(Phase A/B の回帰) |
+| `scripts/smgen-tlv.py selftest` / `smscript-img.py selftest` | PASS / PASS |
+| onoff_light_cpp esp32c6 回帰 | **build green**(app 0x176c50 = Phase B と同一) |
+
+ホストハーネス(`tools/wasm-harness`、ファームと同一の `script_vm.cpp` + Linux 用 WAMR):
+`momentary_toggle.wasm`(**1,452 B**)をロード →
+`on_boot`(log + `kvs_get`)→ `on_sensor`(押下エッジ → `attr_get` BooleanState →
+`attr_set` OnOff トグル → `kvs_set` で押下回数)→ `timer_after` → `script_vm_poll` →
+`on_timer` で長押し強制 OFF → `timer_cancel` が効く(離すと発火しない)→
+`on_attr_write` が 0 → 未 export の `on_command` が no-op → **暴走スクリプト
+(手組みの `loop br 0`)が 50ms で terminate されて復帰**(traps=1 / timeouts=1)。
+
+#### app サイズ増分(esp32c6、WiFi+BLE 構成)
+
+| | Phase B(HEAD) | Phase C(script 無効) | Phase C(既定 = script 有効) |
+|---|---|---|---|
+| app `.bin` | 1,594,688 B | 1,595,200 B(**+512**) | **1,711,264 B(+116,576 = +113.8KB)** |
+| DIRAM `.bss` | — | 77,664 B | 77,776 B(**+112 B**。プールはヒープ) |
+| うち WAMR 単体(`idf.py size-components`) | — | — | 91,902 B(flash `.text` 90,122 / rodata 1,304 / DIRAM 476) |
+
+WAMR 実体は約 90KB(§6 の見積り「85-150KB」の下限側)。残り約 26KB は
+`script_vm.cpp` / `script_host.cpp` と、WAMR が引き込む pthread / thread-manager。
+**RAM は既定でヒープから 96KB(スクリプトがある時だけ)**: 静的確保(96KB を .bss)に
+すると DIRAM 残が 219KB → 96KB まで落ちて WiFi+BLE+Matter のヒープを圧迫するため、
+既定を「イメージが見つかったら 1 度だけ `heap_caps_aligned_alloc`」にした
+(`CONFIG_SM_SCRIPT_POOL_STATIC=y` で §9.3 どおりの静的確保にできる)。
+
+#### 発見した罠
+
+1. **`wasm_runtime_terminate` は THREAD_MGR 無しでは無限ループを止められない**。
+   classic interpreter の `CHECK_SUSPEND_FLAGS()`(loop/br の back-edge)は
+   `WASM_ENABLE_THREAD_MGR != 0` でしかコンパイルされず、terminate は例外を立てるだけなので
+   `loop br 0` は永久に回り続ける。**`CONFIG_WAMR_ENABLE_LIB_PTHREAD=y`(→ thread-manager)**
+   にすると `wasm_set_exception` が `wasm_cluster_set_exception` → `set_thread_cancel_flags`
+   経由で suspend flag を立て、フックから抜けられる。ホストハーネスで
+   「50ms で復帰」を実測して確認した(この検証が無ければ実機で気づけない類の罠)。
+2. **WAMR のローダはバイトコードバッファを保持し、書き換える**(labels-as-values の
+   opcode 置換)。`esp_partition_mmap` の読み取り専用領域を直接渡せないので、
+   プール上へ `wasm_runtime_malloc` して複製してから `wasm_runtime_load` する。
+   読み出し用の一時バッファはロード後に解放する。
+3. **静的 96KB プールは C6 では高すぎる**。DIRAM 452KB のうち `.bss` が 200KB になり、
+   ヒープ残が 96KB まで落ちる(WiFi+BLE+Matter には不足)。既定を遅延ヒープ確保に変えて
+   `.bss` +112 B に収めた。**WAMR に malloc を渡さない**方針は維持(プール外へは伸びない =
+   スクリプトがシステムヒープを食い潰せない)。
+4. **非 root docker では `~/.cache/Espressif` のマウントが要る**。Phase C から
+   component manager が WAMR を取りに行くため、キャッシュディレクトリを作れないと
+   `ERROR: Failed to create cache directory` で configure が落ちる
+   (Phase B の `CCACHE_DISABLE=1` と同じ系統の罠)。REQUIRES に書く名前も
+   短縮名ではなく **`espressif__wasm-micro-runtime`**。
+5. **`no_std` + `#[panic_handler]` + `cdylib` のサンプルはワークスペースに入れられない**
+   (`cargo test --workspace` / `clippy --all-targets` がホスト向けにビルドしようとして壊れる)。
+   ルートの `exclude` + サンプル側の空 `[workspace]` で**独立ワークスペース**にした。
+   SDK 本体(`sm-script-api`)は「wasm32 では実 import、それ以外ではスタブ」にして
+   ワークスペースメンバのまま置き、16B レイアウトの単体テストをホストで回している。
+6. **フック内からホスト関数を呼ぶ間も監視タイマは動いている**。`attr_set` などの副作用は
+   打ち切り時点まで残る(トランザクションではない)。長い処理は `timer_after` で分割する、
+   というスクリプト側の規約を README に明記した。
+7. **`on_sensor` の引数は binding index**(EP/cluster ではない)。バインディング表の
+   並び順に依存するので、スクリプトは index を信用せず `attr_get` で状態を読み直す設計に
+   した方が壊れにくい(サンプルはそうしている)。

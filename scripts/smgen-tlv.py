@@ -257,7 +257,9 @@ PARAMS = {
         "poll_ms": (2, 2, "u"),
         "port": (3, 1, "u"),
     },
-    5: {},  # script(Phase C。params は予約)
+    5: {  # script(Phase C。WASM フックへ委譲)
+        "poll_ms": (0, 4, "u"),  # 0 = 周期発火しない(属性変化時のみ)
+    },
 }
 PARAM_BY_TAG = {drv: {t: (n, w, k) for n, (t, w, k) in ps.items()} for drv, ps in PARAMS.items()}
 

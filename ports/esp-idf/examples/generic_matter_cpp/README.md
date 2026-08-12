@@ -7,8 +7,9 @@ C FFI シムは `docs/design/c-ffi-shim.md`。
 - **G1(構成)**: NVS の `composition` TLV でエンドポイント・デバイスタイプ・搭載クラスタを決める。
 - **G2(配線)**: NVS の `binding` TLV でクラスタとハードウェア(GPIO / LEDC / I2C)を結ぶ。
 - 設定はコンソール(USB-Serial-JTAG)から流し込み、**再起動で反映**する。
-- Phase C(スクリプト VM)/ Phase D(ScriptStore OTA)は未実装。`smscript` パーティションと
-  `script` ドライバ ID だけ予約してある。
+- **G3(スクリプト)**: `smscript` パーティションに置いた WASM(WAMR interp)のフックが
+  属性変化・センサ更新・タイマで走る(Phase C。下の「スクリプト(WASM)」節)。
+- Phase D(ScriptStore による OTA 転送)は未実装。イメージは今のところ esptool で書く。
 
 ベースは `onoff_light_cpp`(WiFi/BLE/Thread、UDP+mDNS、KVS、128KB スタック pump タスク)。
 差分は「起動時に設定 blob を読む」「`on_cluster_change` を HAL へ dispatch する」
@@ -24,6 +25,9 @@ C FFI シムは `docs/design/c-ffi-shim.md`。
 | binding TLV パーサ | `main/bind_tlv.hpp`(ESP-IDF 非依存のヘッダオンリー = ホスト検算と共用) |
 | コンソール | `main/cfg_store.cpp`(esp_console REPL、USB-Serial-JTAG) |
 | TLV ジェネレータ | `scripts/smgen-tlv.py`(ホスト側。hex を出す) |
+| スクリプト VM | `main/script_vm.cpp`(WAMR ラッパ。ESP-IDF 非依存)+ `main/script_host.cpp`(ESP 実体) |
+| スクリプト ABI | `main/script_abi.hpp`(16B 値表現・フック名・import 名)/ `main/script_img.hpp`(`SMWS` ヘッダ) |
+| スクリプト SDK | `crates/sm-script-api`(Rust)/ `web/sdk/sm.d.ts`(AssemblyScript 宣言) |
 
 **既定構成**(NVS に `comp` / `bind` が無いとき):
 EP1 = On/Off Light(device type `0x0100` rev 2、Identify + Groups + OnOff)、
@@ -41,10 +45,18 @@ docker(Rust をコンテナに入れない場合はホストと同一パスで r
 
 ```sh
 REPO=$(git rev-parse --show-toplevel)
-docker run --rm -v $REPO:$REPO -v $HOME/.cargo:$HOME/.cargo -v $HOME/.rustup:$HOME/.rustup \
+mkdir -p $HOME/.cache/Espressif      # ← WAMR を取りに行く component manager のキャッシュ
+docker run --rm -u $(id -u):$(id -g) -e CCACHE_DISABLE=1 \
+  -v $REPO:$REPO -v $HOME/.cargo:$HOME/.cargo -v $HOME/.rustup:$HOME/.rustup \
+  -v $HOME/.cache/Espressif:$HOME/.cache/Espressif \
   -e HOME=$HOME -w $REPO/ports/esp-idf/examples/generic_matter_cpp espressif/idf:release-v5.4 \
   bash -ec 'export PATH=$HOME/.cargo/bin:$PATH; idf.py set-target esp32c6 && idf.py build'
 ```
+
+Phase C から **WAMR を ESP Component Registry から取得する**ため、初回ビルドは
+ネットワークと `~/.cache/Espressif`(component manager のキャッシュ)への書き込みが要る。
+非 root で docker を回す場合はこのディレクトリをマウントしないと
+`Failed to create cache directory` で configure が失敗する。
 
 Thread 構成(ESP32-C6):
 
@@ -158,7 +170,7 @@ anonymous list|array of binding structs:      ← struct 直書き(単一 bindin
 | `gpio_in` | 2 | 0=pin u8、1=invert bool、2=poll_ms u16(既定 50)、3=pull u8(0=none 1=up 既定 2=down) | BooleanState(0x0045)/ Switch(0x003B) | ポーリング + 2 連続一致デバウンス → `sm_attr_set_value` |
 | `ledc` | 3 | 0=ch u8、1=pin u8、2=freq u32(既定 1000)、3=invert bool | LevelControl(0x0008) | CurrentLevel(0..254)→ duty(10bit)。同一 EP の OnOff が off なら duty 0 |
 | `i2c_sht30` | 4 | 0=sda u8、1=scl u8、2=poll_ms u16(既定 5000)、3=port u8(既定 0) | Temperature(0x0402) | 単発測定(0x2C06、CRC 検証)→ 0x0402 と同一 EP の 0x0405 へ push |
-| `script` | 5 | (予約) | 任意 | Phase C(WASM フック)で接続。現状 no-op |
+| `script` | 5 | 0=poll_ms u32(既定 0 = 周期発火しない) | 任意 | 周期で WASM の `on_sensor(bind index)` を呼ぶ(§9.3) |
 
 バインディング上限 16(`bind_tlv.hpp` の `kMaxBindings`)。
 params の tag → 名前の対応は `scripts/smgen-tlv.py` の `PARAMS` と 1 対 1。
@@ -172,7 +184,75 @@ params の tag → 名前の対応は `scripts/smgen-tlv.py` の `PARAMS` と 1 
 | `nvs` | data/nvs | 24KB | コア KVS(`smatter`)+ 設定 blob(`smgen`)+ WiFi/Thread 資格情報 |
 | `factory` | app | 2.5MB | アプリ本体(Thread 構成の openthread 込みでも収まる) |
 | `nvs_factory` | data/nvs | 24KB | esp-matter-mfg-tool 互換 factory データ(`CONFIG_SM_FACTORY_DATA`) |
-| `smscript` | data/0x40 | 256KB | **Phase D 用に予約**(Phase B では未使用) |
+| `smscript` | data/0x40 | 256KB | WASM スクリプト(128KB × 2 スロット。`SMWS` ヘッダ)。オフセット `0x296000` |
+
+## スクリプト(WASM / Phase C = G3)
+
+`smscript` パーティションに有効なイメージがあれば、起動時に WAMR(interpreter)へ
+ロードしてフックを実行する。**イメージが無ければ従来どおり動く**(全フックが no-op)。
+
+### ランタイム
+
+| 項目 | 値 |
+|---|---|
+| VM | WAMR **2.4.0**(ESP Component Registry の `espressif/wasm-micro-runtime`。`main/idf_component.yml`。リポジトリに vendor しない) |
+| モード | classic interpreter のみ(AOT / WASI / libc-builtin / app-framework は無効。`sdkconfig.defaults` の `CONFIG_WAMR_*`) |
+| 線形メモリ | スクリプトの宣言どおり(Rust の既定は 1 page = 64KB)。プールから確保する |
+| ヒーププール | `CONFIG_SM_SCRIPT_POOL_KB`(既定 96KB)。既定では**スクリプトが見つかったときだけ**内部 RAM から確保する(`CONFIG_SM_SCRIPT_POOL_STATIC=y` で .bss 常時確保) |
+| 実行モデル | フックは Matter ポンプと**同一タスクで同期実行**(単線契約) |
+| 暴走対策 | フック呼び出し前に esp_timer ワンショット(`CONFIG_SM_SCRIPT_BUDGET_MS`、既定 50ms)を武装。満了で `wasm_runtime_terminate` → trap でフックを打ち切る |
+| 無効化 | `CONFIG_SM_SCRIPT_ENABLE=n`(WAMR ごとリンクしない = Phase B と同じサイズ) |
+
+### フックとホスト import
+
+フック ABI・ホスト import・**16B 値レイアウト**は `crates/sm-script-api/README.md`
+(および `main/script_abi.hpp` / `web/sdk/sm.d.ts`)に定義がある。発火元だけ再掲:
+
+| フック | 発火元(このファーム) |
+|---|---|
+| `on_boot()` | `script_init()`(sm_init + バインディング初期化の直後) |
+| `on_attr_write(ep,cluster,attr)` | `sm_config_t.on_cluster_change`(IM write / コマンド由来の変化)。HAL への dispatch の**後** |
+| `on_sensor(bind)` | `gpio_in` の確定変化、`i2c_sht30` の push、`script` binding の周期(`poll_ms`) |
+| `on_timer(id)` | pump ループの `script_poll`(`timer_after` / `timer_every`) |
+| `on_command(ep,cluster,cmd)` | **未接続**(現行シムにコマンドフックが無い。Phase D の ScriptStore/CustomCluster で繋ぐ) |
+
+**`on_attr_write` の非 0 戻り値は「観測のみ」**: `on_cluster_change` は既に適用された
+変化の通知で、シムに write を拒否させる口が無い。ファームは警告ログを出すだけで
+書き込みは取り消さない(拒否したいスクリプトは `attr_set` で元の値へ書き戻す)。
+
+### イメージ形式と書き込み
+
+`smscript`(256KB)は 128KB × 2 スロット。各スロット先頭 16B が
+`"SMWS"` + ver u16 + flags u16 + len u32 + crc32 u32(`main/script_img.hpp`)。
+active slot = ヘッダ妥当 + CRC 一致のうち **ver 最大**(同値なら A)。両方無効なら
+スクリプト無し。
+
+```sh
+# 1) スクリプトをビルド(Rust の例)
+cd crates/sm-script-api/examples-wasm/momentary-toggle
+cargo build --release --target wasm32-unknown-unknown
+
+# 2) SMWS ヘッダを付ける
+scripts/smscript-img.py pack \
+  target/wasm32-unknown-unknown/release/momentary_toggle.wasm -o slotA.bin --ver 1
+
+# 3) slot A(= smscript の先頭)へ書く
+esptool.py write_flash 0x296000 slotA.bin
+# slot B は 0x296000 + 0x20000 = 0x2B6000
+```
+
+`scripts/smscript-img.py show <dump>` でスロットの検査ができる。
+
+### スクリプト用 KVS
+
+`kvs_get` / `kvs_set` は NVS namespace **`smscr`**(コアの `smatter`・設定の `smgen` とは別)。
+キーは 15 バイトまでの非 NUL バイト列。
+
+### ホスト検証
+
+`tools/wasm-harness/run.sh`(= `make -C crates/simple-matter-cffi/ctest check-wasm`)が、
+**このファームと同一の `script_vm.cpp`** を Linux 用 WAMR にリンクして、
+`momentary-toggle` のフックのラウンドトリップと暴走スクリプトの打ち切りを検証する。
 
 ## 制約・注意
 
@@ -184,4 +264,8 @@ params の tag → 名前の対応は `scripts/smgen-tlv.py` の `PARAMS` と 1 
   `sm_attr_set_value`(アプリ発 = センサ push)では発火しない → HAL のループが起きない。
 - I2C 読み出しは pump タスクを ~15ms 占有する(clock stretching)。`poll_ms` は
   1 秒以上を推奨。
+- **スクリプトはサンドボックス内**: 線形メモリの外へは触れない(ポインタ引数は VM 側で
+  範囲検証する)。触れる外界は module `"sm"` の import だけ = 能力ベース。
+- スクリプトのフックは pump タスクを占有する。長い処理は `timer_after` で分割する
+  (1 フックあたり既定 50ms で強制打ち切り = そのフックの副作用は途中で止まる)。
 - 実機検証はユーザの機材で行う(本 example のゲートはビルド + ホスト検算まで)。

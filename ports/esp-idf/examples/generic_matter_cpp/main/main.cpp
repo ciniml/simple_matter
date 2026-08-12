@@ -27,6 +27,7 @@
 #include "ble.hpp"
 #include "cfg_store.hpp"
 #include "ot_thread.hpp"
+#include "script_host.hpp"
 
 #include <cstring>
 #include <vector>
@@ -616,6 +617,9 @@ extern "C" void on_cluster_change(void *, uint16_t ep, uint32_t cluster, uint32_
                                   const sm_attr_value_t *value) {
   ESP_LOGI(TAG, "change ep=%u cluster=0x%04x attr=0x%04x", ep, (unsigned)cluster, (unsigned)attr);
   smgen::bindings_on_change(ep, cluster, attr, value);
+  // スクリプト(§9.3): on_attr_write フックへ通知する。HAL の dispatch より後に呼ぶので
+  // 「ハードウェアに反映済みの値」をスクリプトが読める(戻り値による拒否は観測のみ)。
+  smgen::script_notify_attr_write(ep, cluster, attr);
 }
 
 
@@ -724,6 +728,11 @@ static void matter_task(void *) {
   smgen::bindings_init(g_bindings);
   smgen::bindings_log();
   smgen::bindings_apply_initial();
+
+  // スクリプト VM(§9.3): smscript パーティションの active slot をロードして on_boot。
+  // スクリプトが無ければ何もしない(従来どおり動く)。
+  smgen::script_init();
+  smgen::script_log_status();
 
   stack.on_event([](const sm_event_t &ev) {
     ESP_LOGI(TAG, "EVENT kind=%d arg=%u", (int)ev.kind, (unsigned)ev.arg);
@@ -837,6 +846,8 @@ static void matter_task(void *) {
     // 入力系ドライバ(gpio_in ポーリング + デバウンス、i2c_sht30 計測)。値の push は
     // sm_attr_set_value 経由なので on_cluster_change は鳴らない(§9.1)。
     smgen::bindings_poll(now);
+    // スクリプトタイマ(timer_after / timer_every)の満了 → on_timer フック。
+    smgen::script_poll(now);
 
     // WiFi/IP・BLE・ローカル操作のコマンドを排出(同一タスクで sm_* を呼ぶ)。
     Cmd c;

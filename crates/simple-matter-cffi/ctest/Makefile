@@ -18,7 +18,7 @@ CXX      := g++
 CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -I$(INCDIR)
 LDLIBS   := -lpthread -ldl -lm
 
-.PHONY: all lib run check check-generic clean
+.PHONY: all lib run check check-generic check-wasm clean
 
 # `make check` の作業ディレクトリ(状態ディレクトリを分離する)。
 RUNDIR := ./run
@@ -71,6 +71,13 @@ check-generic: compose_check
 	  --comp 1715250001002601010100002402033603060300000006040000000606000000060800000018181525000200260102030000240202360306020400000605040000181818 \
 	  --bind 17152500010026010800000024020335032400002401062602e803000018181525000200260102040000240204350324000824010925028813181818 \
 	  --expect 1:0003,1:0004,1:0006,1:0008,2:0402,2:0405
+
+# Phase C(WASM スクリプト)のホストゲート。ファームと同一の script_vm.cpp を Linux 用
+# WAMR にリンクし、サンプル .wasm(momentary-toggle)でフックのラウンドトリップと
+# 暴走スクリプトの打ち切りを検証する。初回のみ WAMR 取得でネットワークが要るので
+# `check` には含めない(docs/design/generic-firmware.md §9.3)。
+check-wasm:
+	$(ROOT)/tools/wasm-harness/run.sh
 
 clean:
 	rm -f onoff_light controller ble_loopback composed_loopback compose_check

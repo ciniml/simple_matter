@@ -42,11 +42,62 @@ menu "simple-matter generic_matter example"
             上書きする(再ビルド不要)。
 
     config SM_SCRIPT_PARTITION
-        string "Script partition label (reserved for Phase C/D)"
+        string "Script partition label"
         default "smscript"
         help
-            スクリプト(WASM)格納用 raw パーティションのラベル。Phase B では
-            partitions.csv に定義するだけで未使用。
+            スクリプト(WASM)格納用 raw パーティションのラベル。2 スロット構成で
+            各スロット先頭 16B が "SMWS" ヘッダ(docs/design/generic-firmware.md §9.3)。
+
+    config SM_SCRIPT_ENABLE
+        bool "Enable WASM scripting (WAMR)"
+        default y
+        help
+            WASM(WAMR)スクリプト VM を組み込む(§9.3 / Phase C)。n にすると WAMR も
+            静的ヒーププールもリンクされず、Phase B と同じフットプリントに戻る。
+            スクリプトイメージが無いデバイスは y のままでも従来どおり動作する
+            (フックは全て no-op)。
+
+    config SM_SCRIPT_POOL_KB
+        int "WAMR heap pool size (KB)"
+        default 96
+        depends on SM_SCRIPT_ENABLE
+        help
+            WAMR に渡すヒーププール。線形メモリ(既定 64KB = 1 page)+ モジュール +
+            実行スタックが全てここから確保される(WAMR には malloc を渡さない =
+            スクリプトがシステムヒープを食い潰せない)。
+
+    config SM_SCRIPT_POOL_STATIC
+        bool "Reserve the WAMR pool statically (BSS)"
+        default n
+        depends on SM_SCRIPT_ENABLE
+        help
+            y = プールを .bss に静的確保する(確保失敗が起き得ない代わりに、スクリプトを
+            積んでいないデバイスでも RAM を占有する)。n(既定)= スクリプトイメージが
+            見つかったときだけ内部 RAM から 1 度だけ確保する(失敗したら解放して
+            スクリプト無しで起動)。C6 の WiFi+BLE+Matter 構成では 96KB の常時占有が
+            ヒープを圧迫するため既定は n。
+
+    config SM_SCRIPT_MAX_KB
+        int "Max script image size (KB)"
+        default 24
+        depends on SM_SCRIPT_ENABLE
+        help
+            パーティションから読み出す .wasm の上限。読み出しバッファはロード時だけ
+            確保して、プールへ複製したら解放する。
+
+    config SM_SCRIPT_STACK_KB
+        int "WASM execution stack (KB)"
+        default 8
+        depends on SM_SCRIPT_ENABLE
+
+    config SM_SCRIPT_BUDGET_MS
+        int "Per-hook wall clock budget (ms)"
+        default 50
+        depends on SM_SCRIPT_ENABLE
+        help
+            1 フックあたりの壁時計上限。超過すると esp_timer コールバックから
+            wasm_runtime_terminate で trap を上げてフックを打ち切る(§9.3)。
+            0 = 無制限(非推奨)。
 
     config SM_FACTORY_DATA
         bool "Use factory data partition (esp-matter-mfg-tool compatible)"

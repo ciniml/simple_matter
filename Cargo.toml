@@ -6,6 +6,12 @@ members = [
     "crates/bloat-check",
     "crates/simple-matter-ble",
     "crates/smctl",
+    "crates/sm-script-api",
+]
+# wasm32-unknown-unknown 専用のサンプル(no_std + panic_handler + cdylib)は
+# ホストの `cargo test --workspace` / clippy から外す(§9.3 Phase C)。
+exclude = [
+    "crates/sm-script-api/examples-wasm/momentary-toggle",
 ]
 
 [workspace.package]

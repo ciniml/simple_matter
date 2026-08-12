@@ -1,0 +1,10 @@
+## generic_matter_cpp の管理コンポーネント依存(ESP Component Registry)。
+##
+## WAMR は Espressif 公式 component(espressif/wasm-micro-runtime)をそのまま使う
+## = リポジトリに WAMR を vendor しない(docs/design/generic-firmware.md §9.3)。
+## interp / AOT 等の機能選択は sdkconfig.defaults の CONFIG_WAMR_* で行う。
+dependencies:
+  idf:
+    version: ">=5.1"
+  espressif/wasm-micro-runtime:
+    version: "~2.4.0"

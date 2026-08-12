@@ -20,7 +20,7 @@
 //   gpio_in  (2): 0=pin u8, 1=invert bool, 2=poll_ms u16, 3=pull u8(0=none 1=up 2=down)
 //   ledc     (3): 0=ch u8, 1=pin u8, 2=freq u32, 3=invert bool
 //   i2c_sht30(4): 0=sda u8, 1=scl u8, 2=poll_ms u16, 3=port u8
-//   script   (5): 予約(Phase C でスクリプトフックへ委譲)
+//   script   (5): 0=poll_ms u32(0 = 周期発火しない。>0 なら周期で on_sensor を呼ぶ)
 //
 // パーサは params を「context tag → u64」の疎な表として保持するだけなので、
 // ドライバ追加時にパーサを触る必要はない(ドライバ側が param() で読む)。
