@@ -26,6 +26,14 @@ void script_notify_attr_write(uint16_t ep, uint32_t cluster, uint32_t attr);
 // バインディング(script ドライバ / センサ poll)から(→ on_sensor フック)。
 void script_notify_sensor(int32_t bind_index);
 
+// カスタムクラスタ(ScriptStore 等)の invoke から(→ on_command フック、§9.4)。
+// 戻り値は見ない(壊れたスクリプトが ScriptStore を塞げないようにするため)。
+void script_notify_command(uint16_t ep, uint32_t cluster, uint32_t cmd);
+
+// VM を落として active slot から読み直す(ScriptStore の Commit / ロールバック)。
+// スクリプトが無い / ロードできない場合は false(ファームはスクリプト無しで動く)。
+bool script_reload();
+
 // 現在の状態をログに出す(起動時 / cfg-show)。
 void script_log_status();
 

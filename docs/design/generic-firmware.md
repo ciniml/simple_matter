@@ -706,3 +706,159 @@ WAMR 実体は約 90KB(§6 の見積り「85-150KB」の下限側)。残り約 2
 7. **`on_sensor` の引数は binding index**(EP/cluster ではない)。バインディング表の
    並び順に依存するので、スクリプトは index を信用せず `attr_get` で状態を読み直す設計に
    した方が壊れにくい(サンプルはそうしている)。
+
+### Phase D(完了、2026-08-12): ScriptStore クラスタ(G4 = スクリプト OTA)
+
+§9.4 の実装。**コア(`crates/simple-matter`)と C FFI シム(`crates/simple-matter-cffi/src`)は
+無改造**(F4b の `sm_cluster_register` + Phase A の `sm_attr_mark_dirty` だけで成立した)。
+既存 example 3 つ(onoff_light_cpp / controller_hub_cpp / thread_ctrl_hub_cpp)も無変更。
+
+#### 追加・変更ファイル
+
+- `ports/esp-idf/examples/generic_matter_cpp/main/`:
+  - `script_store.hpp`(新規、約 420 行)— **ESP-IDF 非依存のヘッダオンリー**。
+    受信ステートマシン(`ScriptStore`)+ 格納バックエンド vtable(`ScriptStoreBackend`)+
+    CustomCluster への登録(`script_store_register`)。イメージ形式は Phase C の
+    `script_img.hpp` をそのまま使う(**無改造**)。ホストのループバックテストと共用。
+  - `script_store.cpp`(新規)— ESP 実体。`smscript` パーティション(esp_partition)を
+    backend にし、`reload` を `script_reload()` へ、`mark_dirty` を `sm_attr_mark_dirty` へ、
+    `on_command` を `script_notify_command()` へ配線する。起動時にローダと同一規則
+    (ヘッダ妥当 + CRC 一致のうち ver 最大)で active slot を求める。
+  - `script_host.{hpp,cpp}` — `script_reload()`(VM 停止 → active slot から再ロード)と
+    `script_notify_command()`(`on_command` フック)を追加。
+  - `main.cpp` — 3 行(`script_store_init()` を **sm_init より前**、pump ループの
+    `script_store_poll()`、起動ログの `script_store_log_status()`)。
+  - `Kconfig.projbuild` — `SM_SCRIPTSTORE_ENABLE`(既定 y、`SM_SCRIPT_ENABLE` 依存)/
+    `SM_SCRIPTSTORE_EP`(既定 1)。
+  - `README.md` — 「スクリプト OTA — ScriptStore クラスタ」節(コマンド/属性表、
+    smctl 手順、64B チャンク上限・順次のみ・権限の注意)。
+- `crates/simple-matter-cffi/ctest/scriptstore_loopback.cpp`(新規、約 560 行)+ Makefile —
+  ファームと**同一の `script_store.hpp`** にメモリ backend(フラッシュ意味論を模倣:
+  4KB 消去 / 消去済み領域にしか書けない)を注入したループバック。
+- `scripts/smscript-img.py` — `batch` サブコマンド(`.wasm` → `smctl batch` テキスト)と
+  `parse_batch`(往復検証)。`selftest` に batch ラウンドトリップを追加。
+
+#### クラスタ仕様(実装確定)
+
+vendor cluster **`0xFFF1FC01`**、既定 **EP1**(合成 EP へ相乗り。Descriptor の
+ServerList はシムが自動マージ)。
+
+| commands | 引数 |
+|---|---|
+| `Begin`(0x00) | `0`=size u32、`1`=crc32 u32 |
+| `Data`(0x01) | `0`=offset u32(**順次のみ**)、`1`=bytes octstr(**≤64B**) |
+| `Commit`(0x02) / `Abort`(0x03) | なし |
+
+| attributes | 型 | 内容 |
+|---|---|---|
+| `State`(0x0000) | u8 | 0=idle / 1=receiving / 2=committing / 3=error |
+| `ActiveSlot`(0x0001) | u8 | 0=A / 1=B / 255=無し |
+| `Version`(0x0002) | u32 | active イメージの `SMWS` ver |
+| `ChunkMax`(0x0003) | u16 | 64(§9.4 への追加。下記「罠 1」を発見可能にする) |
+
+#### 状態遷移
+
+```
+        Begin                     Commit                    poll: reload ok
+ idle --------> receiving -----------------> committing --------------------> idle
+  ^  \             |  \  Data(順不同/超過)        |  \ poll: reload 失敗
+  |   \ Abort      |   +--> ConstraintError       |   +--> ヘッダ消去 → 旧スロット再ロード
+  |    +-----------+                              |                          |
+  |                | Commit(サイズ不足/CRC 不一致)|                          v
+  +--- Abort/Begin -+------------------------> error <-------------------------+
+```
+
+- `Begin` は idle / receiving / error のどれからでも受ける(やり直し)。
+- `committing` 中の Begin / Data / Commit / Abort は **Busy(0x9c)**。
+- 受信先は**非 active スロット**。`Begin` で `16 + size` を 4KB 単位に切り上げて消去、
+  `Data` は 512B ステージング経由で 4B アラインして書く。
+- **`SMWS` ヘッダは Commit の最後**に書く(それまでスロットは magic 無し = 無効)。
+  途中で電源が落ちても旧スロットが active のまま = 半焼けで文鎮化しない。
+- Commit = **書き戻し読みによる CRC 検証** → ヘッダ書き込み(ver = 現行 +1)→
+  `committing`。**再ロードは invoke ハンドラの中ではなく pump ループの
+  `script_store_poll()`**(単線契約・再入回避)。成功 = idle、失敗 = 新スロットの
+  ヘッダを消して旧スロットを再ロードし error(ロールバック)。
+- active 切替の「マーカー」は置いていない。**ヘッダの ver が切替そのもの**
+  (active = 妥当 + CRC 一致のうち ver 最大 = Phase C のローダ規則)なので、
+  NVS `smgen` 側に状態を持たずに済んだ。
+
+#### 権限(§9.4 との差分)
+
+**invoke = Operate、read = View**(F4b の CustomCluster 既定)。設計 §9.4 は
+「CASE + ACL(Administer)」を想定していたが、**シムに per-command の privilege 指定の
+口が無い**(`SM_CMD_TIMED` のみ)ため、シム無改造では Administer 要求にできない。
+CASE セッション外からは投入できないので「fabric の外から書ける」わけではないが、
+Operate 権限しか持たない相手にもスクリプト投入を許すことになる。README に明記し、
+運用では ACL で Operate を与える相手を絞る。Administer 化はシム側に
+`SM_CMD_ADMINISTER` フラグを足す将来作業(F4b の拡張)。
+
+#### `on_command` フックの配線(§9.3 の宿題)
+
+**カスタムクラスタの invoke だけ**が C++ 側(`sm_cluster_def_t.invoke`)を通るので、
+ScriptStore の invoke から `script_notify_command(ep, cluster, cmd)` を呼べる。
+**合成クラスタ(OnOff 等)のコマンドは依然として未接続**: シムの通知口は
+`on_cluster_change`(= 適用済みの属性変化)だけで、コマンド到達そのものを通す
+コールバックが無い。コア/シム無改造の制約内ではここが上限で、全クラスタで
+`on_command` を鳴らすには `sm_config_t` にコマンドフックを足す必要がある(将来)。
+戻り値は**観測のみ**(壊れたスクリプトが ScriptStore を塞いで文鎮化するのを防ぐ)。
+
+#### ゲート実測
+
+| ゲート | 結果 |
+|---|---|
+| ctest `make check` | **ALL GREEN ×4 + COMPOSE CHECK OK ×2**(`ble_loopback wifi/thread`・`composed_loopback` の回帰 + 新規 `scriptstore_loopback`) |
+| docker `espressif/idf:release-v5.4` esp32c6(WiFi+BLE+WAMR) | **build green**。app **0x1a32a0 = 1,716,384 B**(partition 35% free) |
+| `cargo test --workspace` | **655 pass / 0 fail**(Phase C と同数 = 回帰なし) |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | 0 |
+| `cargo fmt --all --check` | クリーン(Rust の追加は無し) |
+| `scripts/smscript-img.py selftest` | **PASS**(pack/unpack + batch 往復 6 サイズ + 欠落チャンク検出) |
+
+`scriptstore_loopback` の内容(1 プロセス、UDP メモリループバック):
+pairing → 属性 read(State=idle / ActiveSlot=none / Version=0 / ChunkMax=64)→
+**転送 #1**(700B / 11 チャンク → slot A ver 1、フラッシュ内容とヘッダ CRC が一致、
+再ロード済みイメージが原本と bit 一致)→ **転送 #2**(1301B / 21 チャンク → slot B ver 2、
+**slot A は無傷**)→ 順不同 `Data` と サイズ不足 `Commit` が `ConstraintError` →
+`Abort` で idle → **CRC 不一致**の Commit が `ConstraintError` で active を変えない →
+**ロード失敗 → ロールバック**(slot A のヘッダが消え、slot B ver 2 が active のまま)→
+やり直し転送が ver 3 で成功 → `on_command` 通知 62 回。
+
+#### app サイズ増分(esp32c6、WiFi+BLE+WAMR 構成)
+
+| | Phase C | Phase D |
+|---|---|---|
+| app `.bin` | 1,711,264 B(0x1a1ca0) | **1,716,384 B(0x1a32a0、+5,120 = +5.0KB)** |
+| DIRAM `.bss` | 77,776 B | 77,776 B(**±0**。ScriptStore の状態はステートマシン 1 個 ≒ 0.6KB で `.data`/`.bss` 内訳の丸めに埋もれる) |
+
+受信バッファはステージング 512B + ステート ≒ 600B(静的 1 個)。イメージ全体を
+RAM に置かない(チャンクごとにフラッシュへ書く)ので、128KB のスクリプトでも
+RAM は増えない。
+
+#### 発見した罠
+
+1. **`Data` の実効チャンク上限は 64B(設計の 512B は不可)**。シムの
+   `sm_attr_value_t` は octet string を **64B 固定バッファ**(`custom.rs` の `STR_CAP`)で
+   運ぶため、65B 以上の octstr 引数は `ConstraintError` でデコード段階に落ちる。
+   シム無改造の制約なので**仕様側を 64B に合わせ**、`ChunkMax` 属性で機械可読にした
+   (1.5KB のスクリプトで 23 チャンク ≒ 数百 ms、`smctl batch` の単一 CASE 共有前提)。
+   512B にしたければシムの `STR_CAP` 拡大か「長大引数用の別 API」が要る。
+2. **CustomCluster の invoke 引数は型が潰れる**。TLV → `sm_attr_value_t` の平坦化は
+   符号なし整数を一律 `SM_T_U64` にする(宣言型による復元はしない)ので、
+   ハンドラ側は U8/U16/U32/U64 を全部受けて範囲検査する必要がある。
+3. **再ロードを invoke ハンドラの中でやってはいけない**。Commit の応答を返す前に
+   VM を落とすと、フック実行中の再入・IM 応答の遅延(WAMR のロードは数十 ms)が
+   起きる。`committing` 状態を挟んで pump ループで実行する設計にした
+   (ホストテストも `poll()` を pump 相当の位置から呼んで同じ経路を通す)。
+4. **ヘッダを先に書くと半焼けイメージが active になる**。`SMWS` を最後に書けば
+   「本体だけ書かれたスロット = magic 無し = 無効」となり、電源断に対して
+   追加のジャーナルもマーカーも要らない。ロールバックも**ヘッダ 1 個の消去**で済む。
+5. **`esp_partition_write` は 4B アラインで呼ぶ**。64B チャンクをそのまま書くと
+   最終チャンクで長さが 4 の倍数にならない。512B ステージングに貯めて 4B 境界で
+   吐き、端数は Commit 時に 0xFF パディングして書く(len はヘッダが持つので
+   パディングは無害)。ホストのメモリ backend でも**アラインと二重書きを検査**して、
+   実機でしか出ない類のバグをループバックで拾えるようにした。
+6. **カスタムクラスタの登録は `sm_init` より前**(ステージング方式)。一方で
+   active slot はパーティション走査が要るので、`script_store_init()` の中で
+   ローダと同一規則の CRC 検証込み走査を先に回している(128KB の CRC で数 ms)。
+7. **`sm_endpoint_register` は EP0/EP1 に使えない**(`-5`)が、**カスタムクラスタは
+   合成 EP へ足せる**。ScriptStore を EP1 に載せると新規 EP を消費せず、
+   Descriptor の ServerList もシムが合成してくれる(F4b の install_custom)。

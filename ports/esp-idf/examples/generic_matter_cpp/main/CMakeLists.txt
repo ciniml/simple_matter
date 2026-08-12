@@ -10,7 +10,7 @@
 #   espressif__wasm-micro-runtime WAMR(ESP Registry の公式 component。idf_component.yml)
 idf_component_register(
     SRCS "main.cpp" "ble.cpp" "ot_thread.cpp" "bindings.cpp" "cfg_store.cpp"
-         "script_vm.cpp" "script_host.cpp"
+         "script_vm.cpp" "script_host.cpp" "script_store.cpp"
     INCLUDE_DIRS "."
     REQUIRES simple_matter nvs_flash esp_wifi esp_netif esp_event lwip driver esp_timer
              esp_system bt openthread vfs console esp_driver_usb_serial_jtag

@@ -99,6 +99,26 @@ menu "simple-matter generic_matter example"
             wasm_runtime_terminate で trap を上げてフックを打ち切る(§9.3)。
             0 = 無制限(非推奨)。
 
+    config SM_SCRIPTSTORE_ENABLE
+        bool "Enable the ScriptStore vendor cluster (script OTA)"
+        default y
+        depends on SM_SCRIPT_ENABLE
+        help
+            vendor クラスタ ScriptStore(0xFFF1FC01)を CustomCluster として登録し、
+            Begin/Data/Commit/Abort でスクリプトイメージを非 active スロットへ
+            転送できるようにする(§9.4 / Phase D)。Commit で CRC 検証 → ヘッダ書き込み
+            → VM 再ロード(失敗時は旧スロットへロールバック)。
+            認可はシム既定(invoke = Operate)。
+
+    config SM_SCRIPTSTORE_EP
+        int "Endpoint hosting the ScriptStore cluster"
+        default 1
+        depends on SM_SCRIPTSTORE_ENABLE
+        help
+            ScriptStore を載せるエンドポイント。既定 1(合成構成に必ず存在する EP へ
+            相乗りする)。合成 EP へカスタムクラスタを足す形になるので、Descriptor の
+            ServerList はシムが自動でマージする(F4b)。
+
     config SM_FACTORY_DATA
         bool "Use factory data partition (esp-matter-mfg-tool compatible)"
         default n

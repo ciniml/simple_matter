@@ -22,7 +22,7 @@ LDLIBS   := -lpthread -ldl -lm
 
 # `make check` の作業ディレクトリ(状態ディレクトリを分離する)。
 RUNDIR := ./run
-all: onoff_light controller ble_loopback composed_loopback compose_check
+all: onoff_light controller ble_loopback composed_loopback compose_check scriptstore_loopback
 
 lib:
 	cargo build -p simple-matter-cffi --release --features std --target $(TARGET)
@@ -48,16 +48,23 @@ GENDIR := $(ROOT)/ports/esp-idf/examples/generic_matter_cpp/main
 compose_check: compose_check.cpp lib $(GENDIR)/bind_tlv.hpp
 	$(CXX) $(CXXFLAGS) -I$(GENDIR) -o $@ compose_check.cpp $(STATICLIB) $(LDLIBS)
 
+# ScriptStore(Phase D / G4)のループバック。受信ステートマシンはファームと同一ヘッダ
+# (generic_matter_cpp/main/script_store.hpp)を使い、esp_partition の代わりに
+# メモリ backend を注入する。
+scriptstore_loopback: scriptstore_loopback.cpp lib $(GENDIR)/script_store.hpp $(GENDIR)/script_img.hpp
+	$(CXX) $(CXXFLAGS) -I$(GENDIR) -o $@ scriptstore_loopback.cpp $(STATICLIB) $(LDLIBS)
+
 run: onoff_light
 	./onoff_light $(ARGS)
 
 # 自己完結ハーネスの一括実行(ネットワーク・無線なしで green/red が決まる)。
 #   make check
-check: ble_loopback composed_loopback compose_check
+check: ble_loopback composed_loopback compose_check scriptstore_loopback
 	rm -rf $(RUNDIR) && mkdir -p $(RUNDIR)
 	./ble_loopback wifi --dev-dir $(RUNDIR)/ble-wifi-dev --ctrl-dir $(RUNDIR)/ble-wifi-ctrl
 	./ble_loopback thread --dev-dir $(RUNDIR)/ble-thr-dev --ctrl-dir $(RUNDIR)/ble-thr-ctrl
 	./composed_loopback --dev-dir $(RUNDIR)/comp-dev --ctrl-dir $(RUNDIR)/comp-ctrl
+	./scriptstore_loopback --dev-dir $(RUNDIR)/ss-dev --ctrl-dir $(RUNDIR)/ss-ctrl
 	$(MAKE) check-generic
 
 # generic_matter_cpp README の設定例(scripts/smgen-tlv.py examples の出力)を検算する。
@@ -80,5 +87,5 @@ check-wasm:
 	$(ROOT)/tools/wasm-harness/run.sh
 
 clean:
-	rm -f onoff_light controller ble_loopback composed_loopback compose_check
+	rm -f onoff_light controller ble_loopback composed_loopback compose_check scriptstore_loopback
 	rm -rf $(RUNDIR)

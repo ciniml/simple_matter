@@ -214,7 +214,7 @@ params の tag → 名前の対応は `scripts/smgen-tlv.py` の `PARAMS` と 1 
 | `on_attr_write(ep,cluster,attr)` | `sm_config_t.on_cluster_change`(IM write / コマンド由来の変化)。HAL への dispatch の**後** |
 | `on_sensor(bind)` | `gpio_in` の確定変化、`i2c_sht30` の push、`script` binding の周期(`poll_ms`) |
 | `on_timer(id)` | pump ループの `script_poll`(`timer_after` / `timer_every`) |
-| `on_command(ep,cluster,cmd)` | **未接続**(現行シムにコマンドフックが無い。Phase D の ScriptStore/CustomCluster で繋ぐ) |
+| `on_command(ep,cluster,cmd)` | **カスタムクラスタ(ScriptStore)の invoke のみ**(Phase D で配線)。合成クラスタ(OnOff 等)のコマンドは現行シムに口が無く**未接続**。戻り値は観測のみ |
 
 **`on_attr_write` の非 0 戻り値は「観測のみ」**: `on_cluster_change` は既に適用された
 変化の通知で、シムに write を拒否させる口が無い。ファームは警告ログを出すだけで
@@ -242,6 +242,81 @@ esptool.py write_flash 0x296000 slotA.bin
 ```
 
 `scripts/smscript-img.py show <dump>` でスロットの検査ができる。
+
+## スクリプト OTA — ScriptStore クラスタ(Phase D = G4)
+
+書き込み済みのデバイスへ**Matter セッション経由で**スクリプトを差し替える。
+vendor クラスタ **`0xFFF1FC01`(ScriptStore)** を CustomCluster(C FFI シムの F4b)で
+実装しており、シム・コアは無改造。既定のエンドポイントは **EP1**
+(`CONFIG_SM_SCRIPTSTORE_EP`)、無効化は `CONFIG_SM_SCRIPTSTORE_ENABLE=n`。
+
+| コマンド | ID | 引数 |
+|---|---|---|
+| `Begin` | `0x00` | `0` = size u32(本体バイト数)、`1` = crc32 u32(CRC-32/IEEE) |
+| `Data` | `0x01` | `0` = offset u32(**受信済みバイト数と一致する順次のみ**)、`1` = bytes octstr |
+| `Commit` | `0x02` | なし |
+| `Abort` | `0x03` | なし |
+
+| 属性 | ID | 型 | 内容 |
+|---|---|---|---|
+| `State` | `0x0000` | u8 | 0=idle / 1=receiving / 2=committing / 3=error |
+| `ActiveSlot` | `0x0001` | u8 | 0=A / 1=B / 255=スクリプト無し |
+| `Version` | `0x0002` | u32 | active イメージの `SMWS` ver |
+| `ChunkMax` | `0x0003` | u16 | `Data` 1 発の上限バイト数(= **64**。下記) |
+
+### 転送手順(smctl)
+
+```sh
+# 1) .wasm → 転送バッチ(Begin / Data ×N / Commit / Version 読み)を生成
+scripts/smscript-img.py batch \
+  target/wasm32-unknown-unknown/release/momentary_toggle.wasm \
+  --node 1 --ep 1 > store.batch
+
+# 2) 単一プロセス = 単一 CASE セッションで流し込む
+smctl batch store.batch
+
+# 3) 反映の確認(State=0 idle、ActiveSlot が A↔B で切り替わり、Version が +1)
+smctl any read 1 1 0xFFF1FC01 0    # State
+smctl any read 1 1 0xFFF1FC01 1    # ActiveSlot
+smctl any read 1 1 0xFFF1FC01 2    # Version
+```
+
+生成される行はそのまま手で打てる形式:
+
+```text
+any invoke 1 1 0xFFF1FC01 0x00 0=u32:1452 1=u32:2894...   # Begin(size, crc32)
+any invoke 1 1 0xFFF1FC01 0x01 0=u32:0 1=hex:0061736d...  # Data(offset, bytes)
+any invoke 1 1 0xFFF1FC01 0x02                            # Commit
+```
+
+`smctl batch` は 1 プロセスで CASE セッションを共有するので、チャンク 1 本ごとに
+CASE をやり直す無駄が無い(23 チャンク ≒ 1.5KB のスクリプトで数百 ms)。
+
+### 動作と制約(必読)
+
+- **チャンクは 64 バイトが上限**。設計 §9.4 は「≤512」だが、シムの
+  `sm_attr_value_t` は octet string を **64B 固定バッファ**(`STR_CAP`)で運ぶため、
+  シム無改造では 64B が実効上限になる。`ChunkMax` 属性がこの値を返す。
+- **`Data` は順次のみ**。`offset` は受信済みバイト数と一致しなければならず、
+  再送(同じ offset の再投入)も `ConstraintError(0x87)` で弾く。落ちたら
+  `Abort` → `Begin` からやり直す(バッチを頭から流し直す)。
+- 受信先は**非 active スロット**。`Begin` で必要分だけ 4KB 単位で消去し、本体を
+  順に書き、**`SMWS` ヘッダは Commit の最後に書く**。途中で電源が落ちたスロットは
+  magic 無し = 無効なので、旧スロットが active のまま残る(半焼けで文鎮化しない)。
+- `Commit` = 書き戻し読みによる **CRC 検証** → ヘッダ書き込み(ver = 現行 +1)→
+  `State=committing`。**VM の再ロードは invoke ハンドラの中ではなく pump ループ**で
+  実行する(単線契約・再入回避)。成功で `State=idle`、失敗なら**新スロットのヘッダを
+  消して旧スロットへロールバック**し `State=error`(旧スクリプトが再ロードされる)。
+- 状態遷移: `idle --Begin--> receiving --Commit--> committing --(pump)--> idle`。
+  `Abort` はいつでも `idle` へ(`committing` 中だけ `Busy(0x9c)`)。`error` からは
+  `Begin` / `Abort` で復帰する。
+- **認可はシムの CustomCluster 既定 = invoke は Operate 権限**(read は View)。
+  F4b に「このコマンドは Administer」を指定する口が無いため、Administer 限定には
+  できない(設計 §9.4 は CASE + Administer を想定)。運用上は ACL で Operate を
+  与える相手を絞ること。Matter セッション(CASE)の外からは投入できない。
+- `Commit` の CRC は**フラッシュから読み返して**計算するので、転送誤りと書き込み
+  失敗の両方を検出する。イメージそのものの妥当性(WASM として読めるか)は
+  再ロード時に WAMR が判定し、駄目ならロールバックする。
 
 ### スクリプト用 KVS
 

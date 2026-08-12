@@ -467,6 +467,27 @@ void script_notify_sensor(int32_t bind_index) {
   }
 }
 
+void script_notify_command(uint16_t ep, uint32_t cluster, uint32_t cmd) {
+  if (!script_vm_active()) {
+    return;
+  }
+  const int32_t rc = script_on_command((int32_t)ep, (int32_t)cluster, (int32_t)cmd);
+  if (rc != 0) {
+    // 拒否は観測のみ(コマンドは既に実行される。§9.4 / README)。
+    ESP_LOGW(TAG, "on_command returned %d (observed only)", (int)rc);
+  }
+}
+
+bool script_reload() {
+  // 動いている VM を落としてから active slot を読み直す(script_init が
+  // パーティション走査からやり直す)。ロード失敗時はスクリプト無しで戻る。
+  script_vm_stop();
+  g_slot = -1;
+  g_ver = 0;
+  g_len = 0;
+  return script_init();
+}
+
 void script_log_status() {
   if (!script_vm_active()) {
     ESP_LOGI(TAG, "script: none");
@@ -488,6 +509,8 @@ bool script_init() { return false; }
 void script_poll(uint64_t) {}
 void script_notify_attr_write(uint16_t, uint32_t, uint32_t) {}
 void script_notify_sensor(int32_t) {}
+void script_notify_command(uint16_t, uint32_t, uint32_t) {}
+bool script_reload() { return false; }
 void script_log_status() { ESP_LOGI("smgen_script", "script: disabled at build time"); }
 
 } // namespace smgen

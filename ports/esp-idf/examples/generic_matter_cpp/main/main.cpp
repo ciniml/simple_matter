@@ -28,6 +28,7 @@
 #include "cfg_store.hpp"
 #include "ot_thread.hpp"
 #include "script_host.hpp"
+#include "script_store.hpp"
 
 #include <cstring>
 #include <vector>
@@ -712,6 +713,12 @@ static void matter_task(void *) {
   cfg.on_cluster_change = on_cluster_change;
   cfg.cluster_change_ctx = nullptr;
 
+  // ScriptStore(§9.4): vendor クラスタ 0xFFF1FC01 を CustomCluster(F4b)で登録する。
+  // **sm_init より前**でなければならない(登録はステージング方式)。
+#if CONFIG_SM_SCRIPTSTORE_ENABLE
+  smgen::script_store_init((uint16_t)CONFIG_SM_SCRIPTSTORE_EP);
+#endif
+
   SmStack stack(cfg, now_ms());
   if (!stack.ok()) {
     // -7 = composition TLV 不正、-8 = 容量超過/未対応クラスタ(§9.1)。既定構成へ
@@ -733,6 +740,7 @@ static void matter_task(void *) {
   // スクリプトが無ければ何もしない(従来どおり動く)。
   smgen::script_init();
   smgen::script_log_status();
+  smgen::script_store_log_status();
 
   stack.on_event([](const sm_event_t &ev) {
     ESP_LOGI(TAG, "EVENT kind=%d arg=%u", (int)ev.kind, (unsigned)ev.arg);
@@ -848,6 +856,8 @@ static void matter_task(void *) {
     smgen::bindings_poll(now);
     // スクリプトタイマ(timer_after / timer_every)の満了 → on_timer フック。
     smgen::script_poll(now);
+    // ScriptStore の Commit で保留した VM 再ロード(invoke ハンドラの外で実行する。§9.4)。
+    smgen::script_store_poll();
 
     // WiFi/IP・BLE・ローカル操作のコマンドを排出(同一タスクで sm_* を呼ぶ)。
     Cmd c;
