@@ -117,6 +117,14 @@ Matter タスク(単線ポンプ)をブロックしない。
 component を使い、ホスト関数を能力ベースで渡す。MicroPython は「エンドユーザに
 Python を書かせる」ことが製品価値になる場合のみ(S3/P4 の flash 潤沢構成限定)。
 
+補足(WASM の開発体験): 「コンパイル必須」の摩擦は**ブラウザ内コンパイル**で
+緩和できる。AssemblyScript はコンパイラ(asc)自体が TypeScript 製でブラウザ内で
+完結する(公式 playground 方式)ため、静的 Web ページ 1 枚
+(エディタ+API 型定義+asc)で「ブラウザで書く→その場で .wasm→ScriptStore 転送」が
+サーバ無しで成立する。C/C++(clang の WASM 化)は重く、Rust/TinyGo は実質
+サーバサイドコンパイルが要る。よって WASM 採用時のスクリプト言語は
+AssemblyScript を第一候補とする。
+
 注: 純 Rust(esp-hal)経路に載せる場合は C ランタイム持ち込みが苦しいため
 `wasmi`(Rust 製 WASM interp)がほぼ一択になる。汎用 FW は ESP-IDF 経路を主とし、
 Rust 経路は対象外とする(必要になった時点で wasmi で再検討)。
