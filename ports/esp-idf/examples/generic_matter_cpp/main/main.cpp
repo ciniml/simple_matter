@@ -391,6 +391,29 @@ static int open_matter_udp() {
   return fd;
 }
 
+// mDNS のマルチキャスト join(224.0.0.251 / ff02::fb)。
+//
+// STA netif に IP が付く「前」に join すると IGMP/MLD が無効のまま残り、リブート後
+// (fabric 復元 → 自動 WiFi join)の運用 mDNS クエリを一切受信できない(実機 P6 で
+// 発覚。初回コミッショニングのセッションはコミッショニング中の announce で解決が
+// 成立してしまうため潜在化する)。got IPv4 のタイミングで drop → 再 join する。
+static void join_mdns_groups(int fd) {
+  ip_mreq mreq4{};
+  inet_pton(AF_INET, "224.0.0.251", &mreq4.imr_multiaddr);
+  mreq4.imr_interface.s_addr = htonl(INADDR_ANY);
+  setsockopt(fd, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq4, sizeof(mreq4)); // best effort
+  if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq4, sizeof(mreq4)) != 0) {
+    ESP_LOGW(TAG, "IP_ADD_MEMBERSHIP (v4) failed: errno=%d (ignored)", errno);
+  }
+  ipv6_mreq mreq6{};
+  inet_pton(AF_INET6, "ff02::fb", &mreq6.ipv6mr_multiaddr);
+  mreq6.ipv6mr_interface = 0; // 既定 netif
+  setsockopt(fd, IPPROTO_IPV6, IPV6_DROP_MEMBERSHIP, &mreq6, sizeof(mreq6)); // best effort
+  if (setsockopt(fd, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP, &mreq6, sizeof(mreq6)) != 0) {
+    ESP_LOGW(TAG, "IPV6_ADD_MEMBERSHIP (v6) failed: errno=%d (ignored)", errno);
+  }
+}
+
 // mDNS ソケット: :5353 を dual-stack で bind し 224.0.0.251 / ff02::fb に join。
 static int open_mdns_socket() {
   int fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
@@ -411,20 +434,8 @@ static int open_mdns_socket() {
     close(fd);
     return -1;
   }
-  // IPv4 マルチキャスト join(IGMP)。
-  ip_mreq mreq4{};
-  inet_pton(AF_INET, "224.0.0.251", &mreq4.imr_multiaddr);
-  mreq4.imr_interface.s_addr = htonl(INADDR_ANY);
-  if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq4, sizeof(mreq4)) != 0) {
-    ESP_LOGW(TAG, "IP_ADD_MEMBERSHIP (v4) failed: errno=%d (ignored)", errno);
-  }
-  // IPv6 マルチキャスト join(MLD): ff02::fb。
-  ipv6_mreq mreq6{};
-  inet_pton(AF_INET6, "ff02::fb", &mreq6.ipv6mr_multiaddr);
-  mreq6.ipv6mr_interface = 0; // 既定 netif
-  if (setsockopt(fd, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP, &mreq6, sizeof(mreq6)) != 0) {
-    ESP_LOGW(TAG, "IPV6_ADD_MEMBERSHIP (v6) failed: errno=%d (ignored)", errno);
-  }
+  // マルチキャスト join(IP 取得後に IpV4 イベントで再 join する。join_mdns_groups 参照)。
+  join_mdns_groups(fd);
   return fd;
 }
 
@@ -865,6 +876,9 @@ static void matter_task(void *) {
       switch (c.kind) {
       case CmdKind::IpV4:
         stack.set_addrs(c.v4, nullptr);
+        if (mdns_fd >= 0) {
+          join_mdns_groups(mdns_fd); // netif up 後の再 join(リブート経路の必須処置)
+        }
 #if CONFIG_SM_ENABLE_BLE
         sm_wifi_status(true, now); // 遅延 ConnectNetworkResponse を Success で確定。
 #endif
@@ -895,6 +909,24 @@ static void matter_task(void *) {
         break;
       case CmdKind::WifiFailed:
         sm_wifi_status(false, now); // コアが残リトライで再要求する(SM_EV_WIFI_CONNECT_REQUEST)。
+        // 自動 join(コミッショニング済みで保存資格情報から join)している場合、AP の
+        // 一過性拒否(auth→init 0x600 を実機で観測)で 1 回失敗すると誰も再試行しない
+        // まま沈黙する(P6)。3 秒後に再 join を仕掛ける。
+        {
+          esp_timer_handle_t t = nullptr;
+          const esp_timer_create_args_t targs = {
+              .callback = [](void *) { esp_wifi_connect(); },
+              .arg = nullptr,
+              .dispatch_method = ESP_TIMER_TASK,
+              .name = "smgen_rejoin",
+              .skip_unhandled_events = false,
+          };
+          if (esp_timer_create(&targs, &t) == ESP_OK) {
+            ESP_LOGW(TAG, "wifi join failed; retrying in 3s");
+            g_wifi_joining = true;
+            esp_timer_start_once(t, 3000 * 1000);
+          }
+        }
         break;
 #endif
 #if CONFIG_SM_NETWORK_THREAD
@@ -993,6 +1025,13 @@ extern "C" void app_main() {
   ESP_ERROR_CHECK(esp_netif_init());
   ESP_ERROR_CHECK(esp_event_loop_create_default());
 
+  // スクリプト VM のロード(線形メモリ 64KB + 実行スレッド 12KB はヒープから)。
+  // WiFi ドライバ init の**前**に行う(後だと断片化で 64KB が取れない)。逆に
+  // スクリプト側を太らせすぎると esp_wifi_init が ESP_ERR_NO_MEM で落ちるので、
+  // 実行スレッドは 12KB・WiFi バッファは sdkconfig.defaults.esp32c6 で削っている
+  // (P6 の実測バランス)。on_boot は pump 側の script_init が実行スレッド経由で呼ぶ。
+  smgen::script_preload();
+
   g_cmd_queue = xQueueCreate(8, sizeof(Cmd));
 
   // 設定コンソール(USB-Serial-JTAG)。NVS しか触らないので matter_task と独立に動く。
@@ -1008,13 +1047,37 @@ extern "C" void app_main() {
 
 #if CONFIG_SM_ENABLE_BLE
   // NimBLE を起動(GATT 0xFFF6 / 広告)。BLE イベントは g_cmd_queue 経由で matter_task へ。
-  sm_ble_init(g_cmd_queue);
+  //
+  // ただし**コミッショニング済み(保存済み WiFi 資格情報あり)なら起動しない**:
+  // commissionable 広告は不要で、NimBLE の常駐 RAM(数十 KB)が WASM プール
+  // (SM_SCRIPT_POOL_KB、遅延ヒープ確保)を押し出してスクリプトが載らなくなる
+  // (C6 実機で確定: BLE 常駐時の定常 free ≈30KB < 96KB プール)。factory reset
+  // (nvs 消去)で資格情報が消えれば次回起動から再び BLE 広告する。
+  {
+    uint8_t ssid[33];
+    uint8_t pass[65];
+    size_t sl = sizeof(ssid), pl = sizeof(pass);
+    if (load_wifi_creds(ssid, &sl, pass, &pl)) {
+      ESP_LOGI(TAG, "commissioned (saved WiFi creds); skipping BLE to free RAM for scripts");
+    } else {
+      sm_ble_init(g_cmd_queue);
+    }
+  }
 #endif
+
 
   // sm_* を単線で扱う pump タスク(sans-IO 契約: 全 API を同一タスクから)。
   // スタック 128KB 必須級(NanoC6 実機で確定): sm_init はスタック構築 → static へ
   // move のため一時コピーが多段に積まれ 80KB でも Stack protection fault、さらに
   // コミッショニング中の P-256 署名チェーンも深い(ベアメタル実測 ~70KB)。
   // 8KB だと WiFi 開始直後に即リセットループになる。
-  xTaskCreate(&matter_task, "matter", 128 * 1024, nullptr, 5, nullptr);
+  //
+  // スタックは**静的確保**(P6): ヒープから 128KB を取ると、スクリプト VM の
+  // 線形メモリ(64KB、WAMR が os_mmap = システムヒープから取る)と連続ブロックを
+  // 取り合い、確保順のどちらかが必ず負ける。静的にすればヒープの大口需要は
+  // 線形メモリだけになる。
+  static StaticTask_t s_matter_tcb;
+  alignas(8) static StackType_t s_matter_stack[128 * 1024 / sizeof(StackType_t)];
+  xTaskCreateStatic(&matter_task, "matter", sizeof(s_matter_stack) / sizeof(StackType_t), nullptr,
+                    5, s_matter_stack, &s_matter_tcb);
 }

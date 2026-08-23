@@ -5,6 +5,8 @@
 // ループバックテスト(ctest/scriptstore_loopback.cpp)と同一コードを使う。
 
 #include "script_store.hpp"
+#include "esp_system.h"
+#include "esp_timer.h"
 
 #include "sdkconfig.h"
 
@@ -65,7 +67,31 @@ bool be_read(void *, size_t slot, size_t off, uint8_t *out, size_t len) {
   return esp_partition_read(g_part, script_slot_offset(slot) + off, out, len) == ESP_OK;
 }
 
-bool be_reload(void *) { return script_reload(); }
+bool be_reload(void *) {
+  if (script_reload()) {
+    return true;
+  }
+  // 稼働後は WAMR の線形メモリ(64KB、esp-idf の os_mmap = システムヒープ直取り)の
+  // 連続ブロックが取れないことがある(実機 P6。128KB pump スタック+プールで大領域が
+  // 割れる)。commit は成功扱いにして少し待って再起動し、ブート直後の新鮮なヒープで
+  // ロードする(応答/ACK を流し切るための遅延)。無効イメージはブート時ロールバック
+  // (script_init のヘッダ消去)が除去するので文鎮化しない。
+  ESP_LOGW(TAG, "live reload failed; applying via reboot");
+  esp_timer_handle_t t = nullptr;
+  const esp_timer_create_args_t args = {
+      .callback = [](void *) { esp_restart(); },
+      .arg = nullptr,
+      .dispatch_method = ESP_TIMER_TASK,
+      .name = "smscr_reboot",
+      .skip_unhandled_events = false,
+  };
+  if (esp_timer_create(&args, &t) == ESP_OK) {
+    esp_timer_start_once(t, 1500 * 1000);
+  } else {
+    esp_restart();
+  }
+  return true;
+}
 
 void be_mark_dirty(void *, uint32_t attr_id) { sm_attr_mark_dirty(g_ep, kClScriptStore, attr_id); }
 

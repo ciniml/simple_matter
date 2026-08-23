@@ -1,0 +1,9 @@
+# wasm の線形メモリを最小化する(rustc 既定はシャドウスタック 1MB = min 17 ページで、
+# デバイスの WAMR プール(SM_SCRIPT_POOL_KB)に載らない。C6 実機で確定)。
+# - stack-size=8KB でデータ+スタックが 1 ページ(64KB)に収まる
+# - max-memory=64KB を明示(max 無しだと WAMR が成長余地を見にいく実装がある)
+[target.wasm32-unknown-unknown]
+rustflags = [
+  "-C", "link-arg=-zstack-size=8192",
+  "-C", "link-arg=--max-memory=65536",
+]

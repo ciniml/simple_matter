@@ -13,6 +13,16 @@
 
 namespace smgen {
 
+// WAMR プールをブート直後(ヒープ断片化前)に確保する。app_main 冒頭で呼ぶこと
+// (唯一の例外的に pump タスク外から呼べる関数)。稼働後の遅延確保は総 free が
+// 足りても連続ブロック不足でほぼ失敗する(実機 P6)。POOL_STATIC=y では no-op。
+void script_pool_reserve();
+
+// プール確保 + VM ロードを app_main 冒頭で行う(pump スタック確保前でないと
+// WAMR 線形メモリ 64KB の連続ブロックが取れない。実機 P6)。on_boot は呼ばない
+// (pump の script_init が実行する)。pool_reserve を内包する。
+void script_preload();
+
 // パーティションからスクリプトをロードして VM を起動し、on_boot を呼ぶ。
 // スクリプトが無い / 壊れている場合は false(ファームはスクリプト無しで通常動作する)。
 bool script_init();

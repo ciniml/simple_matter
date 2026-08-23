@@ -595,7 +595,16 @@ pub fn resolve_operational_at(
                 if let Some(node) = parsed {
                     // アドレス付き応答: プロキシ応答(AAAA がデバイスのアドレス)を優先し、
                     // 無ければ従来どおり応答元へ adopt する。
-                    if let Some(v6) = node.addrs.iter().find(|a| a.is_ipv6()) {
+                    //
+                    // ただし**リンクローカル(fe80::/10)の AAAA は採用しない**: 応答パース
+                    // 経由では scope_id が付かず、そのまま接続すると送信できず CASE が
+                    // 黙って死ぬ(WiFi デバイスが GUA 取得前に fe80 だけ広告する起動直後の
+                    // 窓で実測。generic-firmware.md P6)。その場合は問い合わせ先(= src、
+                    // v4 なら v4、v6 なら scope 付き)へ adopt する。
+                    if let Some(v6) = node.addrs.iter().find(|a| match a {
+                        IpAddr::V6(v) => !is_v6_link_local(*v),
+                        IpAddr::V4(_) => false,
+                    }) {
                         let addr = SocketAddr::new(*v6, node.port);
                         dis_info!("(at) operational node resolved at {addr}");
                         return Ok(addr);
@@ -625,7 +634,14 @@ pub fn resolve_operational_at(
                 // 2 段目: AAAA 応答からデバイスアドレスを得る。
                 if let Some((hlen, port)) = srv {
                     let addrs = MdnsClient::parse_host_addrs(&rx[..n], &srv_host[..hlen]);
-                    let v6 = addrs.iter().find(|a| a.is_ipv6()).copied();
+                    // 1 段目と同じ理由でリンクローカルは採用しない。
+                    let v6 = addrs
+                        .iter()
+                        .find(|a| match a {
+                            IpAddr::V6(v) => !is_v6_link_local(*v),
+                            IpAddr::V4(_) => false,
+                        })
+                        .copied();
                     if let Some(v6) = v6 {
                         let addr = SocketAddr::new(v6, port);
                         dis_info!("(at) operational node resolved at {addr} (two-step)");

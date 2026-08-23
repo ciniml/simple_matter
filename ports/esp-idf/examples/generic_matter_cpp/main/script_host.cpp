@@ -15,8 +15,14 @@
 
 #include "simple_matter.h"
 
+#include <pthread.h>
+
 #include "driver/gpio.h"
 #include "driver/ledc.h"
+#include "esp_pthread.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "esp_heap_caps.h"
 #include "esp_partition.h"
 #include "esp_system.h"
@@ -330,6 +336,41 @@ bool read_slot(const esp_partition_t *part, size_t s, uint8_t *buf, size_t cap, 
 
 // active slot(妥当なスロットのうち ver 最大。同値なら A)を選び、本体を buf に読む。
 // 無ければ -1。
+// ヘッダ(16B)だけ読んで active slot と本体長を決める(本体は読まない)。
+// 読み出しバッファを**実イメージ長だけ**確保するための前段(上限 24KB の固定確保は
+// 稼働後ヒープでは失敗する。実機 P6)。
+int peek_active(const esp_partition_t *part, size_t cap, uint16_t &ver, uint32_t &len) {
+  int best = -1;
+  ScriptHeader best_hdr{};
+  for (size_t s = 0; s < kScriptSlots; s++) {
+    const size_t off = script_slot_offset(s);
+    if (off + kScriptHdrSize > part->size) {
+      continue;
+    }
+    uint8_t hdr[kScriptHdrSize];
+    if (esp_partition_read(part, off, hdr, sizeof(hdr)) != ESP_OK) {
+      continue;
+    }
+    ScriptHeader h;
+    if (!script_hdr_parse(hdr, sizeof(hdr), h)) {
+      continue;
+    }
+    if (h.len > cap || off + kScriptHdrSize + h.len > part->size) {
+      continue;
+    }
+    if (best < 0 || h.ver > best_hdr.ver) {
+      best = (int)s;
+      best_hdr = h;
+    }
+  }
+  if (best < 0) {
+    return -1;
+  }
+  ver = best_hdr.ver;
+  len = best_hdr.len;
+  return best;
+}
+
 int load_active(const esp_partition_t *part, uint8_t *buf, size_t cap, uint16_t &ver,
                 uint32_t &len) {
   int best = -1;
@@ -373,9 +414,114 @@ ScriptHostOps make_ops() {
   return ops;
 }
 
+// ---- スクリプト実行スレッド(pthread)---------------------------------------
+//
+// esp-idf 版 WAMR の os_self_thread() は pthread_self() 直呼びで、素の FreeRTOS
+// タスク(pump)から wasm を実行すると ESP-IDF の pthread 層が assert する(実機
+// P6。wasm_runtime_init_thread_env でも回避不能)。そこで wasm の**実行だけ**を
+// 専用 pthread に同期ハンドオフする: pump は要求を投げて完了まで block するので
+// sm_* の呼び出し(ホスト import 経由)は従来どおり厳密に直列化されたまま
+// (単線契約は「並行に入らないこと」であり、この構図では並行実行は起きない)。
+// ロード/instantiate(preload)は wasm 実行を伴わないため main タスクのままで良い。
+
+struct ExecReq {
+  enum Kind : uint8_t { Boot, Poll, AttrWrite, Sensor, Command } kind;
+  uint64_t now_ms;
+  int32_t a, b, c;
+};
+
+QueueHandle_t g_exec_q = nullptr;
+SemaphoreHandle_t g_exec_done = nullptr;
+
+void *exec_thread_main(void *) {
+  ExecReq r;
+  for (;;) {
+    if (xQueueReceive(g_exec_q, &r, portMAX_DELAY) != pdTRUE) {
+      continue;
+    }
+    switch (r.kind) {
+    case ExecReq::Boot:
+      script_on_boot();
+      break;
+    case ExecReq::Poll:
+      script_vm_poll(r.now_ms);
+      break;
+    case ExecReq::AttrWrite: {
+      const int32_t rc = script_on_attr_write(r.a, r.b, r.c);
+      if (rc != 0) {
+        // 現行シムに「IM write を拒否する」口が無いため観測のみ(§9.3 / README)。
+        ESP_LOGW(TAG, "on_attr_write returned %d (observed only; write already applied)", (int)rc);
+      }
+      break;
+    }
+    case ExecReq::Sensor:
+      script_on_sensor(r.a);
+      break;
+    case ExecReq::Command: {
+      const int32_t rc = script_on_command(r.a, r.b, r.c);
+      if (rc != 0) {
+        ESP_LOGW(TAG, "on_command returned %d (observed only)", (int)rc);
+      }
+      break;
+    }
+    }
+    xSemaphoreGive(g_exec_done);
+  }
+  return nullptr;
+}
+
+bool exec_ensure_thread() {
+  if (g_exec_q != nullptr) {
+    return true;
+  }
+  g_exec_q = xQueueCreate(1, sizeof(ExecReq));
+  g_exec_done = xSemaphoreCreateBinary();
+  if (g_exec_q == nullptr || g_exec_done == nullptr) {
+    return false;
+  }
+  esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
+  cfg.stack_size = 12 * 1024; // interp の native 再帰 + ホスト import 分(hook は浅い)
+  cfg.prio = 5;
+  cfg.thread_name = "smscr_exec";
+  esp_pthread_set_cfg(&cfg);
+  pthread_t t;
+  if (pthread_create(&t, nullptr, exec_thread_main, nullptr) != 0) {
+    ESP_LOGE(TAG, "script exec thread create failed");
+    return false;
+  }
+  pthread_detach(t);
+  return true;
+}
+
+// pump から呼ぶ: 要求を実行スレッドへ渡し、完了まで待つ(= 直列化)。
+void exec_run(const ExecReq &r) {
+  if (!exec_ensure_thread()) {
+    return;
+  }
+  xQueueSend(g_exec_q, &r, portMAX_DELAY);
+  xSemaphoreTake(g_exec_done, portMAX_DELAY);
+}
+
+
 } // namespace
 
-bool script_init() {
+void script_pool_reserve() {
+#if !CONFIG_SM_SCRIPT_POOL_STATIC
+  // app_main 冒頭(WiFi 等の初期化前 = ヒープが断片化する前)に呼ぶ。稼働後の
+  // ヒープは総 free が足りても連続 kPoolSize が取れない(実機 P6 で確定)。
+  if (g_pool == nullptr) {
+    g_pool =
+        (uint8_t *)heap_caps_aligned_alloc(8, kPoolSize, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    if (g_pool == nullptr) {
+      ESP_LOGW(TAG, "boot-time WAMR pool (%u KB) reservation failed; scripts unavailable",
+               (unsigned)(kPoolSize / 1024));
+    }
+  }
+#endif
+}
+
+// VM のロード実体(旧 script_init から on_boot 実行を除いたもの)。
+static bool script_load() {
   const esp_partition_t *part = esp_partition_find_first(
       ESP_PARTITION_TYPE_DATA, (esp_partition_subtype_t)0x40, CONFIG_SM_SCRIPT_PARTITION);
   if (part == nullptr) {
@@ -383,25 +529,33 @@ bool script_init() {
     return false;
   }
 
-  // 読み出しバッファはロードの間だけ確保する(バイトコードは script_vm_start が
-  // プールへ複製するので、起動後は不要)。
+  // まずヘッダだけで active slot と本体長を決め、読み出しバッファは**実イメージ長**
+  // だけロードの間確保する(バイトコードは script_vm_start がプールへ複製するので、
+  // 起動後は不要。上限 SM_SCRIPT_MAX_KB の固定確保は稼働後ヒープでは失敗する)。
   const size_t img_cap = (size_t)CONFIG_SM_SCRIPT_MAX_KB * 1024;
-  uint8_t *img = (uint8_t *)heap_caps_malloc(img_cap, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-  if (img == nullptr) {
-    ESP_LOGE(TAG, "cannot allocate %u B script read buffer", (unsigned)img_cap);
-    return false;
-  }
   uint16_t ver = 0;
   uint32_t len = 0;
-  const int slot = load_active(part, img, img_cap, ver, len);
+  const int slot = peek_active(part, img_cap, ver, len);
   if (slot < 0) {
     ESP_LOGI(TAG, "no valid script image in '%s' (device runs without script)", part->label);
+    return false;
+  }
+  uint8_t *img = (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+  if (img == nullptr) {
+    ESP_LOGE(TAG, "cannot allocate %u B script read buffer", (unsigned)len);
+    return false;
+  }
+  ScriptHeader hh;
+  if (!read_slot(part, (size_t)slot, img, len, hh)) {
+    ESP_LOGW(TAG, "slot %d: body read/CRC failed", slot);
     heap_caps_free(img);
     return false;
   }
 
 #if !CONFIG_SM_SCRIPT_POOL_STATIC
-  // ここで初めてプールを確保する(スクリプトを積んでいないデバイスは 0 バイト)。
+  // 通常は script_pool_reserve()(app_main 冒頭 = 断片化前)で確保済み。ここは
+  // フォールバック(実機 P6: 稼働後のヒープは総量が足りても 72KB の連続ブロックが
+  // 無く、遅延確保はほぼ失敗する)。
   if (g_pool == nullptr) {
     g_pool = (uint8_t *)heap_caps_aligned_alloc(8, kPoolSize, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
   }
@@ -428,10 +582,17 @@ bool script_init() {
   if (!ok) {
     ESP_LOGE(TAG, "script load failed (slot %d, ver %u, %u B): %s", slot, (unsigned)ver,
              (unsigned)len, err);
-#if !CONFIG_SM_SCRIPT_POOL_STATIC
-    heap_caps_free(g_pool);
-    g_pool = nullptr;
-#endif
+    // プールは解放しない: ブート直後の予約(script_pool_reserve)を手放すと、稼働後の
+    // ヒープでは連続ブロックが取れず二度と確保できない(実機 P6)。次のロード試行
+    // (OTA リトライ / ロールバック)で再利用する。
+    //
+    // ブート時ロールバック: ブート直後(ヒープ最良)でもロードできないイメージは
+    // 無効とみなし、スロットヘッダを消して旧スロットへ戻す(reboot 適用経路の安全網。
+    // ヘッダはスロット先頭 4KB に載っているので 1 消去単位で足りる)。
+    if (esp_timer_get_time() < 10 * 1000 * 1000) {
+      ESP_LOGW(TAG, "erasing invalid script slot %d (boot rollback)", slot);
+      esp_partition_erase_range(part, script_slot_offset((size_t)slot), 4096);
+    }
     return false;
   }
   g_slot = slot;
@@ -440,13 +601,41 @@ bool script_init() {
   ESP_LOGI(TAG, "script loaded: slot %d ver %u (%u B), pool %u KB, budget %d ms, free heap %u B",
            slot, (unsigned)ver, (unsigned)len, (unsigned)(kPoolSize / 1024),
            CONFIG_SM_SCRIPT_BUDGET_MS, (unsigned)esp_get_free_heap_size());
-  script_on_boot();
+  return true;
+}
+
+void script_preload() {
+  // app_main 冒頭(128KB pump スタックや WiFi バッファでヒープが割れる前)で
+  // プール確保と VM ロードまで済ませる。C6 実機では稼働後どころか pump 起動後の
+  // ブート時ですら 64KB(WAMR 線形メモリ、esp-idf の os_mmap = システムヒープ直取り)
+  // の連続ブロックが取れない(P6)。on_boot フックはここでは呼ばない
+  // (sm_init 前のため)— pump 側の script_init が呼ぶ。
+  script_pool_reserve();
+  if (script_load()) {
+    // 実行スレッド(pthread、スタック 24KB はヒープ確保)は今つくる: 稼働後は
+    // 24KB の連続ブロックすら怪しい(P6)。キュー待ちで眠るだけなので害はない。
+    exec_ensure_thread();
+  }
+}
+
+bool script_init() {
+  if (!script_vm_active() && !script_load()) {
+    return false;
+  }
+  // on_boot はスクリプト実行スレッド(pthread)で走らせる(P6: 素の FreeRTOS
+  // タスクから wasm を実行すると esp-idf 版 WAMR の pthread_self が assert)。
+  ExecReq r{};
+  r.kind = ExecReq::Boot;
+  exec_run(r);
   return true;
 }
 
 void script_poll(uint64_t now_ms) {
   if (script_vm_active()) {
-    script_vm_poll(now_ms);
+    ExecReq r{};
+    r.kind = ExecReq::Poll;
+    r.now_ms = now_ms;
+    exec_run(r);
   }
 }
 
@@ -454,16 +643,20 @@ void script_notify_attr_write(uint16_t ep, uint32_t cluster, uint32_t attr) {
   if (!script_vm_active()) {
     return;
   }
-  const int32_t rc = script_on_attr_write((int32_t)ep, (int32_t)cluster, (int32_t)attr);
-  if (rc != 0) {
-    // 現行シムに「IM write を拒否する」口が無いため観測のみ(§9.3 / README)。
-    ESP_LOGW(TAG, "on_attr_write returned %d (observed only; write already applied)", (int)rc);
-  }
+  ExecReq r{};
+  r.kind = ExecReq::AttrWrite;
+  r.a = (int32_t)ep;
+  r.b = (int32_t)cluster;
+  r.c = (int32_t)attr;
+  exec_run(r);
 }
 
 void script_notify_sensor(int32_t bind_index) {
   if (script_vm_active()) {
-    script_on_sensor(bind_index);
+    ExecReq r{};
+    r.kind = ExecReq::Sensor;
+    r.a = bind_index;
+    exec_run(r);
   }
 }
 
@@ -471,11 +664,12 @@ void script_notify_command(uint16_t ep, uint32_t cluster, uint32_t cmd) {
   if (!script_vm_active()) {
     return;
   }
-  const int32_t rc = script_on_command((int32_t)ep, (int32_t)cluster, (int32_t)cmd);
-  if (rc != 0) {
-    // 拒否は観測のみ(コマンドは既に実行される。§9.4 / README)。
-    ESP_LOGW(TAG, "on_command returned %d (observed only)", (int)rc);
-  }
+  ExecReq r{};
+  r.kind = ExecReq::Command;
+  r.a = (int32_t)ep;
+  r.b = (int32_t)cluster;
+  r.c = (int32_t)cmd;
+  exec_run(r);
 }
 
 bool script_reload() {
@@ -505,6 +699,8 @@ void script_log_status() {
 
 namespace smgen {
 
+void script_pool_reserve() {}
+void script_preload() {}
 bool script_init() { return false; }
 void script_poll(uint64_t) {}
 void script_notify_attr_write(uint16_t, uint32_t, uint32_t) {}

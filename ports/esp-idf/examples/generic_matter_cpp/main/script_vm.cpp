@@ -317,6 +317,11 @@ bool script_vm_start(const uint8_t *wasm, size_t len, const ScriptVmConfig &cfg,
   return true;
 }
 
+void script_vm_attach_thread() {
+  // 冪等ではないが二重初期化は WAMR 側が握りつぶす(既に init 済みなら true を返す)。
+  wasm_runtime_init_thread_env();
+}
+
 void script_vm_stop() {
   if (g_vm.env != nullptr) {
     wasm_runtime_destroy_exec_env(g_vm.env);

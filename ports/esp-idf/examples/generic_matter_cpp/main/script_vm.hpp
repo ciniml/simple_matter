@@ -62,6 +62,11 @@ bool script_vm_start(const uint8_t *wasm, size_t len, const ScriptVmConfig &cfg,
                      const ScriptHostOps &ops, char *err, size_t err_cap);
 
 // VM を落とす(インスタンス・モジュール・ランタイムを解放。プールは呼び出し側の所有)。
+// フックを実行するネイティブタスク側で 1 回呼ぶ(WAMR の thread env 初期化)。
+// LIB_PTHREAD 有効の WAMR は wasm 実行時に pthread_self を呼ぶため、素の FreeRTOS
+// タスクからだと ESP-IDF の pthread 層が assert する(実機 P6)。
+void script_vm_attach_thread();
+
 void script_vm_stop();
 
 // VM が動いているか(スクリプト未搭載なら false = 全フックが no-op)。
