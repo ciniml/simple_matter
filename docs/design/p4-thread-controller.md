@@ -253,3 +253,42 @@ Tab5(ESP32-P4)+ Unit Gateway H2 で F8 の全経路を実機確認:
   ならない(dataset があれば attach に変更)、④ ピン極性。
 - 残: TBR(F8e backbone)、NanoH2 のデバイス対応(esp32h2 ターゲット追加)、
   smctl→Thread デバイスの直接操作(PC からは mesh への経路が無く BR 実装後)。
+
+## 9. T1: LVGL コントローラアプリ(Tab5)
+
+Status: 実装中(2026-08-24 開始)。基本通信(F8/P9)完動を受けて、Tab5 の 5 インチ
+タッチ画面で操作する GUI コントローラを作る。
+
+### 9.1 構成
+
+- **新 example `ports/esp-idf/examples/tab5_ctrl_app/`**(Tab5 専用)。
+  thread_ctrl_hub_cpp(F8 参照実装)は無改変で残し、その OT/コントローラ配線を
+  土台に GUI を足す。表示は公式 BSP `espressif/m5stack_tab5`(idf_component.yml)
+  + esp_lvgl_port。フレームバッファ等は PSRAM。
+- **タスク構成(単線契約の維持)**: sm_ctrl_* は従来どおり pump タスク(静的
+  スタック 128KB)専有。UI(LVGL タスク)とは
+  - UI → pump: 操作キュー `UiOp`(Toggle{node} / ReadOnOff{node} /
+    Pair{node, passcode, ipv6} / RefreshAddr{node} = SRP 列挙→set_node_addr)
+  - pump → UI: mutex 保護のスナップショット構造体(ノード一覧・on/off 状態・
+    Thread 状態・直近イベント文字列)+ 更新フラグ。LVGL 側はタイマで反映
+  で結ぶ。pump は run_until 相当を 1 op ずつ実行(settle 済みで次 op)。
+- **画面(v1)**:
+  1. ステータスバー: Thread role/RLOC16/channel/PAN、ノード数、free heap
+  2. デバイス一覧: ノード帳の各ノード(node id / アドレス / on-off 状態バッジ /
+     Toggle ボタン / 再解決ボタン)。10 秒周期で on-off を順次 read して反映
+  3. Pair ダイアログ: IPv6 入力(オンスクリーンキーボード)+ node id(自動採番、
+     編集可)+ passcode(既定 20202021)→ 進捗表示 → 結果
+  4. ネットワーク情報パネル: dataset TLV hex 表示(+ LVGL の QR ウィジェットが
+     使えるなら dataset の QR。デバイス側プリセットの転記を楽にする)
+- Kconfig: 既定ピン(Port A RX=54/TX=53)・baud は F8 と同値。SM_TARGET_* の
+  固定ターゲット自動ペアリングは持たない(UI から行う)。
+
+### 9.2 ゲート
+
+1. docker esp32p4 ビルド green(BSP は managed component。idf:release-v5.4 で
+   依存が解決しない場合は BSP バージョンを固定するか本 example のみ新しい
+   イメージを使い、選択を README/doc に記録)
+2. 実機: 起動ログで LVGL/表示初期化 + leader 化 + pump 稼働。既存ノード
+   (NanoC6 = 0xaabbccdd)が一覧に出て Toggle が通ること(ログで確認、
+   画面・タッチの見た目はユーザ確認)
+3. 回帰: thread_ctrl_hub_cpp / generic_matter_cpp のビルド green 維持
