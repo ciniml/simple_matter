@@ -232,3 +232,24 @@ esp-hosted が要るため、**実機フェーズ送り**とする(prompt の打
 7. `idf.py` の `-DSDKCONFIG_DEFAULTS` を使わない既定経路では、`sdkconfig` が既に
    存在すると `sdkconfig.defaults` の変更が反映されない。設定を足したら
    `rm sdkconfig` してから再 configure する。
+
+## 8. 実機 E2E 記録(P9、2026-08-23、コミット 6946b9d)
+
+Tab5(ESP32-P4)+ Unit Gateway H2 で F8 の全経路を実機確認:
+
+- **配線**: Unit Gateway H2 の Grove は H2 の UART0(TX0/RX0)直結(回路図
+  U195_Sch_v0.3 で確認)= ot_rcp 既定ピンのまま。Tab5 Port A は RX=GPIO54 /
+  TX=GPIO53(53/54 逆は spinel 無応答)。baud 460800。
+- **フロー**: H2 に build-ot-rcp-h2.sh の merged bin(ユニット自身の USB-C から
+  書込)→ Tab5 で spinel 同期 → Thread leader 化 + SRP サーバ → NanoC6
+  (onoff_light_cpp Thread 構成。dataset は smctl `pairing ble-thread` で投入し、
+  PC から CASE 不達 → fail-safe 失効ロールバックで「Thread に居る commissionable」
+  状態にする)→ `CONFIG_SM_TARGET_IPV6`(デバイス ML-EID)へ on-network PASE →
+  **フルコミッショニング 7 秒 → CASE resumption → 30 秒毎 toggle OK**。
+- **実機発見バグ**(詳細はコミット 6946b9d): ① コアのピア照合が ULA の scope_id
+  食い違いで PASE 応答を黙って落とす(canonical_socket_addr を scope 非依存化)、
+  ② P4 は起動直後の main タスク 128KB 生成が assert(hub タスクを静的スタック化)、
+  ③ デバイスの Thread 自動 attach が fabric>0 ゲートで commissionable 状態に
+  ならない(dataset があれば attach に変更)、④ ピン極性。
+- 残: TBR(F8e backbone)、NanoH2 のデバイス対応(esp32h2 ターゲット追加)、
+  smctl→Thread デバイスの直接操作(PC からは mesh への経路が無く BR 実装後)。
