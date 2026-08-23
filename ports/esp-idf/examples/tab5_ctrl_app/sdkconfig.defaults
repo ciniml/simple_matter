@@ -2,7 +2,7 @@
 # docs/design/p4-thread-controller.md §9(T1)。
 #
 # thread_ctrl_hub_cpp の sdkconfig.defaults(F8c、実機で確定)を土台に、
-# BSP(espressif/m5stack_tab5)+ esp_lvgl_port + LVGL9 の要件を足したもの。
+# M5Unified/M5GFX + 自前 LVGL9 ポート(T1b、§9.5)の要件を足したもの。
 #
 # 注意: idf.py は sdkconfig が既に存在すると sdkconfig.defaults の変更を反映しない。
 #       設定を足したら `rm -f sdkconfig` してから set-target し直すこと(F8 の罠 7)。
@@ -13,7 +13,7 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 
 # app_main は表示初期化 + タスク起動だけ(sm_ctrl は専用の静的スタックタスク)。
-# BSP の初期化(MIPI-DSI / I2C / io expander)がそこそこ積むので 8KB。
+# M5.begin()(MIPI-DSI / I2C / io expander / タッチ)がそこそこ積むので 8KB。
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
 # --- OpenThread(FTD。radio は H2 の RCP に spinel over UART で繋ぐ)---
@@ -61,7 +61,7 @@ CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
 # FreeRTOS 1kHz(LVGL のタイマ精度とタッチ応答)。
 CONFIG_FREERTOS_HZ=1000
 
-# --- LVGL9(esp_lvgl_port 経由。BSP が lv_display / lv_indev を作る)---
+# --- LVGL9(自前ポート。main/display_gfx.cpp が lv_display / lv_indev を作る)---
 CONFIG_LV_CONF_SKIP=y
 CONFIG_LV_BUILD_EXAMPLES=n
 # LVGL のヒープは C ライブラリ(= heap_caps)に委譲する。LVGL 内蔵アロケータの
@@ -81,12 +81,9 @@ CONFIG_LV_USE_QRCODE=y
 CONFIG_LV_USE_KEYBOARD=y
 CONFIG_LV_USE_TEXTAREA=y
 
-# BSP の LVGL 描画バッファ(内蔵 RAM の DMA 可能領域)。既定 50 行だと
-# 720x50x2B x2(ダブルバッファ)+ SW 回転用の 1 枚 = 約 216KB を内蔵 RAM から取る。
-# pump タスクの静的スタック 128KB と OT/lwIP/mbedTLS が同居するので 40 行に絞る。
-CONFIG_BSP_LCD_DRAW_BUF_HEIGHT=40
-CONFIG_BSP_LCD_DRAW_BUF_DOUBLE=y
+# LVGL の描画バッファは display_gfx.cpp が PSRAM から確保する
+# (1280x72 x2B x2 枚 ≒ 360KB)。内蔵 RAM は pump の静的スタック 128KB と
+# OT/lwIP/mbedTLS に残す。
 
-# BSP: カメラ(esp_video)は使わないが依存として入る。SPI カメラ制御は落とす。
-CONFIG_CAM_CTRL_SPI_ENABLE=n
-CONFIG_CODEC_I2C_BACKWARD_COMPATIBLE=n
+# 自前ポートは lv_tick_set_cb(esp_timer)を使うので LVGL 内蔵 tick は不要。
+CONFIG_LV_DEF_REFR_PERIOD=16

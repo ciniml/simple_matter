@@ -40,10 +40,10 @@ BLE は使わない。コミッショニングは **on-network PASE over Thread 
 
 | タスク | 役割 |
 |---|---|
-| `app_main` | NVS / netif / event loop → BSP(表示・タッチ・LVGL)→ UI 構築 → pump 起動 |
+| `app_main` | NVS / netif / event loop → `M5.begin()`(PORT.A 5V + パネル + タッチ)→ pump 起動 → spinel 同期待ち → LVGL 起動 → UI 構築 |
 | `ctrl_pump`(静的スタック **128KB**)| `sm_ctrl_*` を専有。UI の操作キューを 1 件ずつ実行 |
 | `ot_main` | `esp_openthread` のメインループ |
-| esp_lvgl_port の LVGL タスク | `lv_*` のみ。`sm_ctrl_*` / `ot*` は**呼ばない** |
+| `lvgl`(`main/display_gfx.cpp` が起動)| `lv_*` のみ。`sm_ctrl_*` / `ot*` は**呼ばない** |
 
 UI → pump は FreeRTOS キューの `sm_ui_op_t`(Toggle / ReadOnOff / Pair / RefreshAddr)、
 pump → UI は mutex 保護のスナップショット + LVGL の 500ms タイマ反映
@@ -54,13 +54,14 @@ pump → UI は mutex 保護のスナップショット + LVGL の 500ms タイ�
 
 | ファイル | 中身 |
 |---|---|
-| `main/main.cpp` | 起動シーケンス、画面回転、**タッチ座標の回転補正**(下記の罠) |
+| `main/main.cpp` | 起動シーケンス(5V → spinel 同期 → LVGL の順序が命) |
+| `main/display_gfx.{hpp,cpp}` | M5Unified/M5GFX の初期化 + 自前 LVGL ポート(flush / touch / tick / タスク / ロック) |
 | `main/ui.cpp` | LVGL の画面全部(sm_ctrl_* を一切呼ばない) |
 | `main/ctrl_pump.cpp` | pump タスク(KVS / UDP / `run_until` は hub から流用) |
 | `main/app_state.{hpp,cpp}` | 操作キュー + スナップショット(UI ↔ pump の唯一の連絡路) |
 | `main/node_book.{hpp,cpp}` | NVS `smctl`/`nods` を TLV パースして NodeId を列挙 |
 | `main/ot_hub.{hpp,cpp}` | hub のコピー + GUI 用ステータス取得(OT 配線は無改変) |
-| `main/idf_component.yml` | `espressif/m5stack_tab5 ~1.2.0`(BSP。lvgl 9.5 / esp_lvgl_port を引く) |
+| `main/idf_component.yml` | `m5stack/m5unified ^0.2.20`(→ `m5stack/m5gfx 0.2.27`)+ `lvgl/lvgl ^9.2.0` |
 
 ## ビルド
 
@@ -75,8 +76,8 @@ idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults" set-target esp32p4
 idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults" build
 ```
 
-docker(**`espressif/idf:release-v5.4` のままで BSP 1.2.0 / LVGL 9.5 が解決する**。
-5.5 への切替は不要だった):
+docker(**`espressif/idf:release-v5.4` のまま。ESP Registry の
+`m5stack/m5unified 0.2.20` / `m5stack/m5gfx 0.2.27` / `lvgl/lvgl 9.5.0` が解決する**):
 
 ```sh
 REPO=$(git rev-parse --show-toplevel)
@@ -113,8 +114,9 @@ idf.py -p /dev/ttyACM0 flash monitor
 - **Thread**: `SM_THREAD_DATASET_TLV_HEX`(空 = 新規ネットワーク生成。NVS 優先)。
 - **Matter**: `SM_TARGET_PORT`(5540)、`SM_UI_DEFAULT_NODE_ID` / `SM_UI_DEFAULT_PASSCODE`
   (Pair ダイアログの初期値)、`SM_UI_FALLBACK_NODE_ID`。
-- **表示/タッチ**: `SM_UI_ROTATION`(既定 90 = 1280x720 横)、
-  `SM_UI_TOUCH_MIRROR_X` / `SM_UI_TOUCH_MIRROR_Y`。
+- **表示/タッチ**: Kconfig は無い。回転は `main/display_gfx.cpp` の
+  `M5.Display.setRotation(1)`(= 1280x720 横。上下逆なら 3)。M5GFX の `getTouch()` は
+  回転を反映した画面座標を返すので、旧 `SM_UI_ROTATION` / `SM_UI_TOUCH_MIRROR_X/Y` は廃止した。
 
 ## 実機手順
 
@@ -126,22 +128,26 @@ idf.py -p /dev/ttyACM0 flash monitor
 
 ## 踏んだ罠(次に触る人へ)
 
-1. **LVGL 9.5 も esp_lvgl_port 2.9 もタッチ座標を画面回転に追従させない。**
-   `lv_indev.c` に rotation 処理は無く、`esp_lvgl_port_touch.c` はタッチ IC の生座標を
-   そのまま渡す。パネルは 720x1280(縦)なので、`lv_display_set_rotation(90)` すると
-   タッチだけ 90 度ずれる。本アプリは `lv_indev_get_read_cb()` で元の read_cb を取り出し、
-   回転変換を挟む形で包んでいる(`main.cpp` の `rotated_touch_read`)。
-   実機で左右/上下が反転していたら `SM_UI_TOUCH_MIRROR_X/Y` を y にする。判断材料は
-   起動直後のログ `touch: panel(x,y) -> screen(x,y) [screen 1280x720]`(先頭 5 点だけ出る)。
+1. **Espressif BSP(`espressif/m5stack_tab5` 1.2.0 + `esp_lvgl_port`)は実機で画面が
+   出なかった**(T1b の発端)。初期化ログは全て正常・バックライトも点くのに真っ黒
+   (board version 2 = ST7123 タッチ搭載個体。パネル init / DPI タイミングが疑い)。
+   **M5Unified/M5GFX へ差し替えて解決した**。BSP 経路で必要だったタッチ座標の回転シム
+   (`rotated_touch_read`)は M5GFX が回転済み座標を返すので不要になり、削除した。
 2. **シムに NodeId の列挙 API が無い**(`sm_ctrl_node_count` は件数、
    `sm_ctrl_node_addr` は引き当てのみ)。GUI の一覧を作るには NodeId そのものが要るので、
    シムが書いた NVS `smctl`/`nods`(smctl `nodes.tlv` v1 = 安定仕様)を C++ 側で
    TLV パースして読み直している(`main/node_book.cpp`。読み取り専用、コア/シムは無改造)。
-3. **BSP の LVGL 描画バッファは内蔵 RAM の DMA 領域**。既定の 50 行だと
-   720x50x2B のダブルバッファ + SW 回転用の 1 枚で約 216KB。pump の静的スタック 128KB と
-   同居するので `CONFIG_BSP_LCD_DRAW_BUF_HEIGHT=40` に絞っている。
-4. **`CONFIG_BSP_DISPLAY_LVGL_AVOID_TEAR=y` にすると SW 回転が無効化される**
-   (`bsp_display.c`)。tear 対策を入れるなら回転をやめるか別手段が要る。
+3. **`M5.begin()` は PORT.A の 5V を一瞬切る**。`Power_Class::begin()` が Tab5 の
+   IO エキスパンダ #0(PI4IOE5V6408 @0x43)へ `OUT_SET=0b01110000` を書く時点で
+   EXT5V_EN(P2)が 0 になり、直後の `setExtOutput(cfg.output_power)` で戻る。
+   5V は **H2(RCP)の電源そのもの**なので、`M5.begin()` は必ず pump(spinel)より
+   前に置くこと。逆順にすると H2 が再起動して spinel が落ちる。
+4. **表示の初期化は 2 段に分けてある**。`sm_display_hw_init()`(= `M5.begin()`。5V と
+   パネル)は最初期、`sm_display_lvgl_start()`(LVGL + 描画)は **spinel 同期後**。
+   T1 で踏んだ「LVGL の初期描画中に spinel UART を開くと RX 取りこぼしで OT の
+   初期リセットが assert ループ」を避けるための分割(§9.4 / §9.5)。
+   LVGL の描画バッファは PSRAM に 1280x72x2B を 2 枚(約 360KB)。内蔵 RAM は
+   pump の静的スタック 128KB と OT/lwIP/mbedTLS に残す。
 5. hub 由来の罠(`RADIO_MODE_UART_RCP`、`CONFIG_LWIP_IPV6_NUM_ADDRESSES=12`、
    SRP サーバの custom header、soft-float `.o` 除去、`rm sdkconfig` してから再 configure)は
    そのまま有効。`thread_ctrl_hub_cpp/README.md` と `docs/design/p4-thread-controller.md` §7 を参照。

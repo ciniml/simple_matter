@@ -260,6 +260,10 @@ Status: ビルドゲート green(2026-08-24。§9.3 実装記録)。実機は親
 基本通信(F8/P9)完動を受けて、Tab5 の 5 インチ
 タッチ画面で操作する GUI コントローラを作る。
 
+> **注意**: §9.1〜§9.4 の「BSP(`espressif/m5stack_tab5` + `esp_lvgl_port`)」記述は
+> **T1b(§9.5)で M5Unified/M5GFX + 自前 LVGL ポートに置き換わった**(実機で画面が
+> 黒のままだったため)。表示層まわりは §9.5 を正とする。OT / pump / UI の記述は有効。
+
 ### 9.1 構成
 
 - **新 example `ports/esp-idf/examples/tab5_ctrl_app/`**(Tab5 専用)。
@@ -398,3 +402,164 @@ ot_hub.{hpp,cpp}}`。
 ノード帳から NanoC6 が一覧表示(1 shown)→ controller ready → 10 秒周期の
 OnOff read が CASE で疎通(MeshForwarder に暗号化 UDP)。タッチ操作・画面の
 見た目はユーザ確認待ち。
+
+### 9.5 T1b: 表示層を Espressif BSP から M5Unified/M5GFX へ差し替え(2026-08-24)
+
+#### 動機(実機で確定した事実)
+
+`espressif/m5stack_tab5` 1.2.0(+ `esp_lvgl_port` 2.9 / `esp_lcd_ili9881c`)経路は、
+実機 Tab5(board version 2 = **ST7123 タッチ**搭載個体)で
+
+- 初期化ログは全て正常(MIPI-DSI / io expander / touch / lvgl port とも ESP_OK)
+- バックライトは点灯する(白っぽく光る)
+- **しかし画面は真っ黒**。`SM_UI_ROTATION=0`(SW 回転なし)でも黒
+
+という状態から抜けられなかった。BSP のパネル init シーケンス / DPI タイミングが
+この個体のパネルに合っていない疑いが濃厚。ユーザ所有の別プロジェクト
+(`tab5_claude_client`)は **同一個体で M5Unified/M5GFX により表示実績あり**のため、
+ユーザ判断で M5GFX へ移行した。
+
+#### M5GFX の入手形態と版
+
+**ESP Registry 版でそのまま解決した**(参考リポジトリの vendor コピーは不要だった)。
+
+| component | 版 | 備考 |
+|---|---|---|
+| `m5stack/m5unified` | **0.2.20** | `main/idf_component.yml` で `^0.2.20` |
+| `m5stack/m5gfx` | **0.2.27** | m5unified が `>=0.2.27` で引く |
+| `lvgl/lvgl` | **9.5.0** | BSP 経由をやめたので直接指定(`^9.2.0`) |
+| idf | **5.4.4** | `espressif/idf:release-v5.4` のまま |
+
+参考リポジトリ(`~/repos/tab5_claude_client`)の `components/M5GFX` / `M5Unified` は
+ciniml フォークの `idf6-tab5-patches` ブランチ(M5GFX 0.2.20 / M5Unified 0.2.14 ベース)で、
+パッチ内容は (a) IDF6 で分割された driver コンポーネントの `REQUIRES` 追加、
+(b) IDF6 で消えた `i2s_port_t` の typedef シム、(c) IDF 6.0.1+ で消えた
+`use_dma2d` フラグのガード — **いずれも IDF6 専用の話**で、IDF 5.4 の registry 版
+(より新しい 0.2.27 / 0.2.20)には不要。今回は 1 行も vendor していない。
+
+ELF 確認: `lgfx::v1::Panel_ST7123` / `Touch_ST7123` / `Touch_GT911` /
+`m5::PI4IOE5V6408_Class` / `m5::Power_Class::setExtOutput` がリンクされている
+(= Tab5 のパネル・タッチ・電源系は M5GFX/M5Unified 側が持っている)。
+
+#### LVGL ポートの構成(`main/display_gfx.{hpp,cpp}`、新規)
+
+`esp_lvgl_port` は使わず、必要最小限を自前で持つ(約 190 行):
+
+- **tick**: `lv_tick_set_cb(esp_timer_get_time()/1000)`。1ms 周期タイマは立てない
+  (取りこぼしに強く、タイマ 1 本節約できる)。
+- **display**: `lv_display_create(1280, 720)` + `LV_COLOR_FORMAT_RGB565` +
+  `lv_display_set_buffers(buf1, buf2, ..., LV_DISPLAY_RENDER_MODE_PARTIAL)`。
+  バッファは **画面の 1/10(1280x72x2B = 184,320B)を 2 枚、PSRAM
+  (`MALLOC_CAP_SPIRAM`)**。DSI は M5GFX 内部のフレームバッファへ書き込む形なので
+  描画バッファ側に DMA 可能性の要求は無い。内蔵 RAM は pump の静的スタック 128KB と
+  OT/lwIP/mbedTLS に残す(BSP 経路では内蔵 RAM から 216KB 取られていた)。
+- **flush_cb**: `M5.Display.startWrite() / setAddrWindow(x,y,w,h) /
+  writePixels((const lgfx::rgb565_t*)px_map, w*h) / endWrite()` →
+  `lv_display_flush_ready()`。**型付き `writePixels`** を使うのがポイントで、
+  `swap` 引数を取り違えて RGB565 のバイト順が壊れる事故を避けられる。
+- **indev**: `LV_INDEV_TYPE_POINTER` + `M5.Display.getTouch(&x,&y)`。
+  **M5GFX は `setRotation()` を反映した画面座標を返す**ので、T1 で必要だった
+  回転シムは丸ごと不要(§9.3 の罠 1 が消滅)。
+- **タスク**: `"lvgl"`(stack 10KB、prio 4)が再帰 mutex を取って `lv_timer_handler()`。
+- **ロック API**: `sm_display_lock(timeout_ms)` / `sm_display_unlock()`
+  (`bsp_display_lock` / `bsp_display_unlock` の置き換え。0 = 無限待ち)。
+
+#### 起動順序(ここが最重要。§9.4 の 2 つの罠と両立させる)
+
+```
+nvs / netif / event loop
+  → sm_display_hw_init()   = M5.begin()  … PORT.A 5V ON + MIPI-DSI パネル + タッチ
+  → vTaskDelay(500ms)                    … H2(ot_rcp)のブート待ち
+  → sm_ctrl_pump_start() + role>=detached 待ち … spinel 同期
+  → sm_display_lvgl_start()              … LVGL 初期化 + 描画開始
+  → sm_ui_create()
+```
+
+**なぜ `M5.begin()` だけ前倒しなのか**: `Power_Class::begin()` は Tab5 の
+IO エキスパンダ #0(PI4IOE5V6408 @0x43)へ `OUT_SET=0b01110000` を書く。この値の
+bit2 = **EXT5V_EN が 0**、つまり **`M5.begin()` は PORT.A の 5V を一瞬切る**
+(直後の `Power.setExtOutput(cfg.output_power)` で戻る)。5V は H2(RCP)の電源
+そのものなので、spinel 同期後に `M5.begin()` を呼ぶと H2 が再起動して spinel が死ぬ。
+一方 §9.4 の「表示の初期描画中に spinel を開くと RX 取りこぼしで assert ループ」は
+**LVGL の描画**が原因なので、パネル init(前)と LVGL(後)に分割すれば両立する。
+
+#### 削除したもの
+
+- managed component: `espressif/m5stack_tab5`(+ 芋づるの `esp_lvgl_port` /
+  `esp_lcd_ili9881c` / `esp_lcd_touch_*` / `esp_video` / `esp_codec_dev` / `usb` 等 23 個)。
+- `main.cpp` の `enable_ext_5v()`(手動 IO エキスパンダ操作)。**M5Unified が
+  `Power.begin()` + `setExtOutput(cfg.output_power=true)` で同一ビット(@0x43 P2)を
+  保証する**ので削除した(判断根拠: `utility/Power_Class.cpp` の
+  `board_M5Tab5` 分岐が `ioe.setPullMode(2,en)` / `ioe.digitalWrite(2,en)` を叩く)。
+- `main.cpp` の `rotated_touch_read()` / `install_touch_rotation()`(タッチ回転シム)。
+- Kconfig: `SM_UI_ROTATION` / `SM_UI_TOUCH_MIRROR_X` / `SM_UI_TOUCH_MIRROR_Y`
+  (回転は `display_gfx.cpp` の `setRotation(1)` 固定。上下逆なら 3)。
+  これに伴い `sdkconfig.local` は**空**にした。
+- sdkconfig: `CONFIG_BSP_LCD_DRAW_BUF_HEIGHT` / `CONFIG_BSP_LCD_DRAW_BUF_DOUBLE` /
+  `CONFIG_CAM_CTRL_SPI_ENABLE` / `CONFIG_CODEC_I2C_BACKWARD_COMPATIBLE`(BSP 由来)。
+  LVGL の `CONFIG_LV_*` は BSP ではなく lvgl 自身の Kconfig なのでそのまま残し、
+  `CONFIG_LV_DEF_REFR_PERIOD=16` を明示。
+
+`ui.cpp` / `app_state.*` / `ctrl_pump.*` / `node_book.*` / `ot_hub.*` は**無変更**
+(`ui.cpp` は元々 `bsp_*` を 1 つも呼んでいなかった)。
+
+#### ゲート実測(T1b)
+
+1. docker `espressif/idf:release-v5.4`、`rm -f sdkconfig` →
+   `-DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.local" set-target esp32p4` →
+   `build` = **Project build complete**、app **0x1949b0 = 1,657,776 B**
+   (4MB パーティションの 60% free。BSP 版 1,627,200 B から +30KB)。
+   text 1,643,932 / data 13,209 / bss 1,477,829。
+   ELF: `T lv_*` **750 本**(`lv_display_create` / `lv_indev_create` /
+   `lv_tick_set_cb` / `lv_qrcode_create` / `lv_keyboard_create` 確認)、
+   `T sm_ctrl_*` **14 本**、`sm_display_hw_init` / `sm_display_lvgl_start` /
+   `sm_display_lock`、M5GFX 系(`Panel_ST7123` / `Touch_ST7123` / `Touch_GT911` /
+   `PI4IOE5V6408_Class` / `Power_Class::setExtOutput`)。**`bsp_*` シンボルは 0**。
+2. 回帰: `cargo fmt --check` 差分なし、`cargo test --workspace` **656 pass / 0 fail**、
+   `cargo clippy --workspace --all-targets` 警告 0(Rust は無変更)。
+   他 example / `crates/` は 1 行も触っていない。
+3. 実機(表示が出るか)は親の flash 待ち。
+
+#### 実機で見るべき起動ログ
+
+```
+tab5_disp: M5.begin: board=<N> display=1280x720 touch=yes   ← autodetect 結果
+tab5_ctrl: openthread up (role=1); starting lvgl
+tab5_disp: lvgl display 1280x720, draw buf 184320 B x2 (PSRAM)
+tab5_disp: lvgl task started
+tab5_ctrl: display up: 1280x720
+tab5_disp: touch: (x,y)                                     ← 先頭 5 点だけ
+tab5_ctrl: app_main done; ui + pump are running
+```
+
+`board=` が Tab5 として検出されているか(`m5gfx::board_t::board_M5Tab5`)、
+`display=1280x720`(720x1280 なら `setRotation` が効いていない)、
+`touch=yes` の 3 点が最初の判断材料。
+
+#### それでも表示されない場合の切り分け候補
+
+1. `board=` が 0(`board_unknown`)/ `display=0x0` → autodetect 失敗。
+   `cfg.fallback_board` は P4 では既に `board_M5Tab5` なので、その場合は
+   パネル種別ではなく I2C(内部 GPIO31/32)側を疑う。
+2. `M5.begin()` は通るのに黒 → `M5.Display.fillScreen(TFT_RED)` を
+   `sm_display_hw_init()` の末尾に入れて **LVGL 抜きで**赤くなるか見る。
+   赤くなれば LVGL ポート(flush / バッファ)側、黒のままなら M5GFX 側。
+3. 色が壊れる(赤青反転・ノイズ)→ `flush_cb` の
+   `writePixels((const lgfx::rgb565_t*)...)` を
+   `writePixels((const uint16_t*)px_map, w*h, true/false)` に替えて swap を試す。
+4. タッチが効かない / ずれる → `touch:` ログの座標を見る。回転が効いていなければ
+   `setRotation(1)` を 3 に、上下逆なら同じく 3。
+5. H2 が再起動する / spinel が Parse ゴミを吐く → `M5.begin()` と pump の順序
+   (上記「起動順序」)が崩れていないか。最終手段として `M5.begin()` の前に
+   raw I2C で @0x43 の P2 を立てる旧 `enable_ext_5v()` 相当を復活させる
+   (0x03 bit2=1 / 0x07 bit2=0 / 0x05 bit2=1)。
+6. LVGL の描画が重い / tear → 描画バッファを 1/6 程度に増やす
+   (`kDrawBufDiv`)、または `LV_DISPLAY_RENDER_MODE_FULL` + PSRAM 全画面 2 枚を試す。
+
+### 9.6 T1 実機確認完了(2026-08-24)
+
+M5GFX 版(T1b)でユーザ確認済み: 画面表示(1280x720 横)、タッチ操作、
+Devices タブの Toggle で NanoC6 の LED 反転まで動作。autodetect は
+`board=22 display=1280x720 touch=yes`。Espressif BSP(board v2 = ST7123)の
+黒画面は M5GFX への差し替えで解消(バックライトは点くが描画されない症状。
+BSP の v2 パネル対応の問題と推定 — upstream 報告候補)。

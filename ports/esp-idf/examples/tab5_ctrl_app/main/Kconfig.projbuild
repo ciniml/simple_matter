@@ -57,31 +57,6 @@ menu "tab5_ctrl_app configuration"
             Pair ダイアログの NodeId 初期値。既に同じ ID のノードが居る場合は
             +1 して自動採番する(ダイアログ上で編集も可)。
 
-    comment "Display / touch"
-
-    config SM_UI_ROTATION
-        int "Screen rotation in degrees (0/90/180/270)"
-        default 90
-        range 0 270
-        help
-            Tab5 のパネルは MIPI-DSI 720x1280(縦)。既定の 90 で 1280x720 の横向きに
-            なる。上下逆さまに見えるときは 270 にする。
-
-    config SM_UI_TOUCH_MIRROR_X
-        bool "Mirror touch X after rotation"
-        default n
-        help
-            LVGL 9.5 / esp_lvgl_port 2.9 はタッチ座標を画面回転に追従させないため、
-            本アプリが read_cb を包んで変換している(main.cpp)。実機で左右が反転して
-            いたらこれを y にする。
-
-    config SM_UI_TOUCH_MIRROR_Y
-        bool "Mirror touch Y after rotation"
-        default n
-        help
-            上下が反転していたらこれを y にする。起動ログの
-            "touch: panel(x,y) -> screen(x,y)" が判断材料。
-
     config SM_UI_FALLBACK_NODE_ID
         hex "Fallback NodeId when the node book blob cannot be parsed"
         default 0xAABBCCDD

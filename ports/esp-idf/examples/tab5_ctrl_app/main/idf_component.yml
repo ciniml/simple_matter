@@ -1,12 +1,15 @@
-## tab5_ctrl_app の managed component 依存。
+## tab5_ctrl_app の managed component 依存(T1b: 表示層を M5GFX へ差し替え済み)。
 ##
-## M5Stack Tab5 の公式 BSP。MIPI-DSI(ili9881c)+ GT911/ST7123 タッチ +
-## esp_lvgl_port(LVGL9)を一括で面倒見てくれる。BSP が esp_lvgl_port ^2 →
-## lvgl/lvgl ^9 を引くので、LVGL は個別に指定しない。
+## Espressif BSP(espressif/m5stack_tab5 + esp_lvgl_port)は実機 Tab5
+## (board version 2 / ST7123 タッチ)で「初期化ログ正常・バックライト点灯・
+## 画面真っ黒」になったため廃止した。docs/design/p4-thread-controller.md §9.5。
 ##
-## 1.2.0 は idf >= 5.4 を要求する(= espressif/idf:release-v5.4 で解決できる)。
-## BSP は esp_video(カメラ)/ esp_codec_dev(音声)も引くが、本アプリでは使わない
-## (リンクはされるが初期化しない)。
+## m5stack/m5unified が m5stack/m5gfx(>=0.2.27)を引く。M5GFX は Tab5 の
+## MIPI-DSI パネル + タッチ(GT911 / ST7123)+ IO エキスパンダ(PORT.A 5V)を
+## 自前で面倒見るので、BSP 相当は不要。
+##
+## LVGL は BSP 経由ではなくなったので直接指定する(ポートは main/display_gfx.cpp)。
 dependencies:
   idf: ">=5.4"
-  espressif/m5stack_tab5: "~1.2.0"
+  m5stack/m5unified: "^0.2.20"
+  lvgl/lvgl: "^9.2.0"
