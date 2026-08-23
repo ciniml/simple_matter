@@ -114,6 +114,9 @@ idf.py -p /dev/ttyACM0 flash monitor
 - **Thread**: `SM_THREAD_DATASET_TLV_HEX`(空 = 新規ネットワーク生成。NVS 優先)。
 - **Matter**: `SM_TARGET_PORT`(5540)、`SM_UI_DEFAULT_NODE_ID` / `SM_UI_DEFAULT_PASSCODE`
   (Pair ダイアログの初期値)、`SM_UI_FALLBACK_NODE_ID`。
+- **WiFi**(T2、§10): `SM_WIFI_SSID` / `SM_WIFI_PASSWORD`(既定は空 = WiFi 無効・Thread のみ)。
+  基板上の ESP32-C6 を SDIO で使う(`espressif/esp_hosted` 2.x + `esp_wifi_remote`)。
+  C6 の slave FW が esp_hosted 2.x でない個体(工場出荷 V1.4.1 = 1.4.x)では繋がらない。
 - **表示/タッチ**: Kconfig は無い。回転は `main/display_gfx.cpp` の
   `M5.Display.setRotation(1)`(= 1280x720 横。上下逆なら 3)。M5GFX の `getTouch()` は
   回転を反映した画面座標を返すので、旧 `SM_UI_ROTATION` / `SM_UI_TOUCH_MIRROR_X/Y` は廃止した。

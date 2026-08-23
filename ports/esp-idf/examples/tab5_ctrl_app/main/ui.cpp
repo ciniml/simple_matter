@@ -64,6 +64,7 @@ struct Ui {
   lv_obj_t *lbl_thread = nullptr;
   lv_obj_t *lbl_heap = nullptr;
   lv_obj_t *lbl_status = nullptr;
+  lv_obj_t *lbl_wifi = nullptr;
   // Devices タブ
   lv_obj_t *list = nullptr;
   lv_obj_t *lbl_empty = nullptr;
@@ -80,6 +81,7 @@ struct Ui {
   lv_obj_t *ta_ipv6 = nullptr;
   lv_obj_t *ta_node = nullptr;
   lv_obj_t *ta_pass = nullptr;
+  lv_obj_t *dd_via = nullptr; // transport 選択(0=Thread / 1=WiFi)
   lv_obj_t *lbl_pair = nullptr;
   lv_obj_t *kb = nullptr;
   bool pair_open = false;
@@ -150,6 +152,7 @@ void close_pair_dialog() {
     lv_obj_delete(g_ui.modal);
     g_ui.modal = nullptr;
     g_ui.ta_ipv6 = g_ui.ta_node = g_ui.ta_pass = g_ui.lbl_pair = g_ui.kb = nullptr;
+    g_ui.dd_via = nullptr;
   }
   g_ui.pair_open = false;
 }
@@ -207,6 +210,8 @@ void on_pair_start(lv_event_t *) {
   }
   sm_ui_op_t op = {};
   op.kind = SM_UI_OP_PAIR;
+  op.via = (g_ui.dd_via != nullptr && lv_dropdown_get_selected(g_ui.dd_via) == 1) ? SM_UI_VIA_WIFI
+                                                                                 : SM_UI_VIA_THREAD;
   snprintf(op.ipv6, sizeof(op.ipv6), "%s", lv_textarea_get_text(g_ui.ta_ipv6));
   uint64_t node = 0;
   if (!parse_hex_u64(lv_textarea_get_text(g_ui.ta_node), &node) || node == 0) {
@@ -268,10 +273,12 @@ void open_pair_dialog(lv_event_t *) {
   lv_obj_set_style_pad_row(card, 10, 0);
 
   make_label(card, &lv_font_montserrat_24, COL_TEXT,
-             "Pair a Thread device (on-network PASE, no BLE)");
+             "Pair a device (on-network PASE, no BLE)");
   make_label(card, &lv_font_montserrat_14, COL_DIM,
-             "The device must already be attached to this Thread network with a\n"
-             "commissioning window open. Copy its ML-EID / OMR address from its log.");
+             "The device must already be on the selected network with a commissioning\n"
+             "window open. Copy its ML-EID / OMR (Thread) or LAN address (WiFi) from\n"
+             "its log. \"via\" only picks the scope for fe80::/10 targets -- prefer a\n"
+             "routable ULA/GUA for WiFi, since the node book does not persist scopes.");
 
   auto add_field = [&](const char *caption, const char *initial, int32_t width) {
     lv_obj_t *row = lv_obj_create(card);
@@ -299,6 +306,18 @@ void open_pair_dialog(lv_event_t *) {
   char pcbuf[16];
   snprintf(pcbuf, sizeof(pcbuf), "%d", CONFIG_SM_UI_DEFAULT_PASSCODE);
   g_ui.ta_pass = add_field("Passcode", pcbuf, 240);
+
+  // transport 選択(§10.3 の 6)。Passcode と同じ行に相乗りさせてカード高を保つ。
+  {
+    lv_obj_t *row = lv_obj_get_parent(g_ui.ta_pass);
+    lv_obj_t *cap = make_label(row, &lv_font_montserrat_20, COL_DIM, "via");
+    lv_obj_set_width(cap, 60);
+    g_ui.dd_via = lv_dropdown_create(row);
+    lv_dropdown_set_options_static(g_ui.dd_via, "Thread\nWiFi");
+    lv_dropdown_set_selected(g_ui.dd_via, 0); // 既定は Thread
+    lv_obj_set_size(g_ui.dd_via, 240, BTN_H);
+    lv_obj_set_style_text_font(g_ui.dd_via, &lv_font_montserrat_20, 0);
+  }
 
   lv_obj_t *btns = lv_obj_create(card);
   lv_obj_remove_style_all(btns);
@@ -389,6 +408,30 @@ void refresh_status_bar() {
                         (unsigned)(g_snap.free_internal_min / 1024),
                         (unsigned)(g_snap.free_psram / 1024));
   lv_label_set_text(g_ui.lbl_status, g_snap.status);
+
+  // WiFi 1 項目(off / connecting / SSID + LL の有無)。
+  switch (g_snap.wifi_state) {
+  case 1:
+    lv_label_set_text_fmt(g_ui.lbl_wifi, "WiFi connecting (%s)",
+                          g_snap.wifi_ssid[0] ? g_snap.wifi_ssid : "-");
+    lv_obj_set_style_text_color(g_ui.lbl_wifi, lv_color_hex(COL_WARN), 0);
+    break;
+  case 2:
+    lv_label_set_text_fmt(g_ui.lbl_wifi, "WiFi %s  if=%u  %s",
+                          g_snap.wifi_ssid[0] ? g_snap.wifi_ssid : "-",
+                          (unsigned)g_snap.wifi_netif,
+                          g_snap.wifi_ll[0] ? "LL ok" : "no LL");
+    lv_obj_set_style_text_color(g_ui.lbl_wifi, lv_color_hex(COL_ON), 0);
+    break;
+  case 3:
+    lv_label_set_text(g_ui.lbl_wifi, "WiFi failed (C6 / SDIO)");
+    lv_obj_set_style_text_color(g_ui.lbl_wifi, lv_color_hex(COL_WARN), 0);
+    break;
+  default:
+    lv_label_set_text(g_ui.lbl_wifi, "WiFi off");
+    lv_obj_set_style_text_color(g_ui.lbl_wifi, lv_color_hex(COL_DIM), 0);
+    break;
+  }
 }
 
 bool node_set_changed() {
@@ -522,7 +565,9 @@ void sm_ui_create() {
   g_ui.lbl_status = make_label(bar, &lv_font_montserrat_16, COL_ACCENT, "booting ...");
   lv_obj_align(g_ui.lbl_status, LV_ALIGN_BOTTOM_LEFT, 0, 0);
   lv_label_set_long_mode(g_ui.lbl_status, LV_LABEL_LONG_DOT);
-  lv_obj_set_width(g_ui.lbl_status, g_scr_w - 40);
+  lv_obj_set_width(g_ui.lbl_status, g_scr_w - 460);
+  g_ui.lbl_wifi = make_label(bar, &lv_font_montserrat_16, COL_DIM, "WiFi off");
+  lv_obj_align(g_ui.lbl_wifi, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
 
   // --- 2. タブ ---
   lv_obj_t *tv = lv_tabview_create(scr);

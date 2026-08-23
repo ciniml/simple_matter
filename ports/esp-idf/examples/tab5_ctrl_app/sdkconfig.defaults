@@ -87,3 +87,35 @@ CONFIG_LV_USE_TEXTAREA=y
 
 # 自前ポートは lv_tick_set_cb(esp_timer)を使うので LVGL 内蔵 tick は不要。
 CONFIG_LV_DEF_REFR_PERIOD=16
+
+# --- WiFi(T2、§10): 基板上の ESP32-C6 を SDIO 経由で使う ---------------------
+#
+# 以下の hosted/SDIO 設定は参照プロジェクト `~/repos/tab5_claude_client` の
+# `sdkconfig.defaults.esp32p4`(同一個体の Tab5 で WiFi 実証済み)からの転記。
+# ピン割当は M5Tab5-UserDemo の既定と同じ。
+CONFIG_ESP_HOSTED_ENABLED=y
+CONFIG_ESP_HOSTED_IDF_SLAVE_TARGET="esp32c6"
+CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
+# CONFIG_ESP_HOSTED_SPI_HOST_INTERFACE is not set
+CONFIG_ESP_HOSTED_SDIO_4_BIT_BUS=y
+# CONFIG_ESP_HOSTED_SDIO_1_BIT_BUS is not set
+# reset の極性: Tab5 の GPIO15 は C6 の CHIP_EN(HIGH = run / LOW = reset)。
+# esp_hosted 2.x の reset_slave は X -> !X -> X で、終了時にピンを "ACTIVE" 側に
+# 残す。よって「ACTIVE = HIGH」と教えると波形が HIGH -> LOW -> HIGH になり、
+# sdmmc_card_init の CMD5 が通る状態(= C6 が走っている)で抜けられる。
+# 名前の上では「active low reset」の慣習と逆だが、実機ではこちらが正しい。
+# CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_LOW is not set
+CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_HIGH=y
+CONFIG_ESP_HOSTED_SDIO_OPTIMIZATION_RX_STREAMING_MODE=y
+CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE=15
+# 実際のピン割当(slot 1、4-bit)。CONFIG_ESP_HOSTED_SDIO_PIN_* は
+# これらから計算される Kconfig 値なので、書くのは PRIV_ の方。
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_CMD_SLOT_1=13
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_CLK_SLOT_1=12
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D0_SLOT_1=11
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D1_4BIT_BUS_SLOT_1=10
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D2_4BIT_BUS_SLOT_1=9
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D3_4BIT_BUS_SLOT_1=8
+# SDIO クロックは 40MHz 既定から 20MHz へ落とす(参照 repo で 40MHz は CMD5 が
+# 繰り返しタイムアウトした)。リンクが安定していると確認できたら戻してよい。
+CONFIG_ESP_HOSTED_SDIO_CLOCK_FREQ_KHZ=20000

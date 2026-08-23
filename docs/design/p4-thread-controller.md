@@ -563,3 +563,210 @@ Devices タブの Toggle で NanoC6 の LED 反転まで動作。autodetect は
 `board=22 display=1280x720 touch=yes`。Espressif BSP(board v2 = ST7123)の
 黒画面は M5GFX への差し替えで解消(バックライトは点くが描画されない症状。
 BSP の v2 パネル対応の問題と推定 — upstream 報告候補)。
+
+## 10. T2: WiFi コミッショニング(AirQ 等の WiFi デバイスを Tab5 から)
+
+Status: 設計(2026-08-24)。T1(§9)完動を受けて、Tab5 コントローラから
+**WiFi LAN 上の Matter デバイス**(例: AirQ = onoff_light_cpp、現在は smctl の
+fabric)を on-network PASE でコミッショニングできるようにする。
+
+### 10.1 方式
+
+- Tab5 の P4 は radio 非搭載。WiFi は**基板上の ESP32-C6 を SDIO 経由で使う**
+  (`espressif/esp_hosted` + `espressif/esp_wifi_remote`。標準 `esp_wifi_*` API が
+  C6 に透過転送される)。BLE コミッショニングはスコープ外(v1 は on-network のみ。
+  デバイス側は WiFi 参加済み or factory data で WiFi 資格情報プリセットが前提)。
+- lwIP に WiFi STA netif が生えれば、pump の UDP ソケットは **wildcard bind 済み**
+  なので送受信はそのまま両 netif で通る。必要なのは
+  (a) WiFi bringup、(b) リンクローカル宛 `sin6_scope_id` の netif 選択、
+  (c) UI(Pair ダイアログの transport 選択 + WiFi 状態表示)の 3 点。
+
+### 10.2 前提(このユニット固有。最重要)
+
+- **C6 の slave FW は esp_hosted 2.12.7 系に焼き替え済み**(同一個体で
+  `~/repos/tab5_claude_client` が実証。工場出荷 V1.4.1 = hosted 1.4.x とは
+  プロトコル非互換)。よって **host も esp_hosted 2.x 系で合わせる**(`^2.12.7`)。
+  参照は IDF 6.0 だったが本 repo は **IDF 5.4.4 のまま**。2.x host が 5.4 で
+  解決・ビルドできるかが最初の検証点(できない場合は版を下げるか、判断を持ち帰る)。
+- SDIO 設定は参照 repo の `sdkconfig.defaults.esp32p4` を正とする:
+  4-bit / CLK=GPIO12 / CMD=13 / D0..D3=11,10,9,8 / **reset=GPIO15 ACTIVE_HIGH** /
+  clock 20MHz / RX streaming mode。
+- **C6 の電源は IO エキスパンダ #2(PI4IOE5V6408 @0x44)bit0 を High**にして入れる
+  (参照 repo `main/wifi_setup.cpp`)。M5Unified の `Power_Class` が保証するかは
+  未確認 → 保証が確認できなければ raw I2C で明示的に立てる(§9.4 の @0x43 P2 と同じ流儀)。
+- WiFi 資格情報は Kconfig(`SM_WIFI_SSID` / `SM_WIFI_PASSWORD`。SSID 空 = WiFi 無効)。
+
+### 10.3 実装項目
+
+1. `main/idf_component.yml`: `espressif/esp_hosted` + `espressif/esp_wifi_remote` 追加。
+2. `sdkconfig.defaults`: 上記 SDIO / hosted 設定(esp32p4 のみの example なので直書きで可)。
+3. **新規 `main/wifi_sta.{hpp,cpp}`**: hosted 初期化 + STA 接続(creds は Kconfig)、
+   IPv6 リンクローカル生成(`esp_netif_create_ip6_linklocal`)、
+   `sm_wifi_netif_index()` / `sm_wifi_status()`(SSID / 接続状態 / LL アドレス)を公開。
+   接続はイベント駆動・ノンブロッキング(UI を待たせない。再接続リトライつき)。
+4. **起動順序**: `M5.begin()` → H2 待ち → spinel 同期(role>=detached)→
+   **WiFi bringup 開始**(完了は待たない)→ LVGL → UI。
+   SDIO は UART54/53 と無関係だが、§9.4 の 2 罠(5V 断 / spinel RX 取りこぼし)を
+   避けるため spinel 同期後に置く。
+5. `ctrl_pump.cpp`:
+   - `sm_ui_op_t` に `via`(0=Thread / 1=WiFi)を追加。`do_pair` は LL 宛のとき
+     `addr.scope_id` を選択された netif index にする(グローバル/ULA 宛は 0 のままで可)。
+   - `send_sm` の fallback: `dst.scope_id==0` かつ宛先が `fe80::/10` のときの既定は
+     従来どおり OT netif。ノード帳由来のアドレスは scope_id を保持している前提だが、
+     リブート後に netif index が変わり得る点はエージェントが nodes.tlv 仕様
+     (`crates/simple-matter/src/controller/nodes.rs`)を確認して対処を記録する。
+   - `REFRESH_ADDR` は SRP 列挙(Thread のみ)。WiFi ノードが SRP に居ない場合は
+     "not in SRP" を note に出すだけで良い(mDNS operational resolve は T2b、今回はやらない)。
+6. `ui.cpp`: Pair ダイアログに transport 選択(Thread / WiFi の 2 択、既定 Thread)。
+   ステータスバーに WiFi 状態(SSID or off / LL アドレス有無)を 1 項目追加。
+   `app_state.hpp` のスナップショットに WiFi 状態フィールドを追加。
+7. コア(`crates/`)・シム・他 example は**変更ゼロ**を維持する。
+
+### 10.4 ゲート
+
+1. docker `espressif/idf:release-v5.4` esp32p4 ビルド green(managed component の
+   解決を含む。hosted 2.x が 5.4 で解決しない場合はその事実と選択肢を記録して停止)。
+2. 回帰: `thread_ctrl_hub_cpp` esp32p4 ビルド green。Rust 無変更なら cargo 系は省略可。
+3. 実機(親/ユーザ): AirQ を factory reset(または open-window)→ Tab5 の WiFi が
+   LAN に接続 → Pair ダイアログ(via=WiFi、AirQ の LL or LAN IPv6 + passcode)→
+   PAIR COMPLETE → Toggle で AirQ の LED 反転 → 再起動後 resumption。
+
+### 10.5 実装記録(T2、2026-08-24)
+
+ビルドゲート(§10.4 の 1 と 2)は green。実機(§10.4 の 3)は親/ユーザ待ち。
+
+#### 版数確定(IDF 5.4.4 のままで解決した)
+
+`espressif/idf:release-v5.4`(v5.4.4)を上げる必要は無かった。`dependencies.lock`:
+
+| component | 確定版 | manifest 指定 | 備考 |
+|---|---|---|---|
+| `espressif/esp_hosted` | **2.12.12** | `^2.12.7` | idf 要件は `>=5.3`。2.12 系のまま |
+| `espressif/esp_wifi_remote` | **1.6.4** | `^1.5.1` | 同じく `>=5.3`。IDF 版別ディレクトリ `idf_v5.4/` を持つ |
+| `espressif/esp_serial_slave_link` | 1.1.2 | (芋づる) | SDIO slave link |
+| `espressif/eppp_link` / `wifi_remote_over_eppp` | 1.1.6 / 0.3.3 | (芋づる) | 使わないがリンク対象 |
+| idf | 5.4.4 | `>=5.4` | 変更なし |
+
+`esp_hosted` 3.x は `idf >= 5.5` なので自動的に除外される(`^2.12.7` 指定でも
+到達しない)。**C6 の slave FW が 2.12.7 系に焼かれている前提**(§10.2)と整合する。
+
+#### 追加 / 変更ファイル(`ports/esp-idf/examples/tab5_ctrl_app/` のみ)
+
+- **新規** `main/wifi_sta.{hpp,cpp}`(約 240 行)。公開 API は `sm_wifi_start()` /
+  `sm_wifi_netif_index()` / `sm_wifi_get_status()` の 3 本。
+- `main/idf_component.yml`: `espressif/esp_hosted ^2.12.7` + `espressif/esp_wifi_remote ^1.5.1`。
+- `main/CMakeLists.txt`: `wifi_sta.cpp` 追加 + REQUIRES に **`esp_wifi`**。
+- `sdkconfig.defaults`: hosted/SDIO 一式(参照 repo `~/repos/tab5_claude_client`
+  `sdkconfig.defaults.esp32p4` からの転記であることをコメントに明記)。
+- `main/Kconfig.projbuild`: `SM_WIFI_SSID` / `SM_WIFI_PASSWORD`(string、既定空)。
+- `main/app_state.hpp`: `sm_ui_op_t.via`(`sm_ui_via_t`: 0=Thread / 1=WiFi)+
+  スナップショットに `wifi_state` / `wifi_ssid` / `wifi_ll` / `wifi_ip4` / `wifi_netif`。
+- `main/ctrl_pump.cpp`: `refresh_wifi_status()`(2 秒周期でスナップショットへ写す)+
+  `do_pair` の scope_id 選択。
+- `main/main.cpp`: spinel 同期の**後**・LVGL の**前**に `sm_wifi_start()`(完了は待たない)。
+- `main/ui.cpp`: Pair ダイアログの `via` ドロップダウン(Thread/WiFi、既定 Thread。
+  Passcode と同じ行に相乗りさせてカード高を維持)+ ステータスバー右下の WiFi 1 項目。
+- `README.md`: 設定節に WiFi の 1 項目。
+- **`crates/` / シム / 他 example は 1 行も触っていない**。
+
+#### 起動順序(§9.4 / §9.5 の不変条件を維持)
+
+```
+M5.begin()  → 500ms → pump(spinel 同期、role>=detached 待ち)
+            → sm_wifi_start()      … ここ。ノンブロッキング
+            → LVGL → UI
+```
+
+`sm_wifi_start()` は「SSID が空なら即 return」「そうでなければ `wifi_up` タスク
+(6KB)を起こして戻る」だけ。C6 の電源確認 → `esp_wifi_init` → `esp_wifi_start` は
+そのタスクの中で走り、接続完了はイベント(`IP_EVENT_STA_GOT_IP` / `GOT_IP6`)で拾う。
+**app_main も LVGL も待たない**。
+
+#### C6 の電源(@0x44 bit0 = WLAN_PWR_EN)— M5Unified が既に立てている
+
+`managed_components/m5stack__m5unified/src/utility/Power_Class.cpp` の
+`board_M5Tab5` 分岐は、IO エキスパンダ #2(PI4IOE5V6408 @0x44)へ
+`OUT_SET = 0b10000001` / `IO_DIR = 0b10110001` を書く。**bit0 = WLAN_PWR_EN が 1**
+なので、`M5.begin()` の時点で C6 の電源は入っている(@0x43 の EXT5V_EN = PORT.A 5V と
+同じ流儀)。よって raw I2C での再設定は不要と判断したが、`M5.begin()` が失敗した
+個体でも黙って死なないよう、`ensure_c6_power()` で **読み戻して 0 のときだけ**
+明示的に立てる(立て直した場合のみ 1500ms の C6 ブート待ちを入れる)。
+`M5.In_I2C` を使うので M5Unified のバス設定と食い違わない。
+
+なお参照 repo は「off → 300ms → on → 1500ms」の強制電源サイクルをしていたが、
+本 repo では (a) `M5.begin()` から spinel 同期(実測 2.1s)分の余裕があること、
+(b) esp_hosted が GPIO15(C6 の CHIP_EN)を reset パルスで叩くこと、から
+既定では行わない。**実機で CMD5 / op_cond がタイムアウトするなら、ここに参照 repo と
+同じ強制電源サイクルを足すのが最初の手**(ただし LVGL のタッチも `M5.In_I2C` を
+使うので、LVGL 開始前に済ませること)。
+
+#### `via` と scope_id の扱い(§10.3 の 5)
+
+`do_pair` は入力アドレスが **`fe80::/10` のときだけ** `scope_id` を設定する
+(`via` = Thread なら `sm_ot_hub_netif_index()`、WiFi なら `sm_wifi_netif_index()`)。
+ULA / グローバル宛(Thread の OMR、WiFi の GUA/ULA)は **`scope_id = 0` のまま**で
+lwIP の経路選択に任せる。選んだ netif がまだ上がっていなければ pairing を始めずに
+`pair_state = 3` + ステータス行でその旨を出す。`send_sm` の fallback
+(`scope_id==0` の LL 宛 → OT netif)は**現状維持**。
+
+#### nodes.tlv は scope_id を保存しない(リブート後の netif index ずれ)
+
+`crates/simple-matter/src/controller/nodes.rs` の v1 フォーマットは 1 エントリあたり
+`node_id` / `label` / **IP バイト列(4 or 16)** / `port` だけで、
+`decode_entry` は `SocketAddr::new(ip, port)` を組む = **`scope_id` は 0 に落ちる**
+(`encode_nodes` も `ip.octets()` しか書かない)。つまり:
+
+- **リンクローカル(`fe80::`)でコミッショニングしたノードは、リブート後に
+  `scope_id = 0` で復元される** → `send_sm` の fallback で **OT netif** 宛になる。
+  Thread ノードなら正しいが、**WiFi ノードだと宛先が壊れる**。
+- ULA / グローバル宛(Thread OMR、WiFi の GUA/ULA)は scope が要らないので**実害なし**。
+
+対処は「WiFi デバイスは LL ではなく LAN の GUA/ULA でコミッショニングする」を
+運用の既定にすること(Pair ダイアログの説明文にもその旨を書いた)。恒久対処は
+(a) nodes.tlv v2 で scope_id を持つ、(b) C++ 側で「WiFi 由来の NodeId」を別 KVS に
+覚えて起動時に `sm_ctrl_set_node_addr` で scope 付きに直す、(c) mDNS operational
+resolve(T2b)で毎回引き直す、のいずれか。**今回は (c) の前段として "not in SRP" を
+note に出すところまで**(`REFRESH_ADDR` は SRP 列挙のまま = Thread 専用)。
+
+#### ゲート実測
+
+1. docker `espressif/idf:release-v5.4`、経路 (b) cargo、`rm -f sdkconfig` →
+   `-DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.local" set-target esp32p4` →
+   `build` = **Project build complete**、app **0x1d5870 = 1,923,184 B**
+   (4MB パーティションの 54% free。T1b の 1,657,776 B から **+265,408 B** = hosted /
+   wifi_remote / protobuf-c RPC の分)。text 1,908,664 / data 14,397 / bss 1,609,803。
+   ELF: `sm_wifi_start()` / `sm_wifi_netif_index()` / `sm_wifi_get_status()`、
+   `T esp_hosted_*` 12 本(`esp_hosted_init` / `esp_hosted_get_default_sdio_config` ほか)、
+   `sdmmc_card_init`、`rpc__*` 1125 本、`T sm_ctrl_*` 14 本、`T lv_*` 751 本。
+2. 追加確認(**下記の罠 1 のため必須**): `CONFIG_SM_WIFI_SSID="testssid"` を足した
+   別ビルドで green、app **約 1,937,700 B**(+14.5KB)。ELF に `(anonymous namespace)::wifi_task`、
+   `esp_netif_create_default_wifi_sta` / `esp_netif_create_ip6_linklocal`、
+   `W esp_wifi_init` / `W esp_wifi_connect`(esp_hosted の
+   `host/api/src/esp_wifi_weak.c`)→ `T esp_wifi_remote_init` / `_connect` /
+   `_set_mode` / `_set_config` / `_start` に解決。`CONFIG_ESP_WIFI_REMOTE_LIBRARY_HOSTED=1`。
+3. 回帰: `thread_ctrl_hub_cpp` esp32p4 build green(app **1,022,048 B**)。
+   Rust は無変更なので cargo 系は省略(§10.4 の 2 の但し書き)。
+
+#### 発見した罠(次に触る人へ)
+
+1. **既定(SSID 空)ビルドでは WiFi のコードが丸ごと GC される**。`CONFIG_SM_WIFI_SSID`
+   は文字列マクロなので `CONFIG_SM_WIFI_SSID[0] == '\0'` は**コンパイル時定数**、
+   `sm_wifi_start()` の早期 return 以降(`wifi_task` / `esp_wifi_init` 呼び出し)が
+   `-ffunction-sections` + `--gc-sections` で消える。**既定ビルドの ELF に
+   `esp_wifi_init` が居ないのは正常**で、リンク可能性を確かめたければ SSID を入れた
+   ビルドを別に回す必要がある(上のゲート 2)。flash 節約としては望ましい挙動だが、
+   hosted / wifi_remote 自体は SSID の有無に関わらずリンクされる(+265,408 B)。
+2. **`main` の REQUIRES に `esp_wifi` が要る**。`esp_wifi_remote` は自分の
+   `include/` に `esp_wifi.h` を持っておらず、**IDF 内蔵 `esp_wifi` コンポーネントの
+   include ディレクトリに `idf_v5.4/include/injected/` を前置する**形で差し込む
+   (`esp_wifi_remote/CMakeLists.txt` の `set_target_properties(... INTERFACE_INCLUDE_DIRECTORIES)`)。
+   managed component を manifest に足しただけでは `esp_wifi.h: No such file or directory`。
+3. **`esp_wifi_*` は esp_hosted の weak シンボル経由**。`nm` で `W esp_wifi_init`
+   (8 バイト)しか見えないのが正しい姿で、中身は `esp_wifi_remote_init` への
+   テールコール。`T esp_wifi_init` を探しても見つからないので驚かないこと。
+4. **`esp_wifi_connect()` を `WIFI_EVENT_STA_DISCONNECTED` ハンドラから呼ばない**。
+   既定イベントループのタスクには OT / IP のイベントも乗っているので、リトライの
+   バックオフを `vTaskDelay` で入れるとそこが詰まる。本実装ではハンドラは状態を
+   書くだけにして、再接続は `wifi_up` タスクの 5 秒周期監視ループに任せている。
+5. `IP_EVENT_GOT_IP6` は **OT netif でも飛ぶ**。`ev->esp_netif != g_netif` で
+   弾かないと Thread の LL アドレスを WiFi のものとして表示してしまう。

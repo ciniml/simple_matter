@@ -18,6 +18,7 @@
 #include "ctrl_pump.hpp"
 #include "display_gfx.hpp"
 #include "ui.hpp"
+#include "wifi_sta.hpp"
 
 #include "esp_event.h"
 #include "esp_log.h"
@@ -77,6 +78,13 @@ extern "C" void app_main(void) {
     }
     vTaskDelay(pdMS_TO_TICKS(100));
   }
+
+  // --- 2.5 WiFi(基板上の C6 / SDIO)を起動する。完了は待たない ---
+  //
+  // spinel 同期の **後**、LVGL の **前**(§10.3 の 4)。SDIO は PORT.A の
+  // UART54/53 とは無関係だが、§9.4 の 2 罠(PORT.A 5V 断 / spinel RX 取りこぼし)を
+  // 避けるため OT が立ってからにする。SSID 未設定なら即 return する。
+  sm_wifi_start();
 
   // --- 3. LVGL(display + touch indev + LVGL タスク)---
   lv_display_t *disp = sm_display_lvgl_start();

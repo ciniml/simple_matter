@@ -18,6 +18,7 @@
 #include "app_state.hpp"
 #include "node_book.hpp"
 #include "ot_hub.hpp"
+#include "wifi_sta.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -401,6 +402,19 @@ void refresh_thread_status() {
   sm_app_unlock();
 }
 
+// WiFi の状態をスナップショットへ写す(UI は wifi_sta.hpp を直接見ない)。
+void refresh_wifi_status() {
+  sm_wifi_status_t w = {};
+  sm_wifi_get_status(&w);
+  sm_ui_snapshot_t *s = sm_app_lock();
+  s->wifi_state = w.state;
+  memcpy(s->wifi_ssid, w.ssid, sizeof(s->wifi_ssid));
+  memcpy(s->wifi_ll, w.ll_addr, sizeof(s->wifi_ll));
+  memcpy(s->wifi_ip4, w.ip4, sizeof(s->wifi_ip4));
+  s->wifi_netif = w.netif_index;
+  sm_app_unlock();
+}
+
 // ---- 操作ハンドラ ----
 
 // quiet = 周期ポーリング(ステータス行を汚さない)。timeout_ms は CASE 込みの上限。
@@ -486,7 +500,23 @@ void do_pair(const sm_ui_op_t &op) {
     return;
   }
   addr.port = CONFIG_SM_TARGET_PORT;
-  addr.scope_id = sm_ot_hub_netif_index();
+
+  // scope_id はリンクローカル(fe80::/10)宛のときだけ意味を持つ。
+  // ULA / グローバル宛は 0 のままにして lwIP の経路選択に任せる
+  // (Thread の OMR も WiFi の GUA/ULA もこちら)。
+  const bool is_ll = (addr.ip[0] == 0xfe) && ((addr.ip[1] & 0xc0) == 0x80);
+  const bool via_wifi = (op.via == SM_UI_VIA_WIFI);
+  if (is_ll) {
+    addr.scope_id = via_wifi ? sm_wifi_netif_index() : sm_ot_hub_netif_index();
+    if (addr.scope_id == 0) {
+      sm_ui_snapshot_t *s = sm_app_lock();
+      s->pair_state = 3;
+      sm_app_unlock();
+      sm_app_set_status("pair: the %s netif is not up (link-local target needs a scope)",
+                        via_wifi ? "WiFi" : "Thread");
+      return;
+    }
+  }
 
   {
     sm_ui_snapshot_t *s = sm_app_lock();
@@ -494,8 +524,9 @@ void do_pair(const sm_ui_op_t &op) {
     s->pair_phase = 0;
     sm_app_unlock();
   }
-  sm_app_set_status("pairing %016llx at [%s]:%d ...", (unsigned long long)op.node_id, op.ipv6,
-                    CONFIG_SM_TARGET_PORT);
+  sm_app_set_status("pairing %016llx at [%s]:%d via %s%s ...", (unsigned long long)op.node_id,
+                    op.ipv6, CONFIG_SM_TARGET_PORT, via_wifi ? "WiFi" : "Thread",
+                    is_ll ? " (link-local)" : "");
 
   if (sm_ctrl_pair_start(op.node_id, op.passcode, &addr, now_ms()) != 0) {
     sm_ui_snapshot_t *s = sm_app_lock();
@@ -640,6 +671,7 @@ void pump_task(void *) {
     if (now >= next_status) {
       next_status = now + 2000;
       refresh_thread_status();
+      refresh_wifi_status();
       if (sm_ctrl_node_count() != 0) {
         sm_ui_snapshot_t *s = sm_app_lock();
         size_t shown = s->node_count;

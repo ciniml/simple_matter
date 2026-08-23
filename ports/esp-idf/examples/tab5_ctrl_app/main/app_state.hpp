@@ -26,11 +26,19 @@ enum sm_ui_op_kind_t : uint8_t {
   SM_UI_OP_REFRESH_ADDR = 3 // SRP 列挙 → sm_ctrl_set_node_addr
 };
 
+// PAIR の転送路(§10.3 の 5)。リンクローカル宛の sin6_scope_id をどちらの
+// netif にするかだけの違いで、グローバル / ULA 宛では効かない。
+enum sm_ui_via_t : uint8_t {
+  SM_UI_VIA_THREAD = 0,
+  SM_UI_VIA_WIFI = 1
+};
+
 struct sm_ui_op_t {
   sm_ui_op_kind_t kind;
   uint64_t node_id;
   uint32_t passcode; // PAIR のみ
   char ipv6[46];     // PAIR のみ(NUL 終端の IPv6 リテラル)
+  uint8_t via;       // PAIR のみ(sm_ui_via_t。既定 = Thread)
 };
 
 // ノード 1 件の表示状態。
@@ -60,6 +68,13 @@ struct sm_ui_snapshot_t {
   bool ctrl_ready;
   size_t node_count;
   sm_ui_node_t nodes[SM_UI_MAX_NODES];
+
+  // --- WiFi(T2、§10。pump が sm_wifi_get_status() をコピーする)---
+  uint8_t wifi_state;    // sm_wifi_state_t: 0=off 1=connecting 2=connected 3=failed
+  char wifi_ssid[33];    //
+  char wifi_ll[46];      // リンクローカル(未取得なら "")
+  char wifi_ip4[16];     // IPv4(未取得なら "")
+  uint32_t wifi_netif;   // lwIP netif index(0 = 未確立)
 
   // --- pairing ---
   uint8_t pair_state; // 0=idle 1=進行中 2=成功 3=失敗

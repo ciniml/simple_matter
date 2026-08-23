@@ -38,6 +38,20 @@ menu "tab5_ctrl_app configuration"
             (生成された TLV は起動ログと画面の Network タブに出る)。
             NVS に保存済みの dataset があればそちらが優先される。
 
+    comment "WiFi (on-board ESP32-C6 over SDIO -- esp_hosted / esp_wifi_remote)"
+
+    config SM_WIFI_SSID
+        string "WiFi SSID (empty = WiFi disabled, Thread only)"
+        default ""
+        help
+            空にすると sm_wifi_start() が何もせず戻る(Thread だけで動く)。
+            C6 の slave FW が esp_hosted 2.x でない個体では、ここを設定しても
+            SDIO の CMD5 が通らず初期化に失敗する(画面の WiFi 表示が "failed")。
+
+    config SM_WIFI_PASSWORD
+        string "WiFi password (empty = open AP)"
+        default ""
+
     comment "Matter"
 
     config SM_TARGET_PORT

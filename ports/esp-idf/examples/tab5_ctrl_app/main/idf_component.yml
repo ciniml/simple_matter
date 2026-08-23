@@ -9,7 +9,14 @@
 ## 自前で面倒見るので、BSP 相当は不要。
 ##
 ## LVGL は BSP 経由ではなくなったので直接指定する(ポートは main/display_gfx.cpp)。
+##
+## WiFi(T2、§10)は基板上の ESP32-C6 を SDIO で使う。esp_wifi_remote が
+## 標準 esp_wifi_* API を esp_hosted 経由で C6 へ透過転送する。
+## C6 の slave FW は esp_hosted 2.12.7 系に焼き替え済み(工場出荷の V1.4.1 =
+## hosted 1.4.x とはプロトコル非互換)なので host も 2.x 系で合わせる。
 dependencies:
   idf: ">=5.4"
   m5stack/m5unified: "^0.2.20"
   lvgl/lvgl: "^9.2.0"
+  espressif/esp_hosted: "^2.12.7"
+  espressif/esp_wifi_remote: "^1.5.1"
