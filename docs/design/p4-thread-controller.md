@@ -256,7 +256,8 @@ Tab5(ESP32-P4)+ Unit Gateway H2 で F8 の全経路を実機確認:
 
 ## 9. T1: LVGL コントローラアプリ(Tab5)
 
-Status: 実装中(2026-08-24 開始)。基本通信(F8/P9)完動を受けて、Tab5 の 5 インチ
+Status: ビルドゲート green(2026-08-24。§9.3 実装記録)。実機は親の flash 待ち。
+基本通信(F8/P9)完動を受けて、Tab5 の 5 インチ
 タッチ画面で操作する GUI コントローラを作る。
 
 ### 9.1 構成
@@ -292,3 +293,108 @@ Status: 実装中(2026-08-24 開始)。基本通信(F8/P9)完動を受けて、T
    (NanoC6 = 0xaabbccdd)が一覧に出て Toggle が通ること(ログで確認、
    画面・タッチの見た目はユーザ確認)
 3. 回帰: thread_ctrl_hub_cpp / generic_matter_cpp のビルド green 維持
+
+### 9.3 実装記録(T1、2026-08-24)
+
+ビルドゲート(§9.2 の 1 と 3)は green。実機(§9.2 の 2)は親の flash 待ち。
+
+#### IDF / BSP の版数
+
+- **`espressif/idf:release-v5.4`(v5.4.4)のまま解決した**。v5.5 への切替は不要。
+- managed component: **`espressif/m5stack_tab5` 1.2.0~1**(`main/idf_component.yml` で
+  `~1.2.0` 指定)→ 芋づるで **`lvgl/lvgl` 9.5.0** / `espressif/esp_lvgl_port` 2.9.0 /
+  `esp_lcd_ili9881c` / `esp_lcd_touch_gt911` / `esp_lcd_touch_st7123` /
+  `esp_video` 2.0.1(カメラ。使わないがリンクされる)/ `esp_codec_dev` / `usb` 等 23 個。
+- 表示は `bsp_display_start()`(BSP 既定の描画バッファ方針)+ `bsp_display_rotate()`。
+  パネルは MIPI-DSI **720x1280(縦)**、`LV_DISPLAY_ROTATION_90` で **1280x720 横**にする。
+
+#### 追加ファイル(`ports/esp-idf/examples/tab5_ctrl_app/`、全て新規)
+
+`CMakeLists.txt` / `partitions.csv` / `sdkconfig.defaults` / `README.md` /
+`main/{CMakeLists.txt, idf_component.yml, Kconfig.projbuild, esp_ot_custom_config.h,
+main.cpp, ui.{hpp,cpp}, ctrl_pump.{hpp,cpp}, app_state.{hpp,cpp}, node_book.{hpp,cpp},
+ot_hub.{hpp,cpp}}`。
+
+- `ot_hub.*` は `thread_ctrl_hub_cpp` からのコピー(OT 配線は 1 行も変えていない)+
+  GUI 用の `sm_ot_hub_get_status()` / `sm_ot_hub_dataset_hex()` 追加、F8e(BR)足場の削除。
+- `ctrl_pump.cpp` は hub の `main.cpp` の KVS / UDP / `run_until` をそのまま流用し、
+  固定シナリオの代わりに UI 操作キューのループを載せたもの。静的スタック 128KB の
+  `xTaskCreateStatic`(P4 の起動時 assert 回避。P9 の発見)も同形。
+- **既存 example(`thread_ctrl_hub_cpp` / `generic_matter_cpp` / `onoff_light_cpp`)と
+  コア/シム(`crates/`)への変更はゼロ**。
+- `partitions.csv` は hub と **nvs(0x9000/0x6000)・phy_init のオフセットが同一**で、
+  app のみ 4MB(Tab5 = 16MB flash)。hub を焼いた Tab5 に上書きしてもノード帳
+  (NVS `smctl`)と OT dataset が残る。
+
+#### UI 構成(最終形)
+
+- ステータスバー(96px): role / network name / channel / PAN / RLOC16 / SRP 状態 +
+  登録ホスト数 / ノード数、内蔵 heap(最小値付き)と PSRAM、直近イベント 1 行。
+- `Devices` タブ: ノード 1 件 = 96px の行(NodeId / 運用アドレス / On-Off バッジ /
+  直近結果 / `Toggle` / `Read` / `⟳ Addr`)。ボタン高さ 64px。10 秒周期で 1 ノードずつ
+  read してバッジを更新。`+ Pair new device` でモーダル。
+- Pair ダイアログ: IPv6 / NodeId(hex、既存と衝突しない値を自動採番)/ passcode を
+  `lv_keyboard` で入力 → PAIR_PHASE をフェーズ名で表示 → 結果。
+- `Network` タブ: Thread 詳細 + active dataset TLV hex + `lv_qrcode`(280px)。
+- タスク分離: UI→pump は `sm_ui_op_t` の FreeRTOS キュー、pump→UI は mutex 保護
+  スナップショット + LVGL 500ms タイマ。**`ui.cpp` は `sm_ctrl_*` / `ot*` を 1 つも呼ばない**。
+
+#### ゲート実測
+
+1. docker `espressif/idf:release-v5.4`、経路 (b) cargo、`rm -f sdkconfig` →
+   `-DSDKCONFIG_DEFAULTS="sdkconfig.defaults" set-target esp32p4` → `build` =
+   **Project build complete**、app **1,627,200 B**(`0x18d440`、4MB パーティションの 61% free)。
+   ELF に `sm_ctrl_init` / `sm_ctrl_pair_start` / `sm_ctrl_invoke` / `sm_ctrl_read_scalar` /
+   `sm_ctrl_set_node_addr` ほか **`T sm_ctrl_*` 14 本**、`T lv_*` 785 本
+   (`lv_qrcode_create` / `lv_keyboard_create` / `lv_tabview_create` / `bsp_display_start` 確認)。
+2. 回帰: `thread_ctrl_hub_cpp` esp32p4 build green(app **1,022,560 B**、65% free)。
+   `generic_matter_cpp` / `onoff_light_cpp` は共有ファイル無変更のため影響なし。
+3. 回帰: `cargo test --workspace` = **656 pass / 0 fail**、`cargo fmt --check` 差分なし、
+   `cargo clippy --workspace --all-targets` 警告 0(Rust は無変更)。
+
+#### 発見した罠(次に触る人へ)
+
+1. **LVGL 9.5 も esp_lvgl_port 2.9 もタッチ座標を画面回転に追従させない**(最重要)。
+   `lv_indev.c` に rotation 処理は存在せず、`esp_lvgl_port_touch.c` はタッチ IC の
+   生座標をそのまま `lv_indev_data_t` に入れる。パネルが 720x1280 なので
+   `lv_display_set_rotation(90)` すると**タッチだけ 90 度ずれる**。対策として
+   `lv_indev_get_read_cb()` で BSP が入れた read_cb を取り出し、回転変換を挟んで
+   `lv_indev_set_read_cb()` で差し替えている(`main.cpp: rotated_touch_read`。公開 API のみ)。
+   実機で反転していたときのために `SM_UI_TOUCH_MIRROR_X/Y` と、先頭 5 点の
+   `touch: panel(x,y) -> screen(x,y)` ログを用意した。
+2. **シムには NodeId の列挙 API が無い**。`sm_ctrl_node_count`(件数)と
+   `sm_ctrl_node_addr(node_id)`(引き当て)だけでは GUI の一覧が作れない。
+   コア/シム無改造の制約下では、シムが書いた NVS `smctl`/`nods`
+   (= smctl `nodes.tlv` v1。`crates/simple-matter/src/controller/nodes.rs` の doc が仕様)を
+   C++ 側で Matter TLV パースして NodeId を取り出すのが唯一の道
+   (`main/node_book.cpp`、読み取り専用 60 行)。**将来 `sm_ctrl_node_id_at(index)` を
+   シムに足すのが素直**(そのときこのファイルは捨てられる)。
+3. **BSP の LVGL 描画バッファは内蔵 RAM の DMA 領域**。既定 50 行で
+   720x50x2B のダブルバッファ + SW 回転用 1 枚 ≒ 216KB。pump の静的スタック 128KB と
+   同居させるため `CONFIG_BSP_LCD_DRAW_BUF_HEIGHT=40` に絞った。
+4. **`CONFIG_BSP_DISPLAY_LVGL_AVOID_TEAR=y` は SW 回転を無効化する**
+   (`bsp_display.c` が `sw_rotate = false` を強制)。既定 n のままにすること。
+5. `idf.py set-target` は引数形式が `set-target <target>`(`-DIDF_TARGET=` 併用でも
+   ターゲット引数は必須)。スクリプト化するときに嵌る。
+6. BSP は使わないカメラ(`esp_video`)/音声(`esp_codec_dev`)/USB ホストまで引くが、
+   初期化しなければリンクされるだけで害はない(app 1.6MB のうち相応分は占める)。
+
+### 9.4 実機ブリングアップ追記(親検証、2026-08-24)
+
+エージェント実装後の実機で 2 つの罠を追加発見・修正:
+
+1. **PORT.A(Grove)5V は IO エキスパンダ #0(PI4IOE5V6408 @0x43)の P2**。
+   Espressif BSP はエキスパンダ初期化でチップをリセットするだけで P2 を立て直さない
+   ため、BSP を一度でも初期化すると **Grove 5V が落ちて H2 が無電源ブートループ**
+   (残留電流の ROM ログ 115200bps が spinel 460800 に Parse ゴミとして流れ込み、
+   既知良品の hub ビルドまで巻き添えで起動不能に見える)。電源状態は P4 リセットを
+   跨いで保持される。対策: app_main 冒頭で明示的に P2 を出力 High(M5Tab5-UserDemo
+   の bsp_set_ext_5v_en と同じビット。同デモの「PI4IOE1」= addr low に注意)。
+2. **OT(spinel 同期)→ 表示の順で初期化**。MIPI-DSI + LVGL の初期描画中に spinel
+   UART を開くと RX 取りこぼしで初期リセットが失敗し assert ループ。role>=detached を
+   待ってから bsp_display_start する。
+
+実機確認済み: 5V 投入 → spinel 同期(2.1s)→ display 1280x720 → UI 構築 →
+ノード帳から NanoC6 が一覧表示(1 shown)→ controller ready → 10 秒周期の
+OnOff read が CASE で疎通(MeshForwarder に暗号化 UDP)。タッチ操作・画面の
+見た目はユーザ確認待ち。

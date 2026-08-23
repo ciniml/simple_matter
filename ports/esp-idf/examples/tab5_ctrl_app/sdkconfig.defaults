@@ -1,0 +1,92 @@
+# tab5_ctrl_app 既定設定(ターゲットは esp32p4 = M5Stack Tab5)。
+# docs/design/p4-thread-controller.md §9(T1)。
+#
+# thread_ctrl_hub_cpp の sdkconfig.defaults(F8c、実機で確定)を土台に、
+# BSP(espressif/m5stack_tab5)+ esp_lvgl_port + LVGL9 の要件を足したもの。
+#
+# 注意: idf.py は sdkconfig が既に存在すると sdkconfig.defaults の変更を反映しない。
+#       設定を足したら `rm -f sdkconfig` してから set-target し直すこと(F8 の罠 7)。
+
+# --- パーティション / flash(Tab5 = 16MB flash / 32MB PSRAM)---
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# app_main は表示初期化 + タスク起動だけ(sm_ctrl は専用の静的スタックタスク)。
+# BSP の初期化(MIPI-DSI / I2C / io expander)がそこそこ積むので 8KB。
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# --- OpenThread(FTD。radio は H2 の RCP に spinel over UART で繋ぐ)---
+CONFIG_OPENTHREAD_ENABLED=y
+CONFIG_OPENTHREAD_FTD=y
+CONFIG_OPENTHREAD_RADIO_SPINEL_UART=y
+CONFIG_OPENTHREAD_DNS_CLIENT=y
+# SRP サーバ(このハブがデバイスの _matter._tcp 登録を受ける)。v5.4 では
+# OPENTHREAD_CONFIG_SRP_SERVER_ENABLE が CONFIG_OPENTHREAD_BORDER_ROUTER の中でしか
+# 1 にならないため、custom header で SRP サーバだけを有効化する(F8 の罠 3)。
+CONFIG_OPENTHREAD_HEADER_CUSTOM=y
+CONFIG_OPENTHREAD_CUSTOM_HEADER_PATH="main"
+CONFIG_OPENTHREAD_CUSTOM_HEADER_FILE_NAME="esp_ot_custom_config.h"
+CONFIG_OPENTHREAD_SRP_CLIENT=n
+CONFIG_OPENTHREAD_CLI=n
+CONFIG_OPENTHREAD_CONSOLE_ENABLE=n
+
+# OpenThread は eventfd を使う(radio / netif / task queue の 3 本)。
+CONFIG_VFS_SUPPORT_IO=y
+
+# --- lwIP(Thread は IPv6 のみ)---
+CONFIG_LWIP_IPV6=y
+CONFIG_LWIP_IPV6_AUTOCONFIG=y
+# openthread の lwIP netif は 12 を要求する(8 だとコンパイルで #error。F8 の罠 2)。
+CONFIG_LWIP_IPV6_NUM_ADDRESSES=12
+CONFIG_LWIP_MULTICAST_PING=y
+CONFIG_LWIP_SO_REUSE=y
+CONFIG_LWIP_MAX_SOCKETS=10
+
+# --- C++ ---
+CONFIG_COMPILER_CXX_EXCEPTIONS=n
+CONFIG_COMPILER_CXX_RTTI=n
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# --- PSRAM(Tab5 = 32MB hex PSRAM。sm_ctrl の供給メモリと LVGL のバッファの置き場)---
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_HEX=y
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_FETCH_INSTRUCTIONS=y
+CONFIG_SPIRAM_RODATA=y
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+
+# FreeRTOS 1kHz(LVGL のタイマ精度とタッチ応答)。
+CONFIG_FREERTOS_HZ=1000
+
+# --- LVGL9(esp_lvgl_port 経由。BSP が lv_display / lv_indev を作る)---
+CONFIG_LV_CONF_SKIP=y
+CONFIG_LV_BUILD_EXAMPLES=n
+# LVGL のヒープは C ライブラリ(= heap_caps)に委譲する。LVGL 内蔵アロケータの
+# 固定プールだと 1280x720 の UI で足りなくなるため。
+CONFIG_LV_USE_CLIB_MALLOC=y
+CONFIG_LV_USE_CLIB_SPRINTF=y
+CONFIG_LV_USE_CLIB_STRING=y
+# 5 インチ / 1280x720 を指で押す前提のフォント。
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_16=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_24=y
+CONFIG_LV_FONT_DEFAULT_MONTSERRAT_20=y
+# dataset を QR で出す(デバイス側プリセットの転記用)。
+CONFIG_LV_USE_QRCODE=y
+# オンスクリーンキーボード(IPv6 / passcode 入力)。
+CONFIG_LV_USE_KEYBOARD=y
+CONFIG_LV_USE_TEXTAREA=y
+
+# BSP の LVGL 描画バッファ(内蔵 RAM の DMA 可能領域)。既定 50 行だと
+# 720x50x2B x2(ダブルバッファ)+ SW 回転用の 1 枚 = 約 216KB を内蔵 RAM から取る。
+# pump タスクの静的スタック 128KB と OT/lwIP/mbedTLS が同居するので 40 行に絞る。
+CONFIG_BSP_LCD_DRAW_BUF_HEIGHT=40
+CONFIG_BSP_LCD_DRAW_BUF_DOUBLE=y
+
+# BSP: カメラ(esp_video)は使わないが依存として入る。SPI カメラ制御は落とす。
+CONFIG_CAM_CTRL_SPI_ENABLE=n
+CONFIG_CODEC_I2C_BACKWARD_COMPATIBLE=n

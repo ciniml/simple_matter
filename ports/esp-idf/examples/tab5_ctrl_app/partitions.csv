@@ -1,0 +1,10 @@
+# tab5_ctrl_app のパーティションテーブル(M5Stack Tab5 = ESP32-P4 + 16MB flash)。
+#
+# nvs / phy_init のオフセットとサイズは thread_ctrl_hub_cpp と**完全に同一**にしてある。
+# 同じ Tab5 に hub を書いた後で本アプリを書いても、コントローラのノード帳
+#(NVS namespace "smctl")と OT の active dataset がそのまま引き継がれる。
+# app だけ 4MB に拡張する(openthread FTD + LVGL + コントローラ .a)。
+# Name,   Type, SubType, Offset,   Size,    Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+factory,  app,  factory, 0x10000,  0x400000,

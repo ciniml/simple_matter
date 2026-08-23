@@ -1,0 +1,12 @@
+## tab5_ctrl_app の managed component 依存。
+##
+## M5Stack Tab5 の公式 BSP。MIPI-DSI(ili9881c)+ GT911/ST7123 タッチ +
+## esp_lvgl_port(LVGL9)を一括で面倒見てくれる。BSP が esp_lvgl_port ^2 →
+## lvgl/lvgl ^9 を引くので、LVGL は個別に指定しない。
+##
+## 1.2.0 は idf >= 5.4 を要求する(= espressif/idf:release-v5.4 で解決できる)。
+## BSP は esp_video(カメラ)/ esp_codec_dev(音声)も引くが、本アプリでは使わない
+## (リンクはされるが初期化しない)。
+dependencies:
+  idf: ">=5.4"
+  espressif/m5stack_tab5: "~1.2.0"
