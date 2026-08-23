@@ -10,3 +10,4 @@ ca-state.bin
 crates/sm-script-api/examples-wasm/*/target/
 tools/wasm-harness/.wamr/
 tools/wasm-harness/build/
+/JOURNAL.md
