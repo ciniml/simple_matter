@@ -997,3 +997,17 @@ Phase E' で入れるなら「別ページ + 遅延 import + Cache Storage」で
 10. **bootloader オフセットはチップ依存**(C6/H2/S3/C3/C2 = 0x0、ESP32/S2 = 0x1000、
     P4/C5 = 0x2000)。esptool-js の `loader.chip.CHIP_NAME` を見て決める設計にした
     (接続前はプランに出せない)。
+
+### P6: NanoC6 実機 E2E 記録(2026-08-23、コミット f21a64a)
+
+G1-G4 を NanoC6(esp32c6)実機で完走: ble-wifi コミッショニング → toggle/read →
+cfg-comp/cfg-bind で dimmable+温湿度 2EP へ変身(descriptor/PartsList/MoveToLevel を
+smctl で検証)→ smctl batch による WASM スクリプト OTA → live reload →
+on_boot 実行("momentary-toggle ready")→ 再起動永続。実機でのみ発見できた
+バグ 9 件と最終メモリ構成(pump スタック 128KB 静的 / WAMR プール 24KB 静的 /
+線形メモリ 64KB はシステムヒープ・preload 確保 / 実行は専用 pthread)は
+コミット f21a64a のメッセージと各ソースコメント(P6 タグ)に記録。
+
+**未検証の残り**: Tab5+Unit Gateway H2(F8。H2 への RCP 書き込みはユニット自身の
+USB-C が必要な可能性)、AirQ の S3 デバイス役、マルチキャスト mDNS が AP 越しに
+通らない件の深掘り(unicast QU / --at で運用可能)。
