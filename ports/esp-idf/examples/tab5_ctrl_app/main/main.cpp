@@ -15,6 +15,7 @@
 // UI ↔ pump は app_state.hpp の操作キュー + スナップショットのみで結ぶ。
 
 #include "app_state.hpp"
+#include "ble_central.hpp"
 #include "ctrl_pump.hpp"
 #include "display_gfx.hpp"
 #include "ui.hpp"
@@ -85,6 +86,15 @@ extern "C" void app_main(void) {
   // UART54/53 とは無関係だが、§9.4 の 2 罠(PORT.A 5V 断 / spinel RX 取りこぼし)を
   // 避けるため OT が立ってからにする。SSID 未設定なら即 return する。
   sm_wifi_start();
+
+  // --- 2.6 BLE(NimBLE host-only + esp_hosted VHCI)。完了は待たない ---
+  //
+  // **WiFi の後**(§11.1)。BLE の HCI は WiFi と同じ SDIO リンク(esp_hosted)を通るので、
+  // トランスポート(`esp_hosted_init`)の初期化が二重に走らないよう、ble_up タスクの中で
+  // WiFi の初期化が落ち着くのを待ってから hosted / C6 BT controller / NimBLE を上げる。
+  // SSID 未設定(WiFi 無効)のときは ble_up タスク自身が `esp_hosted_init()` を持つので、
+  // **BLE だけ使う構成でも動く**。
+  sm_ble_central_boot();
 
   // --- 3. LVGL(display + touch indev + LVGL タスク)---
   lv_display_t *disp = sm_display_lvgl_start();

@@ -64,6 +64,13 @@ menu "tab5_ctrl_app configuration"
         int "Default passcode shown in the pair dialog"
         default 20202021
 
+    config SM_UI_DEFAULT_DISCRIMINATOR
+        int "Default discriminator shown in the pair dialog (BLE)"
+        default 3840
+        help
+            BLE コミッショニング(via = BLE)のときに 1 番目の入力欄へ出す既定値。
+            Matter の既定 discriminator は 3840(= 0xF00)。
+
     config SM_UI_DEFAULT_NODE_ID
         hex "First NodeId offered by the pair dialog"
         default 0xAABBCCDD

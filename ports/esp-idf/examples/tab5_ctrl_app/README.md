@@ -5,8 +5,17 @@ M5Stack **Tab5**(ESP32-P4 + 5 インチ 1280x720 タッチ)と **Unit Gateway H2
 Matter コントローラ**の GUI 版。設計は `docs/design/p4-thread-controller.md` §9(T1)、
 土台の CUI 版は `thread_ctrl_hub_cpp`(同 §3 F8c / §8 P9 で実機動作確定)。
 
-BLE は使わない。コミッショニングは **on-network PASE over Thread UDP**
-(デバイスを同じ active dataset で Thread に参加させてから、その IPv6 へ PASE)。
+コミッショニングは 4 経路:
+
+| via | 経路 | 入力 |
+|---|---|---|
+| On-network Thread | Thread UDP 上の PASE | デバイスの IPv6(ML-EID / OMR) |
+| On-network WiFi | WiFi(基板上 C6)上の PASE | デバイスの IPv6(GUA / ULA 推奨) |
+| BLE - WiFi | BLE(BTP)で PASE → **Tab5 の WiFi 資格情報**を投入 → mDNS 解決 → CASE over UDP | discriminator |
+| BLE - Thread | BLE(BTP)で PASE → **Tab5 の active dataset**を投入 → SRP 解決 → CASE over UDP | discriminator |
+
+BLE(T3、§11)は P4 に BT radio が無いため **NimBLE を host-only** で動かし、HCI を
+`esp_hosted` の VHCI 経由で基板上の C6 に流す(WiFi と同じ SDIO リンク)。
 
 ## 画面(v1)
 
@@ -61,6 +70,8 @@ pump → UI は mutex 保護のスナップショット + LVGL の 500ms タイ�
 | `main/app_state.{hpp,cpp}` | 操作キュー + スナップショット(UI ↔ pump の唯一の連絡路) |
 | `main/node_book.{hpp,cpp}` | NVS `smctl`/`nods` を TLV パースして NodeId を列挙 |
 | `main/ot_hub.{hpp,cpp}` | hub のコピー + GUI 用ステータス取得(OT 配線は無改変) |
+| `main/wifi_sta.{hpp,cpp}` | 基板上 C6 の WiFi STA(esp_hosted / esp_wifi_remote) |
+| `main/ble_central.{hpp,cpp}` | NimBLE central(host-only + VHCI)。scan → GATT 0xFFF6 → BTP 給餌 |
 | `main/idf_component.yml` | `m5stack/m5unified ^0.2.20`(→ `m5stack/m5gfx 0.2.27`)+ `lvgl/lvgl ^9.2.0` |
 
 ## ビルド
@@ -117,6 +128,11 @@ idf.py -p /dev/ttyACM0 flash monitor
 - **WiFi**(T2、§10): `SM_WIFI_SSID` / `SM_WIFI_PASSWORD`(既定は空 = WiFi 無効・Thread のみ)。
   基板上の ESP32-C6 を SDIO で使う(`espressif/esp_hosted` 2.x + `esp_wifi_remote`)。
   C6 の slave FW が esp_hosted 2.x でない個体(工場出荷 V1.4.1 = 1.4.x)では繋がらない。
+- **BLE**(T3、§11): Kconfig の追加項目は `SM_UI_DEFAULT_DISCRIMINATOR`(3840)のみ。
+  投入する資格情報はダイアログでは訊かず、**Tab5 が既に持っているもの**を使う
+  (BLE - WiFi → `SM_WIFI_SSID`/`SM_WIFI_PASSWORD`、BLE - Thread → active dataset)。
+  よって **BLE - WiFi を使うには `SM_WIFI_SSID` の設定が必須**。BLE 自体は WiFi 無効でも動く
+  (その場合 `esp_hosted` の初期化を BLE 側が行う)。
 - **表示/タッチ**: Kconfig は無い。回転は `main/display_gfx.cpp` の
   `M5.Display.setRotation(1)`(= 1280x720 横。上下逆なら 3)。M5GFX の `getTouch()` は
   回転を反映した画面座標を返すので、旧 `SM_UI_ROTATION` / `SM_UI_TOUCH_MIRROR_X/Y` は廃止した。
@@ -128,6 +144,11 @@ idf.py -p /dev/ttyACM0 flash monitor
 3. Network タブの dataset TLV hex(または QR)をデバイス側にプリセットして起動。
 4. デバイスのログの ML-EID / OMR を `+ Pair new device` の IPv6 欄へ入力 → `Start pairing`。
 5. 一覧に出た行の `Toggle` でデバイスが点滅すれば完走。
+
+BLE の場合は 3〜4 の代わりに: デバイスを factory reset して BLE 広告状態にする →
+`+ Pair new device` の `via` を `BLE - WiFi` / `BLE - Thread` にすると 1 番目の欄が
+`Discriminator`(既定 3840)に変わる → `Start pairing`。進捗は
+`scanning → connected → subscribed → BTP+PASE → handoff → CASE → done` で出る。
 
 ## 踏んだ罠(次に触る人へ)
 

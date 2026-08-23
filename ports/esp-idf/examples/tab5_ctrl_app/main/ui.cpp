@@ -81,11 +81,16 @@ struct Ui {
   lv_obj_t *ta_ipv6 = nullptr;
   lv_obj_t *ta_node = nullptr;
   lv_obj_t *ta_pass = nullptr;
-  lv_obj_t *dd_via = nullptr; // transport 選択(0=Thread / 1=WiFi)
+  lv_obj_t *dd_via = nullptr;      // 経路(sm_ui_via_t、4 択)
+  lv_obj_t *lbl_addr_cap = nullptr; // 1 番目の欄のキャプション("IPv6" / "Discriminator")
+  lv_obj_t *lbl_hint = nullptr;     // ダイアログの説明文(経路で書き換える)
   lv_obj_t *lbl_pair = nullptr;
   lv_obj_t *kb = nullptr;
   bool pair_open = false;
   bool pair_started = false; // Start を押してから結果表示を始める
+  bool pair_ble = false;     // 1 番目の欄が discriminator になっているか
+  char saved_ipv6[46] = {};  // BLE へ切り替えたときに退避する IPv6
+  char saved_disc[8] = {};   // on-network へ戻したときに退避する discriminator
 };
 
 Ui g_ui;
@@ -152,7 +157,7 @@ void close_pair_dialog() {
     lv_obj_delete(g_ui.modal);
     g_ui.modal = nullptr;
     g_ui.ta_ipv6 = g_ui.ta_node = g_ui.ta_pass = g_ui.lbl_pair = g_ui.kb = nullptr;
-    g_ui.dd_via = nullptr;
+    g_ui.dd_via = g_ui.lbl_addr_cap = g_ui.lbl_hint = nullptr;
   }
   g_ui.pair_open = false;
 }
@@ -204,15 +209,72 @@ bool parse_hex_u64(const char *s, uint64_t *out) {
   return true;
 }
 
+// via の選択(0..3)。sm_ui_via_t と同じ並びにしてある。
+uint8_t selected_via() {
+  if (g_ui.dd_via == nullptr) {
+    return SM_UI_VIA_THREAD;
+  }
+  uint32_t sel = lv_dropdown_get_selected(g_ui.dd_via);
+  return (uint8_t)(sel <= SM_UI_VIA_BLE_THREAD ? sel : SM_UI_VIA_THREAD);
+}
+
+bool via_is_ble(uint8_t via) {
+  return via == SM_UI_VIA_BLE_WIFI || via == SM_UI_VIA_BLE_THREAD;
+}
+
+// 経路を切り替えたら 1 番目の欄を IPv6 ⇄ Discriminator で付け替える(§11.1 の UI)。
+void on_via_changed(lv_event_t *) {
+  const bool ble = via_is_ble(selected_via());
+  if (ble == g_ui.pair_ble || g_ui.ta_ipv6 == nullptr) {
+    return;
+  }
+  const char *cur = lv_textarea_get_text(g_ui.ta_ipv6);
+  if (ble) {
+    snprintf(g_ui.saved_ipv6, sizeof(g_ui.saved_ipv6), "%s", cur);
+    char dbuf[8];
+    snprintf(dbuf, sizeof(dbuf), "%d", CONFIG_SM_UI_DEFAULT_DISCRIMINATOR);
+    lv_textarea_set_text(g_ui.ta_ipv6, g_ui.saved_disc[0] ? g_ui.saved_disc : dbuf);
+    lv_label_set_text(g_ui.lbl_addr_cap, "Discriminator");
+    lv_label_set_text(g_ui.lbl_hint,
+                      "The device must be advertising its Matter commissionable service\n"
+                      "(0xFFF6) over BLE. No address needed: the Tab5 hands over its own\n"
+                      "WiFi credentials or Thread dataset, then resolves the node over\n"
+                      "mDNS (WiFi) / SRP (Thread) and finishes with CASE over UDP.");
+  } else {
+    snprintf(g_ui.saved_disc, sizeof(g_ui.saved_disc), "%s", cur);
+    lv_textarea_set_text(g_ui.ta_ipv6, g_ui.saved_ipv6[0] ? g_ui.saved_ipv6 : "fd00::1");
+    lv_label_set_text(g_ui.lbl_addr_cap, "IPv6");
+    lv_label_set_text(g_ui.lbl_hint,
+                      "The device must already be on the selected network with a commissioning\n"
+                      "window open. Copy its ML-EID / OMR (Thread) or LAN address (WiFi) from\n"
+                      "its log. \"via\" only picks the scope for fe80::/10 targets -- prefer a\n"
+                      "routable ULA/GUA for WiFi, since the node book does not persist scopes.");
+  }
+  g_ui.pair_ble = ble;
+  if (g_ui.kb != nullptr) {
+    lv_keyboard_set_textarea(g_ui.kb, g_ui.ta_ipv6);
+    lv_keyboard_set_mode(g_ui.kb, ble ? LV_KEYBOARD_MODE_NUMBER : LV_KEYBOARD_MODE_TEXT_LOWER);
+  }
+}
+
 void on_pair_start(lv_event_t *) {
   if (g_ui.ta_ipv6 == nullptr) {
     return;
   }
   sm_ui_op_t op = {};
-  op.kind = SM_UI_OP_PAIR;
-  op.via = (g_ui.dd_via != nullptr && lv_dropdown_get_selected(g_ui.dd_via) == 1) ? SM_UI_VIA_WIFI
-                                                                                 : SM_UI_VIA_THREAD;
-  snprintf(op.ipv6, sizeof(op.ipv6), "%s", lv_textarea_get_text(g_ui.ta_ipv6));
+  op.via = selected_via();
+  const bool ble = via_is_ble(op.via);
+  op.kind = ble ? SM_UI_OP_PAIR_BLE : SM_UI_OP_PAIR;
+  if (ble) {
+    long d = strtol(lv_textarea_get_text(g_ui.ta_ipv6), nullptr, 10);
+    if (d <= 0 || d > 4095) {
+      lv_label_set_text(g_ui.lbl_pair, "#e67e22 discriminator must be 1..4095 #");
+      return;
+    }
+    op.discriminator = (uint16_t)d;
+  } else {
+    snprintf(op.ipv6, sizeof(op.ipv6), "%s", lv_textarea_get_text(g_ui.ta_ipv6));
+  }
   uint64_t node = 0;
   if (!parse_hex_u64(lv_textarea_get_text(g_ui.ta_node), &node) || node == 0) {
     lv_label_set_text(g_ui.lbl_pair, "#e67e22 NodeId must be a non-zero hex value #");
@@ -229,7 +291,7 @@ void on_pair_start(lv_event_t *) {
     return;
   }
   g_ui.pair_started = true;
-  lv_label_set_text(g_ui.lbl_pair, "starting on-network PASE ...");
+  lv_label_set_text(g_ui.lbl_pair, ble ? "starting BLE scan ..." : "starting on-network PASE ...");
 }
 
 // 既存 NodeId と衝突しない初期値を作る。
@@ -272,14 +334,15 @@ void open_pair_dialog(lv_event_t *) {
   lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_row(card, 10, 0);
 
-  make_label(card, &lv_font_montserrat_24, COL_TEXT,
-             "Pair a device (on-network PASE, no BLE)");
-  make_label(card, &lv_font_montserrat_14, COL_DIM,
-             "The device must already be on the selected network with a commissioning\n"
-             "window open. Copy its ML-EID / OMR (Thread) or LAN address (WiFi) from\n"
-             "its log. \"via\" only picks the scope for fe80::/10 targets -- prefer a\n"
-             "routable ULA/GUA for WiFi, since the node book does not persist scopes.");
+  make_label(card, &lv_font_montserrat_24, COL_TEXT, "Pair a device");
+  g_ui.lbl_hint =
+      make_label(card, &lv_font_montserrat_14, COL_DIM,
+                 "The device must already be on the selected network with a commissioning\n"
+                 "window open. Copy its ML-EID / OMR (Thread) or LAN address (WiFi) from\n"
+                 "its log. \"via\" only picks the scope for fe80::/10 targets -- prefer a\n"
+                 "routable ULA/GUA for WiFi, since the node book does not persist scopes.");
 
+  lv_obj_t *first_cap = nullptr;
   auto add_field = [&](const char *caption, const char *initial, int32_t width) {
     lv_obj_t *row = lv_obj_create(card);
     lv_obj_remove_style_all(row);
@@ -289,6 +352,9 @@ void open_pair_dialog(lv_event_t *) {
     lv_obj_set_style_pad_column(row, 12, 0);
     lv_obj_t *cap = make_label(row, &lv_font_montserrat_20, COL_DIM, caption);
     lv_obj_set_width(cap, 180);
+    if (first_cap == nullptr) {
+      first_cap = cap;
+    }
     lv_obj_t *ta = lv_textarea_create(row);
     lv_textarea_set_one_line(ta, true);
     lv_textarea_set_text(ta, initial);
@@ -300,6 +366,7 @@ void open_pair_dialog(lv_event_t *) {
   };
 
   g_ui.ta_ipv6 = add_field("IPv6", "fd00::1", 700);
+  g_ui.lbl_addr_cap = first_cap;
   char idbuf[24];
   snprintf(idbuf, sizeof(idbuf), "%016llx", (unsigned long long)suggest_node_id());
   g_ui.ta_node = add_field("NodeId (hex)", idbuf, 360);
@@ -307,16 +374,19 @@ void open_pair_dialog(lv_event_t *) {
   snprintf(pcbuf, sizeof(pcbuf), "%d", CONFIG_SM_UI_DEFAULT_PASSCODE);
   g_ui.ta_pass = add_field("Passcode", pcbuf, 240);
 
-  // transport 選択(§10.3 の 6)。Passcode と同じ行に相乗りさせてカード高を保つ。
+  // 経路の選択(§10.3 の 6 / §11.1)。Passcode と同じ行に相乗りさせてカード高を保つ。
+  // 並びは sm_ui_via_t と一致させること(selected_via() がそのまま使う)。
   {
     lv_obj_t *row = lv_obj_get_parent(g_ui.ta_pass);
     lv_obj_t *cap = make_label(row, &lv_font_montserrat_20, COL_DIM, "via");
     lv_obj_set_width(cap, 60);
     g_ui.dd_via = lv_dropdown_create(row);
-    lv_dropdown_set_options_static(g_ui.dd_via, "Thread\nWiFi");
-    lv_dropdown_set_selected(g_ui.dd_via, 0); // 既定は Thread
-    lv_obj_set_size(g_ui.dd_via, 240, BTN_H);
+    lv_dropdown_set_options_static(
+        g_ui.dd_via, "On-network Thread\nOn-network WiFi\nBLE - WiFi\nBLE - Thread");
+    lv_dropdown_set_selected(g_ui.dd_via, SM_UI_VIA_THREAD); // 既定は on-network Thread
+    lv_obj_set_size(g_ui.dd_via, 360, BTN_H);
     lv_obj_set_style_text_font(g_ui.dd_via, &lv_font_montserrat_20, 0);
+    lv_obj_add_event_cb(g_ui.dd_via, on_via_changed, LV_EVENT_VALUE_CHANGED, nullptr);
   }
 
   lv_obj_t *btns = lv_obj_create(card);
@@ -340,6 +410,7 @@ void open_pair_dialog(lv_event_t *) {
 
   g_ui.pair_open = true;
   g_ui.pair_started = false;
+  g_ui.pair_ble = false;
 }
 
 // --- Devices タブ ---
@@ -411,29 +482,33 @@ void refresh_status_bar() {
                         (unsigned)(g_snap.free_psram / 1024));
   lv_label_set_text(g_ui.lbl_status, g_snap.status);
 
-  // WiFi 1 項目(off / connecting / SSID + LL の有無)。
+  // WiFi + BLE 1 項目(どちらも基板上の C6 = esp_hosted 経由)。
+  char wifi[96];
+  uint32_t col = COL_DIM;
   switch (g_snap.wifi_state) {
   case 1:
-    lv_label_set_text_fmt(g_ui.lbl_wifi, "WiFi connecting (%s)",
-                          g_snap.wifi_ssid[0] ? g_snap.wifi_ssid : "-");
-    lv_obj_set_style_text_color(g_ui.lbl_wifi, lv_color_hex(COL_WARN), 0);
+    snprintf(wifi, sizeof(wifi), "WiFi connecting (%s)",
+             g_snap.wifi_ssid[0] ? g_snap.wifi_ssid : "-");
+    col = COL_WARN;
     break;
   case 2:
-    lv_label_set_text_fmt(g_ui.lbl_wifi, "WiFi %s  if=%u  %s",
-                          g_snap.wifi_ssid[0] ? g_snap.wifi_ssid : "-",
-                          (unsigned)g_snap.wifi_netif,
-                          g_snap.wifi_ll[0] ? "LL ok" : "no LL");
-    lv_obj_set_style_text_color(g_ui.lbl_wifi, lv_color_hex(COL_ON), 0);
+    snprintf(wifi, sizeof(wifi), "WiFi %s  if=%u  %s",
+             g_snap.wifi_ssid[0] ? g_snap.wifi_ssid : "-", (unsigned)g_snap.wifi_netif,
+             g_snap.wifi_ll[0] ? "LL ok" : "no LL");
+    col = COL_ON;
     break;
   case 3:
-    lv_label_set_text(g_ui.lbl_wifi, "WiFi failed (C6 / SDIO)");
-    lv_obj_set_style_text_color(g_ui.lbl_wifi, lv_color_hex(COL_WARN), 0);
+    snprintf(wifi, sizeof(wifi), "WiFi failed (C6 / SDIO)");
+    col = COL_WARN;
     break;
   default:
-    lv_label_set_text(g_ui.lbl_wifi, "WiFi off");
-    lv_obj_set_style_text_color(g_ui.lbl_wifi, lv_color_hex(COL_DIM), 0);
+    snprintf(wifi, sizeof(wifi), "WiFi off");
     break;
   }
+  static const char *BLE_HOST_NAME[] = {"off", "starting", "ready", "failed"};
+  const char *ble = g_snap.ble_host < 4 ? BLE_HOST_NAME[g_snap.ble_host] : "?";
+  lv_label_set_text_fmt(g_ui.lbl_wifi, "%s   BLE %s", wifi, ble);
+  lv_obj_set_style_text_color(g_ui.lbl_wifi, lv_color_hex(col), 0);
 }
 
 bool node_set_changed() {
@@ -516,15 +591,30 @@ void refresh_pair_dialog() {
   }
   const char *phase =
       g_snap.pair_phase < (sizeof(PHASE_NAME) / sizeof(PHASE_NAME[0])) ? PHASE_NAME[g_snap.pair_phase] : "?";
+  // BLE 経路は「どこまで進んだか」がフェーズより先に動くので stage も出す。
+  static const char *BLE_STAGE_NAME[] = {"idle",     "scanning", "connected", "subscribed",
+                                         "BTP+PASE", "handoff",  "CASE",      "done",
+                                         "failed"};
+  const char *stage = g_snap.ble_stage < (sizeof(BLE_STAGE_NAME) / sizeof(BLE_STAGE_NAME[0]))
+                          ? BLE_STAGE_NAME[g_snap.ble_stage]
+                          : "?";
   switch (g_snap.pair_state) {
   case 1:
-    lv_label_set_text_fmt(g_ui.lbl_pair, "commissioning ... (%s)", phase);
+    if (g_ui.pair_ble) {
+      lv_label_set_text_fmt(g_ui.lbl_pair, "BLE: %s (%s)", stage, phase);
+    } else {
+      lv_label_set_text_fmt(g_ui.lbl_pair, "commissioning ... (%s)", phase);
+    }
     break;
   case 2:
     lv_label_set_text(g_ui.lbl_pair, "#27ae60 PAIR COMPLETE #");
     break;
   case 3:
-    lv_label_set_text_fmt(g_ui.lbl_pair, "#e67e22 failed at %s #", phase);
+    if (g_ui.pair_ble) {
+      lv_label_set_text_fmt(g_ui.lbl_pair, "#e67e22 failed at %s / %s #", stage, phase);
+    } else {
+      lv_label_set_text_fmt(g_ui.lbl_pair, "#e67e22 failed at %s #", phase);
+    }
     break;
   default:
     break;

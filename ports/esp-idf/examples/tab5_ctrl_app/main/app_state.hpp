@@ -20,25 +20,43 @@ inline constexpr size_t SM_UI_DATASET_HEX_CAP = 2 * 254 + 1;
 
 // UI → pump の操作種別。
 enum sm_ui_op_kind_t : uint8_t {
-  SM_UI_OP_TOGGLE = 0,      // OnOff Toggle(cluster 0x0006 cmd 0x02)
-  SM_UI_OP_READ_ONOFF = 1,  // OnOff.OnOff 読み(cluster 0x0006 attr 0x0000)
-  SM_UI_OP_PAIR = 2,        // on-network PASE コミッショニング
-  SM_UI_OP_REFRESH_ADDR = 3 // SRP 列挙 → sm_ctrl_set_node_addr
+  SM_UI_OP_TOGGLE = 0,       // OnOff Toggle(cluster 0x0006 cmd 0x02)
+  SM_UI_OP_READ_ONOFF = 1,   // OnOff.OnOff 読み(cluster 0x0006 attr 0x0000)
+  SM_UI_OP_PAIR = 2,         // on-network PASE コミッショニング
+  SM_UI_OP_REFRESH_ADDR = 3, // SRP 列挙(→ WiFi なら mDNS)→ アドレス更新
+  SM_UI_OP_PAIR_BLE = 4      // BLE コミッショニング(T3、§11)
 };
 
-// PAIR の転送路(§10.3 の 5)。リンクローカル宛の sin6_scope_id をどちらの
-// netif にするかだけの違いで、グローバル / ULA 宛では効かない。
+// PAIR の経路。0/1 は on-network(リンクローカル宛の sin6_scope_id をどちらの
+// netif にするかだけの違いで、グローバル / ULA 宛では効かない。§10.3 の 5)。
+// 2/3 は BLE コミッショニング(T3、§11)で、投入するネットワーク資格情報の種別を兼ねる。
 enum sm_ui_via_t : uint8_t {
   SM_UI_VIA_THREAD = 0,
-  SM_UI_VIA_WIFI = 1
+  SM_UI_VIA_WIFI = 1,
+  SM_UI_VIA_BLE_WIFI = 2,  // BLE 経由 → デバイスを WiFi(Tab5 と同じ AP)へ
+  SM_UI_VIA_BLE_THREAD = 3 // BLE 経由 → デバイスを Thread(Tab5 の dataset)へ
 };
 
 struct sm_ui_op_t {
   sm_ui_op_kind_t kind;
   uint64_t node_id;
-  uint32_t passcode; // PAIR のみ
-  char ipv6[46];     // PAIR のみ(NUL 終端の IPv6 リテラル)
-  uint8_t via;       // PAIR のみ(sm_ui_via_t。既定 = Thread)
+  uint32_t passcode;      // PAIR / PAIR_BLE のみ
+  char ipv6[46];          // PAIR のみ(NUL 終端の IPv6 リテラル)
+  uint8_t via;            // PAIR / PAIR_BLE のみ(sm_ui_via_t)
+  uint16_t discriminator; // PAIR_BLE のみ(広告照合。既定 3840)
+};
+
+// BLE コミッショニングの進捗(スナップショットの ble_stage)。UI はこれを文字列にする。
+enum sm_ui_ble_stage_t : uint8_t {
+  SM_UI_BLE_IDLE = 0,
+  SM_UI_BLE_SCANNING = 1,  // discriminator 一致の 0xFFF6 広告を探している
+  SM_UI_BLE_CONNECTED = 2, // 接続 + MTU 交換済み(GATT 発見中)
+  SM_UI_BLE_SUBSCRIBED = 3, // C2 subscribe 完了(= BTP 給餌開始)
+  SM_UI_BLE_COMMISSIONING = 4, // BTP 上で PASE → AddNOC → ネットワーク投入
+  SM_UI_BLE_HANDOFF = 5,   // BLE_DONE。運用アドレス解決(SRP / mDNS)待ち
+  SM_UI_BLE_CASE = 6,      // CASE over UDP + CommissioningComplete
+  SM_UI_BLE_DONE = 7,      //
+  SM_UI_BLE_FAILED = 8     //
 };
 
 // ノード 1 件の表示状態。
@@ -75,6 +93,10 @@ struct sm_ui_snapshot_t {
   char wifi_ll[46];      // リンクローカル(未取得なら "")
   char wifi_ip4[16];     // IPv4(未取得なら "")
   uint32_t wifi_netif;   // lwIP netif index(0 = 未確立)
+
+  // --- BLE(T3、§11。pump が sm_ble_central_state() をコピーする)---
+  uint8_t ble_host;  // sm_ble_host_state_t: 0=off 1=starting 2=ready 3=failed
+  uint8_t ble_stage; // sm_ui_ble_stage_t(BLE コミッショニングの進捗)
 
   // --- pairing ---
   uint8_t pair_state; // 0=idle 1=進行中 2=成功 3=失敗

@@ -802,3 +802,222 @@ note に出すところまで**(`REFRESH_ADDR` は SRP 列挙のまま = Thread 
   懸念 3 点はすべて杞憂だった(問題なし)。
 - 実測フロー: SDIO 初期化 ≈2 秒、WiFi 接続 ≈5-15 秒(リトライ込み)、
   PASE→AddNOC→CASE 完了 ≈7 秒。
+
+## 11. T3: BLE コミッショニング(Tab5 から ble-wifi / ble-thread)
+
+Status: 設計(2026-08-24)。T2(WiFi、§10)完了を受けて、BLE 広告中の Matter デバイスを
+Tab5 から直接コミッショニングできるようにする(コミッショニング窓が UDP で開いていない
+工場出荷状態のデバイスを、IP アドレス入力なしで取り込む)。
+
+### 11.1 方式
+
+- **BLE radio は基板上 C6(esp_hosted)**: P4 に BT controller は無いので、
+  NimBLE を **host-only** で動かし HCI を esp_hosted VHCI 経由で C6 に流す。
+  esp_hosted 2.12.12 に P4 向けの同梱例 `examples/host_nimble_bleprph_host_only_vhci`
+  があり、これの sdkconfig(`CONFIG_BT_ENABLED` + NimBLE host-only +
+  `ESP_HOSTED_NIMBLE_HCI_VHCI`)を正とする。**IDF 5.4.4 で解決・ビルドできるかが
+  最初の検証点**(esp_hosted の Kconfig 依存: `BT_NIMBLE_ENABLED &&
+  !BT_CONTROLLER_ENABLED && !BT_NIMBLE_TRANSPORT_UART`)。
+- **C6 slave FW**: 焼き替え済み 2.12.7 slave は `sdkconfig.defaults.esp32c6` の
+  `CONFIG_BT_ENABLED=y` 既定のままビルドされている見込み(参照 repo の build.sh は
+  BT を無効化していない)= BT controller 入り。真偽は実機の HCI 同期で確定する
+  (失敗したら slave 再ビルド・再書込が必要という事実を記録して停止)。
+- **BTP central 給餌はシム F7b API をそのまま使う**(c-ffi-shim.md §11.4:
+  `sm_ctrl_match_adv` / `sm_ctrl_ble_pair_start`(kind 0=wifi / 1=thread)/
+  `sm_ctrl_ble_event` / `sm_ctrl_ble_poll`、完了イベント `SM_CTRL_EV_BLE_DONE`)。
+  staticlib は default features(ble,controller)で **既に有効**(Rust 変更ゼロ)。
+- **NimBLE central は controller_hub_cpp の移植**(`main/ble_central.{hpp,cpp}`、
+  F7b 実機検証済み): scan → `sm_ctrl_match_adv` で discriminator 照合 → connect →
+  MTU 交換 → GATT 0xFFF6 C1/C2 発見 → C2 subscribe → C1 write / C2 indication 給餌。
+  **C1 write は C2 subscribe 完了までゲート**(F7b 実機バグの学び)。
+  NimBLE コールバック → FreeRTOS queue → pump の直列化も同形(単線契約維持)。
+- **資格情報は Tab5 が既に持っているものを自動使用**(ダイアログ入力は増やさない):
+  - ble-wifi: Kconfig `SM_WIFI_SSID` / `SM_WIFI_PASSWORD`(= Tab5 自身と同じ AP へ)
+  - ble-thread: ot_hub の active dataset TLV(`sm_ot_hub_dataset_hex` を bytes 化。
+    Tab5 は Thread leader なので dataset の持ち主そのもの)
+- **handoff(BLE_DONE 後)**: C++ が BLE 切断 → 運用アドレス解決 → シムが自動で
+  CASE over UDP + CommissioningComplete(F7b の流儀)。解決手段は kind で分岐:
+  - thread: SRP 列挙(既存 REFRESH_ADDR と同じ)→ `sm_ctrl_set_node_addr`
+  - wifi: **mDNS resolve を pump に追加**(`sm_ctrl_resolve_start` の出力を
+    5353/ff02::fb(WiFi netif join)ソケットで送り、応答を `sm_ctrl_mdns_rx` へ。
+    = T2b の前倒し。これで WiFi ノードのリブート後再解決も手に入る)
+- **UI**: Pair ダイアログの via を 4 択に(On-network Thread / On-network WiFi /
+  BLE→WiFi / BLE→Thread)。BLE 選択時は IPv6 欄の代わりに discriminator 欄
+  (既定 3840)を使う(欄の付け替えは表示切替で可。passcode / NodeId は共通)。
+  進捗はスキャン→接続→BTP→PASE フェーズ→handoff→完了をステータス行で見せる。
+
+### 11.2 E2E ターゲット(実機)
+
+- **ble-wifi(主)**: NanoC6 の generic_matter_cpp(P6 で ble-wifi 実績)を
+  factory reset して BLE 広告状態にする。
+- ble-thread: 対応デバイス(BLE+Thread 併載ビルド)が現用機材に無ければ実装のみ
+  (ループバックゲートは F7b で検証済み)。準備できたら後日実機。
+
+### 11.3 ゲート
+
+1. docker esp32p4 ビルド green(NimBLE host-only + VHCI が IDF 5.4 で成立するか。
+   不可なら事実と選択肢(IDF 5.5 の影響範囲等)を記録して停止)
+2. 回帰: thread_ctrl_hub_cpp / controller_hub_cpp(S3 BLE)/ tab5_ctrl_app の
+  (BLE 無し構成があるなら)ビルド green
+3. 実機: scan → discriminator 照合 → BTP handshake → PASE → BLE_DONE →
+   handoff(mDNS/SRP)→ PAIR COMPLETE → Toggle
+
+### 11.4 実装記録(T3、2026-08-24)
+
+ビルドゲート(§11.3 の 1 と 2)は green。実機(同 3)は親/ユーザ待ち。
+
+#### 版数 / Kconfig の確定内容(IDF 5.4.4 のままで成立した)
+
+**NimBLE host-only + esp_hosted VHCI は `espressif/idf:release-v5.4`(5.4.4)で素直に通る**。
+決め手は IDF 5.4 の `components/bt/Kconfig` で **`BT_ENABLED` が `SOC_BT_SUPPORTED` に
+依存していない**こと(依存するのは `BT_CONTROLLER_ENABLED` の方)。よって radio を持たない
+P4 でも「ホストだけ有効・controller 無効」が選べる。managed component の版は T2 から不変
+(`esp_hosted` 2.12.12 / `esp_wifi_remote` 1.6.4)で、**`dependencies.lock` は 1 行も動いていない**
+(BLE は既に入っているコンポーネントの Kconfig を立てるだけ)。
+
+`sdkconfig.defaults` への追記(前半 8 行は esp_hosted 同梱例
+`examples/host_nimble_bleprph_host_only_vhci/sdkconfig.defaults` からの転記 = 由来を明記):
+
+| Kconfig | 値 | 理由 |
+|---|---|---|
+| `CONFIG_BT_ENABLED` | y | BT スタックを引く(P4 でも可) |
+| `CONFIG_BT_CONTROLLER_DISABLED` | y | **host-only**。controller は C6 側 |
+| `CONFIG_BT_BLUEDROID_ENABLED` | n | ホストは NimBLE |
+| `CONFIG_BT_NIMBLE_ENABLED` | y | |
+| `CONFIG_BT_NIMBLE_TRANSPORT_UART` | n | VHCI を使うので UART HCI は切る |
+| `CONFIG_ESP_HOSTED_ENABLE_BT_NIMBLE` | y | esp_hosted の BT 経路 |
+| `CONFIG_ESP_HOSTED_NIMBLE_HCI_VHCI` | y | HCI を SDIO(hosted)へ |
+| `CONFIG_ESP_WIFI_REMOTE_LIBRARY_HOSTED` | y | 同梱例に合わせる(T2 でも実質同値) |
+| `CONFIG_BT_NIMBLE_ROLE_CENTRAL/OBSERVER` | y | scan + connect + GATT client |
+| `CONFIG_BT_NIMBLE_ROLE_PERIPHERAL/BROADCASTER` | n | コミッショナは advertise しない |
+| `CONFIG_BT_NIMBLE_MAX_CONNECTIONS` | 1 | BTP は 1 本。内蔵 RAM の節約 |
+| `CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE` | 5120 | 同上(既定 4096〜) |
+
+esp_hosted の Kconfig ガードは `BT_ENABLED && BT_NIMBLE_ENABLED && !BT_CONTROLLER_ENABLED &&
+!BT_NIMBLE_TRANSPORT_UART`。4 条件のどれかを外すと `ESP_HOSTED_ENABLE_BT_NIMBLE` が
+**メニューごと消える**(設定しても sdkconfig に現れない)ので、確認は生成後の
+`grep ESP_HOSTED_ENABLE_BT_NIMBLE sdkconfig` で行うこと。
+
+#### 追加 / 変更ファイル(`ports/esp-idf/examples/tab5_ctrl_app/` のみ)
+
+- **新規** `main/ble_central.{hpp,cpp}`(約 380 行)。controller_hub_cpp(F7b、S3 実機検証済み)の
+  移植 + P4 host-only の起動シーケンス。公開 API は
+  `sm_ble_central_boot()` / `_state()` / `_queue()` / `_start(disc, scan_ms)` / `_stop()` /
+  `_write_c1()` / `_disconnect()`。NimBLE のコールバックは **queue に積むだけ**で
+  `sm_ctrl_*` を 1 つも呼ばない(単線契約)。
+- `main/ctrl_pump.cpp`: 新 op `SM_UI_OP_PAIR_BLE` の処理(`do_pair_ble` / `drive_ble_phase`)、
+  mDNS 解決(`open_mdns` / `resolve_via_mdns`)、SRP アドレスを mDNS 応答に仕立てる
+  `feed_addr_as_mdns`(下記の罠 2)、`REFRESH_ADDR` の mDNS フォールバック、
+  スナップショットへの `ble_host` 反映。
+- `main/app_state.hpp`: `SM_UI_OP_PAIR_BLE` / `sm_ui_via_t` を 4 値へ拡張 /
+  `sm_ui_op_t.discriminator` / `sm_ui_ble_stage_t` / スナップショットの `ble_host` `ble_stage`。
+- `main/ui.cpp`: via ドロップダウンを 4 択(`On-network Thread` / `On-network WiFi` /
+  `BLE - WiFi` / `BLE - Thread`。**並びは `sm_ui_via_t` と同一**)、`LV_EVENT_VALUE_CHANGED` で
+  1 番目の欄を `IPv6` ⇄ `Discriminator`(既定 3840)に付け替え(退避つき)+ 説明文の差し替え、
+  ステータスバーに `BLE off/starting/ready/failed`、ダイアログに BLE stage 表示。
+- `main/main.cpp`: `sm_wifi_start()` の**直後**に `sm_ble_central_boot()`(非ブロッキング)。
+- `main/CMakeLists.txt`: `ble_central.cpp` + REQUIRES に `bt` / `espressif__esp_hosted`
+  (条件付き REQUIRES は不可なので常時)。
+- `main/Kconfig.projbuild`: `SM_UI_DEFAULT_DISCRIMINATOR`(3840)。
+- `sdkconfig.defaults` / `README.md`。
+- **`crates/` / シム / 他 example は 1 行も触っていない**。`dependencies.lock` も無変更。
+
+#### 起動順序(§9.4 / §9.5 / §10.5 の不変条件を維持)
+
+```
+M5.begin() → 500ms → pump(spinel 同期、role>=detached 待ち)
+           → sm_wifi_start()        … ノンブロッキング
+           → sm_ble_central_boot()  … ここ。同じくノンブロッキング
+           → LVGL → UI
+```
+
+`sm_ble_central_boot()` は queue を作って `ble_up` タスク(5KB)を起こすだけ。そのタスクは
+
+1. WiFi が有効なら状態が `CONNECTING` を抜ける(= `esp_wifi_init` が済んだ)のを最大 30 秒待つ
+2. `esp_hosted_init()`(済んでいれば即 OK)→ `esp_hosted_connect_to_slave()`
+3. `esp_hosted_bt_controller_init()` / `_enable()`(**C6 側 controller の起動 RPC**)
+4. `nimble_port_init()` + `nimble_port_freertos_init(host_task)`
+
+を順に行い、`ble_hs` の sync コールバックで `READY` になる。
+
+#### BLE コミッショニングのフロー(pump タスク内、`do_pair_ble`)
+
+```
+資格情報(WiFi = Kconfig / Thread = sm_ot_hub_dataset_hex → bytes)
+  → sm_ctrl_ble_pair_start(node_id, passcode, kind, cred…)
+  → sm_ble_central_start(discriminator, 60s)      … scan(sm_ctrl_match_adv で照合)
+  → drive_ble_phase(120s): queue → sm_ctrl_ble_event / sm_ctrl_ble_poll → C1 write
+       ※ C1 write は **C2 subscribe 完了までゲート**(F7b 実機バグ)
+  → SM_CTRL_EV_BLE_DONE → BLE 切断
+  → handoff: thread = SRP 列挙(最大 ~120 秒リトライ)/ wifi = mDNS 解決(60 秒)
+  → run_until(120s) で CASE over UDP + CommissioningComplete → PAIR COMPLETE
+```
+
+#### ゲート実測
+
+1. docker `espressif/idf:release-v5.4`、経路 (b) cargo、`rm -f sdkconfig` →
+   `-DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.local" set-target esp32p4` → `build` =
+   **Project build complete**、app **0x1fe030 = 2,088,496 B**(4MB パーティションの 50% free。
+   T2 の 1,923,184 B から **+165,312 B** = NimBLE ホスト + hosted VHCI + BLE central)。
+   text 2,074,422 / data 14,461 / bss 1,741,707。
+   ELF: `T ble_hs_*` **88 本**(`ble_hs_init` / `ble_gap_disc` / `ble_gattc_write_no_rsp_flat` /
+   `nimble_port_init` / `nimble_port_run`)、`T ble_transport_ll_init` /
+   `ble_transport_to_ll_acl_impl`(= VHCI 経路が繋がっている)、
+   `T sm_ctrl_ble_pair_start` / `sm_ctrl_ble_event` / `sm_ctrl_ble_poll` / `sm_ctrl_match_adv`、
+   `T sm_ble_central_*` 7 本、`T esp_hosted_bt_controller_init` / `_enable` /
+   `esp_hosted_init` / `esp_hosted_connect_to_slave`、`T sm_ctrl_*` 21 本、`T lv_*` 751 本。
+2. 回帰: `thread_ctrl_hub_cpp` esp32p4 build **green**。`controller_hub_cpp` は S3 prebuilt が
+   必要なためビルドせず、**共有ファイル(`crates/` / シム / 他 example)の無変更**で代替
+   (`git status` で本 example 以外の差分ゼロを確認)。Rust 無変更のため cargo 系は省略。
+
+#### 発見した罠(次に触る人へ)
+
+1. **`esp_hosted_init()` の二重呼びは排他されていない**。WiFi(`esp_wifi_init` →
+   `esp_wifi_remote` → `esp_hosted_init`)と BLE(VHCI)は**同じ SDIO トランスポートを共有**
+   するが、`esp_hosted_init_done` は素の `static uint8_t` で、同時に走らせると SDIO/RPC の
+   二重初期化になる。本実装は `ble_up` タスクが **WiFi の状態が `CONNECTING` を抜けるまで
+   待ってから** `esp_hosted_init()` を呼ぶことで直列化している(WiFi 無効時は BLE 側が
+   トランスポートの持ち主になるので、**SSID 未設定でも BLE は動く**)。
+2. **`sm_ctrl_set_node_addr` は BLE→UDP handoff を再開しない**(最重要)。シムで
+   `Activity::BleHandoff` → `set_peer` + `resume` → `Activity::Pairing` を行うのは
+   **`sm_ctrl_mdns_rx` が解決に成功したときだけ**(`controller.rs` の `sm_ctrl_mdns_rx`)。
+   `set_node_addr` はノード帳のアドレスを書き替えて `RESOLVE_DONE` を積むだけなので、
+   §11.1 が想定した「thread: SRP → `sm_ctrl_set_node_addr`」だけでは **BLE_DONE の後で
+   永久に止まる**。シム無改造の制約下での回避策として、SRP で引いたアドレスを
+   **最小の mDNS 応答に仕立てて `sm_ctrl_mdns_rx` へ渡している**(`feed_addr_as_mdns`):
+   `sm_ctrl_resolve_start` が作るクエリの QNAME(= `<compressed-fabric>-<node-id>._matter._tcp.local`。
+   compressed fabric は C++ から見えないのでここから借りる)を owner にした SRV 1 本 +
+   その target(`smsrp.local`)の AAAA 1 本、DNS 圧縮ポインタなし。
+   **恒久対処はシム側で `sm_ctrl_set_node_addr` にも handoff 再開を持たせること**
+   (そうすればこの合成パケットは捨てられる)。
+3. **`ESP_HOSTED_ENABLE_BT_NIMBLE` は 4 条件が揃わないとメニューごと消える**(上表)。
+   `sdkconfig.defaults` に書いても無言で無視されるので、生成後の `sdkconfig` を grep して
+   確認すること。`BT_CONTROLLER_DISABLED` は choice のメンバなので `BT_CONTROLLER_ENABLED` を
+   明示的に n にする必要はない(P4 では `SOC_BT_SUPPORTED` 不成立で選べない)。
+4. **C6 の BT controller は RPC で明示的に起動する**。esp_hosted 同梱例と同じく
+   `esp_hosted_bt_controller_init()` + `_enable()` を `nimble_port_init()` の**前**に呼ぶ
+   (`ble_transport_ll_init` は `transport_drv_reconfigure()` しかしない)。
+   ここが失敗するときは **C6 の slave FW が `CONFIG_BT_ENABLED=n` でビルドされている**疑い。
+5. mDNS 解決用ソケットは **5353 に bind**(QM 応答をマルチキャストで返す実装のため)し、
+   `ff02::fb` を **WiFi netif の index で join** する。クエリはシムが返す IPv4
+   マルチキャスト(224.0.0.251、v4-mapped で送出)と `ff02::fb%wifi` の両方へ投げる。
+6. NimBLE は既定の `BT_NIMBLE_MEM_ALLOC_MODE_INTERNAL` で内蔵 RAM を取る。pump の静的
+   スタック 128KB + LVGL(描画バッファは PSRAM)と同居させるため、接続数 1 / host タスク 5KB /
+   central+observer のみに絞ってある。bss は T2 の 1,609,803 → 1,741,707(+約 129KB)。
+
+#### 実機で見るべき点
+
+```
+tab5_wifi: got IPv4 ... / got IPv6 ...             ← 先に WiFi(esp_hosted)が上がる
+ble_cent: wifi settled (state=2); bringing up hosted BT
+ble_cent: nimble host started (host-only over esp_hosted VHCI)
+ble_cent: nimble host synced (own addr type 0)     ← ここまで来れば BLE ready
+ble_cent: scanning for 0xFFF6 commissionable (discriminator=3840)
+ble_cent: matched device; connecting → MTU=... → C2 subscribed
+pump:  BLE phase 1..9 → BLE_DONE → handoff → PAIR COMPLETE
+```
+
+判断材料は (a) `nimble host synced` が出るか(出なければ C6 の BT controller / slave FW)、
+(b) `matched device` が出るか(出なければ discriminator or 広告)、(c) `C2 subscribed` の後で
+BTP が進むか、(d) handoff で運用アドレスが引けるか(WiFi = mDNS、Thread = SRP)。
+ble-thread は §11.2 のとおり対応デバイスが手元に無ければ実機は後日。
