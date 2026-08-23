@@ -8,7 +8,7 @@ CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
 # pump は app_main 内。メインタスクスタック 128KB(sm_ctrl の in-place 構築 +
 # P-256 署名チェーン。F7a の AirQ 実機で確定した値)。
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=131072
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
 
 # --- OpenThread(FTD。radio は H2 の RCP に spinel over UART で繋ぐ)---
 CONFIG_OPENTHREAD_ENABLED=y

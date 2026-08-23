@@ -782,12 +782,17 @@ static void matter_task(void *) {
 #endif
 
 #if CONFIG_SM_NETWORK_THREAD
-  // コミッショニング済みなら保存済み dataset で自動 attach(再起動後の運用復帰)。
-  if (stack.fabric_count() > 0) {
+  // 保存済み dataset があれば fabric の有無によらず自動 attach する。
+  //   - fabric>0: 再起動後の運用復帰(従来どおり)
+  //   - fabric=0: 「Thread には居るが未コミッショニング」の commissionable デバイス。
+  //     fail-safe 失効ロールバック後や、on-network PASE(P4 ハブの F8 経路 =
+  //     dataset プリセット運用)がこの状態を前提にする(実機 P9 で発覚)。
+  {
     uint8_t ds[256];
     size_t n = sizeof(ds);
     if (load_thread_dataset(ds, &n)) {
-      ESP_LOGI(TAG, "fabric restored; auto-attaching saved Thread dataset (%u B)", (unsigned)n);
+      ESP_LOGI(TAG, "auto-attaching saved Thread dataset (%u B, fabrics=%u)", (unsigned)n,
+               (unsigned)stack.fabric_count());
       sm_ot_apply_dataset(ds, n);
     }
   }

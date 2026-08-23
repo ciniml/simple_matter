@@ -16,6 +16,7 @@
 
 #include "simple_matter.h"
 
+
 #include "ot_hub.hpp"
 
 #include <cstdint>
@@ -286,7 +287,10 @@ bool do_toggle(uint64_t node_id) {
 
 } // namespace
 
-extern "C" void app_main(void) {
+// ハブ本体。スタック 128KB 必須級(sm_ctrl_init のスタック構築一時コピー +
+// P-256 署名チェーン。S3 実機で確定)。P4 では起動直後の main タスク 128KB 生成が
+// heap 未整備で assert する(実機 P9)ため、静的スタックの専用タスクで動かす。
+static void hub_task(void *) {
   ESP_ERROR_CHECK(nvs_flash_init());
   ESP_ERROR_CHECK(esp_netif_init());
   ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -295,10 +299,12 @@ extern "C" void app_main(void) {
   sm_ot_hub_init();
   if (!sm_ot_hub_wait_ready(10000)) {
     ESP_LOGE(TAG, "openthread did not come up (check RCP UART wiring / H2 firmware)");
+    vTaskDelete(nullptr);
     return;
   }
   if (!sm_ot_hub_form_network()) {
     ESP_LOGE(TAG, "failed to form/restore Thread network");
+    vTaskDelete(nullptr);
     return;
   }
   sm_ot_hub_wait_leader(30000);
@@ -313,6 +319,7 @@ extern "C" void app_main(void) {
   }
   if (!mem) {
     ESP_LOGE(TAG, "failed to allocate %zu bytes for sm_ctrl context", rounded);
+    vTaskDelete(nullptr);
     return;
   }
   ESP_LOGI(TAG, "sm_ctrl context: size=%zu align=%zu (supplied from %s)", need, align,
@@ -332,6 +339,7 @@ extern "C" void app_main(void) {
   if (rc != 0) {
     ESP_LOGE(TAG, "sm_ctrl_init rc=%d", rc);
     heap_caps_free(mem);
+    vTaskDelete(nullptr);
     return;
   }
   ESP_LOGI(TAG, "controller ready: nodes=%zu", sm_ctrl_node_count());
@@ -340,6 +348,7 @@ extern "C" void app_main(void) {
   if (g_udp < 0) {
     sm_ctrl_deinit();
     heap_caps_free(mem);
+    vTaskDelete(nullptr);
     return;
   }
 
@@ -388,4 +397,11 @@ extern "C" void app_main(void) {
       }
     }
   }
+}
+
+extern "C" void app_main(void) {
+  static StaticTask_t s_hub_tcb;
+  alignas(8) static StackType_t s_hub_stack[128 * 1024 / sizeof(StackType_t)];
+  xTaskCreateStatic(&hub_task, "hub", sizeof(s_hub_stack) / sizeof(StackType_t), nullptr, 5,
+                    s_hub_stack, &s_hub_tcb);
 }
