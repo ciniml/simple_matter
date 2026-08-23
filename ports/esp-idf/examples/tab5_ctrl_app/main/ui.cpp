@@ -332,7 +332,9 @@ void open_pair_dialog(lv_event_t *) {
 
   g_ui.kb = lv_keyboard_create(modal);
   lv_obj_set_size(g_ui.kb, g_scr_w, g_scr_h - 424);
-  lv_obj_set_pos(g_ui.kb, 0, 424);
+  // lv_keyboard のコンストラクタは BOTTOM_MID アラインを設定するので、set_pos の
+  // y はそのアンカーからのオフセットになり画面外へ飛ぶ(実機で発見)。align で置く。
+  lv_obj_align(g_ui.kb, LV_ALIGN_BOTTOM_MID, 0, 0);
   lv_keyboard_set_textarea(g_ui.kb, g_ui.ta_ipv6);
   lv_keyboard_set_mode(g_ui.kb, LV_KEYBOARD_MODE_TEXT_LOWER);
 

@@ -770,3 +770,35 @@ note に出すところまで**(`REFRESH_ADDR` は SRP 列挙のまま = Thread 
    書くだけにして、再接続は `wifi_up` タスクの 5 秒周期監視ループに任せている。
 5. `IP_EVENT_GOT_IP6` は **OT netif でも飛ぶ**。`ev->esp_netif != g_netif` で
    弾かないと Thread の LL アドレスを WiFi のものとして表示してしまう。
+
+### 10.6 T2 実機 E2E 完了(2026-08-24)
+
+実機で §10.4 ゲート 3 を完走した。手順と結果:
+
+- AirQ(S3 onoff_light_cpp)を NVS 消去(`espflash erase-region 0x9000 0x6000`)で
+  factory reset → 再起動で WiFi join、`fabrics=0` = PASE 受付、GUA 取得を確認。
+- Tab5 起動: C6 電源は M5Unified 設定済みを読み戻しで確認 → SDIO/esp_hosted 初期化 OK →
+  iotap 接続(切断リトライ 2 回は coex の常態)→ IPv4 + LL + **GUA** 取得。
+- Pair ダイアログ(via=WiFi、AirQ の GUA)→ **PASE phase 1→9 約 7 秒 → PAIR COMPLETE**
+  → Toggle 連続 OK(status=0)→ read OnOff 一致 → AirQ 側ログでも OnOff イベント確認。
+- 同一 fabric の NanoC6(Thread)Toggle も並行して成功 = **Thread + WiFi の
+  2 トランスポート同時運用**を 1 台の Tab5 で実証。
+
+#### 実機で発見・修正したバグ(T1 から潜在)
+
+**Pair ダイアログのオンスクリーンキーボードが画面外に飛ぶ**: LVGL 9 の
+`lv_keyboard` はコンストラクタで `lv_obj_align(obj, LV_ALIGN_BOTTOM_MID, 0, 0)` を
+設定するため、その後の `lv_obj_set_pos(kb, 0, 424)` は「下端中央アンカーからの
+オフセット」と解釈され、kb が画面下端より 424px 下=完全に画面外になる
+(LVGL の set_pos は align プロパティを上書きしない)。`lv_obj_align(BOTTOM_MID)`
+への置き換えで解決。T1 実機確認ではダイアログを開いていなかったため今回まで潜伏。
+
+#### 実機での観測メモ
+
+- **GUA(SLAAC)取得は RA タイミング依存**: 初回ブートでは 4 分待っても GUA が
+  出ず(LL のみ)、リブート後は 12 秒で取得した。恒常的な esp_hosted の
+  マルチキャスト RX 問題ではない(LL への NDP/ping は常に通る)。GUA が無い間は
+  fe80 + via=WiFi で運用できる。§10.5 の「CMD5 / スタック 6KB / spinel 干渉」の
+  懸念 3 点はすべて杞憂だった(問題なし)。
+- 実測フロー: SDIO 初期化 ≈2 秒、WiFi 接続 ≈5-15 秒(リトライ込み)、
+  PASE→AddNOC→CASE 完了 ≈7 秒。
