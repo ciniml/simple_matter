@@ -152,3 +152,7 @@ CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
 # pump の静的スタック 128KB / OT / lwIP / mbedTLS に残す。
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=5120
+
+# --- デバッグコンソール(T5a、§13): USB-Serial-JTAG をプライマリコンソールに ---
+# (ログと同じ ttyACM に esp_console REPL を載せる。generic_matter_cpp と同じ構成)
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

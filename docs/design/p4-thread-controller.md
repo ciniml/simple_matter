@@ -1223,3 +1223,98 @@ Double は **f32 に丸めてから**載せる(C++ 側の読み替えを「下�
 3. 種別検出が 1 回で決まり、リブート後に再検出が走らないこと(NVS "smui")。
 4. センサ 1 ノード + 照明 1 ノードで、照明の Toggle 応答が
    センサの順繰り poll に阻害されないこと(1 周期 1 操作 + busy 契約)。
+
+## 13. T5: デバッグ自動化(GUI リモート制御 / GUI 非依存の機能呼び出し / スクショ)
+
+Status: 設計(2026-08-24)。T3/T4 の実機デバッグで「タッチ操作が人間必須」なことが
+反復速度のボトルネックだったため、シリアルコンソールから Tab5 を完全リモート制御
+できるようにする。エージェントによる自動 E2E(コマンド投入 → ログ/画面で検証)が狙い。
+
+### 13.1 構成(3 層。いずれも USB-Serial-JTAG の esp_console に載せる)
+
+Tab5 の CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y は設定済みで、ログと同じ ttyACM を
+esp_console REPL と共用する(generic FW の smgen コンソールと同じ流儀)。
+
+**T5a: 機能の直接呼び出し(GUI 非依存)** — UI↔pump の単線契約(sm_ui_op_t キュー +
+スナップショット)がそのまま注入点になる。コンソールコマンドは **UI と同じ
+`sm_app_post_op()` を呼ぶだけ**(pump 側は呼び出し元を区別しない = 実機で GUI と
+同一経路の検証になる)。
+- `nodes` = ノード帳 + 種別 + センサ値/on-off(スナップショットのテキストダンプ)
+- `status` = Thread/WiFi/BLE/pairing 状態(ステータスバー相当)
+- `toggle <node>` / `read <node>` / `addr <node>`
+- `pair <ipv6> <node> <passcode> [thread|wifi]`(on-network)
+- `pair-ble <disc> <node> <passcode> [wifi|thread]`(BLE)
+- 出力は 1 行 1 レコードの安定書式(スクリプトから grep できること)
+
+**T5b: GUI のリモート操作** — LVGL の入力はタッチ indev 経由なので、
+`display_gfx.cpp` の indev read_cb をラップして**合成タップを注入**する
+(T1 の回転シムと同じ手口。公開 API のみ)。
+- `tap <x> <y>` = 押下 80ms → 離す(1 発でボタン/キーボードが押せる)
+- `swipe <x1> <y1> <x2> <y2>`(タブ切替等。v1 では任意)
+- `ui-dump` = ウィジェットツリーを走査してクラス名 / 座標 / hidden / ラベル文字列を
+  印字(タップ座標の特定と表示検証の両方に使う。LVGL タスクで
+  `sm_display_lock()` を取って走査)
+
+**T5c: スクリーンショット(フレームバッファ転送)** — `lv_snapshot_take`
+(RGB565、PSRAM に 1280×720×2 ≒ 1.8MB)で現在の画面を取り、コンソールへ
+base64 で流す。フレーミングは
+`SCREENSHOT <w> <h> RGB565 <base64len>` → base64 本文(76 桁/行)→ `END`。
+- USB-Serial-JTAG の実効スループットで 1.8MB×4/3 ≒ 5〜15 秒。`screenshot 2` で
+  1/2 間引き(640×360、約 1/4 時間)も用意する
+- PC 側デコーダ `scripts/tab5shot.py`(pyserial: コマンド送信 → フレーム受信 →
+  PNG 保存)。tap/ui-dump/nodes も同スクリプトのサブコマンドにすると
+  エージェントの 1 コマンド操作になる
+- 撮影中は `sm_display_lock()` で描画を止める(転送はロック外で行う =
+  スナップショットバッファからの送出なので UI は数秒固まらない)
+
+### 13.2 契約上の注意
+
+- コンソールタスクから `sm_ctrl_*` / `lv_*` を直接呼ばない。pump へは op キュー、
+  LVGL へは「合成タップの注入」(indev read_cb が LVGL タスクで拾う)と
+  「lock を取ってのツリー走査 / snapshot」だけ。単線契約は不変。
+- ログと REPL が混ざるのは許容(プロンプト汚れ対策として、コマンド応答は
+  `OK`/`ERR` 終端の安定書式にし、スクリプト側は終端マーカで切る)。
+
+### 13.3 ゲート
+
+1. tab5_ctrl_app esp32p4 build green + 回帰(hub)green
+2. 実機: シリアルから `nodes`/`toggle`/`pair-ble` が GUI と同一挙動、
+   `tap` で Pair ダイアログが開く、`ui-dump` にラベルが出る、
+   `screenshot` の PNG が PC で復元できる(目視一致)
+3. 以降の実機 E2E はこの経路で**エージェントが自走**できること(タッチ手番の排除)
+
+### 12.6 / 13.4 実機追記(T4 実戦投入 + T5a 稼働、2026-08-25 未明)
+
+**動いたもの(実機実証)**:
+- **T5a デバッグコンソール稼働**(`main/console_dbg.cpp`): USB-Serial-JTAG の REPL に
+  `nodes` / `status` / `toggle` / `read` / `pair` / `pairble` / `udptest`。
+  入力は **CRLF 必須**(LF のみでは linenoise が確定しない)。以降の実機 E2E は
+  タッチ操作なしでエージェントが自走できるようになった(この節の検証は全て自走)。
+- **AirQ(airq-sensor、discriminator 2340 に変更 + WiFi 資格情報のビルド時プリセット
+  `SM_WIFI_SSID/SM_WIFI_PASS` を追加)を on-network PASE で 4.7 秒コミッショニング**
+  (`pair fe80::... 11 wifi`)→ **T4 の種別検出が kind=2(センサ)を自動判定し
+  AirQuality=Good を CASE read で取得**。f32 パイプライン込みの T4 経路が実機で成立。
+- `udptest` による決定的切り分け: **esp_hosted 経由の Tab5 は非既定グループの
+  IPv4 マルチキャスト受信が不可能**(join は成功を返すのに 1 パケットも来ない。
+  ユニキャスト :5353 受信は正常)。ff02::1(RA)等の既定グループのみ通る。
+  → mDNS 解決はマルチキャスト受信に依存してはならない。resolve は
+  v4/v6 マルチキャスト送信 + **/24 ユニキャスト掃引**(デバイスはユニキャスト
+  クエリに応答することを PC probe で実証)の 3 本立てに変更済み。
+
+**残る不具合(次セッションの先頭課題)**:
+1. **シム: BLE 試行の 2 回目以降で BTP が壊れる**(3 バイトの C1 write を 5 秒毎に
+   繰り返す。1 回目は常に正常)。`sm_ctrl_ble_pair_start` の再入で BTP/handshake
+   状態が完全リセットされていない疑い。回避 = 試行毎に Tab5 再起動。
+2. **airq-sensor(Rust S3)の WiFi RX が数分で沈黙する**(コミッショニング直後は
+   CASE/read 成立 → 数分後に NDP/ping ごと不応答。センサ/e-ink は生存)。
+   esp-radio + BLE coex の RX 停止系。Tab5 再起動後の CASE resumption が
+   「unreachable」になる直接原因。
+3. NanoC6(onoff_light_cpp thread、discriminator 2560 に変更)の ble-thread E2E は
+   1 の回避(再起動後 1 発目)で再試行するところで中断。
+4. 細事: unwedge のダミー解決がノード帳に幽霊ノード(::1)を残す/その
+   「0 shown / 1 in book」ログが 2 秒毎に出る。掃引のバースト(254 パケット)は
+   10ms/32 発で均しているが要観察。
+5. **ビルドの罠(重要)**: simple_matter コンポーネントの cargo 呼び出しは
+   staticlib(.a)が存在すると ninja にスキップされ **Rust の変更が反映されない**。
+   Rust を触ったら `target/<triple>/release/libsimple_matter_cffi.a` を消してから
+   ビルドする(恒久対処 = CMakeLists に Rust ソースの DEPENDS を張る、将来)。

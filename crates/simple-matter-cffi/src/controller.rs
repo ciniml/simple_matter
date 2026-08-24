@@ -1953,6 +1953,16 @@ pub extern "C" fn sm_ctrl_ble_event(
                 s.ble_subscribed = false;
                 s.ble_hs_out.clear();
                 s.btp.reset();
+                // BLE フェーズ(BLE_DONE 前)の切断は、このセッションでは回復できない
+                // (C++ 側は再接続を試みない設計)。Activity を畳んで PAIR_FAILED を
+                // 立てないと、以降の pair/invoke が永久に busy(-2/-10)で弾かれる
+                // (T4 実機で発覚。BleHandoff は BLE 切断後が正常経路なので触らない)。
+                if let Activity::BlePairing { node_id } = s.activity {
+                    let mut e = CtrlShim::ev(sm_ctrl_event_kind_t::SM_CTRL_EV_PAIR_FAILED);
+                    e.node_id = node_id;
+                    s.push_event(e);
+                    s.activity = Activity::Idle;
+                }
                 0
             }
             sm_ble_event_kind_t::SM_BLE_C2_SUBSCRIBED => {

@@ -16,6 +16,7 @@
 
 #include "app_state.hpp"
 #include "ble_central.hpp"
+#include "console_dbg.hpp"
 #include "ctrl_pump.hpp"
 #include "display_gfx.hpp"
 #include "ui.hpp"
@@ -109,6 +110,9 @@ extern "C" void app_main(void) {
   sm_display_lock(0);
   sm_ui_create();
   sm_display_unlock();
+
+  // --- 5. デバッグコンソール(T5a、§13.1。ログと同じ USB-Serial-JTAG に REPL)---
+  sm_console_start();
 
   ESP_LOGI(TAG, "app_main done; ui + pump are running");
 }

@@ -662,7 +662,7 @@ static void matter_task(void *) {
   // sm_config を組む。
   sm_config_t cfg;
   memset(&cfg, 0, sizeof(cfg));
-  cfg.discriminator = 3840;
+  cfg.discriminator = 2560; // 3840 は同一環境の別実験ボードと混信するため変更(T4 実機)
   // passcode はデバイスに置かない(verifier 指定時は無視される)。
   cfg.passcode = 0;
   cfg.verifier_iterations = 2000;

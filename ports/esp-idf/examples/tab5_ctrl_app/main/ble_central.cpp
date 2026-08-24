@@ -137,6 +137,30 @@ int on_dsc_disc(uint16_t conn, const struct ble_gatt_error *err, uint16_t chr_va
   return 0;
 }
 
+// 全キャラクタリスティック列挙のフォールバック(by-uuid で C1/C2 が見つからない
+// ペリフェラル対策。サービス発見の全列挙フォールバックと同じ動機)。
+int on_all_chr_disc(uint16_t conn, const struct ble_gatt_error *err,
+                    const struct ble_gatt_chr *chr, void *arg) {
+  (void)arg;
+  if (err->status == 0 && chr != nullptr) {
+    if (ble_uuid_cmp(&chr->uuid.u, &s_c1_uuid.u) == 0) {
+      s_c1_val_handle = chr->val_handle;
+    } else if (ble_uuid_cmp(&chr->uuid.u, &s_c2_uuid.u) == 0) {
+      s_c2_val_handle = chr->val_handle;
+    }
+  } else if (err->status == BLE_HS_EDONE) {
+    if (s_c1_val_handle != 0 && s_c2_val_handle != 0) {
+      ESP_LOGI(TAG, "C1/C2 found via all-characteristics discovery (%u / %u)", s_c1_val_handle,
+               s_c2_val_handle);
+      ble_gattc_disc_all_dscs(conn, s_c2_val_handle, s_svc_end, on_dsc_disc, nullptr);
+    } else {
+      ESP_LOGE(TAG, "C1/C2 not found (even via all-characteristics discovery)");
+      ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
+    }
+  }
+  return 0;
+}
+
 int on_c2_disc(uint16_t conn, const struct ble_gatt_error *err, const struct ble_gatt_chr *chr,
                void *arg) {
   (void)arg;
@@ -146,7 +170,8 @@ int on_c2_disc(uint16_t conn, const struct ble_gatt_error *err, const struct ble
     if (s_c2_val_handle != 0) {
       ble_gattc_disc_all_dscs(conn, s_c2_val_handle, s_svc_end, on_dsc_disc, nullptr);
     } else {
-      ESP_LOGE(TAG, "C2 characteristic not found");
+      ESP_LOGW(TAG, "C2 not found by uuid; falling back to all-characteristics discovery");
+      ble_gattc_disc_all_chrs(conn, s_svc_start, s_svc_end, on_all_chr_disc, nullptr);
     }
   }
   return 0;
@@ -158,7 +183,51 @@ int on_c1_disc(uint16_t conn, const struct ble_gatt_error *err, const struct ble
   if (err->status == 0 && chr != nullptr) {
     s_c1_val_handle = chr->val_handle;
   } else if (err->status == BLE_HS_EDONE) {
-    ble_gattc_disc_chrs_by_uuid(conn, s_svc_start, s_svc_end, &s_c2_uuid.u, on_c2_disc, nullptr);
+    if (s_c1_val_handle != 0) {
+      ble_gattc_disc_chrs_by_uuid(conn, s_svc_start, s_svc_end, &s_c2_uuid.u, on_c2_disc, nullptr);
+    } else {
+      ESP_LOGW(TAG, "C1 not found by uuid; falling back to all-characteristics discovery");
+      ble_gattc_disc_all_chrs(conn, s_svc_start, s_svc_end, on_all_chr_disc, nullptr);
+    }
+  }
+  return 0;
+}
+
+// 0xFFF6 の照合(16-bit と、Bluetooth base UUID 展開の 128-bit の両対応)。
+// TrouBLE(airq-sensor)はサービス UUID を 128-bit 形式で返すことがあり、
+// ble_uuid_cmp は型が違うと不一致になるため自前で見る。
+bool uuid_is_fff6(const ble_uuid_any_t *u) {
+  if (u->u.type == BLE_UUID_TYPE_16) {
+    return u->u16.value == 0xFFF6;
+  }
+  if (u->u.type == BLE_UUID_TYPE_128) {
+    // 0000FFF6-0000-1000-8000-00805F9B34FB(NimBLE は LSB first で保持)
+    static const uint8_t kFff6Base[16] = {0xFB, 0x34, 0x9B, 0x5F, 0x80, 0x00, 0x00, 0x80,
+                                          0x00, 0x10, 0x00, 0x00, 0xF6, 0xFF, 0x00, 0x00};
+    return memcmp(u->u128.value, kFff6Base, 16) == 0;
+  }
+  return false;
+}
+
+// 全サービス列挙のフォールバック(下の on_svc_disc から使う)。UUID を自前照合する。
+int on_all_svc_disc(uint16_t conn, const struct ble_gatt_error *err,
+                    const struct ble_gatt_svc *svc, void *arg) {
+  (void)arg;
+  if (err->status == 0 && svc != nullptr) {
+    if (uuid_is_fff6(&svc->uuid)) {
+      s_svc_start = svc->start_handle;
+      s_svc_end = svc->end_handle;
+    }
+  } else if (err->status == BLE_HS_EDONE) {
+    if (s_svc_start != 0) {
+      ESP_LOGI(TAG, "0xFFF6 found via all-services discovery (handles %u..%u)", s_svc_start,
+               s_svc_end);
+      ble_gattc_disc_chrs_by_uuid(conn, s_svc_start, s_svc_end, &s_c1_uuid.u, on_c1_disc, nullptr);
+    } else {
+      // 本当に無い。繋ぎっぱなしにせず切って pump にすぐ知らせる(タイムアウト待ち回避)。
+      ESP_LOGE(TAG, "0xFFF6 service not found (even via all-services discovery)");
+      ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
+    }
   }
   return 0;
 }
@@ -173,7 +242,10 @@ int on_svc_disc(uint16_t conn, const struct ble_gatt_error *err, const struct bl
     if (s_svc_start != 0) {
       ble_gattc_disc_chrs_by_uuid(conn, s_svc_start, s_svc_end, &s_c1_uuid.u, on_c1_disc, nullptr);
     } else {
-      ESP_LOGE(TAG, "0xFFF6 service not found");
+      // Find-By-Type-Value に応答しないペリフェラルがいる(実機: TrouBLE 0.6 の
+      // airq-sensor。BlueZ/NimBLE ペリフェラルは応答する)。全サービス列挙で再試行。
+      ESP_LOGW(TAG, "disc_svc_by_uuid found nothing; falling back to all-services discovery");
+      ble_gattc_disc_all_svcs(conn, on_all_svc_disc, nullptr);
     }
   }
   return 0;
@@ -184,7 +256,12 @@ int gap_event(struct ble_gap_event *event, void *arg) {
   switch (event->type) {
   case BLE_GAP_EVENT_DISC: {
     if (adv_matches(event->disc.data, event->disc.length_data)) {
-      ESP_LOGI(TAG, "matched device; connecting");
+      // 広告元アドレスを必ず出す(同じ discriminator を広告する第三のデバイスを
+      // 掴んだ事故が実機であった。type 0=public 1=random)。
+      ESP_LOGI(TAG, "matched device %02x:%02x:%02x:%02x:%02x:%02x (type=%d); connecting",
+               event->disc.addr.val[5], event->disc.addr.val[4], event->disc.addr.val[3],
+               event->disc.addr.val[2], event->disc.addr.val[1], event->disc.addr.val[0],
+               event->disc.addr.type);
       ble_gap_disc_cancel();
       s_scanning = false;
       ble_gap_connect(s_own_addr_type, &event->disc.addr, 30000, nullptr, gap_event, nullptr);

@@ -907,21 +907,63 @@ struct MdnsCached {
 MdnsCached g_mdns_cache[8];
 size_t g_mdns_cache_n = 0;
 int g_mdns_fd = -1;
+int g_mdns_fd6 = -1;
 
-void drain_mdns_to_cache() {
-  if (g_mdns_fd < 0) {
+// IPv6 側の mDNS ソケット(:5353 bind + ff02::fb を WiFi netif で MLD join)。
+// **v4 と v6 の両方で聞く**のが肝(実機 T4/T5 で確定):
+//   - C++ デバイス(NanoC6 等)は v6 join に失敗する(errno=125)→ v4 でしか届かない
+//   - Rust デバイス(AirQ)は v6 MLD join が生きている一方、v4 マルチキャストの
+//     受信/到達が不安定 → v6 なら確実
+//   - Tab5 自身も IPv6 マルチキャスト RX は安定(RA/GUA 取得が毎回通る)
+int open_mdns6_5353(uint32_t netif_index) {
+  int fd = socket(AF_INET6, SOCK_DGRAM, 0);
+  if (fd < 0) {
+    return -1;
+  }
+  int on = 1;
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+  setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on));
+  struct sockaddr_in6 a = {};
+  a.sin6_family = AF_INET6;
+  a.sin6_port = htons(5353);
+  if (bind(fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
+    ESP_LOGW(TAG, "mdns6 bind(5353) failed errno=%d", errno);
+    close(fd);
+    return -1;
+  }
+  struct ipv6_mreq m6 = {};
+  inet_pton(AF_INET6, "ff02::fb", &m6.ipv6mr_multiaddr);
+  m6.ipv6mr_interface = netif_index;
+  if (setsockopt(fd, IPPROTO_IPV6, IPV6_JOIN_GROUP, &m6, sizeof(m6)) != 0) {
+    ESP_LOGW(TAG, "MLD join ff02::fb on netif %u failed errno=%d", (unsigned)netif_index, errno);
+  }
+  return fd;
+}
+
+// v6 側でクエリを送る(ff02::fb%netif 宛)。
+void send_mdns6_query(int fd, const uint8_t *q, size_t qn, uint32_t netif_index) {
+  struct sockaddr_in6 m = {};
+  m.sin6_family = AF_INET6;
+  m.sin6_port = htons(5353);
+  inet_pton(AF_INET6, "ff02::fb", &m.sin6_addr);
+  m.sin6_scope_id = netif_index;
+  sendto(fd, q, qn, 0, (struct sockaddr *)&m, sizeof(m));
+}
+
+void drain_one_to_cache(int fd) {
+  if (fd < 0) {
     return;
   }
   for (;;) {
     struct timeval tv = {0, 0};
     fd_set rfds;
     FD_ZERO(&rfds);
-    FD_SET(g_mdns_fd, &rfds);
-    if (select(g_mdns_fd + 1, &rfds, nullptr, nullptr, &tv) <= 0) {
+    FD_SET(fd, &rfds);
+    if (select(fd + 1, &rfds, nullptr, nullptr, &tv) <= 0) {
       return;
     }
     uint8_t rx[1500];
-    int n = recv(g_mdns_fd, rx, sizeof(rx), 0);
+    int n = recv(fd, rx, sizeof(rx), 0);
     if (n <= 0) {
       return;
     }
@@ -936,6 +978,11 @@ void drain_mdns_to_cache() {
       ESP_LOGI(TAG, "mdns cached %d B during BLE phase (%u total)", n, (unsigned)g_mdns_cache_n);
     }
   }
+}
+
+void drain_mdns_to_cache() {
+  drain_one_to_cache(g_mdns_fd);
+  drain_one_to_cache(g_mdns_fd6);
 }
 
 // キャッシュした announce をシムへ流す。RESOLVE_DONE が立てば true。
@@ -954,11 +1001,35 @@ bool replay_mdns_cache() {
   return false;
 }
 
+// 受信 1 回分をシムへ給餌する。RESOLVE_DONE で true。
+bool feed_rx_once(int fd) {
+  uint8_t rx[1500];
+  struct sockaddr_storage src = {};
+  socklen_t sl = sizeof(src);
+  int n = recvfrom(fd, rx, sizeof(rx), 0, (struct sockaddr *)&src, &sl);
+  if (n <= 0) {
+    return false;
+  }
+  int32_t rc = sm_ctrl_mdns_rx(rx, (size_t)n, nullptr, now_ms());
+  ESP_LOGI(TAG, "mdns rx %d B (%s) -> rc=%ld", n,
+           src.ss_family == AF_INET6 ? "v6" : "v4", (long)rc);
+  if (rc == 0) {
+    sm_ctrl_event_t ev;
+    while (sm_ctrl_take_event(&ev)) {
+      if (ev.kind == SM_CTRL_EV_RESOLVE_DONE) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 bool resolve_via_mdns(uint64_t node_id, uint32_t netif_index, uint64_t timeout_ms) {
-  (void)netif_index;
-  const bool own_fd = (g_mdns_fd < 0);
-  int fd = own_fd ? open_mdns_5353() : g_mdns_fd;
-  if (fd < 0) {
+  const bool own4 = (g_mdns_fd < 0);
+  const bool own6 = (g_mdns_fd6 < 0);
+  int fd4 = own4 ? open_mdns_5353() : g_mdns_fd;
+  int fd6 = own6 ? open_mdns6_5353(netif_index) : g_mdns_fd6;
+  if (fd4 < 0 && fd6 < 0) {
     return false;
   }
 
@@ -969,7 +1040,6 @@ bool resolve_via_mdns(uint64_t node_id, uint32_t netif_index, uint64_t timeout_m
 
   uint64_t until = now_ms() + timeout_ms;
   uint64_t next_q = 0;
-  uint8_t rx[1500];
   bool ok = false;
   while (!ok && now_ms() < until) {
     if (now_ms() >= next_q) {
@@ -978,36 +1048,68 @@ bool resolve_via_mdns(uint64_t node_id, uint32_t netif_index, uint64_t timeout_m
       sm_addr_t qdst = {};
       size_t qn = sm_ctrl_resolve_start(node_id, nullptr, now_ms(), q, sizeof(q), &qdst);
       if (qn > 0) {
-        sendto(fd, q, qn, 0, (struct sockaddr *)&mdst, sizeof(mdst));
-        ESP_LOGI(TAG, "mdns query %u B -> 224.0.0.251:5353 (from :5353)", (unsigned)qn);
-      }
-    }
-    struct timeval tv = {0, 200000};
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    FD_SET(fd, &rfds);
-    if (select(fd + 1, &rfds, nullptr, nullptr, &tv) > 0 && FD_ISSET(fd, &rfds)) {
-      struct sockaddr_in src;
-      socklen_t sl = sizeof(src);
-      int n = recvfrom(fd, rx, sizeof(rx), 0, (struct sockaddr *)&src, &sl);
-      if (n > 0) {
-        int32_t rc = sm_ctrl_mdns_rx(rx, (size_t)n, nullptr, now_ms());
-        char sip[20] = {0};
-        inet_ntop(AF_INET, &src.sin_addr, sip, sizeof(sip));
-        ESP_LOGI(TAG, "mdns rx %d B from %s:%u -> rc=%ld", n, sip, ntohs(src.sin_port), (long)rc);
-        if (rc == 0) {
-          sm_ctrl_event_t ev;
-          while (sm_ctrl_take_event(&ev)) {
-            if (ev.kind == SM_CTRL_EV_RESOLVE_DONE) {
-              ok = true;
+        if (fd4 >= 0) {
+          sendto(fd4, q, qn, 0, (struct sockaddr *)&mdst, sizeof(mdst));
+        }
+        if (fd6 >= 0) {
+          send_mdns6_query(fd6, q, qn, netif_index);
+        }
+        ESP_LOGI(TAG, "mdns query %u B -> v4/v6 mcast (from :5353)", (unsigned)qn);
+        // **ユニキャスト掃引(最終手段だが決定打)**: esp_hosted 経由の Tab5 は
+        // 既定グループ(ff02::1 等)以外のマルチキャスト受信が当てにならず、
+        // デバイスの announce/QM 応答が届かないことがある(実機 T4/T5 で確定。
+        // PC では同じ announce が受信できているのに Tab5 だけ無音)。
+        // 我々のデバイスは **直接ユニキャストの mDNS クエリに応答する**(PC probe で
+        // 実証)ので、自分の /24 全ホストへ QU クエリを直送する。応答はユニキャストで
+        // 返るためマルチキャスト受信に一切依存しない。1 周 ≈ 254 パケット(18KB)。
+        if (fd4 >= 0) {
+          sm_wifi_status_t w = {};
+          sm_wifi_get_status(&w);
+          struct in_addr self = {};
+          if (w.ip4[0] != 0 && inet_pton(AF_INET, w.ip4, &self) == 1) {
+            struct sockaddr_in u = {};
+            u.sin_family = AF_INET;
+            u.sin_port = htons(5353);
+            for (uint32_t host = 1; host <= 254; ++host) {
+              u.sin_addr.s_addr = (self.s_addr & htonl(0xFFFFFF00u)) | htonl(host);
+              if (u.sin_addr.s_addr == self.s_addr) {
+                continue;
+              }
+              sendto(fd4, q, qn, 0, (struct sockaddr *)&u, sizeof(u));
+              if ((host & 0x1F) == 0) {
+                vTaskDelay(pdMS_TO_TICKS(10)); // バーストを少し均す
+              }
             }
           }
         }
       }
     }
+    struct timeval tv = {0, 200000};
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    int maxfd = -1;
+    if (fd4 >= 0) {
+      FD_SET(fd4, &rfds);
+      maxfd = fd4 > maxfd ? fd4 : maxfd;
+    }
+    if (fd6 >= 0) {
+      FD_SET(fd6, &rfds);
+      maxfd = fd6 > maxfd ? fd6 : maxfd;
+    }
+    if (select(maxfd + 1, &rfds, nullptr, nullptr, &tv) > 0) {
+      if (fd4 >= 0 && FD_ISSET(fd4, &rfds) && feed_rx_once(fd4)) {
+        ok = true;
+      }
+      if (!ok && fd6 >= 0 && FD_ISSET(fd6, &rfds) && feed_rx_once(fd6)) {
+        ok = true;
+      }
+    }
   }
-  if (own_fd) {
-    close(fd);
+  if (own4 && fd4 >= 0) {
+    close(fd4);
+  }
+  if (own6 && fd6 >= 0) {
+    close(fd6);
   }
   return ok;
 }
@@ -1153,6 +1255,9 @@ bool drive_ble_phase(const sm_ui_op_t &op, uint64_t timeout_ms) {
         sm_ctrl_ble_event(SM_BLE_DISCONNECTED, 0, nullptr, 0, now_ms());
         subscribed = false;
         sm_app_set_status("BLE link dropped during commissioning");
+        // BLE_DONE 前の切断はこのセッションでは回復できない(GATT 未発見・
+        // ペリフェラル都合の切断など)。タイムアウトまで待たず即失敗にする。
+        return false;
         break;
       case BleCentralEvent::ScanTimeout:
         sm_app_set_status("no device advertising discriminator %u", (unsigned)op.discriminator);
@@ -1290,12 +1395,20 @@ void do_pair_ble(const sm_ui_op_t &op) {
     while (q != nullptr && xQueueReceive(q, &stale, 0) == pdTRUE) {
     }
   }
+  // シム側のイベント残骸も捨てる(前回切断時の PAIR_FAILED が残っていると、
+  // 新しい試行の drive_ble_phase が最初の take_event で拾って即失敗する。実機で発覚)。
+  {
+    sm_ctrl_event_t stale;
+    while (sm_ctrl_take_event(&stale)) {
+    }
+  }
 
   // WiFi kind: mDNS ソケットを **BLE 開始前**に開いて join しておく。デバイスの
   // operational announce は ConnectNetwork 成功直後(= BLE_DONE より前)に流れるので、
   // BLE フェーズ中から聞いていないと取り逃す(実機 + PC 側パケット観測で確定)。
   g_mdns_cache_n = 0;
   g_mdns_fd = thread_kind ? -1 : open_mdns_5353();
+  g_mdns_fd6 = thread_kind ? -1 : open_mdns6_5353(sm_wifi_netif_index());
 
   sm_app_set_status("BLE scan for discriminator %u (node %016llx, %s credentials) ...",
                     (unsigned)op.discriminator, (unsigned long long)op.node_id,
@@ -1320,6 +1433,10 @@ void do_pair_ble(const sm_ui_op_t &op) {
     if (g_mdns_fd >= 0) {
       close(g_mdns_fd);
       g_mdns_fd = -1;
+    }
+    if (g_mdns_fd6 >= 0) {
+      close(g_mdns_fd6);
+      g_mdns_fd6 = -1;
     }
     return;
   }
@@ -1354,7 +1471,10 @@ void do_pair_ble(const sm_ui_op_t &op) {
     drain_mdns_to_cache(); // BLE フェーズの取りこぼしを最終回収
     resolved = replay_mdns_cache();
     if (!resolved) {
-      resolved = resolve_via_mdns(op.node_id, idx, 20000);
+      // EUI-64 導出が使える相手(public アドレス)は 20 秒で切り上げて導出へ。
+      // 使えない相手(TrouBLE 等の static random)は 60 秒待つ —
+      // AirQ(Rust FW)は WiFi join 後の DHCP + mDNS 開始に 20 秒以上かかる実測。
+      resolved = resolve_via_mdns(op.node_id, idx, g_ble_peer_mac_ok ? 20000 : 60000);
     }
     // 最終フォールバック(ESP32 ファミリ限定の割り切り): BLE ピアの BT MAC から
     // WiFi MAC(-2)→ EUI-64 を導出し、運用アドレスを直接与える。SLAAC(EUI-64)
@@ -1384,6 +1504,10 @@ void do_pair_ble(const sm_ui_op_t &op) {
   if (g_mdns_fd >= 0) {
     close(g_mdns_fd);
     g_mdns_fd = -1;
+  }
+  if (g_mdns_fd6 >= 0) {
+    close(g_mdns_fd6);
+    g_mdns_fd6 = -1;
   }
 
   if (!resolved) {
