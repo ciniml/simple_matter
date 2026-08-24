@@ -587,6 +587,12 @@ int32_t sm_ctrl_init(uint8_t *mem,
 // 二重 init 防止フラグを解除する(同一プロセスでの再初期化 = プロセス再起動相当が可能になる)。
 void sm_ctrl_deinit(void);
 
+// 進行中の運用操作(CASE 確立待ち / 応答待ち / pairing)を外部都合で中断し Idle に戻す。
+// C++ 側の待ち(run_until 等)がタイムアウトしたときに呼ぶ。呼ばないと不達ノード宛の
+// CASE が HANDSHAKE_TIMEOUT(60s)まで内部で粘り、その間の全操作が busy(-10)で弾かれる。
+// 戻り値: 1=中断した、0=元々 Idle、-1=未初期化。
+int32_t sm_ctrl_abort_op(void);
+
 // コミッショニングを開始する(UDP 直接 PASE。§11.1)。
 //
 // 戻り値: 0=OK、-1=未初期化/NULL、-2=busy(他トランザクション進行中)、-3=commission 拒否。

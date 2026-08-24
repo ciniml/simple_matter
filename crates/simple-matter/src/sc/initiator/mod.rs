@@ -236,6 +236,34 @@ impl<'c, C: Crypto, R: Rng, F> ScInitiator<'c, C, R, F> {
         }
     }
 
+    /// 期限切れ(60s 超過)ハンドシェイクを破棄し、予約セッションを解放して、
+    /// それを運んでいた exchange を返す([`on_tick`](Self::on_tick) の exchange 返却版。
+    /// 統合層が exchange を close して再送バッファも回収する)。`Failed { Timeout }` を積む。
+    pub fn expire_timed_out<const S: usize>(
+        &mut self,
+        sessions: &mut SessionManager<S>,
+        now_ms: u64,
+    ) -> Option<ExchangeId> {
+        let expired = match &self.hs {
+            Some(h) => now_ms.saturating_sub(h.started_ms) > HANDSHAKE_TIMEOUT_MS,
+            None => false,
+        };
+        if !expired {
+            return None;
+        }
+        let h = self.hs.take()?;
+        let kind = match h.kind {
+            InitiatorKind::Pase(_) => HandshakeKindTag::Pase,
+            InitiatorKind::Case(_) => HandshakeKindTag::Case,
+        };
+        sessions.remove(h.reserved);
+        self.event = Some(ScEvent::Failed {
+            kind,
+            reason: ScFailReason::Timeout,
+        });
+        Some(h.exchange)
+    }
+
     /// `dest` を Rng で満たす(コミッショナの attestation nonce 払い出し用)。
     pub fn fill_random(&mut self, dest: &mut [u8]) -> Result<()> {
         self.rng.fill_bytes(dest)
@@ -321,6 +349,23 @@ impl<'c, C: Crypto, R: Rng, F> ScInitiator<'c, C, R, F> {
     /// 解放は呼び出し元(controller 層)が行う。
     pub(crate) fn cancel_handshake(&mut self) {
         self.hs = None;
+    }
+
+    /// 進行中ハンドシェイクを外部都合で中断する(BLE リンク断など)。
+    ///
+    /// 予約セッションを解放し、閉じるべき exchange を返す(呼び出し側が
+    /// exchange manager で close する)。`Failed` イベントは積まない(中断の
+    /// 意思決定は統合層が済ませている)。initiator のハンドシェイクスロットは
+    /// **1 本**なので、これを畳まないと次の `start_pase`/`start_case` が
+    /// `NoSpace` で沈黙し、60s の HANDSHAKE_TIMEOUT まで何も送れなくなる
+    /// (T4 実機: BLE 2 回目の試行が BTP keep-alive だけ流して止まる症状)。
+    pub fn abort_handshake<const S: usize>(
+        &mut self,
+        sessions: &mut SessionManager<S>,
+    ) -> Option<ExchangeId> {
+        let h = self.hs.take()?;
+        sessions.remove(h.reserved);
+        Some(h.exchange)
     }
 
     /// 進行中ハンドシェイクを破棄し、予約セッションを解放して `Failed` を積む。

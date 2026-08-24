@@ -283,6 +283,12 @@ bool run_until(int fd, uint64_t timeout_ms, sm_ctrl_event_t &out_ev,
       }
     }
     if (now_ms() > until) {
+      // pump が諦めるならシム側の進行中 op も畳む(不達ノード宛 CASE が内部で
+      // 60 秒粘って全操作を busy にする実機症状の対処)。
+      int32_t ab = sm_ctrl_abort_op();
+      if (ab > 0) {
+        ESP_LOGW(TAG, "run_until timeout: aborted the in-flight controller op");
+      }
       return false;
     }
     uint64_t now = now_ms();
@@ -595,8 +601,39 @@ void refresh_wifi_status() {
 bool resolve_via_mdns(uint64_t node_id, uint32_t netif_index, uint64_t timeout_ms);
 
 // quiet = 周期ポーリング(ステータス行を汚さない)。timeout_ms は CASE 込みの上限。
+// 周期 poll の失敗バックオフ(行 index 別)。成功した操作はこれを解除する。
+uint64_t g_backoff_until[SM_UI_MAX_NODES] = {};
+
+void clear_backoff(uint64_t node_id) {
+  sm_ui_snapshot_t *s = sm_app_lock();
+  size_t i = node_index(s, node_id);
+  sm_app_unlock();
+  if (i < SM_UI_MAX_NODES) {
+    g_backoff_until[i] = 0;
+  }
+}
+
+// 操作開始の共通手順: シムのイベント残骸を捨ててから開始し、busy(-10)なら
+// 最大 5 秒ポンプを回して再試行する(残骸イベント誤認 + 直前 op の畳み待ち。実機の学び)。
+template <typename F> int32_t start_op_clean(F start) {
+  int32_t rc = -10;
+  const uint64_t until = now_ms() + 5000;
+  for (;;) {
+    sm_ctrl_event_t stale;
+    while (sm_ctrl_take_event(&stale)) {
+    }
+    rc = start();
+    if (rc != -10 || now_ms() >= until) {
+      return rc;
+    }
+    pump_once(g_udp, 200);
+  }
+}
+
 bool do_read_onoff(uint64_t node_id, bool quiet, uint64_t timeout_ms) {
-  if (sm_ctrl_read_scalar(node_id, EP_ONOFF, CL_ONOFF, ATTR_ONOFF, now_ms()) != 0) {
+  if (start_op_clean([&] {
+        return sm_ctrl_read_scalar(node_id, EP_ONOFF, CL_ONOFF, ATTR_ONOFF, now_ms());
+      }) != 0) {
     if (!quiet) {
       sm_app_set_status("read %016llx: rejected (busy / unknown node)",
                         (unsigned long long)node_id);
@@ -623,11 +660,33 @@ bool do_read_onoff(uint64_t node_id, bool quiet, uint64_t timeout_ms) {
 // 任意パスのスカラ read。成功なら *out に生の value_u64、*out_null に null 判定。
 bool do_read_scalar(uint64_t node_id, const SensorAttrPath &p, uint64_t timeout_ms, uint64_t *out,
                     bool *out_null) {
-  if (sm_ctrl_read_scalar(node_id, p.ep, p.cluster, p.attr, now_ms()) != 0) {
+  // **開始前にシムのイベント残骸を捨てる**(実機で発覚): pump が run_until の
+  // タイムアウトで諦めた後にシム内の read が完了すると READ_DONE がキューに残り、
+  // 次の read がそれを自分の結果と誤認する(その裏で本物の read は進行中 → 続く
+  // 開始が -10 busy)。Idle でないと開始できないので、ここで捨てて良いのは残骸だけ。
+  int32_t src = -10;
+  const uint64_t until = now_ms() + 5000;
+  for (;;) {
+    sm_ctrl_event_t stale;
+    while (sm_ctrl_take_event(&stale)) {
+    }
+    src = sm_ctrl_read_scalar(node_id, p.ep, p.cluster, p.attr, now_ms());
+    if (src != -10 || now_ms() >= until) {
+      break;
+    }
+    pump_once(g_udp, 200); // 進行中の op を畳ませてから再試行
+  }
+  if (src != 0) {
+    ESP_LOGW(TAG, "read ep%u/0x%04lx/0x%04lx: start rejected rc=%ld", (unsigned)p.ep,
+             (unsigned long)p.cluster, (unsigned long)p.attr, (long)src);
     return false;
   }
   sm_ctrl_event_t ev;
   if (!run_until(g_udp, timeout_ms, ev, term_read) || ev.kind != SM_CTRL_EV_READ_DONE) {
+    ESP_LOGW(TAG, "read ep%u/0x%04lx/0x%04lx: %s (kind=%d status=%u)", (unsigned)p.ep,
+             (unsigned long)p.cluster, (unsigned long)p.attr,
+             ev.kind == SM_CTRL_EV_READ_FAILED ? "READ_FAILED" : "timeout/other", (int)ev.kind,
+             ev.status);
     return false;
   }
   *out = ev.value_u64;
@@ -646,11 +705,16 @@ bool do_read_sensor_slot(uint64_t node_id, uint8_t slot, bool quiet, uint64_t ti
   bool is_null = false;
   if (!do_read_scalar(node_id, p, timeout_ms, &raw, &is_null)) {
     set_node_sensor(node_id, slot, false, 0);
+    ESP_LOGW(TAG, "sensor slot %s (ep%u cluster 0x%04lx attr 0x%04lx) read failed for %016llx",
+             p.name, (unsigned)p.ep, (unsigned long)p.cluster, (unsigned long)p.attr,
+             (unsigned long long)node_id);
     if (!quiet) {
       sm_app_set_status("read %s of %016llx failed", p.name, (unsigned long long)node_id);
     }
     return false;
   }
+  ESP_LOGI(TAG, "sensor slot %s = raw 0x%llx%s", p.name, (unsigned long long)raw,
+           is_null ? " (null)" : "");
   set_node_sensor(node_id, slot, !is_null, raw);
   if (!quiet) {
     sm_app_set_status("read %s of %016llx OK", p.name, (unsigned long long)node_id);
@@ -666,6 +730,10 @@ bool do_read_sensor_all(uint64_t node_id, bool quiet, uint64_t timeout_ms) {
       all = false;
       break; // 1 本落ちたら以降も落ちる(死んだノードで 5 回 CASE を試さない)
     }
+  }
+  if (all) {
+    clear_backoff(node_id);
+    set_node_note(node_id, "sensors OK");
   }
   if (!quiet) {
     sm_app_set_status(all ? "refreshed all sensor attributes of %016llx"
@@ -719,7 +787,9 @@ void after_pair_complete(uint64_t node_id) {
 
 void do_toggle(uint64_t node_id) {
   sm_app_set_status("toggle %016llx ...", (unsigned long long)node_id);
-  if (sm_ctrl_invoke(node_id, EP_ONOFF, CL_ONOFF, CMD_TOGGLE, now_ms()) != 0) {
+  if (start_op_clean([&] {
+        return sm_ctrl_invoke(node_id, EP_ONOFF, CL_ONOFF, CMD_TOGGLE, now_ms());
+      }) != 0) {
     set_node_note(node_id, "toggle rejected");
     sm_app_set_status("toggle %016llx: rejected", (unsigned long long)node_id);
     return;
@@ -727,6 +797,7 @@ void do_toggle(uint64_t node_id) {
   sm_ctrl_event_t ev;
   if (run_until(g_udp, 20000, ev, term_invoke) && ev.kind == SM_CTRL_EV_INVOKE_DONE) {
     set_node_note(node_id, "toggle OK");
+    clear_backoff(node_id);
     sm_app_set_status("toggle %016llx OK (status=%u)", (unsigned long long)node_id, ev.status);
     // 直後に読み直してバッジを合わせる。
     do_read_onoff(node_id, true, 20000);
@@ -737,6 +808,34 @@ void do_toggle(uint64_t node_id) {
 }
 
 // SRP サーバ帳からデバイスの運用アドレスを引き、ノード帳へ反映する(F8b)。
+// 運用アドレスの直接指定(T5a `setaddr`)。v4 リテラルも受ける(is_v6=false)。
+// WiFi デバイスの IPv6 近隣解決が成立しない環境(esp-radio が NS を受信しない等)で
+// v4 に切り替える実験・運用の入口。
+void do_set_addr(const sm_ui_op_t &op) {
+  sm_addr_t a = {};
+  uint8_t v4[4];
+  if (inet_pton(AF_INET6, op.ipv6, a.ip) == 1) {
+    a.is_v6 = true;
+    if (a.ip[0] == 0xfe && (a.ip[1] & 0xc0) == 0x80) {
+      a.scope_id = (op.via == SM_UI_VIA_WIFI) ? sm_wifi_netif_index() : sm_ot_hub_netif_index();
+    }
+  } else if (inet_pton(AF_INET, op.ipv6, v4) == 1) {
+    a.is_v6 = false;
+    memcpy(a.ip, v4, 4);
+  } else {
+    sm_app_set_status("setaddr: '%s' is not an IP literal", op.ipv6);
+    return;
+  }
+  a.port = CONFIG_SM_TARGET_PORT;
+  int rc = sm_ctrl_set_node_addr(op.node_id, &a);
+  sm_ctrl_event_t ev;
+  while (sm_ctrl_take_event(&ev)) {
+  }
+  refresh_node_addr_view(op.node_id);
+  set_node_note(op.node_id, rc == 0 ? "addr set" : "setaddr failed");
+  sm_app_set_status("setaddr %016llx -> %s rc=%d", (unsigned long long)op.node_id, op.ipv6, rc);
+}
+
 void do_refresh_addr(uint64_t node_id) {
   sm_app_set_status("SRP lookup for %016llx ...", (unsigned long long)node_id);
   uint8_t ip[16];
@@ -782,11 +881,19 @@ void do_refresh_addr(uint64_t node_id) {
 void do_pair(const sm_ui_op_t &op) {
   sm_addr_t addr = {};
   addr.is_v6 = true;
-  if (inet_pton(AF_INET6, op.ipv6, addr.ip) != 1) {
+  uint8_t v4[4];
+  if (inet_pton(AF_INET6, op.ipv6, addr.ip) == 1) {
+    addr.is_v6 = true;
+  } else if (inet_pton(AF_INET, op.ipv6, v4) == 1) {
+    // IPv4 リテラルも受ける。WiFi デバイス(特に esp-radio の Rust FW)は IPv6 の
+    // 近隣解決が成立しないことがあり、v4 で組んだ方が運用が安定する(T5 実機)。
+    addr.is_v6 = false;
+    memcpy(addr.ip, v4, 4);
+  } else {
     sm_ui_snapshot_t *s = sm_app_lock();
     s->pair_state = 3;
     sm_app_unlock();
-    sm_app_set_status("pair: '%s' is not a valid IPv6 address", op.ipv6);
+    sm_app_set_status("pair: '%s' is not an IPv6/IPv4 address", op.ipv6);
     return;
   }
   addr.port = CONFIG_SM_TARGET_PORT;
@@ -794,7 +901,7 @@ void do_pair(const sm_ui_op_t &op) {
   // scope_id はリンクローカル(fe80::/10)宛のときだけ意味を持つ。
   // ULA / グローバル宛は 0 のままにして lwIP の経路選択に任せる
   // (Thread の OMR も WiFi の GUA/ULA もこちら)。
-  const bool is_ll = (addr.ip[0] == 0xfe) && ((addr.ip[1] & 0xc0) == 0x80);
+  const bool is_ll = addr.is_v6 && (addr.ip[0] == 0xfe) && ((addr.ip[1] & 0xc0) == 0x80);
   const bool via_wifi = (op.via == SM_UI_VIA_WIFI);
   if (is_ll) {
     addr.scope_id = via_wifi ? sm_wifi_netif_index() : sm_ot_hub_netif_index();
@@ -1017,6 +1124,24 @@ bool feed_rx_once(int fd) {
     sm_ctrl_event_t ev;
     while (sm_ctrl_take_event(&ev)) {
       if (ev.kind == SM_CTRL_EV_RESOLVE_DONE) {
+        // **WiFi デバイスは IPv4 を運用アドレスにする**(T5 実機で確定):
+        // esp-radio(Rust FW)は NS/マルチキャストを受信できず IPv6 の近隣解決が
+        // 成立しないため、AAAA(fe80)を採ると近隣キャッシュが冷えた時点で不達になる。
+        // v4 ソケットへ応答が来たなら応答元 v4 がそのままデバイスの運用アドレス。
+        if (src.ss_family == AF_INET) {
+          const auto *s4 = (const struct sockaddr_in *)&src;
+          sm_addr_t a = {};
+          a.is_v6 = false;
+          memcpy(a.ip, &s4->sin_addr, 4);
+          a.port = CONFIG_SM_TARGET_PORT;
+          sm_ctrl_set_node_addr(ev.node_id, &a);
+          char ip[20] = {0};
+          inet_ntop(AF_INET, &s4->sin_addr, ip, sizeof(ip));
+          ESP_LOGI(TAG, "operational address pinned to IPv4 %s (responder source)", ip);
+          sm_ctrl_event_t drop;
+          while (sm_ctrl_take_event(&drop)) {
+          }
+        }
         return true;
       }
     }
@@ -1356,9 +1481,10 @@ void do_pair_ble(const sm_ui_op_t &op) {
   }
 
   // シムが直前の操作(周期 read の CASE 等)を畳み終えるまで busy(rc=-2)になり得る。
-  // 30 秒までポンプを回しながらリトライする(実機 livelock の学び)。
+  // 不達ノードへの CASE は initiator の HANDSHAKE_TIMEOUT(60 秒)まで内部で
+  // 粘るので、それを跨げる **90 秒**までポンプを回しながらリトライする(実機の学び)。
   int rc = -1;
-  const uint64_t start_until = now_ms() + 30000;
+  const uint64_t start_until = now_ms() + 90000;
   for (;;) {
     if (thread_kind) {
       rc = sm_ctrl_ble_pair_start(op.node_id, op.passcode, 1 /*thread*/, dataset, dataset_len,
@@ -1638,7 +1764,7 @@ void pump_task(void *) {
 
   // --- 4. 定常ループ: UI の操作を 1 件ずつ + 周期タスク ---
   uint64_t next_status = 0;
-  uint64_t next_poll = now_ms() + 5000; // 起動直後の read は 5 秒待ってから
+  uint64_t next_poll = now_ms() + 30000; // 起動直後は WiFi/Thread 収束待ち(5 秒だと初回が必ず落ちて 2 分退避)
   size_t poll_index = 0;
   for (;;) {
     sm_ui_op_t op;
@@ -1676,6 +1802,9 @@ void pump_task(void *) {
       case SM_UI_OP_PAIR_BLE:
         do_pair_ble(op);
         break;
+      case SM_UI_OP_SET_ADDR:
+        do_set_addr(op);
+        break;
       }
       refresh_thread_status();
       continue;
@@ -1706,7 +1835,6 @@ void pump_task(void *) {
     // (特に sm_ctrl_ble_pair_start)が rc=-2 で弾かれ続ける)。
     if (now >= next_poll) {
       next_poll = now + 10000;
-      static uint64_t backoff_until[SM_UI_MAX_NODES] = {};
       sm_ui_snapshot_t *s = sm_app_lock();
       size_t count = s->node_count;
       sm_app_unlock();
@@ -1717,7 +1845,7 @@ void pump_task(void *) {
         for (size_t tries = 0; tries < count; ++tries) {
           size_t idx = poll_index % count;
           poll_index = (poll_index + 1) % count;
-          if (idx < SM_UI_MAX_NODES && now < backoff_until[idx]) {
+          if (idx < SM_UI_MAX_NODES && now < g_backoff_until[idx]) {
             continue;
           }
           sm_ui_snapshot_t *s2 = sm_app_lock();
@@ -1743,7 +1871,7 @@ void pump_task(void *) {
           }
           set_node_busy(id, false);
           if (slot < SM_UI_MAX_NODES) {
-            backoff_until[slot] = ok ? 0 : now + 120000;
+            g_backoff_until[slot] = ok ? 0 : now + 120000;
             if (!ok) {
               set_node_note(id, "unreachable (retry in 2min)");
             }

@@ -24,7 +24,8 @@ enum sm_ui_op_kind_t : uint8_t {
   SM_UI_OP_READ_ONOFF = 1,   // Read(照明 = OnOff 1 発 / センサ = 全属性の再読込。T4)
   SM_UI_OP_PAIR = 2,         // on-network PASE コミッショニング
   SM_UI_OP_REFRESH_ADDR = 3, // SRP 列挙(→ WiFi なら mDNS)→ アドレス更新 + 種別再検出
-  SM_UI_OP_PAIR_BLE = 4      // BLE コミッショニング(T3、§11)
+  SM_UI_OP_PAIR_BLE = 4,     // BLE コミッショニング(T3、§11)
+  SM_UI_OP_SET_ADDR = 5      // 運用アドレスを直接指定(ipv6 欄に v4/v6 リテラル。T5a)
 };
 
 // PAIR の経路。0/1 は on-network(リンクローカル宛の sin6_scope_id をどちらの

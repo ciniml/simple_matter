@@ -298,10 +298,18 @@ impl<
 
     /// 時間駆動の内部掃引(ハンドシェイク/トランザクションのタイムアウト掃除)。
     fn drive_ticks(&mut self, now_ms: u64) {
-        self.mgr
+        // 期限切れハンドシェイクの exchange も閉じる(responder 側 stack.rs と同じ理由。
+        // 閉じないと initiator exchange + 再送バッファがリークする)。
+        while let Some(ex) = self
+            .mgr
             .handler_mut()
             .sc
-            .on_tick(&mut self.sessions, now_ms);
+            .expire_timed_out(&mut self.sessions, now_ms)
+        {
+            if let Some(freed) = self.mgr.close(ex) {
+                self.tx_pool.release(freed);
+            }
+        }
         self.mgr.handler_mut().im.on_tick(now_ms);
     }
 
@@ -415,6 +423,24 @@ impl<
     // 開始系(open_initiator + send_reliable の配線、§7.2)
     // ----------------------------------------------------------------------
 
+    /// 進行中のハンドシェイク(PASE/CASE)を外部都合で中断し、スロット・予約
+    /// セッション・exchange を解放する。BLE リンク断で PASE を途中放棄するとき等に
+    /// 統合層が呼ぶ。何も進行していなければ no-op。
+    pub fn abort_handshake(&mut self) {
+        if let Some(ex) = self
+            .mgr
+            .handler_mut()
+            .sc
+            .abort_handshake(&mut self.sessions)
+        {
+            if let Some(freed) = self.mgr.close(ex) {
+                // close は再送バッファの返却を伴う(捨てると tx_pool が枯渇し、
+                // 数回の中断で start_pase/start_case が二度と通らなくなる。T5 実機)。
+                self.tx_pool.release(freed);
+            }
+        }
+    }
+
     /// peer への unsecured セッションを能動確保し PASE を開始する(§7.2)。
     pub fn start_pase(
         &mut self,
@@ -428,7 +454,11 @@ impl<
         let reserved = match self.sessions.reserve(peer, now_ms) {
             Ok(r) => r,
             Err(e) => {
-                let _ = self.mgr.close(ex);
+                if let Some(freed) = self.mgr.close(ex) {
+                    // close は再送バッファの返却を伴う(捨てると tx_pool が枯渇し、
+                    // 数回の中断で start_pase/start_case が二度と通らなくなる。T5 実機)。
+                    self.tx_pool.release(freed);
+                }
                 return Err(e);
             }
         };
@@ -448,7 +478,11 @@ impl<
             Ok(l) => l,
             Err(e) => {
                 self.sessions.remove(reserved);
-                let _ = self.mgr.close(ex);
+                if let Some(freed) = self.mgr.close(ex) {
+                    // close は再送バッファの返却を伴う(捨てると tx_pool が枯渇し、
+                    // 数回の中断で start_pase/start_case が二度と通らなくなる。T5 実機)。
+                    self.tx_pool.release(freed);
+                }
                 return Err(e);
             }
         };
@@ -467,7 +501,11 @@ impl<
             // Failed イベントが積まれて後続の待ち手を誤らせる)。
             self.mgr.handler_mut().sc.cancel_handshake();
             self.sessions.remove(reserved);
-            let _ = self.mgr.close(ex);
+            if let Some(freed) = self.mgr.close(ex) {
+                // close は再送バッファの返却を伴う(捨てると tx_pool が枯渇し、
+                // 数回の中断で start_pase/start_case が二度と通らなくなる。T5 実機)。
+                self.tx_pool.release(freed);
+            }
         })
     }
 
@@ -485,7 +523,11 @@ impl<
         let reserved = match self.sessions.reserve(peer, now_ms) {
             Ok(r) => r,
             Err(e) => {
-                let _ = self.mgr.close(ex);
+                if let Some(freed) = self.mgr.close(ex) {
+                    // close は再送バッファの返却を伴う(捨てると tx_pool が枯渇し、
+                    // 数回の中断で start_pase/start_case が二度と通らなくなる。T5 実機)。
+                    self.tx_pool.release(freed);
+                }
                 return Err(e);
             }
         };
@@ -506,7 +548,11 @@ impl<
             Ok(l) => l,
             Err(e) => {
                 self.sessions.remove(reserved);
-                let _ = self.mgr.close(ex);
+                if let Some(freed) = self.mgr.close(ex) {
+                    // close は再送バッファの返却を伴う(捨てると tx_pool が枯渇し、
+                    // 数回の中断で start_pase/start_case が二度と通らなくなる。T5 実機)。
+                    self.tx_pool.release(freed);
+                }
                 return Err(e);
             }
         };
@@ -522,7 +568,11 @@ impl<
             // start_pase と同じ巻き戻し(コメント参照)。
             self.mgr.handler_mut().sc.cancel_handshake();
             self.sessions.remove(reserved);
-            let _ = self.mgr.close(ex);
+            if let Some(freed) = self.mgr.close(ex) {
+                // close は再送バッファの返却を伴う(捨てると tx_pool が枯渇し、
+                // 数回の中断で start_pase/start_case が二度と通らなくなる。T5 実機)。
+                self.tx_pool.release(freed);
+            }
         })
     }
 
@@ -548,7 +598,11 @@ impl<
             {
                 Ok(l) => l,
                 Err(e) => {
-                    let _ = self.mgr.close(ex);
+                    if let Some(freed) = self.mgr.close(ex) {
+                        // close は再送バッファの返却を伴う(捨てると tx_pool が枯渇し、
+                        // 数回の中断で start_pase/start_case が二度と通らなくなる。T5 実機)。
+                        self.tx_pool.release(freed);
+                    }
                     return Err(e);
                 }
             };
@@ -591,7 +645,11 @@ impl<
         ) {
             Ok(l) => l,
             Err(e) => {
-                let _ = self.mgr.close(ex);
+                if let Some(freed) = self.mgr.close(ex) {
+                    // close は再送バッファの返却を伴う(捨てると tx_pool が枯渇し、
+                    // 数回の中断で start_pase/start_case が二度と通らなくなる。T5 実機)。
+                    self.tx_pool.release(freed);
+                }
                 return Err(e);
             }
         };
@@ -622,7 +680,11 @@ impl<
         {
             Ok(l) => l,
             Err(e) => {
-                let _ = self.mgr.close(ex);
+                if let Some(freed) = self.mgr.close(ex) {
+                    // close は再送バッファの返却を伴う(捨てると tx_pool が枯渇し、
+                    // 数回の中断で start_pase/start_case が二度と通らなくなる。T5 実機)。
+                    self.tx_pool.release(freed);
+                }
                 return Err(e);
             }
         };
@@ -658,7 +720,11 @@ impl<
             {
                 Ok(l) => l,
                 Err(e) => {
-                    let _ = self.mgr.close(ex);
+                    if let Some(freed) = self.mgr.close(ex) {
+                        // close は再送バッファの返却を伴う(捨てると tx_pool が枯渇し、
+                        // 数回の中断で start_pase/start_case が二度と通らなくなる。T5 実機)。
+                        self.tx_pool.release(freed);
+                    }
                     return Err(e);
                 }
             };
@@ -701,7 +767,11 @@ impl<
         ) {
             Ok(l) => l,
             Err(e) => {
-                let _ = self.mgr.close(ex);
+                if let Some(freed) = self.mgr.close(ex) {
+                    // close は再送バッファの返却を伴う(捨てると tx_pool が枯渇し、
+                    // 数回の中断で start_pase/start_case が二度と通らなくなる。T5 実機)。
+                    self.tx_pool.release(freed);
+                }
                 return Err(e);
             }
         };
@@ -740,7 +810,11 @@ impl<
         ) {
             Ok(l) => l,
             Err(e) => {
-                let _ = self.mgr.close(ex);
+                if let Some(freed) = self.mgr.close(ex) {
+                    // close は再送バッファの返却を伴う(捨てると tx_pool が枯渇し、
+                    // 数回の中断で start_pase/start_case が二度と通らなくなる。T5 実機)。
+                    self.tx_pool.release(freed);
+                }
                 return Err(e);
             }
         };
@@ -783,7 +857,11 @@ impl<
         ) {
             Ok(l) => l,
             Err(e) => {
-                let _ = self.mgr.close(ex);
+                if let Some(freed) = self.mgr.close(ex) {
+                    // close は再送バッファの返却を伴う(捨てると tx_pool が枯渇し、
+                    // 数回の中断で start_pase/start_case が二度と通らなくなる。T5 実機)。
+                    self.tx_pool.release(freed);
+                }
                 return Err(e);
             }
         };

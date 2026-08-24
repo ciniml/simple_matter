@@ -1318,3 +1318,51 @@ base64 で流す。フレーミングは
    staticlib(.a)が存在すると ninja にスキップされ **Rust の変更が反映されない**。
    Rust を触ったら `target/<triple>/release/libsimple_matter_cffi.a` を消してから
    ビルドする(恒久対処 = CMakeLists に Rust ソースの DEPENDS を張る、将来)。
+
+### 12.7 / 13.5 実機完了記録(①〜③ + T4 目標構成の成立、2026-08-25)
+
+前節 §12.6/13.4 の残課題①〜③を順に解消し、**T4 の目標構成(AirQ 空気質センサ +
+NanoC6 Thread 照明を 1 台の Tab5 で)を実機で成立**させた。検証は全てコンソール
+(T5a)からの自走。
+
+1. **① シム: BLE 2 回目以降の沈黙 — 真因 = initiator の handshake スロット(1 本)が
+   中断後も残り `start_pase` が NoSpace**(commissioner は「後で再試行」扱いで無送信、
+   60s の HANDSHAKE_TIMEOUT まで沈黙。BTP keep-alive の 3 バイト書き込みだけが残る)。
+   `ScInitiator::abort_handshake` + `ControllerStack::abort_handshake` を追加し、
+   BLE 切断時の abort で予約セッション・exchange ごと畳む。ホストのユニットテストに
+   「2 セッション連続」を追加して再現・修正を固定(657 pass)。
+2. **② AirQ「不達」— 真因は WiFi 沈黙ではなく IPv6 近隣解決**: airq-sensor(esp-radio)
+   は NS(solicited-node マルチキャスト)を受信できず、近隣キャッシュが冷えると
+   fe80 宛が届かなくなる(PC からのユニキャスト mDNS には常に応答 = 生きている)。
+   対処 = **WiFi デバイスの運用アドレスは IPv4**: mDNS 解決成功時に応答元 v4 を
+   `sm_ctrl_set_node_addr` で固定、`pair`/`setaddr` は v4 リテラルを受理。
+   v4 では ARP(ブロードキャスト)で解決できるため再起動後も安定。
+3. **③ NanoC6 ble-thread E2E 完走**(onoff_light_cpp thread、discriminator 2560):
+   scan → BTP+PASE → dataset 投入 → Thread attach → SRP 登録 → CASE、**約 13 秒で
+   PAIR COMPLETE** → Toggle OK。
+4. **pump の残骸イベント誤認**(実機で発覚): run_until がタイムアウトで諦めた後に
+   シム内で完了した READ_DONE がキューに残り、次の read がそれを自分の結果と誤認
+   (裏で本物の read が進行 → 続く開始が -10)。`start_op_clean` = 開始前ドレイン +
+   busy 5 秒リトライを全 op に適用。pair 開始の busy 待ちは 90 秒(不達ノードの
+   CASE が HANDSHAKE_TIMEOUT まで粘るため)。
+5. **console_repl のスタック不足**: 数 KB のスナップショットをスタックに置いた上で
+   float printf → stack protection fault でリブート。static 化 + REPL スタック 16KB。
+6. 実測: AirQ 5 属性 read(AQ/CO2 f32/PM2.5 f32/温度/湿度)が **1 秒で全成功**
+   (例: CO2 772ppm、PM2.5 1.9µg/m³、28.3℃、45.8%)。起動直後の初回 poll は
+   Thread 再アタッチ待ちで落ちるため 30 秒後に変更、成功した操作はバックオフを解除。
+7. **`sm_ctrl_abort_op`(シム API 追加)**: pump の `run_until` がタイムアウトで諦めたら
+   シム側の進行中 op(CASE 確立待ち / 応答待ち / pairing)も畳んで Idle に戻す。
+   これが無いと、Thread 再アタッチ中の NanoC6 宛 CASE が内部で 60 秒粘り、その間の
+   AirQ read や UI 操作が全部 busy(-10)になる(実機で観測 → 追加後は abort 直後に
+   AirQ の 5 属性 read が成功)。C ヘッダに宣言追加(ABI 追加のみ)。
+8. **コアの exchange リーク 2 件(実機で発覚、②の最終真因)**:
+   (a) 期限切れハンドシェイクで予約セッションは解放するが **exchange を閉じていなかった**
+   (responder / initiator 両方)。コントローラ再起動を挟んだ半端な CASE の exchange が
+   デバイスのプール(4 本)に残り、数回で枯渇 → 新規 Sigma1 を黙って捨てる
+   (NanoC6 が「デバイス再起動まで応答しない」症状。Tab5 の連続再起動で再現)。
+   `ScResponder::expire_one` / `ScInitiator::expire_timed_out` を追加し、両 stack の
+   drive_ticks で exchange を close + 再送バッファ回収。
+   (b) `ExchangeManager::close` の返す再送バッファ id を捨てていた(`let _ =`)→ 中断
+   数回で tx_pool 枯渇 → `start_case` が -4 で二度と通らない。全 close 箇所で release。
+   検証: 3 台の FW を更新後、**Tab5 を 60 秒間隔で 3 回連続再起動 → NanoC6 Toggle OK ×2、
+   AirQ 5 属性 read OK**(デバイス側の再起動なし)。

@@ -1640,6 +1640,35 @@ pub extern "C" fn sm_ctrl_set_node_addr(node_id: u64, addr: *const sm_addr_t) ->
     0
 }
 
+/// 進行中の運用操作を外部都合で中断し Idle に戻す(C++ の待ちがタイムアウトしたとき用)。
+///
+/// 不達ノード宛の CASE は initiator の HANDSHAKE_TIMEOUT(60s)まで内部で粘り、
+/// その間の全操作が busy(-10)で弾かれる(T5 実機)。ハンドシェイクスロット・予約
+/// セッション・exchange は [`ControllerStack::abort_handshake`] で解放する。
+/// 応答待ち中(AwaitOp)の IM exchange は MRP の諦めで自然に解放される。
+///
+/// 戻り値: 1=中断した、0=元々 Idle、-1=未初期化。
+#[no_mangle]
+pub extern "C" fn sm_ctrl_abort_op() -> i32 {
+    if !CTRL_INITED.load(Ordering::SeqCst) {
+        return -1;
+    }
+    // SAFETY: 単線契約。
+    let s = unsafe { ctrl_shim() };
+    if matches!(s.activity, Activity::Idle) {
+        return 0;
+    }
+    s.stack.abort_handshake();
+    s.comm = None;
+    #[cfg(feature = "ble")]
+    {
+        s.ble_hs_out.clear();
+        s.btp.reset();
+    }
+    s.activity = Activity::Idle;
+    1
+}
+
 /// 現在の管理ノード数(ノード帳のエントリ数)。
 #[no_mangle]
 pub extern "C" fn sm_ctrl_node_count() -> usize {
@@ -1958,6 +1987,11 @@ pub extern "C" fn sm_ctrl_ble_event(
                 // 立てないと、以降の pair/invoke が永久に busy(-2/-10)で弾かれる
                 // (T4 実機で発覚。BleHandoff は BLE 切断後が正常経路なので触らない)。
                 if let Activity::BlePairing { node_id } = s.activity {
+                    // 進行中の PASE handshake(initiator は単一スロット)を畳む。
+                    // 畳まないと次の ble_pair_start は受理されるのに start_pase が
+                    // NoSpace で沈黙する(2 回目以降の BLE 試行が止まる実機症状の真因)。
+                    s.stack.abort_handshake();
+                    s.comm = None;
                     let mut e = CtrlShim::ev(sm_ctrl_event_kind_t::SM_CTRL_EV_PAIR_FAILED);
                     e.node_id = node_id;
                     s.push_event(e);
@@ -2418,6 +2452,102 @@ mod tests {
             // PASE 第 1 フラグメントが ble_poll で取り出せる。
             let plen = sm_ctrl_ble_poll(1000, frag.as_mut_ptr(), frag.len());
             assert!(plen > 0, "PBKDFParamRequest fragment expected");
+
+            // (6) BLE 切断で中断 → PAIR_FAILED が立ち Idle に戻る(T4 実機の abort 対処)。
+            assert_eq!(
+                sm_ctrl_ble_event(
+                    sm_ble_event_kind_t::SM_BLE_DISCONNECTED,
+                    0,
+                    core::ptr::null(),
+                    0,
+                    2000
+                ),
+                0
+            );
+            let mut saw_failed = false;
+            while sm_ctrl_take_event(&mut ev) {
+                if ev.kind == sm_ctrl_event_kind_t::SM_CTRL_EV_PAIR_FAILED {
+                    saw_failed = true;
+                }
+            }
+            assert!(
+                saw_failed,
+                "DISCONNECTED during BlePairing must raise PAIR_FAILED"
+            );
+
+            // (7) **2 回目のセッション**が 1 回目と同じ形で進むこと(実機で「2 回目以降は
+            //     handshake が出ず 3 バイトの書き込みだけ繰り返す」症状があった)。
+            assert_eq!(
+                sm_ctrl_ble_pair_start(
+                    node_id,
+                    20202021,
+                    0,
+                    ssid.as_ptr(),
+                    ssid.len(),
+                    pass.as_ptr(),
+                    pass.len(),
+                    3000
+                ),
+                0,
+                "second ble_pair_start must be accepted after abort"
+            );
+            assert_eq!(
+                sm_ctrl_ble_event(
+                    sm_ble_event_kind_t::SM_BLE_CONNECTED,
+                    mtu,
+                    core::ptr::null(),
+                    0,
+                    3000
+                ),
+                0
+            );
+            let hlen2 = sm_ctrl_ble_poll(3000, frag.as_mut_ptr(), frag.len());
+            assert_eq!(
+                hlen2, hlen,
+                "second session must emit a full handshake request (got {hlen2} B)"
+            );
+            let mut peripheral2 = Btp::<6>::new(BtpRole::Peripheral);
+            peripheral2
+                .process_incoming(&frag[..hlen2], Some(mtu), 3000)
+                .unwrap();
+            let rlen2 = peripheral2
+                .process_outgoing(&mut resp, Some(mtu), 3000)
+                .unwrap();
+            assert!(rlen2 > 0);
+            assert_eq!(
+                sm_ctrl_ble_event(
+                    sm_ble_event_kind_t::SM_BLE_C2_SUBSCRIBED,
+                    0,
+                    core::ptr::null(),
+                    0,
+                    3000
+                ),
+                0
+            );
+            assert_eq!(
+                sm_ctrl_ble_event(
+                    sm_ble_event_kind_t::SM_BLE_C1_WRITE,
+                    0,
+                    resp.as_ptr(),
+                    rlen2,
+                    3000,
+                ),
+                0
+            );
+            let mut saw_pase = false;
+            while sm_ctrl_take_event(&mut ev) {
+                if ev.kind == sm_ctrl_event_kind_t::SM_CTRL_EV_PAIR_PHASE
+                    && ev.phase == phase_code(Phase::Pase)
+                {
+                    saw_pase = true;
+                }
+            }
+            assert!(saw_pase, "second session must reach PASE");
+            let plen2 = sm_ctrl_ble_poll(3000, frag.as_mut_ptr(), frag.len());
+            assert!(
+                plen2 > 3,
+                "second session must emit PBKDFParamRequest, not a 3-byte ACK (got {plen2} B)"
+            );
 
             sm_ctrl_deinit();
         }

@@ -23,20 +23,31 @@ namespace {
 uint64_t parse_hex(const char *s) { return strtoull(s, nullptr, 16); }
 
 int cmd_nodes(int, char **) {
-  sm_ui_snapshot_t snap;
+  // スナップショットは数 KB あるので REPL タスクのスタックに置かない(実機で
+  // console_repl の stack protection fault → リブート)。コンソールは単一タスク。
+  static sm_ui_snapshot_t snap;
   sm_app_snapshot_get(&snap);
   printf("NODES %u\n", (unsigned)snap.node_count);
   for (size_t i = 0; i < snap.node_count && i < SM_UI_MAX_NODES; ++i) {
     const sm_ui_node_t &n = snap.nodes[i];
     printf("NODE %016llx kind=%u onoff=%d aq=%u addr=%s note=\"%s\"\n",
            (unsigned long long)n.node_id, n.kind, (int)n.onoff, n.aq, n.addr, n.note);
+    if (n.kind == 2) {
+      printf("SENSOR %016llx co2=%s%.1f pm25=%s%.1f temp_c100=%s%ld hum_p100=%s%ld\n",
+             (unsigned long long)n.node_id, n.has_co2 ? "" : "-", n.has_co2 ? n.co2 : 0.0f,
+             n.has_pm25 ? "" : "-", n.has_pm25 ? n.pm25 : 0.0f, n.has_temp ? "" : "-",
+             n.has_temp ? (long)n.temp_c100 : 0L, n.has_hum ? "" : "-",
+             n.has_hum ? (long)n.hum_p100 : 0L);
+    }
   }
   printf("OK\n");
   return 0;
 }
 
 int cmd_status(int, char **) {
-  sm_ui_snapshot_t snap;
+  // スナップショットは数 KB あるので REPL タスクのスタックに置かない(実機で
+  // console_repl の stack protection fault → リブート)。コンソールは単一タスク。
+  static sm_ui_snapshot_t snap;
   sm_app_snapshot_get(&snap);
   printf("STATUS thread_role=%d wifi_state=%u wifi_ip4=%s wifi_ll=%s wifi_gua_ok=%d ble=%u "
          "pair_state=%u pair_phase=%u ble_stage=%u nodes=%u\n",
@@ -108,6 +119,33 @@ int cmd_pair(int argc, char **argv) {
     printf("ERR node id must be non-zero\n");
     return 1;
   }
+  printf(sm_app_post_op(&op) ? "OK queued\n" : "ERR queue full\n");
+  return 0;
+}
+
+int cmd_refresh(int argc, char **argv) {
+  if (argc < 2) {
+    printf("ERR usage: refresh <node_hex>\n");
+    return 1;
+  }
+  sm_ui_op_t op = {};
+  op.kind = SM_UI_OP_REFRESH_ADDR;
+  op.node_id = parse_hex(argv[1]);
+  printf(sm_app_post_op(&op) ? "OK queued\n" : "ERR queue full\n");
+  return 0;
+}
+
+int cmd_setaddr(int argc, char **argv) {
+  // setaddr <node_hex> <ip literal (v4/v6)> [wifi|thread]
+  if (argc < 3) {
+    printf("ERR usage: setaddr <node_hex> <ip> [wifi|thread]\n");
+    return 1;
+  }
+  sm_ui_op_t op = {};
+  op.kind = SM_UI_OP_SET_ADDR;
+  op.node_id = parse_hex(argv[1]);
+  snprintf(op.ipv6, sizeof(op.ipv6), "%s", argv[2]);
+  op.via = (argc >= 4 && strcmp(argv[3], "thread") == 0) ? SM_UI_VIA_THREAD : SM_UI_VIA_WIFI;
   printf(sm_app_post_op(&op) ? "OK queued\n" : "ERR queue full\n");
   return 0;
 }
@@ -186,6 +224,8 @@ void sm_console_start() {
   esp_console_repl_config_t repl_cfg = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
   repl_cfg.prompt = "tab5>";
   repl_cfg.max_cmdline_length = 128;
+  // float printf + ソケット操作(udptest)を REPL タスクで行うので余裕を持たせる。
+  repl_cfg.task_stack_size = 16384;
   esp_console_dev_usb_serial_jtag_config_t hw = ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
   if (esp_console_new_repl_usb_serial_jtag(&hw, &repl_cfg, &repl) != ESP_OK) {
     ESP_LOGW("con", "console repl init failed (continuing without it)");
@@ -198,6 +238,8 @@ void sm_console_start() {
   reg("pairble", "pairble <disc> <node_hex> [wifi|thread] [passcode]", cmd_pairble);
   reg("pair", "pair <ipv6> <node_hex> [thread|wifi] [passcode]", cmd_pair);
   reg("udptest", "udptest <port> <secs>", cmd_udptest);
+  reg("setaddr", "setaddr <node_hex> <ip> [wifi|thread]", cmd_setaddr);
+  reg("refresh", "refresh <node_hex> (SRP/mDNS re-resolve + kind re-detect)", cmd_refresh);
   ESP_ERROR_CHECK(esp_console_start_repl(repl));
   ESP_LOGI("con", "debug console ready (nodes/status/toggle/read/pair/pairble)");
 }

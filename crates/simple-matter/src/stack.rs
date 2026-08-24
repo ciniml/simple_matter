@@ -328,10 +328,20 @@ impl<
 
     /// 時間駆動の内部掃引(SC ハンドシェイクタイムアウト・IM 掃除・fail-safe 期限)。
     fn drive_ticks(&mut self, now_ms: u64) {
-        self.mgr
+        // 期限切れハンドシェイクは予約セッションだけでなく **exchange も閉じる**
+        // (再送バッファも回収)。閉じないと相手が途中で消えた半端な CASE/PASE の
+        // responder exchange が残り、コントローラの再起動数回で exchange 枯渇 →
+        // 新規 Sigma1 を黙って捨てる(T5 実機で NanoC6 が「デバイス再起動まで応答しない」)。
+        while let Some(ex) = self
+            .mgr
             .handler_mut()
             .sc
-            .on_tick(&mut self.sessions, now_ms);
+            .expire_one(&mut self.sessions, now_ms)
+        {
+            if let Some(freed) = self.mgr.close(ex) {
+                self.tx_pool.release(freed);
+            }
+        }
         self.mgr.handler_mut().im.on_tick(now_ms);
         let _ = self.mgr.handler_mut().im.data_model_mut().on_tick(now_ms);
         // fail-safe タイマ経過で fabric を巻き戻していたら(Core Spec §11.10)、その fabric の
