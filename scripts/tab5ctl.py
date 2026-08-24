@@ -44,7 +44,7 @@ DEFAULT_BAUD = 115200
 # OpenThread のログは `I(12345) OPENTHREAD:` とスペース無しで来る(実機で確認)。
 LOG_RE = re.compile(r"^(?:\x1b\[[0-9;]*m)?[VDIWE] ?\(\d+\)")
 # base64 本文(`B:` 接頭辞 + 最大 76 桁)。行内のどこにあっても拾う。
-B64_LINE_RE = re.compile(r"B:([A-Za-z0-9+/=]{1,76})")
+B64_LINE_RE = re.compile(r"B([0-9a-f]{4}):([A-Za-z0-9+/=]{1,76})")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 PROMPT_RE = re.compile(r"^tab5>\s*")
 
@@ -145,9 +145,22 @@ class Tab5:
             # ことがある(実機で `...MeshForwarder-: screenshot 2` を観測)。本文行は
             # `B:` 接頭辞付きなので、行内から正規表現で抽出する(癒着しても拾える)。
             for m in B64_LINE_RE.finditer(stripped):
-                chunks.append(m.group(1))
-                got += len(m.group(1))
+                idx = int(m.group(1), 16)
+                # 連番は 16bit で折り返す(フル解像度は 3.2 万行)。
+                while idx < (len(chunks) & 0xFFFF) and idx + 0x10000 > len(chunks) - 0x8000:
+                    idx += 0x10000
+                if idx < len(chunks):
+                    continue  # 重複(再送等)は無視
+                while len(chunks) < idx:
+                    chunks.append(None)  # 欠落
+                chunks.append(m.group(2))
+                got += len(m.group(2))
 
+        missing = [i for i, c in enumerate(chunks) if c is None]
+        if missing:
+            raise RuntimeError(
+                f"base64 行の欠落 {len(missing)} 本(先頭: {missing[:8]} / 全 {len(chunks)} 行)"
+            )
         data = base64.b64decode("".join(chunks))
         expect = w * h * 2
         if len(data) < expect:

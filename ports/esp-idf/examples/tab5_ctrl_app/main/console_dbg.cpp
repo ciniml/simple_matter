@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "driver/usb_serial_jtag.h"
 #include "esp_console.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
@@ -414,13 +415,13 @@ int cmd_ui_dump(int, char **) {
 const char kB64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 // n(<=57)バイトを base64 の 1 行(<=76 桁)にして印字する。
-void b64_emit_line(const uint8_t *src, size_t n) {
-  // 各行に `B:` 接頭辞。転送中に混ざるログ行が**行の途中に癒着する**ことがある
-  // (実機で観測)ので、PC 側は行内から `B:` 以降を正規表現で抽出する。
-  char line[84];
-  line[0] = 'B';
-  line[1] = ':';
-  size_t j = 2;
+void b64_emit_line(const uint8_t *src, size_t n, uint32_t line_no) {
+  // 各行に `B<連番 hex4>:` 接頭辞。転送中に混ざるログ行が**行の途中に癒着する**/
+  // 行が丸ごと落ちることがある(実機で観測)ので、PC 側は行内から正規表現で抽出し、
+  // 連番で欠落を検出する。
+  char line[92];
+  int pre = snprintf(line, sizeof(line), "B%04x:", (unsigned)(line_no & 0xffff));
+  size_t j = (size_t)pre;
   size_t i = 0;
   for (; i + 3 <= n; i += 3) {
     const uint32_t v = ((uint32_t)src[i] << 16) | ((uint32_t)src[i + 1] << 8) | src[i + 2];
@@ -443,8 +444,17 @@ void b64_emit_line(const uint8_t *src, size_t n) {
     line[j++] = kB64[(v >> 6) & 0x3f];
     line[j++] = '=';
   }
-  line[j] = '\0';
-  puts(line);
+  line[j++] = '\n';
+  // printf/puts(VFS 経由)は USB-Serial-JTAG の TX バッファが満ちると**捨てる**
+  // (実機で 267 行 ≈ 22KB の連続欠落を観測)。ドライバへ直接書き、空き待ちでブロックする。
+  size_t off = 0;
+  while (off < j) {
+    int w = usb_serial_jtag_write_bytes(line + off, j - off, pdMS_TO_TICKS(2000));
+    if (w <= 0) {
+      break; // ホストが 2 秒読まない = 諦める(PC 側は連番の欠落として検出する)
+    }
+    off += (size_t)w;
+  }
 }
 
 int cmd_screenshot(int argc, char **argv) {
@@ -509,24 +519,25 @@ int cmd_screenshot(int argc, char **argv) {
   printf("SCREENSHOT %d %d RGB565 %u\n", (int)ow, (int)oh, b64len);
   uint8_t acc[57];
   size_t accn = 0;
+  uint32_t line_no = 0;
   for (int32_t y = 0; y < oh; ++y) {
     const uint8_t *row = db.data + (size_t)(y * div) * stride;
     for (int32_t x = 0; x < ow; ++x) {
       const uint8_t *px = row + (size_t)(x * div) * 2u;
       acc[accn++] = px[0];
       if (accn == sizeof(acc)) {
-        b64_emit_line(acc, accn);
+        b64_emit_line(acc, accn, line_no++);
         accn = 0;
       }
       acc[accn++] = px[1];
       if (accn == sizeof(acc)) {
-        b64_emit_line(acc, accn);
+        b64_emit_line(acc, accn, line_no++);
         accn = 0;
       }
     }
   }
   if (accn > 0) {
-    b64_emit_line(acc, accn);
+    b64_emit_line(acc, accn, line_no++);
   }
   heap_caps_free(mem);
   printf("END\n");

@@ -13,7 +13,8 @@ idf_component_register(
          "display_gfx.cpp" "wifi_sta.cpp" "ble_central.cpp" "console_dbg.cpp"
     INCLUDE_DIRS "."
     REQUIRES simple_matter nvs_flash esp_netif esp_event lwip esp_timer esp_system
-             esp_psram driver openthread vfs esp_wifi bt espressif__esp_hosted console)
+             esp_psram driver openthread vfs esp_wifi bt espressif__esp_hosted console
+             esp_driver_usb_serial_jtag)
 
 # C FFI シムヘッダの利用と UI コードは C++17。
 target_compile_features(${COMPONENT_LIB} PRIVATE cxx_std_17)
