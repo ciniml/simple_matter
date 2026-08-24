@@ -32,6 +32,11 @@ struct BleCentralMsg {
   uint16_t mtu;
   uint16_t frag_len;
   uint8_t frag[256];
+  // Connected のみ: ピアの BT MAC(印字順)。public アドレスのときだけ valid。
+  // ESP32 ファミリは WiFi STA MAC = BT MAC - 2 なので、mDNS が全滅した環境での
+  // 運用アドレス導出(EUI-64)に使える(ctrl_pump の最終フォールバック)。
+  uint8_t peer_mac[6];
+  uint8_t peer_mac_valid;
 };
 
 // BLE ホストの起動状態(UI のステータス表示用)。

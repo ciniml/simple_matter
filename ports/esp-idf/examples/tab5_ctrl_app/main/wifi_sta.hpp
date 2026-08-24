@@ -28,6 +28,7 @@ struct sm_wifi_status_t {
   uint8_t state;    // sm_wifi_state_t
   char ssid[33];    // 設定された SSID(空 = 無効)
   char ll_addr[46]; // WiFi netif のリンクローカル(未取得なら "")
+  char gua[46];     // グローバル/ULA の IPv6(SLAAC。未取得なら "")
   char ip4[16];     // 取得した IPv4(未取得なら "")
   uint32_t netif_index;
   uint32_t retries;

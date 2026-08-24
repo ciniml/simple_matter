@@ -1021,3 +1021,56 @@ pump:  BLE phase 1..9 → BLE_DONE → handoff → PAIR COMPLETE
 (b) `matched device` が出るか(出なければ discriminator or 広告)、(c) `C2 subscribed` の後で
 BTP が進むか、(d) handoff で運用アドレスが引けるか(WiFi = mDNS、Thread = SRP)。
 ble-thread は §11.2 のとおり対応デバイスが手元に無ければ実機は後日。
+
+### 11.5 T3 実機 E2E 完了(2026-08-24)
+
+BLE→WiFi の実機フルパスを完走した(ターゲット = NanoC6 generic_matter_cpp、
+factory reset 状態、discriminator 3840): scan 0.05 秒で照合 → connect → MTU 247 →
+GATT → C2 subscribe → BTP+PASE(phase 1-6)→ AddWiFi(10)→ ConnectNetwork(11、
+遅延応答 8 秒)→ BLE_DONE → **mDNS 解決 0.3 秒**(453B 応答)→ CASE(phase 8-9)→
+**PAIR COMPLETE 全体 ≈17 秒** → Toggle OK。ble-thread は実装済み・実機は対象デバイス
+の準備待ち(§11.2)。
+
+#### 実機で発見した問題と対処(時系列。重要度順ではない)
+
+1. **C6 slave 2.12.7 は FeatureControl RPC(BT init/enable)に無応答**(タイムアウト)。
+   ただし BT controller は slave 起動時から生きていて HCI は通る。同梱例に合わせ
+   **警告して続行**に変更(真の判定は nimble sync)。slave を 2.12.12+ に焼き替えれば
+   解消する可能性はあるが未確認。
+2. **死んだノードへの周期 read が livelock を起こす**: CASE 確立試行が MRP 諦めまで
+   ~20 秒シムを塞ぎ、10 秒周期 poll と重なってシムがほぼ常時 busy →
+   `sm_ctrl_ble_pair_start` が rc=-2 で弾かれ続ける。対処 = read 失敗ノードに
+   **2 分バックオフ** + pair 開始の **30 秒 busy リトライ**(pump を回しながら)。
+3. **`sm_ctrl_set_node_addr` は BLE handoff を再開しない**(シム制約。再開するのは
+   `sm_ctrl_mdns_rx` の解決成功だけ)。Thread kind の SRP 引き当ては **mDNS 応答に
+   合成して給餌**(`feed_addr_as_mdns`。QNAME は `sm_ctrl_resolve_start` の出力から
+   借用)。恒久策 = シムに set_node_addr でも resume する改修(将来)。
+4. **handoff 失敗でシムが BleHandoff のまま永久 busy**(abort API なし)。対処 =
+   ダミー解決(::1)を給餌して CASE を即失敗させ状態機械を畳む(unwedge)。
+5. **最重要: esp_hosted + WiFi power save(既定 MIN_MODEM)で IPv4 マルチキャスト
+   RX が全滅する**。症状は「IPv6 NDP(solicited-node)は通るのに 224.0.0.251 が
+   1 パケットも届かない」「RA が来ず GUA 取得がブート毎に不安定」。
+   **`esp_wifi_set_ps(WIFI_PS_NONE)` で完治**(mDNS announce/応答の受信も RA も安定。
+   デバイス例が全て ps=none だったのはこれ)。PC 上の 5353 リスナー
+   (マルチキャスト join + パケットダンプ)が切り分けの決め手だった。
+6. **デバイスの operational announce は ConnectNetwork 成功直後(BLE_DONE より前)に
+   3 発だけ流れる**。取り逃すと以後はクエリ頼みになるため、mDNS ソケット
+   (AF_INET、:5353 bind + IGMP join、IF=WiFi IPv4 明示)を **BLE 開始前に開き**、
+   BLE フェーズ中の応答パケット(QR=1、150B 以上)をキャッシュして BLE_DONE 後に
+   リプレイする。加えてクエリループ(source port 5353、20 秒)と、
+   **EUI-64 導出フォールバック**(BLE ピアの BT MAC−2 = WiFi MAC → 自分の GUA
+   prefix or fe80 + EUI-64 を合成して直接給餌。ESP32 ファミリ限定の割り切り)の
+   三段構え。今回の成功パスはクエリ応答(0.3 秒)で、キャッシュ・導出は保険として残す。
+7. **前回セッションの BLE イベント残骸(Disconnected 等)が新セッションを即死させる**
+   → pair 開始前にキューをドレイン。
+8. デバイス側の改善課題(generic FW、このリポジトリの別タスク):
+   (a) fail-safe 巻き戻し後も WiFi 資格情報が残り、次回 ConnectNetwork が
+   「切断 → coex 中の再 join」になって失敗しやすい(e5-light の「同一資格情報なら
+   no-op」未移植)。(b) mDNS responder がクエリに答えない状況が PS/join 状態に
+   依存して発生し得る(announce 頼みの潜在穴。generic-firmware.md の注記どおり)。
+
+#### 送信側の scope 補完の変更
+
+`send_sm` の「scope 未指定の fe80 宛」fallback を OT netif 固定から
+**WiFi netif 優先(up なら)**に変更。Thread ノードの実用アドレスは fd::(ML/OMR)
+なので実害なし、WiFi ノードの fe80(nodes.tlv は scope を持たない)が正しく届く。

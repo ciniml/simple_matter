@@ -214,7 +214,26 @@ int gap_event(struct ble_gap_event *event, void *arg) {
   case BLE_GAP_EVENT_MTU: {
     s_att_mtu = event->mtu.value;
     ESP_LOGI(TAG, "MTU=%u; discovering GATT", s_att_mtu);
-    push(BleCentralEvent::Connected, s_att_mtu, nullptr, 0);
+    // ピアの BT MAC を Connected に載せる(NimBLE の addr.val は LSB first →
+    // 印字順に反転して詰める)。ctrl_pump の EUI-64 フォールバック用。
+    {
+      BleCentralMsg m{};
+      m.kind = BleCentralEvent::Connected;
+      m.mtu = s_att_mtu;
+      struct ble_gap_conn_desc desc;
+      if (ble_gap_conn_find(s_conn_handle, &desc) == 0 &&
+          desc.peer_id_addr.type == BLE_ADDR_PUBLIC) {
+        for (int i = 0; i < 6; ++i) {
+          m.peer_mac[i] = desc.peer_id_addr.val[5 - i];
+        }
+        m.peer_mac_valid = 1;
+        ESP_LOGI(TAG, "peer BT MAC %02x:%02x:%02x:%02x:%02x:%02x", m.peer_mac[0], m.peer_mac[1],
+                 m.peer_mac[2], m.peer_mac[3], m.peer_mac[4], m.peer_mac[5]);
+      }
+      if (s_queue != nullptr) {
+        xQueueSend(s_queue, &m, 0);
+      }
+    }
     ble_gattc_disc_svc_by_uuid(s_conn_handle, &s_svc_uuid.u, on_svc_disc, nullptr);
     return 0;
   }
@@ -293,12 +312,21 @@ void ble_up_task(void *) {
     vTaskDelete(nullptr);
     return;
   }
-  if (esp_hosted_bt_controller_init() != ESP_OK || esp_hosted_bt_controller_enable() != ESP_OK) {
-    // ここで落ちる典型は「C6 の slave FW が CONFIG_BT_ENABLED=n でビルドされている」。
-    ESP_LOGE(TAG, "C6 BT controller init/enable failed (slave firmware built without BT?)");
-    s_state = SM_BLE_HOST_FAILED;
-    vTaskDelete(nullptr);
-    return;
+  // FeatureControl RPC で C6 側 BT controller を起動する。**失敗しても致命にしない**:
+  // 同梱例(host_nimble_bleprph_host_only_vhci)も警告どまりで nimble_port_init へ進む。
+  // slave FW によっては BT が起動時から生きていて RPC 側だけ応答しない(実機 2.12.7 で
+  // Req_FeatureControl タイムアウトを観測)。真の判定は HCI reset(nimble sync)の成否。
+  esp_err_t bt_rc = esp_hosted_bt_controller_init();
+  if (bt_rc != ESP_OK) {
+    ESP_LOGW(TAG, "bt_controller_init rc=%d; retrying once", (int)bt_rc);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    bt_rc = esp_hosted_bt_controller_init();
+  }
+  esp_err_t bt_en = esp_hosted_bt_controller_enable();
+  if (bt_rc != ESP_OK || bt_en != ESP_OK) {
+    ESP_LOGW(TAG, "C6 BT controller init/enable rc=%d/%d -- continuing; nimble sync will tell "
+                  "whether the slave firmware has BT",
+             (int)bt_rc, (int)bt_en);
   }
   if (nimble_port_init() != ESP_OK) {
     ESP_LOGE(TAG, "nimble_port_init() failed");

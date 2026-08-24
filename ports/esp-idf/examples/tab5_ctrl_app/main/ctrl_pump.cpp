@@ -146,8 +146,17 @@ void send_sm(int fd, const uint8_t *buf, size_t len, const sm_addr_t &dst) {
   m.sin6_port = htons(dst.port);
   if (dst.is_v6) {
     memcpy(&m.sin6_addr, dst.ip, 16);
-    // リンクローカル宛は scope_id(OT netif index)が要る。
-    m.sin6_scope_id = dst.scope_id != 0 ? dst.scope_id : sm_ot_hub_netif_index();
+    // リンクローカル宛は scope_id が要る。scope 未指定の fe80 は **WiFi netif を優先**
+    // (Thread ノードの実用アドレスは ML/OMR の fd:: で、fe80 で届く相手は実質 WiFi。
+    //  nodes.tlv / mDNS 給餌は scope を持たないので、ここが唯一の補完点)。
+    uint32_t fallback = sm_ot_hub_netif_index();
+    if (dst.ip[0] == 0xfe && (dst.ip[1] & 0xc0) == 0x80) {
+      uint32_t widx = sm_wifi_netif_index();
+      if (widx != 0) {
+        fallback = widx;
+      }
+    }
+    m.sin6_scope_id = dst.scope_id != 0 ? dst.scope_id : fallback;
   } else {
     m.sin6_addr.un.u8_addr[10] = 0xff;
     m.sin6_addr.un.u8_addr[11] = 0xff;
@@ -580,64 +589,137 @@ void do_pair(const sm_ui_op_t &op) {
 // `sm_ctrl_set_node_addr` はノード帳のアドレスを差し替えるだけで **再開しない**ので、
 // Thread(SRP 由来)の handoff も「mDNS 応答の形」でシムへ渡す必要がある。
 
-// mDNS(QM/QU 両対応)ソケットを開く。5353 に bind して ff02::fb を `netif_index` で join。
-int open_mdns(uint32_t netif_index) {
-  int fd = socket(AF_INET6, SOCK_DGRAM, 0);
+// mDNS で `node_id` の運用アドレスを解決してシムへ給餌する(WiFi ノードの handoff)。
+// 成功 = シムが RESOLVE_DONE を立て、BLE handoff なら CASE へ再開した。
+//
+// **鍵は「デバイスの announce を拾う」こと**(実機 T3 + PC 側パケット観測で確定):
+// 我々のデバイスは ConnectNetwork 直後に operational 広告(PTR/SRV/TXT/A の
+// announce)を数回マルチキャストするが、**個別 SRV クエリには応答しない**
+// (generic-firmware.md の既知の穴。announce で解決が成立するため潜伏していた)。
+// announce の宛先は 224.0.0.251:5353 なので、受けるには **5353 に bind + IGMP join
+// した AF_INET ソケット**が必須(エフェメラルポートの g_udp には決して届かない)。
+// join は AF_INET ソケットで行う(AF_INET6 dual ソケットへの v4 join は lwIP で
+// 効かないことがある)。IGMP の egress/membership は WiFi の IPv4 を明示する
+// (W3 の学び: IF 未指定のマルチキャストは既定 IF に飛ぶ)。
+// クエリ(SRV QU)も同ソケットから送り続ける(応答する実装なら :5353 に
+// ユニキャストで返ってくるので、これもマルチキャスト RX に依存しない)。
+// 5353 に bind + 224.0.0.251 join した AF_INET ソケットを開く(IF = WiFi の IPv4)。
+int open_mdns_5353() {
+  sm_wifi_status_t w = {};
+  sm_wifi_get_status(&w);
+  struct in_addr wifi_ip4 = {};
+  if (w.ip4[0] == 0 || inet_pton(AF_INET, w.ip4, &wifi_ip4) != 1) {
+    ESP_LOGW(TAG, "mdns: WiFi IPv4 is not up");
+    return -1;
+  }
+  int fd = socket(AF_INET, SOCK_DGRAM, 0);
   if (fd < 0) {
     return -1;
   }
-  int off = 0;
-  setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
   int on = 1;
   setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-  struct sockaddr_in6 a = {};
-  a.sin6_family = AF_INET6;
-  a.sin6_port = htons(5353);
+  struct sockaddr_in a = {};
+  a.sin_family = AF_INET;
+  a.sin_port = htons(5353);
   if (bind(fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
-    ESP_LOGE(TAG, "mdns bind(5353) failed");
+    ESP_LOGE(TAG, "mdns bind(5353) failed errno=%d", errno);
     close(fd);
     return -1;
   }
-  struct ipv6_mreq m6 = {};
-  inet_pton(AF_INET6, "ff02::fb", &m6.ipv6mr_multiaddr);
-  m6.ipv6mr_interface = netif_index;
-  if (setsockopt(fd, IPPROTO_IPV6, IPV6_JOIN_GROUP, &m6, sizeof(m6)) != 0) {
-    ESP_LOGW(TAG, "IPV6_JOIN_GROUP ff02::fb on netif %u failed (QU only)", (unsigned)netif_index);
-  }
   struct ip_mreq m4 = {};
   m4.imr_multiaddr.s_addr = inet_addr("224.0.0.251");
-  m4.imr_interface.s_addr = htonl(INADDR_ANY);
-  setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m4, sizeof(m4)); // best effort
+  m4.imr_interface = wifi_ip4;
+  if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m4, sizeof(m4)) != 0) {
+    ESP_LOGW(TAG, "IGMP join 224.0.0.251 on %s failed errno=%d", w.ip4, errno);
+  }
+  setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, &wifi_ip4, sizeof(wifi_ip4));
   return fd;
 }
 
-// mDNS で `node_id` の運用アドレスを解決してシムへ給餌する(WiFi ノードの handoff)。
-// 成功 = シムが RESOLVE_DONE を立て、BLE handoff なら CASE へ再開した。
+// BLE フェーズ中に 5353 ソケットへ届いたパケットのキャッシュ(announce 捕獲用)。
+// デバイスの operational announce は **ConnectNetwork 成功〜BLE_DONE の間**に流れる
+// (遅延 ConnectNetworkResponse より早い。実機 + PC 側パケット観測で確定)ので、
+// 解決開始まで取っておいて後からシムへリプレイする。
+struct MdnsCached {
+  uint16_t len;
+  uint8_t buf[600];
+};
+MdnsCached g_mdns_cache[8];
+size_t g_mdns_cache_n = 0;
+int g_mdns_fd = -1;
+
+void drain_mdns_to_cache() {
+  if (g_mdns_fd < 0) {
+    return;
+  }
+  for (;;) {
+    struct timeval tv = {0, 0};
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(g_mdns_fd, &rfds);
+    if (select(g_mdns_fd + 1, &rfds, nullptr, nullptr, &tv) <= 0) {
+      return;
+    }
+    uint8_t rx[1500];
+    int n = recv(g_mdns_fd, rx, sizeof(rx), 0);
+    if (n <= 0) {
+      return;
+    }
+    // 応答(QR=1)かつフルレコードが載るサイズだけキャッシュする(クエリや小物で
+    // 8 枠を潰さない。announce は SRV+TXT+A 込みで 400B 超)。
+    const bool is_response = (n > 12) && (rx[2] & 0x80);
+    if (is_response && n >= 150 && (size_t)n <= sizeof(g_mdns_cache[0].buf) &&
+        g_mdns_cache_n < 8) {
+      memcpy(g_mdns_cache[g_mdns_cache_n].buf, rx, (size_t)n);
+      g_mdns_cache[g_mdns_cache_n].len = (uint16_t)n;
+      g_mdns_cache_n++;
+      ESP_LOGI(TAG, "mdns cached %d B during BLE phase (%u total)", n, (unsigned)g_mdns_cache_n);
+    }
+  }
+}
+
+// キャッシュした announce をシムへ流す。RESOLVE_DONE が立てば true。
+bool replay_mdns_cache() {
+  for (size_t i = 0; i < g_mdns_cache_n; ++i) {
+    if (sm_ctrl_mdns_rx(g_mdns_cache[i].buf, g_mdns_cache[i].len, nullptr, now_ms()) == 0) {
+      sm_ctrl_event_t ev;
+      while (sm_ctrl_take_event(&ev)) {
+        if (ev.kind == SM_CTRL_EV_RESOLVE_DONE) {
+          ESP_LOGI(TAG, "resolved from a cached announce (#%u)", (unsigned)i);
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
 bool resolve_via_mdns(uint64_t node_id, uint32_t netif_index, uint64_t timeout_ms) {
-  int fd = open_mdns(netif_index);
+  (void)netif_index;
+  const bool own_fd = (g_mdns_fd < 0);
+  int fd = own_fd ? open_mdns_5353() : g_mdns_fd;
   if (fd < 0) {
     return false;
   }
+
+  struct sockaddr_in mdst = {};
+  mdst.sin_family = AF_INET;
+  mdst.sin_port = htons(5353);
+  mdst.sin_addr.s_addr = inet_addr("224.0.0.251");
+
   uint64_t until = now_ms() + timeout_ms;
   uint64_t next_q = 0;
   uint8_t rx[1500];
   bool ok = false;
-  while (now_ms() < until) {
+  while (!ok && now_ms() < until) {
     if (now_ms() >= next_q) {
       next_q = now_ms() + 2000;
       uint8_t q[512];
       sm_addr_t qdst = {};
       size_t qn = sm_ctrl_resolve_start(node_id, nullptr, now_ms(), q, sizeof(q), &qdst);
       if (qn > 0) {
-        // (a) シムが指定するマルチキャスト宛(IPv4 224.0.0.251:5353、v4-mapped で送る)
-        send_sm(fd, q, qn, qdst);
-        // (b) IPv6 の ff02::fb は WiFi netif を明示して送る
-        struct sockaddr_in6 m = {};
-        m.sin6_family = AF_INET6;
-        m.sin6_port = htons(5353);
-        inet_pton(AF_INET6, "ff02::fb", &m.sin6_addr);
-        m.sin6_scope_id = netif_index;
-        sendto(fd, q, qn, 0, (struct sockaddr *)&m, sizeof(m));
+        sendto(fd, q, qn, 0, (struct sockaddr *)&mdst, sizeof(mdst));
+        ESP_LOGI(TAG, "mdns query %u B -> 224.0.0.251:5353 (from :5353)", (unsigned)qn);
       }
     }
     struct timeval tv = {0, 200000};
@@ -645,16 +727,28 @@ bool resolve_via_mdns(uint64_t node_id, uint32_t netif_index, uint64_t timeout_m
     FD_ZERO(&rfds);
     FD_SET(fd, &rfds);
     if (select(fd + 1, &rfds, nullptr, nullptr, &tv) > 0 && FD_ISSET(fd, &rfds)) {
-      struct sockaddr_in6 src;
+      struct sockaddr_in src;
       socklen_t sl = sizeof(src);
       int n = recvfrom(fd, rx, sizeof(rx), 0, (struct sockaddr *)&src, &sl);
-      if (n > 0 && sm_ctrl_mdns_rx(rx, (size_t)n, nullptr, now_ms()) == 0) {
-        ok = true;
-        break;
+      if (n > 0) {
+        int32_t rc = sm_ctrl_mdns_rx(rx, (size_t)n, nullptr, now_ms());
+        char sip[20] = {0};
+        inet_ntop(AF_INET, &src.sin_addr, sip, sizeof(sip));
+        ESP_LOGI(TAG, "mdns rx %d B from %s:%u -> rc=%ld", n, sip, ntohs(src.sin_port), (long)rc);
+        if (rc == 0) {
+          sm_ctrl_event_t ev;
+          while (sm_ctrl_take_event(&ev)) {
+            if (ev.kind == SM_CTRL_EV_RESOLVE_DONE) {
+              ok = true;
+            }
+          }
+        }
       }
     }
   }
-  close(fd);
+  if (own_fd) {
+    close(fd);
+  }
   return ok;
 }
 
@@ -728,6 +822,34 @@ bool feed_addr_as_mdns(uint64_t node_id, const uint8_t ip[16], uint16_t port) {
 
 // ---- BLE コミッショニング(T3、§11.1)----
 
+// 直近の BLE 接続相手の BT MAC(印字順)。EUI-64 フォールバックに使う。
+uint8_t g_ble_peer_mac[6] = {};
+bool g_ble_peer_mac_ok = false;
+
+// ESP32 ファミリの MAC 割当(base=WiFi STA、+2=BT)を逆算して、BLE ピアの
+// WiFi 側 IPv6 インターフェース ID(EUI-64)を作る。48bit 減算で桁借りも処理。
+void derive_wifi_eui64(const uint8_t bt_mac[6], uint8_t eui64_out[8]) {
+  uint8_t mac[6];
+  memcpy(mac, bt_mac, 6);
+  uint64_t v = 0;
+  for (int i = 0; i < 6; ++i) {
+    v = (v << 8) | mac[i];
+  }
+  v -= 2; // BT = base + 2 → WiFi STA = BT - 2
+  for (int i = 5; i >= 0; --i) {
+    mac[i] = (uint8_t)v;
+    v >>= 8;
+  }
+  eui64_out[0] = mac[0] ^ 0x02;
+  eui64_out[1] = mac[1];
+  eui64_out[2] = mac[2];
+  eui64_out[3] = 0xff;
+  eui64_out[4] = 0xfe;
+  eui64_out[5] = mac[3];
+  eui64_out[6] = mac[4];
+  eui64_out[7] = mac[5];
+}
+
 void set_ble_stage(uint8_t stage) {
   sm_ui_snapshot_t *s = sm_app_lock();
   s->ble_stage = stage;
@@ -751,6 +873,10 @@ bool drive_ble_phase(const sm_ui_op_t &op, uint64_t timeout_ms) {
       case BleCentralEvent::Connected:
         sm_ctrl_ble_event(SM_BLE_CONNECTED, m.mtu, nullptr, 0, now_ms());
         set_ble_stage(SM_UI_BLE_CONNECTED);
+        if (m.peer_mac_valid) {
+          memcpy(g_ble_peer_mac, m.peer_mac, 6);
+          g_ble_peer_mac_ok = true;
+        }
         sm_app_set_status("BLE connected (MTU=%u); discovering the Matter GATT service",
                           (unsigned)m.mtu);
         break;
@@ -773,6 +899,7 @@ bool drive_ble_phase(const sm_ui_op_t &op, uint64_t timeout_ms) {
         return false;
       }
     }
+    drain_mdns_to_cache(); // announce は ConnectNetwork 成功直後に流れる(取り逃し防止)
     // シムが積んだ BTP フラグメントを C1 write で送る。
     // **C2 subscribe 完了まで write しない**(C1 handle は GATT 発見の完了で確定する。
     //  CONNECTED 直後の handshake request はシムが退避しているので取りこぼさない。F7b 実機バグ)。
@@ -863,15 +990,28 @@ void do_pair_ble(const sm_ui_op_t &op) {
     return;
   }
 
-  int rc;
-  if (thread_kind) {
-    rc = sm_ctrl_ble_pair_start(op.node_id, op.passcode, 1 /*thread*/, dataset, dataset_len,
-                                nullptr, 0, now_ms());
-  } else {
-    rc = sm_ctrl_ble_pair_start(op.node_id, op.passcode, 0 /*wifi*/,
-                                (const uint8_t *)CONFIG_SM_WIFI_SSID, strlen(CONFIG_SM_WIFI_SSID),
-                                (const uint8_t *)CONFIG_SM_WIFI_PASSWORD,
-                                strlen(CONFIG_SM_WIFI_PASSWORD), now_ms());
+  // シムが直前の操作(周期 read の CASE 等)を畳み終えるまで busy(rc=-2)になり得る。
+  // 30 秒までポンプを回しながらリトライする(実機 livelock の学び)。
+  int rc = -1;
+  const uint64_t start_until = now_ms() + 30000;
+  for (;;) {
+    if (thread_kind) {
+      rc = sm_ctrl_ble_pair_start(op.node_id, op.passcode, 1 /*thread*/, dataset, dataset_len,
+                                  nullptr, 0, now_ms());
+    } else {
+      rc = sm_ctrl_ble_pair_start(op.node_id, op.passcode, 0 /*wifi*/,
+                                  (const uint8_t *)CONFIG_SM_WIFI_SSID, strlen(CONFIG_SM_WIFI_SSID),
+                                  (const uint8_t *)CONFIG_SM_WIFI_PASSWORD,
+                                  strlen(CONFIG_SM_WIFI_PASSWORD), now_ms());
+    }
+    if (rc == 0 || now_ms() >= start_until) {
+      break;
+    }
+    sm_app_set_status("controller busy; waiting to start BLE pairing ...");
+    pump_once(g_udp, 200); // 進行中の交換を進めて畳ませる
+    sm_ctrl_event_t drop;
+    while (sm_ctrl_take_event(&drop)) {
+    }
   }
   if (rc != 0) {
     sm_ui_snapshot_t *s = sm_app_lock();
@@ -881,6 +1021,21 @@ void do_pair_ble(const sm_ui_op_t &op) {
     sm_app_set_status("sm_ctrl_ble_pair_start rejected (rc=%d; busy?)", rc);
     return;
   }
+
+  // 前回セッションの残骸イベント(Disconnected 等)を捨てる。ドレインしないと
+  // 新しいペアリングの直後に古い DISCONNECTED がシムへ流れて即死する(実機で発覚)。
+  {
+    QueueHandle_t q = sm_ble_central_queue();
+    BleCentralMsg stale;
+    while (q != nullptr && xQueueReceive(q, &stale, 0) == pdTRUE) {
+    }
+  }
+
+  // WiFi kind: mDNS ソケットを **BLE 開始前**に開いて join しておく。デバイスの
+  // operational announce は ConnectNetwork 成功直後(= BLE_DONE より前)に流れるので、
+  // BLE フェーズ中から聞いていないと取り逃す(実機 + PC 側パケット観測で確定)。
+  g_mdns_cache_n = 0;
+  g_mdns_fd = thread_kind ? -1 : open_mdns_5353();
 
   sm_app_set_status("BLE scan for discriminator %u (node %016llx, %s credentials) ...",
                     (unsigned)op.discriminator, (unsigned long long)op.node_id,
@@ -902,6 +1057,10 @@ void do_pair_ble(const sm_ui_op_t &op) {
     s->pair_state = 3;
     s->ble_stage = SM_UI_BLE_FAILED;
     sm_app_unlock();
+    if (g_mdns_fd >= 0) {
+      close(g_mdns_fd);
+      g_mdns_fd = -1;
+    }
     return;
   }
 
@@ -932,7 +1091,39 @@ void do_pair_ble(const sm_ui_op_t &op) {
   } else {
     uint32_t idx = sm_wifi_netif_index();
     sm_app_set_status("BLE done; resolving the device over mDNS (WiFi) ...");
-    resolved = resolve_via_mdns(op.node_id, idx, 60000);
+    drain_mdns_to_cache(); // BLE フェーズの取りこぼしを最終回収
+    resolved = replay_mdns_cache();
+    if (!resolved) {
+      resolved = resolve_via_mdns(op.node_id, idx, 20000);
+    }
+    // 最終フォールバック(ESP32 ファミリ限定の割り切り): BLE ピアの BT MAC から
+    // WiFi MAC(-2)→ EUI-64 を導出し、運用アドレスを直接与える。SLAAC(EUI-64)
+    // 前提。Tab5 自身が GUA を持っていれば同一 prefix の GUA(再起動後も有効)、
+    // 無ければリンクローカル(send_sm の fe80 → WiFi netif 補完で届く)。
+    if (!resolved && g_ble_peer_mac_ok) {
+      uint8_t eui[8];
+      derive_wifi_eui64(g_ble_peer_mac, eui);
+      sm_wifi_status_t w = {};
+      sm_wifi_get_status(&w);
+      uint8_t ip[16] = {};
+      if (w.gua[0] != 0 && inet_pton(AF_INET6, w.gua, ip) == 1) {
+        memcpy(ip + 8, eui, 8); // 自分の GUA の上位 64bit + ピアの EUI-64
+      } else {
+        ip[0] = 0xfe;
+        ip[1] = 0x80;
+        memcpy(ip + 8, eui, 8);
+      }
+      char ips[48] = {0};
+      inet_ntop(AF_INET6, ip, ips, sizeof(ips));
+      ESP_LOGW(TAG, "mDNS silent; trying the derived address %s (EUI-64 from the BLE peer MAC)",
+               ips);
+      sm_app_set_status("mDNS silent; trying derived address %s", ips);
+      resolved = feed_addr_as_mdns(op.node_id, ip, CONFIG_SM_TARGET_PORT);
+    }
+  }
+  if (g_mdns_fd >= 0) {
+    close(g_mdns_fd);
+    g_mdns_fd = -1;
   }
 
   if (!resolved) {
@@ -942,6 +1133,18 @@ void do_pair_ble(const sm_ui_op_t &op) {
     sm_app_unlock();
     sm_app_set_status("handoff failed: could not resolve the operational address of %016llx",
                       (unsigned long long)op.node_id);
+    // **シムの詰まり解消**(実機で発見): 解決に失敗すると Activity::BleHandoff が
+    // 保留のまま残り、以降の pair/invoke が rc=-2 で永久に弾かれる(abort API が無い)。
+    // ダミーの運用アドレス(::1)を「解決成功」として給餌し、CASE を即失敗させて
+    // 状態機械を畳ませる。PAIR_FAILED は run_until で回収して捨てる。
+    static const uint8_t kLoopback[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    if (feed_addr_as_mdns(op.node_id, kLoopback, CONFIG_SM_TARGET_PORT)) {
+      sm_ctrl_event_t ev2;
+      run_until(g_udp, 30000, ev2, term_pair);
+      ESP_LOGW(TAG, "handoff aborted via loopback CASE (shim unwedged)");
+    } else {
+      ESP_LOGE(TAG, "could not unwedge the shim; further ops will be rejected until reboot");
+    }
     return;
   }
 
@@ -1101,17 +1304,44 @@ void pump_task(void *) {
       }
     }
     // 10 秒周期でノードを 1 件ずつ read して on/off バッジを更新する。
+    //
+    // **落ちているノードには 2 分のバックオフ**を入れる(実機で発見した livelock:
+    // 死んだノードへの read は CASE 確立を毎回試み、MRP が諦めるまで ~20 秒シムを
+    // 塞ぐ。10 秒周期でそれを繰り返すとシムがほぼ常時 busy になり、UI の操作
+    // (特に sm_ctrl_ble_pair_start)が rc=-2 で弾かれ続ける)。
     if (now >= next_poll) {
       next_poll = now + 10000;
+      static uint64_t backoff_until[SM_UI_MAX_NODES] = {};
       sm_ui_snapshot_t *s = sm_app_lock();
       size_t count = s->node_count;
-      uint64_t id = count ? s->nodes[poll_index % count].node_id : 0;
       sm_app_unlock();
       if (count > 0) {
-        poll_index = (poll_index + 1) % count;
-        set_node_busy(id, true);
-        do_read_onoff(id, true, 10000);
-        set_node_busy(id, false);
+        // バックオフ中でないノードを 1 件選ぶ(全員バックオフ中ならスキップ)。
+        uint64_t id = 0;
+        size_t slot = 0;
+        for (size_t tries = 0; tries < count; ++tries) {
+          size_t idx = poll_index % count;
+          poll_index = (poll_index + 1) % count;
+          if (idx < SM_UI_MAX_NODES && now < backoff_until[idx]) {
+            continue;
+          }
+          sm_ui_snapshot_t *s2 = sm_app_lock();
+          id = idx < s2->node_count ? s2->nodes[idx].node_id : 0;
+          sm_app_unlock();
+          slot = idx;
+          break;
+        }
+        if (id != 0) {
+          set_node_busy(id, true);
+          bool ok = do_read_onoff(id, true, 10000);
+          set_node_busy(id, false);
+          if (slot < SM_UI_MAX_NODES) {
+            backoff_until[slot] = ok ? 0 : now + 120000;
+            if (!ok) {
+              set_node_note(id, "unreachable (retry in 2min)");
+            }
+          }
+        }
       }
     }
   }

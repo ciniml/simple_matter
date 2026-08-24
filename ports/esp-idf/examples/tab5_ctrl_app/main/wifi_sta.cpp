@@ -126,9 +126,14 @@ void on_event(void *, esp_event_base_t base, int32_t id, void *data) {
     if (ev->esp_netif != g_netif) {
       return; // OT netif の GOT_IP6 は無視する
     }
+    // fe80::/10 はリンクローカル、それ以外(SLAAC の GUA/ULA)は gua に入れる。
+    const uint8_t *b = (const uint8_t *)ev->ip6_info.ip.addr;
+    const bool is_ll = (b[0] == 0xfe) && ((b[1] & 0xc0) == 0x80);
     lock();
     g_status.state = SM_WIFI_CONNECTED;
-    snprintf(g_status.ll_addr, sizeof(g_status.ll_addr), IPV6STR, IPV62STR(ev->ip6_info.ip));
+    snprintf(is_ll ? g_status.ll_addr : g_status.gua,
+             is_ll ? sizeof(g_status.ll_addr) : sizeof(g_status.gua), IPV6STR,
+             IPV62STR(ev->ip6_info.ip));
     g_status.netif_index = (uint32_t)esp_netif_get_netif_impl_index(g_netif);
     unlock();
     ESP_LOGI(TAG, "got IPv6 " IPV6STR " (netif index %d)", IPV62STR(ev->ip6_info.ip),
@@ -193,6 +198,11 @@ void wifi_task(void *) {
     vTaskDelete(nullptr);
     return;
   }
+  // power save は切る(デバイス例は全て ps=none 運用)。modem sleep のままだと
+  // DTIM バッファ経由のマルチキャスト(mDNS announce / RA)を取りこぼす —
+  // 実機 T3 で「IPv6 NDP は通るのに 224.0.0.251 が一切届かない」「RA が来ず
+  // GUA 取得がブート毎に不安定」の 2 症状として観測された第一容疑。
+  esp_wifi_set_ps(WIFI_PS_NONE);
 
   ESP_LOGI(TAG, "wifi started; connecting to \"%s\"", CONFIG_SM_WIFI_SSID);
 
