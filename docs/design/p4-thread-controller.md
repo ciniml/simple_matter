@@ -1132,3 +1132,94 @@ subscribe レポート経路(同関数)も同時に直る。回帰 = cargo test 
 2. 回帰: thread_ctrl_hub_cpp ビルド green、他 example 変更ゼロ
 3. 実機(親 + ユーザ): AirQ(airq-sensor)と NanoC6(thread 照明)を Tab5 の
    fabric にコミッショニング → 一覧にセンサ行(実測値)と照明行(Toggle 動作)が並ぶ
+
+### 12.5 実装記録(T4、2026-08-24)
+
+**結論**: §12.2(シム f32)+ §12.3(tab5_ctrl_app のノード種別対応)を実装。
+crates/ の変更は設計どおり **1 箇所(+ 単体テスト 1 本)** のみ、他 example の
+変更ゼロ。ビルドゲートは全緑(実機 E2E は次フェーズ)。
+
+#### 変更 / 追加ファイル
+
+| ファイル | 変更 |
+|---|---|
+| `crates/simple-matter-cffi/src/controller.rs` | `scalar_from_reports` の TLV → `value_u64` 変換を `scalar_from_tlv()` に切り出し、`Float(f32)` / `Double(f64)` を追加。テスト `scalar_from_tlv_covers_floats` を追加 |
+| `.../tab5_ctrl_app/main/app_state.hpp` | `sm_ui_node_kind_t` / `sm_ui_sensor_slot_t` を追加、`sm_ui_node_t` に `kind` + センサ値 5 種(`has_*` フラグ付き)を追加 |
+| `.../tab5_ctrl_app/main/ctrl_pump.cpp` | 種別検出(NVS "smui" キャッシュ)、センサ属性の順繰り poll、`f32_from_value()`、Read / ⟳ の種別分岐 |
+| `.../tab5_ctrl_app/main/ui.cpp` | センサ行(AirQuality 色付きバッジ + 2 行目サマリ、Toggle 非表示) |
+
+#### シムの差分(§12.2)
+
+```rust
+fn scalar_from_tlv(v: &TlvValue<'_>) -> (u64, bool) {
+    match *v {
+        TlvValue::Boolean(b) => (b as u64, false),
+        TlvValue::UnsignedInteger(u) => (u, false),
+        TlvValue::SignedInteger(i) => (i as u64, false),
+        TlvValue::Float(f) => (f.to_bits() as u64, false),      // ← 追加
+        TlvValue::Double(d) => ((d as f32).to_bits() as u64, false), // ← 追加
+        TlvValue::Null => (0, true),
+        _ => (0, false),
+    }
+}
+```
+
+C ヘッダ / ABI は不変。read と subscribe が同じ関数を通るので両経路が同時に直る。
+Double は **f32 に丸めてから**載せる(C++ 側の読み替えを「下位 32bit を memcpy」の
+1 通りに保つため)。C++ 側は `f32_from_value()`(ctrl_pump.cpp)で復元する。
+
+#### tab5_ctrl_app の設計メモ
+
+- **種別検出は 2 段**: EP1 AirQuality(0x005B/0)read 成功 = センサ、駄目なら
+  EP1 OnOff(0x0006/0)read を試して成功 = 照明。**両方落ちたら UNKNOWN のまま
+  キャッシュしない**。「AirQuality が読めない = 照明」と即断すると、単にノードが
+  不達なだけのときに誤って照明として NVS に焼き付いてしまう(実装中に気付いた罠)。
+- **キャッシュ**: NVS namespace `"smui"`、key = NodeId の hex。**NVS のキー長上限は
+  15 文字**なので `%016llx` は入らない。下位 60bit を `%015llx` で焼く。値は
+  `nvs_set_u8`(sm_ui_node_kind_t)。
+- **判定タイミング**: (a) ペア完了直後(`after_pair_complete`)、(b) キャッシュに
+  無いノードの初回 poll(その 1 周期を検出に使う)、(c) ⟳ Addr ボタン
+  (キャッシュを消して再検出 = 誤判別からの復帰導線)。
+- **周期 poll**: 10 秒周期 / 2 分バックオフ / 1 周期 1 操作の既存契約は不変。
+  センサは `SENSOR_ATTRS[]`(AQ → CO2 → PM2.5 → 温度 → 湿度)を
+  **NodeId で引くカーソル表**(`g_cursor`)で 1 属性ずつ回す。行の並び替えで
+  カーソルが他ノードへ移らないよう、行 index ではなく NodeId で持つこと。
+- **Read ボタン**: 照明 = 従来どおり OnOff 1 発。センサ = カーソルを先頭に戻して
+  5 属性を連続読み(1 本落ちたら打ち切る。死んだノードで CASE を 5 回試さない)。
+
+#### UI(§12.3 の 3)
+
+- ノード行の高さは **96px 据え置き**。左カラム(480px)を
+  `NodeId / アドレス / 計測値サマリ` の 3 段にし、サマリ行は照明行では
+  `LV_OBJ_FLAG_HIDDEN`(LVGL 9 の flex は hidden 要素を配置から外す)。
+- バッジ(150×56)は照明が `ON` / `OFF` / `?`、センサが AirQuality 6 段階の
+  色付きラベル(Good 緑 → ExtPoor 赤、0/未取得はグレー "?")。
+- 2 行目サマリ = `CO2 812ppm   PM2.5 3.2ug/m3   26.5C   41%`。未取得は "-"。
+- Toggle ボタンはセンサ行では hidden。Read / ⟳ Addr は両種別に出す。
+- **`lv_label_set_text_fmt` に `%f` は渡さない**(`lv_snprintf` は既定で float
+  非対応)。float は C ライブラリの `snprintf` か整数演算で桁を作ってから `%s`
+  で流す。ここでは整数演算にしてある(`-Wformat-truncation` 対策で値域も clamp)。
+- 行幅の内訳: 480(左カラム)+ 150(バッジ)+ 120(note)+ 160(Toggle)
+  + 120(Read)+ 150(⟳ Addr)+ 隙間 12×5 = 1240 < 1280。
+
+#### ゲート実測
+
+| ゲート | 結果 |
+|---|---|
+| `cargo fmt --all --check` | green |
+| `cargo test --workspace` | green(`controller::tests::scalar_from_tlv_covers_floats` を含め全通過) |
+| `cargo clippy --workspace --all-targets` | green(警告ゼロ) |
+| tab5_ctrl_app esp32p4 docker build | green(`tab5_ctrl_app.bin` = 0x1ffc00 バイト、app partition の 50% 空き) |
+| thread_ctrl_hub_cpp esp32p4 build(回帰) | green(0xf98a0 バイト) |
+| 他 example の変更 | ゼロ(`git status` = crates 1 + tab5_ctrl_app 3 ファイルのみ) |
+
+#### 実機で見るべき点(次フェーズ)
+
+1. AirQ の EP 配置が前提どおりか(EP1 = AirQuality/CO2/PM2.5、EP2 = 温度、
+   EP3 = 湿度)。ずれていたら `SENSOR_ATTRS[]` の ep だけ直せばよい。
+2. CO2 / PM2.5 が **f32 として妥当な値**に見えるか(壊れていれば TLV が
+   f32 でない = デバイス側が u16 等で報告している可能性。その場合は
+   `scalar_from_tlv` ではなく C++ 側の読み替えを直す)。
+3. 種別検出が 1 回で決まり、リブート後に再検出が走らないこと(NVS "smui")。
+4. センサ 1 ノード + 照明 1 ノードで、照明の Toggle 応答が
+   センサの順繰り poll に阻害されないこと(1 周期 1 操作 + busy 契約)。

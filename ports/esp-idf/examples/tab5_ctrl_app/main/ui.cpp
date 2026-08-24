@@ -17,6 +17,7 @@
 
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "esp_log.h"
@@ -49,11 +50,27 @@ const char *PHASE_NAME[] = {"Idle",        "PASE",  "ArmFailSafe",    "Attestati
                             "CSR",         "AddTrustedRoot", "AddNOC", "CASE",
                             "Complete",    "Done",  "AddWiFi",        "ConnectNetwork"};
 
+// AirQualityEnum(0..6)の表示(T4、§12.3 の 3)。0 = Unknown / 未取得はグレーの "?"。
+struct AqStyle {
+  const char *name;
+  uint32_t color;
+};
+const AqStyle AQ_STYLE[] = {
+    {"?", 0x4a5163},         // 0 Unknown
+    {"Good", 0x27ae60},      // 1
+    {"Fair", 0x7fb800},      // 2
+    {"Moderate", 0xd4b106},  // 3
+    {"Poor", 0xe67e22},      // 4
+    {"VeryPoor", 0xd94f2b},  // 5
+    {"ExtPoor", 0xc0392b},   // 6 ExtremelyPoor
+};
+
 // --- ウィジェット一式 ---
 struct NodeRowWidgets {
   lv_obj_t *root = nullptr;
   lv_obj_t *lbl_id = nullptr;
   lv_obj_t *lbl_addr = nullptr;
+  lv_obj_t *lbl_sensor = nullptr; // センサ行の 2 行目サマリ(照明行では隠す)
   lv_obj_t *badge = nullptr;
   lv_obj_t *lbl_note = nullptr;
   lv_obj_t *btn_toggle = nullptr;
@@ -429,24 +446,31 @@ void build_node_row(size_t idx) {
   lv_obj_set_flex_align(w.root, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
   lv_obj_set_style_pad_column(w.root, 12, 0);
 
+  // 左カラム: NodeId / アドレス /(センサ行のみ)計測値サマリの 3 段。
+  // ROW_H は 96 のまま(20+14+16 の 3 行 = 約 60px < ROW_H-20)。
   lv_obj_t *col = lv_obj_create(w.root);
   lv_obj_remove_style_all(col);
-  lv_obj_set_size(col, 470, ROW_H - 20);
+  // 幅は行の総和が画面に収まるように: 480 + 150(badge) + 120(note) + 160 + 120 + 150
+  // (ボタン)+ 隙間 12×5 = 1240 < 1280。
+  lv_obj_set_size(col, 480, ROW_H - 20);
   lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
   w.lbl_id = make_label(col, &lv_font_montserrat_20, COL_TEXT, "-");
   w.lbl_addr = make_label(col, &lv_font_montserrat_14, COL_DIM, "-");
+  w.lbl_sensor = make_label(col, &lv_font_montserrat_16, COL_ACCENT, "");
+  lv_obj_add_flag(w.lbl_sensor, LV_OBJ_FLAG_HIDDEN);
 
+  // バッジ: 照明は ON/OFF、センサは AirQuality の 6 段階(色 + 名前)。
   w.badge = lv_obj_create(w.root);
   style_panel(w.badge, COL_OFF);
-  lv_obj_set_size(w.badge, 96, 56);
+  lv_obj_set_size(w.badge, 150, 56);
   lv_obj_remove_flag(w.badge, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_t *bl = make_label(w.badge, &lv_font_montserrat_20, 0xffffff, "?");
+  lv_obj_t *bl = make_label(w.badge, &lv_font_montserrat_16, 0xffffff, "?");
   lv_obj_center(bl);
   lv_obj_set_user_data(w.badge, bl);
 
   w.lbl_note = make_label(w.root, &lv_font_montserrat_14, COL_DIM, "");
-  lv_obj_set_width(w.lbl_note, 150);
+  lv_obj_set_width(w.lbl_note, 120);
 
   void *ud = (void *)(uintptr_t)idx;
   w.btn_toggle = make_button(w.root, "Toggle", 160, COL_ACCENT, on_toggle, ud);
@@ -542,10 +566,17 @@ void refresh_devices() {
   for (size_t i = 0; i < g_ui.row_count; ++i) {
     const sm_ui_node_t &n = g_snap.nodes[i];
     NodeRowWidgets &w = g_ui.rows[i];
-    lv_label_set_text_fmt(w.lbl_id, "Node 0x%016llx", (unsigned long long)n.node_id);
+    const bool sensor = (n.kind == SM_UI_KIND_SENSOR);
+    lv_label_set_text_fmt(w.lbl_id, "Node 0x%016llx%s", (unsigned long long)n.node_id,
+                          sensor ? "   [air quality]" : "");
     lv_label_set_text(w.lbl_addr, n.addr);
     lv_obj_t *bl = (lv_obj_t *)lv_obj_get_user_data(w.badge);
-    if (n.onoff > 0) {
+    if (sensor) {
+      // AirQuality の 6 段階(未取得 / Unknown はグレーの "?")。
+      const uint8_t aq = (n.has_aq && n.aq <= 6) ? n.aq : 0;
+      lv_obj_set_style_bg_color(w.badge, lv_color_hex(AQ_STYLE[aq].color), 0);
+      lv_label_set_text(bl, AQ_STYLE[aq].name);
+    } else if (n.onoff > 0) {
       lv_obj_set_style_bg_color(w.badge, lv_color_hex(COL_ON), 0);
       lv_label_set_text(bl, "ON");
     } else if (n.onoff == 0) {
@@ -555,6 +586,43 @@ void refresh_devices() {
       lv_obj_set_style_bg_color(w.badge, lv_color_hex(COL_WARN), 0);
       lv_label_set_text(bl, "?");
     }
+
+    // 2 行目のサマリ(センサ行のみ)。未取得の項目は "-"。
+    if (sensor) {
+      // %f は使わない(lv_snprintf は既定で float 非対応。整数演算で桁を作る)。
+      // 値域はクランプする(異常値で桁溢れさせない = -Wformat-truncation 対策も兼ねる)。
+      auto clamp = [](int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); };
+      char co2[24], pm25[24], temp[24], hum[24];
+      if (n.has_co2) {
+        snprintf(co2, sizeof(co2), "%dppm", clamp((int)(n.co2 + 0.5f), 0, 99999));
+      } else {
+        snprintf(co2, sizeof(co2), "-");
+      }
+      if (n.has_pm25) {
+        int t = clamp((int)(n.pm25 * 10.0f + 0.5f), 0, 99999);
+        snprintf(pm25, sizeof(pm25), "%d.%dug/m3", t / 10, t % 10);
+      } else {
+        snprintf(pm25, sizeof(pm25), "-");
+      }
+      if (n.has_temp) {
+        int t = clamp((int)(n.temp_c100 / 10), -9999, 9999); // 0.1 ℃ 単位
+        snprintf(temp, sizeof(temp), "%s%d.%dC", (t < 0 ? "-" : ""), abs(t) / 10, abs(t) % 10);
+      } else {
+        snprintf(temp, sizeof(temp), "-");
+      }
+      if (n.has_hum) {
+        snprintf(hum, sizeof(hum), "%d%%", clamp((int)(n.hum_p100 / 100), 0, 100));
+      } else {
+        snprintf(hum, sizeof(hum), "-");
+      }
+      lv_label_set_text_fmt(w.lbl_sensor, "CO2 %s   PM2.5 %s   %s   %s", co2, pm25, temp, hum);
+      lv_obj_remove_flag(w.lbl_sensor, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(w.lbl_sensor, LV_OBJ_FLAG_HIDDEN);
+    }
+    // Toggle は照明行だけ(センサに OnOff は無い)。隠した要素は flex 配置から外れる。
+    lv_obj_set_flag(w.btn_toggle, LV_OBJ_FLAG_HIDDEN, sensor);
+
     lv_label_set_text(w.lbl_note, n.busy ? "working ..." : n.note);
   }
 }

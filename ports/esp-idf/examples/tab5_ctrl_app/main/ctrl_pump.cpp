@@ -39,12 +39,40 @@ namespace {
 
 constexpr const char *TAG = "pump";
 constexpr const char *SM_NVS_NAMESPACE = "smctl";
+// ノード種別のキャッシュ(T4、§12.3 の 1)。key = NodeId の hex(下位 60bit、15 桁 =
+// NVS のキー長上限)、値 = sm_ui_node_kind_t。
+constexpr const char *SM_UI_NVS_NAMESPACE = "smui";
 
 // OnOff クラスタ。
 constexpr uint16_t EP_ONOFF = 1;
 constexpr uint32_t CL_ONOFF = 0x0006;
 constexpr uint32_t CMD_TOGGLE = 0x02;
 constexpr uint32_t ATTR_ONOFF = 0x0000;
+
+// 空気質センサ(airq-sensor、docs/design/airq-port.md §A1)の読み出しパス。
+// **f32 の 2 本(CO2 / PM2.5)は value_u64 の下位 32bit にビットパターンが載る**
+// (シム §12.2。型情報は ABI に無いので「このパスは f32」を C++ 側が知っている前提)。
+struct SensorAttrPath {
+  uint16_t ep;
+  uint32_t cluster;
+  uint32_t attr;
+  const char *name;
+};
+constexpr SensorAttrPath SENSOR_ATTRS[SM_UI_SLOT_COUNT] = {
+    {1, 0x005B, 0x0000, "AirQuality"}, // enum8 0..6
+    {1, 0x040D, 0x0000, "CO2"},        // f32 ppm
+    {1, 0x042A, 0x0000, "PM2.5"},      // f32 µg/m³
+    {2, 0x0402, 0x0000, "Temp"},       // i16 ×0.01 ℃
+    {3, 0x0405, 0x0000, "Humidity"},   // u16 ×0.01 %
+};
+
+// value_u64 の下位 32bit を f32 に戻す(§12.2 の C++ 側契約。memcpy 経由)。
+float f32_from_value(uint64_t v) {
+  uint32_t bits = (uint32_t)v;
+  float f;
+  memcpy(&f, &bits, sizeof(f));
+  return f;
+}
 
 uint64_t now_ms() { return (uint64_t)esp_timer_get_time() / 1000ull; }
 
@@ -316,6 +344,131 @@ void set_node_onoff(uint64_t node_id, int8_t v) {
   sm_app_unlock();
 }
 
+// ---- ノード種別(T4)----
+
+uint8_t node_kind(uint64_t node_id) {
+  sm_ui_snapshot_t *s = sm_app_lock();
+  size_t i = node_index(s, node_id);
+  uint8_t k = i < SM_UI_MAX_NODES ? s->nodes[i].kind : (uint8_t)SM_UI_KIND_UNKNOWN;
+  sm_app_unlock();
+  return k;
+}
+
+void set_node_kind(uint64_t node_id, uint8_t kind) {
+  sm_ui_snapshot_t *s = sm_app_lock();
+  size_t i = node_index(s, node_id);
+  if (i < SM_UI_MAX_NODES) {
+    s->nodes[i].kind = kind;
+  }
+  sm_app_unlock();
+}
+
+// NVS キー(15 文字上限)。NodeId 下位 60bit の hex。
+void kind_key(uint64_t node_id, char out[16]) {
+  snprintf(out, 16, "%015llx", (unsigned long long)(node_id & 0x0FFFFFFFFFFFFFFFull));
+}
+
+uint8_t kind_cache_get(uint64_t node_id) {
+  char k[16];
+  kind_key(node_id, k);
+  nvs_handle_t h;
+  if (nvs_open(SM_UI_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+    return SM_UI_KIND_UNKNOWN;
+  }
+  uint8_t v = SM_UI_KIND_UNKNOWN;
+  if (nvs_get_u8(h, k, &v) != ESP_OK) {
+    v = SM_UI_KIND_UNKNOWN;
+  }
+  nvs_close(h);
+  return v > SM_UI_KIND_SENSOR ? (uint8_t)SM_UI_KIND_UNKNOWN : v;
+}
+
+void kind_cache_set(uint64_t node_id, uint8_t kind) {
+  char k[16];
+  kind_key(node_id, k);
+  nvs_handle_t h;
+  if (nvs_open(SM_UI_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+    return;
+  }
+  if (kind == SM_UI_KIND_UNKNOWN) {
+    nvs_erase_key(h, k); // 再検出のためにキャッシュを捨てる(⟳ ボタン)
+  } else {
+    nvs_set_u8(h, k, kind);
+  }
+  nvs_commit(h);
+  nvs_close(h);
+}
+
+// センサ値 1 件を書き込む(has_* も併せて更新。null / 失敗は has=false)。
+void set_node_sensor(uint64_t node_id, uint8_t slot, bool has, uint64_t raw) {
+  sm_ui_snapshot_t *s = sm_app_lock();
+  size_t i = node_index(s, node_id);
+  if (i < SM_UI_MAX_NODES) {
+    sm_ui_node_t &n = s->nodes[i];
+    switch (slot) {
+    case SM_UI_SLOT_AQ:
+      n.has_aq = has ? 1 : 0;
+      n.aq = has ? (uint8_t)(raw & 0xFF) : 0;
+      break;
+    case SM_UI_SLOT_CO2:
+      n.has_co2 = has ? 1 : 0;
+      n.co2 = has ? f32_from_value(raw) : 0.0f;
+      break;
+    case SM_UI_SLOT_PM25:
+      n.has_pm25 = has ? 1 : 0;
+      n.pm25 = has ? f32_from_value(raw) : 0.0f;
+      break;
+    case SM_UI_SLOT_TEMP:
+      // i16 ×0.01 ℃(u64 に符号拡張済みの値が載る)。
+      n.has_temp = has ? 1 : 0;
+      n.temp_c100 = has ? (int32_t)(int16_t)(raw & 0xFFFF) : 0;
+      break;
+    case SM_UI_SLOT_HUM:
+      n.has_hum = has ? 1 : 0;
+      n.hum_p100 = has ? (int32_t)(uint16_t)(raw & 0xFFFF) : 0;
+      break;
+    default:
+      break;
+    }
+  }
+  sm_app_unlock();
+}
+
+// センサ属性の順繰り位置(NodeId で引く小さな表。行の並び替えに巻き込まれない)。
+struct SensorCursor {
+  uint64_t node_id;
+  uint8_t slot;
+};
+SensorCursor g_cursor[SM_UI_MAX_NODES] = {};
+
+uint8_t *cursor_for(uint64_t node_id) {
+  for (SensorCursor &c : g_cursor) {
+    if (c.node_id == node_id) {
+      return &c.slot;
+    }
+  }
+  for (SensorCursor &c : g_cursor) {
+    if (c.node_id == 0) {
+      c.node_id = node_id;
+      c.slot = 0;
+      return &c.slot;
+    }
+  }
+  g_cursor[0].node_id = node_id; // 表が埋まったら先頭を再利用(実害なし)
+  g_cursor[0].slot = 0;
+  return &g_cursor[0].slot;
+}
+
+void clear_node_sensors(uint64_t node_id) {
+  sm_ui_snapshot_t *s = sm_app_lock();
+  size_t i = node_index(s, node_id);
+  if (i < SM_UI_MAX_NODES) {
+    sm_ui_node_t &n = s->nodes[i];
+    n.has_aq = n.has_co2 = n.has_pm25 = n.has_temp = n.has_hum = 0;
+  }
+  sm_app_unlock();
+}
+
 // sm_addr_t を "[addr]:port" の表示文字列にする。
 void format_addr(const sm_addr_t &a, char *out, size_t cap) {
   char ip[64] = {0};
@@ -377,6 +530,8 @@ void rebuild_node_list() {
     row.node_id = ids[i];
     row.onoff = -1;
     row.busy = 0;
+    // 種別は NVS キャッシュから引く(無ければ UNKNOWN = 初回 poll で検出する)。
+    row.kind = kind_cache_get(ids[i]);
     if (present) {
       format_addr(a, row.addr, sizeof(row.addr));
     } else {
@@ -384,8 +539,16 @@ void rebuild_node_list() {
     }
     for (size_t j = 0; j < old_count; ++j) {
       if (old[j].node_id == ids[i]) {
-        row.onoff = old[j].onoff;
-        memcpy(row.note, old[j].note, sizeof(row.note));
+        // 既知の表示状態(on/off・note・センサ値)は NodeId が同じなら引き継ぐ。
+        uint64_t id = row.node_id;
+        char addr[64];
+        memcpy(addr, row.addr, sizeof(addr));
+        uint8_t kind = row.kind != SM_UI_KIND_UNKNOWN ? row.kind : old[j].kind;
+        row = old[j];
+        row.node_id = id;
+        memcpy(row.addr, addr, sizeof(addr));
+        row.kind = kind;
+        row.busy = 0;
         break;
       }
     }
@@ -455,6 +618,103 @@ bool do_read_onoff(uint64_t node_id, bool quiet, uint64_t timeout_ms) {
     sm_app_set_status("read %016llx failed", (unsigned long long)node_id);
   }
   return false;
+}
+
+// 任意パスのスカラ read。成功なら *out に生の value_u64、*out_null に null 判定。
+bool do_read_scalar(uint64_t node_id, const SensorAttrPath &p, uint64_t timeout_ms, uint64_t *out,
+                    bool *out_null) {
+  if (sm_ctrl_read_scalar(node_id, p.ep, p.cluster, p.attr, now_ms()) != 0) {
+    return false;
+  }
+  sm_ctrl_event_t ev;
+  if (!run_until(g_udp, timeout_ms, ev, term_read) || ev.kind != SM_CTRL_EV_READ_DONE) {
+    return false;
+  }
+  *out = ev.value_u64;
+  *out_null = ev.value_is_null;
+  return true;
+}
+
+// センサ属性 1 件を読んでスナップショットへ書く(§12.3 の 2)。戻り値 = 通信が成立したか
+// (null 応答も「成立」扱い。has_* は false になる)。
+bool do_read_sensor_slot(uint64_t node_id, uint8_t slot, bool quiet, uint64_t timeout_ms) {
+  if (slot >= SM_UI_SLOT_COUNT) {
+    return false;
+  }
+  const SensorAttrPath &p = SENSOR_ATTRS[slot];
+  uint64_t raw = 0;
+  bool is_null = false;
+  if (!do_read_scalar(node_id, p, timeout_ms, &raw, &is_null)) {
+    set_node_sensor(node_id, slot, false, 0);
+    if (!quiet) {
+      sm_app_set_status("read %s of %016llx failed", p.name, (unsigned long long)node_id);
+    }
+    return false;
+  }
+  set_node_sensor(node_id, slot, !is_null, raw);
+  if (!quiet) {
+    sm_app_set_status("read %s of %016llx OK", p.name, (unsigned long long)node_id);
+  }
+  return true;
+}
+
+// センサの全属性を先頭から読み直す(UI の Read ボタン / ペア直後)。
+bool do_read_sensor_all(uint64_t node_id, bool quiet, uint64_t timeout_ms) {
+  bool all = true;
+  for (uint8_t slot = 0; slot < SM_UI_SLOT_COUNT; ++slot) {
+    if (!do_read_sensor_slot(node_id, slot, true, timeout_ms)) {
+      all = false;
+      break; // 1 本落ちたら以降も落ちる(死んだノードで 5 回 CASE を試さない)
+    }
+  }
+  if (!quiet) {
+    sm_app_set_status(all ? "refreshed all sensor attributes of %016llx"
+                          : "sensor refresh of %016llx failed",
+                      (unsigned long long)node_id);
+  }
+  return all;
+}
+
+// ノード種別を実機に問い合わせる(§12.3 の 1)。
+//
+// AirQuality(EP1 0x005B/0)が読めれば SENSOR、駄目なら OnOff(EP1 0x0006/0)を試して
+// 読めれば LIGHT。**両方落ちたら UNKNOWN**(= ノードが不達なだけの可能性があるので
+// キャッシュしない)。読めた値はそのまま表示にも反映する。
+uint8_t probe_node_kind(uint64_t node_id, uint64_t timeout_ms) {
+  uint64_t raw = 0;
+  bool is_null = false;
+  if (do_read_scalar(node_id, SENSOR_ATTRS[SM_UI_SLOT_AQ], timeout_ms, &raw, &is_null)) {
+    set_node_sensor(node_id, SM_UI_SLOT_AQ, !is_null, raw);
+    return SM_UI_KIND_SENSOR;
+  }
+  static constexpr SensorAttrPath kOnOff = {EP_ONOFF, CL_ONOFF, ATTR_ONOFF, "OnOff"};
+  if (do_read_scalar(node_id, kOnOff, timeout_ms, &raw, &is_null)) {
+    set_node_onoff(node_id, is_null ? (int8_t)-1 : (int8_t)(raw != 0 ? 1 : 0));
+    return SM_UI_KIND_LIGHT;
+  }
+  return SM_UI_KIND_UNKNOWN;
+}
+
+// 種別を確定させてキャッシュへ書く。確定できなければ UNKNOWN のまま(次の poll で再挑戦)。
+uint8_t resolve_node_kind(uint64_t node_id, uint64_t timeout_ms) {
+  uint8_t kind = probe_node_kind(node_id, timeout_ms);
+  set_node_kind(node_id, kind);
+  if (kind != SM_UI_KIND_UNKNOWN) {
+    kind_cache_set(node_id, kind);
+    ESP_LOGI(TAG, "node %016llx detected as %s", (unsigned long long)node_id,
+             kind == SM_UI_KIND_SENSOR ? "air-quality sensor" : "on/off light");
+  }
+  return kind;
+}
+
+// ペア完了直後の初期化(§12.3 の 1: 「ペア完了時に判定」)。行が既にある前提。
+void after_pair_complete(uint64_t node_id) {
+  uint8_t kind = resolve_node_kind(node_id, 20000);
+  if (kind == SM_UI_KIND_SENSOR) {
+    *cursor_for(node_id) = 0;
+    do_read_sensor_all(node_id, true, 20000);
+  }
+  // LIGHT は probe_node_kind が OnOff を読んだ時点でバッジが埋まっている。
 }
 
 void do_toggle(uint64_t node_id) {
@@ -575,7 +835,7 @@ void do_pair(const sm_ui_op_t &op) {
   if (ok) {
     sm_app_set_status("PAIR COMPLETE node=%016llx", (unsigned long long)op.node_id);
     rebuild_node_list();
-    do_read_onoff(op.node_id, true, 20000);
+    after_pair_complete(op.node_id);
   } else {
     sm_app_set_status("pairing failed (phase=%u status=%u)", ev.phase, ev.status);
   }
@@ -1164,7 +1424,7 @@ void do_pair_ble(const sm_ui_op_t &op) {
     sm_app_set_status("PAIR COMPLETE (BLE -> %s) node=%016llx", thread_kind ? "Thread" : "WiFi",
                       (unsigned long long)op.node_id);
     rebuild_node_list();
-    do_read_onoff(op.node_id, true, 20000);
+    after_pair_complete(op.node_id);
   } else {
     sm_app_set_status("BLE handoff CASE failed (phase=%u status=%u)", ev.phase, ev.status);
   }
@@ -1267,12 +1527,23 @@ void pump_task(void *) {
         break;
       case SM_UI_OP_READ_ONOFF:
         set_node_busy(op.node_id, true);
-        do_read_onoff(op.node_id, false, 20000);
+        // 種別で分岐。センサ行の Read は「全属性の再読込」(§12.3 の 3)。
+        if (node_kind(op.node_id) == SM_UI_KIND_SENSOR) {
+          *cursor_for(op.node_id) = 0; // 順繰りも先頭へ戻す
+          do_read_sensor_all(op.node_id, false, 20000);
+        } else {
+          do_read_onoff(op.node_id, false, 20000);
+        }
         set_node_busy(op.node_id, false);
         break;
       case SM_UI_OP_REFRESH_ADDR:
         set_node_busy(op.node_id, true);
         do_refresh_addr(op.node_id);
+        // ⟳ は種別の再検出も兼ねる(誤判別からの復帰導線。§12.3 の 1)。
+        kind_cache_set(op.node_id, SM_UI_KIND_UNKNOWN);
+        set_node_kind(op.node_id, SM_UI_KIND_UNKNOWN);
+        clear_node_sensors(op.node_id);
+        resolve_node_kind(op.node_id, 15000);
         set_node_busy(op.node_id, false);
         break;
       case SM_UI_OP_PAIR:
@@ -1333,7 +1604,19 @@ void pump_task(void *) {
         }
         if (id != 0) {
           set_node_busy(id, true);
-          bool ok = do_read_onoff(id, true, 10000);
+          // 種別で分岐(T4、§12.3 の 2)。未判定なら **この 1 周期を検出に使う**
+          // (AirQuality → OnOff の 2 read。以後は NVS キャッシュで再判定しない)。
+          bool ok;
+          uint8_t kind = node_kind(id);
+          if (kind == SM_UI_KIND_UNKNOWN) {
+            ok = resolve_node_kind(id, 10000) != SM_UI_KIND_UNKNOWN;
+          } else if (kind == SM_UI_KIND_SENSOR) {
+            uint8_t *cur = cursor_for(id);
+            ok = do_read_sensor_slot(id, *cur, true, 10000);
+            *cur = (uint8_t)((*cur + 1) % SM_UI_SLOT_COUNT);
+          } else {
+            ok = do_read_onoff(id, true, 10000);
+          }
           set_node_busy(id, false);
           if (slot < SM_UI_MAX_NODES) {
             backoff_until[slot] = ok ? 0 : now + 120000;

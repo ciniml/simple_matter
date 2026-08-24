@@ -878,16 +878,28 @@ fn scalar_from_reports(
         }
         let mut v = d.value();
         if let Ok(Some(e)) = v.read_next() {
-            return Some(match e.value {
-                TlvValue::Boolean(b) => (b as u64, false),
-                TlvValue::UnsignedInteger(u) => (u, false),
-                TlvValue::SignedInteger(i) => (i as u64, false),
-                TlvValue::Null => (0, true),
-                _ => (0, false),
-            });
+            return Some(scalar_from_tlv(&e.value));
         }
     }
     None
+}
+
+/// TLV 要素 1 個を `(value_u64, is_null)` に落とす(C ABI は u64 1 本のまま)。
+///
+/// 浮動小数点は **`f32::to_bits()` のビットパターン**を載せる(§12.2)。イベントに
+/// 型情報は足さない(ABI 維持)ので、C++ 側は「このパスは f32」と知っている前提で
+/// `memcpy` により下位 32bit を `f32` へ戻す。Double は f32 へ丸めてから載せる
+/// (Matter の計測系属性は single 前提。C++ 側の読み替えを 1 通りに保つ)。
+fn scalar_from_tlv(v: &TlvValue<'_>) -> (u64, bool) {
+    match *v {
+        TlvValue::Boolean(b) => (b as u64, false),
+        TlvValue::UnsignedInteger(u) => (u, false),
+        TlvValue::SignedInteger(i) => (i as u64, false),
+        TlvValue::Float(f) => (f.to_bits() as u64, false),
+        TlvValue::Double(d) => ((d as f32).to_bits() as u64, false),
+        TlvValue::Null => (0, true),
+        _ => (0, false),
+    }
 }
 
 /// 運用操作を開始する(live セッションがあれば即発行、無ければ CASE 自動確立)。0=OK、負値=失敗。
@@ -2402,5 +2414,39 @@ mod tests {
 
         // SAFETY: alloc と同じ layout で解放する。
         unsafe { dealloc(mem, layout) };
+    }
+
+    /// スカラ read の TLV → `value_u64` 変換(§12.2 の f32 対応を含む)。
+    ///
+    /// f32 属性(CO2 / PM2.5 の MeasuredValue)は `f32::to_bits()` のビットパターンが
+    /// そのまま載り、C++ 側の `memcpy` で元の値に戻ること。
+    #[test]
+    fn scalar_from_tlv_covers_floats() {
+        // 整数系・bool・null は従来どおり。
+        assert_eq!(scalar_from_tlv(&TlvValue::Boolean(true)), (1, false));
+        assert_eq!(
+            scalar_from_tlv(&TlvValue::UnsignedInteger(4100)),
+            (4100, false)
+        );
+        assert_eq!(
+            scalar_from_tlv(&TlvValue::SignedInteger(-2650)),
+            (-2650i64 as u64, false)
+        );
+        assert_eq!(scalar_from_tlv(&TlvValue::Null), (0, true));
+
+        // f32: ビットパターンが下位 32bit に載り、C++ 側の memcpy で復元できる。
+        let co2 = 812.5f32;
+        let (bits, is_null) = scalar_from_tlv(&TlvValue::Float(co2));
+        assert!(!is_null);
+        assert_eq!(bits, co2.to_bits() as u64);
+        assert_eq!(bits >> 32, 0, "上位 32bit は 0(C++ は下位 32bit だけ見る)");
+        assert_eq!(f32::from_bits(bits as u32), co2);
+
+        // f64 は f32 へ丸めてから載せる(読み替えを 1 通りに保つ)。
+        let (bits, _) = scalar_from_tlv(&TlvValue::Double(3.25f64));
+        assert_eq!(f32::from_bits(bits as u32), 3.25f32);
+
+        // 対象外の型は従来どおり (0, false)。
+        assert_eq!(scalar_from_tlv(&TlvValue::Utf8String("x")), (0, false));
     }
 }

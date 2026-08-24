@@ -21,9 +21,9 @@ inline constexpr size_t SM_UI_DATASET_HEX_CAP = 2 * 254 + 1;
 // UI → pump の操作種別。
 enum sm_ui_op_kind_t : uint8_t {
   SM_UI_OP_TOGGLE = 0,       // OnOff Toggle(cluster 0x0006 cmd 0x02)
-  SM_UI_OP_READ_ONOFF = 1,   // OnOff.OnOff 読み(cluster 0x0006 attr 0x0000)
+  SM_UI_OP_READ_ONOFF = 1,   // Read(照明 = OnOff 1 発 / センサ = 全属性の再読込。T4)
   SM_UI_OP_PAIR = 2,         // on-network PASE コミッショニング
-  SM_UI_OP_REFRESH_ADDR = 3, // SRP 列挙(→ WiFi なら mDNS)→ アドレス更新
+  SM_UI_OP_REFRESH_ADDR = 3, // SRP 列挙(→ WiFi なら mDNS)→ アドレス更新 + 種別再検出
   SM_UI_OP_PAIR_BLE = 4      // BLE コミッショニング(T3、§11)
 };
 
@@ -59,13 +59,46 @@ enum sm_ui_ble_stage_t : uint8_t {
   SM_UI_BLE_FAILED = 8     //
 };
 
+// ノード種別(T4、§12.3 の 1)。EP1 の AirQuality(0x005B)read が通れば SENSOR、
+// OnOff(0x0006)が通れば LIGHT。判定結果は pump 側で NVS("smui")にキャッシュする。
+enum sm_ui_node_kind_t : uint8_t {
+  SM_UI_KIND_UNKNOWN = 0,
+  SM_UI_KIND_LIGHT = 1,
+  SM_UI_KIND_SENSOR = 2
+};
+
+// センサ属性のスロット(周期 poll はこの順に 1 周期 1 属性ずつ回す。§12.3 の 2)。
+enum sm_ui_sensor_slot_t : uint8_t {
+  SM_UI_SLOT_AQ = 0,   // EP1 0x005B/0 (u8, AirQualityEnum 0..6)
+  SM_UI_SLOT_CO2 = 1,  // EP1 0x040D/0 (f32, ppm)
+  SM_UI_SLOT_PM25 = 2, // EP1 0x042A/0 (f32, µg/m³)
+  SM_UI_SLOT_TEMP = 3, // EP2 0x0402/0 (i16, ×0.01 ℃)
+  SM_UI_SLOT_HUM = 4,  // EP3 0x0405/0 (u16, ×0.01 %)
+  SM_UI_SLOT_COUNT = 5
+};
+
 // ノード 1 件の表示状態。
 struct sm_ui_node_t {
   uint64_t node_id;
   char addr[64];  // "[fd..]:5540"(未解決なら "-")
-  int8_t onoff;   // -1=不明 0=Off 1=On
+  int8_t onoff;   // -1=不明 0=Off 1=On(照明のみ)
   uint8_t busy;   // 1 = このノードに対する操作が進行中
   char note[40];  // 直近の結果("toggle OK" / "invoke failed" 等)
+
+  // --- T4: ノード種別とセンサ値(§12.3 の 4)---
+  uint8_t kind; // sm_ui_node_kind_t
+
+  // 「未取得 / null」は has_* = 0 で表す(値そのものに番兵を使わない)。
+  uint8_t aq;         // AirQualityEnum 0..6(0 = Unknown)
+  uint8_t has_aq;     //
+  float co2;          // ppm
+  uint8_t has_co2;    //
+  float pm25;         // µg/m³
+  uint8_t has_pm25;   //
+  int32_t temp_c100;  // ℃ ×100
+  uint8_t has_temp;   //
+  int32_t hum_p100;   // % ×100
+  uint8_t has_hum;    //
 };
 
 // pump → UI のスナップショット(丸ごとコピーして使う)。
