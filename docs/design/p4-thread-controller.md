@@ -1074,3 +1074,61 @@ GATT → C2 subscribe → BTP+PASE(phase 1-6)→ AddWiFi(10)→ ConnectNetwork(1
 `send_sm` の「scope 未指定の fe80 宛」fallback を OT netif 固定から
 **WiFi netif 優先(up なら)**に変更。Thread ノードの実用アドレスは fd::(ML/OMR)
 なので実害なし、WiFi ノードの fe80(nodes.tlv は scope を持たない)が正しく届く。
+
+## 12. T4: マルチデバイス UI(AirQ 空気質 + NanoC6 照明を 1 画面で)
+
+Status: 設計(2026-08-24)。T3 完了を受けて、Tab5 コントローラの UI を
+「照明の on/off」専用から**ノード種別対応**に拡張する。目標構成:
+AirQ(airq-sensor = Rust S3 FW、SEN55/SCD40 実センサ)の空気質値の表示 +
+NanoC6(onoff_light_cpp Thread 構成)の on/off 操作を同一画面で扱う。
+
+### 12.1 前提と実機配置(T4 完了時の姿)
+
+| 機材 | FW | 役割 |
+|---|---|---|
+| Tab5 + H2 | tab5_ctrl_app | Thread leader + WiFi + BLE コントローラ |
+| NanoC6 | onoff_light_cpp(thread) | Thread 照明(要焼き戻し。現 generic FW) |
+| AirQ(S3) | airq-sensor(Rust) | WiFi 空気質センサ(要焼き替え。現 onoff_light_cpp) |
+
+コミッショニングは T2/T3 の既存経路(NanoC6 = on-network Thread、AirQ =
+on-network WiFi か BLE→WiFi)。フリート焼き替えは実機フェーズで親が行う。
+
+### 12.2 シム拡張(唯一の crates/ 変更): f32 スカラ read
+
+`scalar_from_reports`(crates/simple-matter-cffi/src/controller.rs)の TlvValue
+マッチに **Float32 を追加**し、`f32::to_bits()` のビットパターンを `value_u64` に
+載せる(C ヘッダ・ABI 変更なし。C++ 側は `memcpy` で f32 に戻す)。現状 f32 属性
+(CO2 / PM2.5 の MeasuredValue)は `_ => (0,false)` に落ちて読めない。
+subscribe レポート経路(同関数)も同時に直る。回帰 = cargo test 全緑。
+**値の型判別**のため、イベントに型情報は足さない(ABI 維持)— C++ 側が
+「このパスは f32」と知っている前提で読み替える(smctl の cluster_def! と同じ割り切り)。
+
+### 12.3 UI / pump の拡張(tab5_ctrl_app)
+
+1. **ノード種別の検出**: ペア完了時と起動時の一覧再構築時に、EP1 の
+   AirQuality(0x005B attr 0x0000)を read してみる → 成功 = センサ、
+   失敗(UNSUPPORTED_CLUSTER 等)= 照明(OnOff 前提)。結果は NVS
+   (namespace "smui"、key = node id hex)にキャッシュしてリブート後も再判別しない
+   (誤判別時は ⟳ で再検出できる導線があるとよい)。
+2. **周期ポーリングの種別分岐**(既存の 10 秒周期 + 2 分バックオフを維持):
+   - 照明: OnOff read(現行どおり)
+   - センサ: AirQuality(EP1 0x005B/0, u8)→ CO2(EP1 0x040D/0, f32)→
+     PM2.5(EP1 0x042A/0, f32)→ 温度(EP2 0x0402/0, i16 ×0.01℃)→
+     湿度(EP3 0x0405/0, u16 ×0.01%)を 1 周期 1 属性ずつ順繰り
+     (CASE 済みなら 1 read ≈ 0.3 秒なので 5 属性 50 秒で一巡。まとめ読みは
+     シムが単発 read のみなので v1 はしない)
+3. **ノード行の表示**(sm_ui_node_t 拡張):
+   - 照明行: 現行どおり(On/Off バッジ + Toggle/Read/⟳)
+   - センサ行: バッジの代わりに **AirQuality の 6 段階を色付きラベル**
+     (Good=緑〜VeryPoor/ExtremelyPoor=赤)、2 行目に
+     `CO2 812ppm  PM2.5 3.2µg/m³  26.5℃  41%` のようなサマリ。Toggle ボタンは
+     出さない(Read = 全属性の再読込に流用)
+4. スナップショット: sm_ui_node_t に `kind`(0=不明/1=照明/2=センサ)と
+   センサ値 5 種(f32×2 / i32×3、null 可)を追加。UI ↔ pump の単線契約は不変。
+
+### 12.4 ゲート
+
+1. cargo test / clippy / fmt 全緑(シム f32)+ tab5_ctrl_app esp32p4 docker build green
+2. 回帰: thread_ctrl_hub_cpp ビルド green、他 example 変更ゼロ
+3. 実機(親 + ユーザ): AirQ(airq-sensor)と NanoC6(thread 照明)を Tab5 の
+   fabric にコミッショニング → 一覧にセンサ行(実測値)と照明行(Toggle 動作)が並ぶ

@@ -539,6 +539,11 @@ static void wifi_init_sta() {
 
 #if CONFIG_SM_ENABLE_BLE
 // ConnectNetwork(sm_take_wifi_request)で得た SSID/pass を設定して join を開始する。
+//
+// **同一資格情報で接続済みなら no-op**(e5-light の学びの移植。T3 実機で再発):
+// fail-safe 巻き戻し後も WiFi 資格情報と接続は残るため、次回コミッショニングの
+// ConnectNetwork が「接続済みリンクを切断 → BLE coex 中の再 join」になり失敗しやすい。
+// 接続済み + 同一 SSID/pass なら即 Success を返してリンクに触らない。
 static void wifi_join(const uint8_t *ssid, size_t ssid_len, const uint8_t *pass, size_t pass_len) {
   wifi_config_t wc{};
   size_t sn = ssid_len < sizeof(wc.sta.ssid) ? ssid_len : sizeof(wc.sta.ssid) - 1;
@@ -546,6 +551,27 @@ static void wifi_join(const uint8_t *ssid, size_t ssid_len, const uint8_t *pass,
   size_t pn = pass_len < sizeof(wc.sta.password) ? pass_len : sizeof(wc.sta.password) - 1;
   memcpy(wc.sta.password, pass, pn);
   wc.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+  if (g_wifi_connected) {
+    wifi_config_t cur{};
+    if (esp_wifi_get_config(WIFI_IF_STA, &cur) == ESP_OK &&
+        strncmp((const char *)cur.sta.ssid, (const char *)wc.sta.ssid, sizeof(cur.sta.ssid)) == 0 &&
+        strncmp((const char *)cur.sta.password, (const char *)wc.sta.password,
+                sizeof(cur.sta.password)) == 0) {
+      ESP_LOGI(TAG, "wifi join: already connected to \"%.*s\" with the same credentials (no-op)",
+               (int)sn, (const char *)wc.sta.ssid);
+      if (g_cmd_queue) {
+        // GOT_IP 済みなので IpV4 の再送で遅延 ConnectNetworkResponse を Success で確定させる。
+        Cmd c{};
+        c.kind = CmdKind::IpV4;
+        esp_netif_ip_info_t info{};
+        if (g_sta_netif != nullptr && esp_netif_get_ip_info(g_sta_netif, &info) == ESP_OK) {
+          memcpy(c.v4, &info.ip.addr, 4);
+        }
+        xQueueSend(g_cmd_queue, &c, 0);
+      }
+      return;
+    }
+  }
   esp_wifi_set_config(WIFI_IF_STA, &wc);
   g_wifi_joining = true;
   esp_err_t err = esp_wifi_connect();
