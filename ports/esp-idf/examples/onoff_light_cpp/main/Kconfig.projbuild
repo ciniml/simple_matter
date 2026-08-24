@@ -39,6 +39,16 @@ menu "simple-matter onoff_light example"
             OnOff 状態を反映する LED の GPIO 番号。既定は M5 NanoC6 の GPIO7
             (ESP32-S3 は DevKitC の RGB LED = GPIO48)。
 
+    config SM_BUTTON_GPIO
+        int "Local toggle button GPIO (-1 to disable)"
+        default -1 if IDF_TARGET_ESP32S3
+        default 9
+        help
+            本体ボタンで OnOff をローカルトグルするための GPIO 番号
+            (docs/design/p4-thread-controller.md §15)。既定は M5 NanoC6 の
+            BOOT ボタン = GPIO9(active-low、内部プルアップ)。-1 で無効。
+            ESP32-S3 DevKitC は既定 -1(ボタンなし想定)。
+
     config SM_FACTORY_DATA
         bool "Use factory data partition (esp-matter-mfg-tool compatible)"
         default n

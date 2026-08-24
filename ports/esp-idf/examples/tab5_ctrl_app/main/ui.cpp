@@ -2,6 +2,7 @@
 //
 // 画面構成(v1):
 //   1. ステータスバー   : Thread role / RLOC16 / channel / PAN / SRP / ノード数 / free heap
+//   2. Dashboard タブ   : センサ 1 台 = 1 カード(5 タイル)+ 下段に照明の小タイル(T6 §14)
 //   2. Devices タブ     : ノード一覧(NodeId・アドレス・On/Off バッジ・Toggle/Read/Addr)
 //                         + 「Pair new device」でダイアログ
 //   3. Pair ダイアログ  : IPv6 / NodeId / passcode をオンスクリーンキーボードで入力
@@ -65,6 +66,75 @@ const AqStyle AQ_STYLE[] = {
     {"ExtPoor", 0xc0392b},   // 6 ExtremelyPoor
 };
 
+// --- Dashboard タブ(T6、§14.1)---
+//
+// 1280 幅の内訳: タブ本体 pad 12×2 → 1256、カード pad 10×2 → 1236、
+// タイル 236×5 + 隙間 12×4 = 1228 ≤ 1236。
+constexpr int32_t TILE_W = 236;
+constexpr int32_t TILE_H = 210;
+constexpr int32_t TILE_GAP = 12;
+constexpr int32_t CARD_HEAD_H = 34;
+constexpr int32_t CARD_H = CARD_HEAD_H + 8 + TILE_H + 20; // pad_all 10 の上下込み
+constexpr int32_t LIGHT_TILE_W = 400;
+constexpr int32_t LIGHT_TILE_H = 92;
+
+// タイルの地色。しきい値色は下の *_color()、中立(温湿度)と未取得はこの 2 色。
+constexpr uint32_t COL_TILE_NEUTRAL = 0x2b3448;
+constexpr uint32_t COL_TILE_NONE = 0x394155; // 未取得(グレー)
+constexpr uint32_t COL_LVL_GOOD = 0x27ae60;
+constexpr uint32_t COL_LVL_FAIR = 0xd4b106;
+constexpr uint32_t COL_LVL_POOR = 0xe67e22;
+constexpr uint32_t COL_LVL_BAD = 0xc0392b;
+
+// §14.1 のしきい値。CO2: <800 / <1000 / <1500 / それ以上。
+uint32_t co2_color(float v) {
+  if (v < 800.0f) {
+    return COL_LVL_GOOD;
+  }
+  if (v < 1000.0f) {
+    return COL_LVL_FAIR;
+  }
+  if (v < 1500.0f) {
+    return COL_LVL_POOR;
+  }
+  return COL_LVL_BAD;
+}
+// PM2.5: <12 / <35 / <55 / それ以上(µg/m³)。
+uint32_t pm25_color(float v) {
+  if (v < 12.0f) {
+    return COL_LVL_GOOD;
+  }
+  if (v < 35.0f) {
+    return COL_LVL_FAIR;
+  }
+  if (v < 55.0f) {
+    return COL_LVL_POOR;
+  }
+  return COL_LVL_BAD;
+}
+
+// タイル(名前 / 値 / 単位の 3 段)。**値は必ずラベルウィジェット**にする
+// (canvas に描くと ui-dump で拾えない。§14.3 のゲート 2)。
+struct SensorTile {
+  lv_obj_t *root = nullptr;
+  lv_obj_t *lbl_value = nullptr;
+  lv_obj_t *lbl_unit = nullptr;
+};
+
+struct SensorCard {
+  lv_obj_t *root = nullptr;
+  lv_obj_t *lbl_title = nullptr;
+  lv_obj_t *lbl_age = nullptr;
+  SensorTile tiles[SM_UI_SLOT_COUNT];
+};
+
+struct LightTile {
+  lv_obj_t *root = nullptr;
+  lv_obj_t *lbl_id = nullptr;
+  lv_obj_t *badge = nullptr;
+  lv_obj_t *lbl_badge = nullptr;
+};
+
 // --- ウィジェット一式 ---
 struct NodeRowWidgets {
   lv_obj_t *root = nullptr;
@@ -82,6 +152,17 @@ struct Ui {
   lv_obj_t *lbl_heap = nullptr;
   lv_obj_t *lbl_status = nullptr;
   lv_obj_t *lbl_wifi = nullptr;
+  // Dashboard タブ(T6)
+  lv_obj_t *dash = nullptr;            // スクロールするカラム(タブ本体)
+  lv_obj_t *lbl_dash_empty = nullptr;  // センサ 0 台のときのメッセージ
+  lv_obj_t *lights_panel = nullptr;    // 下段(照明の小タイル)
+  lv_obj_t *lights_wrap = nullptr;     // 小タイルを並べる wrap 行
+  SensorCard cards[SM_UI_MAX_NODES];
+  size_t card_count = 0;
+  uint64_t card_ids[SM_UI_MAX_NODES] = {};
+  LightTile lights[SM_UI_MAX_NODES];
+  size_t light_count = 0;
+  uint64_t light_ids[SM_UI_MAX_NODES] = {};
   // Devices タブ
   lv_obj_t *list = nullptr;
   lv_obj_t *lbl_empty = nullptr;
@@ -627,6 +708,220 @@ void refresh_devices() {
   }
 }
 
+// --- Dashboard タブ(T6、§14.1)---
+
+// 照明の小タイル(user_data = g_ui.light_ids のインデックス。Devices タブの
+// row_ids とは別配列にして、片方の作り直しがもう片方に波及しないようにする)。
+void on_dash_toggle(lv_event_t *e) {
+  size_t i = (size_t)(uintptr_t)lv_event_get_user_data(e);
+  post(SM_UI_OP_TOGGLE, i < g_ui.light_count ? g_ui.light_ids[i] : 0);
+}
+
+void build_tile(lv_obj_t *parent, SensorTile &t, const char *name, const lv_font_t *value_font) {
+  t.root = lv_obj_create(parent);
+  style_panel(t.root, COL_TILE_NONE);
+  lv_obj_set_size(t.root, TILE_W, TILE_H);
+  lv_obj_remove_flag(t.root, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(t.root, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(t.root, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_row(t.root, 4, 0);
+  make_label(t.root, &lv_font_montserrat_20, 0xe6edf3, name);
+  t.lbl_value = make_label(t.root, value_font, 0xffffff, "-");
+  t.lbl_unit = make_label(t.root, &lv_font_montserrat_20, 0xd6dde6, "");
+}
+
+void build_sensor_card(size_t i) {
+  SensorCard &c = g_ui.cards[i];
+  c.root = lv_obj_create(g_ui.dash);
+  style_panel(c.root, COL_PANEL);
+  lv_obj_set_size(c.root, LV_PCT(100), CARD_H);
+  lv_obj_remove_flag(c.root, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(c.root, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(c.root, 8, 0);
+
+  lv_obj_t *head = lv_obj_create(c.root);
+  lv_obj_remove_style_all(head);
+  lv_obj_set_size(head, LV_PCT(100), CARD_HEAD_H);
+  lv_obj_set_flex_flow(head, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(head, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  c.lbl_title = make_label(head, &lv_font_montserrat_24, COL_TEXT, "-");
+  c.lbl_age = make_label(head, &lv_font_montserrat_20, COL_DIM, "-");
+
+  lv_obj_t *row = lv_obj_create(c.root);
+  lv_obj_remove_style_all(row);
+  lv_obj_set_size(row, LV_PCT(100), TILE_H);
+  lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(row, TILE_GAP, 0);
+  // AirQuality は名称("ExtPoor" 等)なので 32px、数値の 4 枚は 48px。
+  build_tile(row, c.tiles[SM_UI_SLOT_AQ], "Air Quality", &lv_font_montserrat_32);
+  build_tile(row, c.tiles[SM_UI_SLOT_CO2], "CO2", &lv_font_montserrat_48);
+  build_tile(row, c.tiles[SM_UI_SLOT_PM25], "PM2.5", &lv_font_montserrat_48);
+  build_tile(row, c.tiles[SM_UI_SLOT_TEMP], "Temperature", &lv_font_montserrat_48);
+  build_tile(row, c.tiles[SM_UI_SLOT_HUM], "Humidity", &lv_font_montserrat_48);
+}
+
+void build_light_tile(size_t i) {
+  LightTile &t = g_ui.lights[i];
+  t.root = lv_obj_create(g_ui.lights_wrap);
+  style_panel(t.root, COL_ROW);
+  lv_obj_set_size(t.root, LIGHT_TILE_W, LIGHT_TILE_H);
+  lv_obj_remove_flag(t.root, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(t.root, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(t.root, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(t.root, 12, 0);
+
+  t.lbl_id = make_label(t.root, &lv_font_montserrat_20, COL_TEXT, "-");
+  lv_obj_set_width(t.lbl_id, 120);
+
+  t.badge = lv_obj_create(t.root);
+  style_panel(t.badge, COL_OFF);
+  lv_obj_set_size(t.badge, 80, 52);
+  lv_obj_remove_flag(t.badge, LV_OBJ_FLAG_SCROLLABLE);
+  t.lbl_badge = make_label(t.badge, &lv_font_montserrat_20, 0xffffff, "?");
+  lv_obj_center(t.lbl_badge);
+
+  make_button(t.root, "Toggle", 140, COL_ACCENT, on_dash_toggle, (void *)(uintptr_t)i);
+}
+
+// 値を 1 タイルに流す(色 + 文字列。未取得は "-" + グレー)。
+void set_tile(SensorTile &t, const char *value, const char *unit, uint32_t color) {
+  lv_obj_set_style_bg_color(t.root, lv_color_hex(color), 0);
+  lv_label_set_text(t.lbl_value, value);
+  lv_label_set_text(t.lbl_unit, unit);
+}
+
+int clamp_i(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+// スナップショットのノード集合(NodeId + 種別)が変わったか。
+bool dash_set_changed() {
+  size_t sensors = 0, lights = 0;
+  for (size_t i = 0; i < g_snap.node_count; ++i) {
+    const sm_ui_node_t &n = g_snap.nodes[i];
+    if (n.kind == SM_UI_KIND_SENSOR) {
+      if (sensors >= g_ui.card_count || g_ui.card_ids[sensors] != n.node_id) {
+        return true;
+      }
+      ++sensors;
+    } else {
+      // UNKNOWN も照明扱いで下段に出す(種別が確定したらここで作り直しになる)。
+      if (lights >= g_ui.light_count || g_ui.light_ids[lights] != n.node_id) {
+        return true;
+      }
+      ++lights;
+    }
+  }
+  return sensors != g_ui.card_count || lights != g_ui.light_count;
+}
+
+void rebuild_dashboard() {
+  for (size_t i = 0; i < SM_UI_MAX_NODES; ++i) {
+    if (g_ui.cards[i].root != nullptr) {
+      lv_obj_delete(g_ui.cards[i].root);
+      g_ui.cards[i] = SensorCard{};
+    }
+    if (g_ui.lights[i].root != nullptr) {
+      lv_obj_delete(g_ui.lights[i].root);
+      g_ui.lights[i] = LightTile{};
+    }
+  }
+  g_ui.card_count = 0;
+  g_ui.light_count = 0;
+  for (size_t i = 0; i < g_snap.node_count; ++i) {
+    const sm_ui_node_t &n = g_snap.nodes[i];
+    if (n.kind == SM_UI_KIND_SENSOR) {
+      g_ui.card_ids[g_ui.card_count] = n.node_id;
+      build_sensor_card(g_ui.card_count);
+      ++g_ui.card_count;
+    } else {
+      g_ui.light_ids[g_ui.light_count] = n.node_id;
+      build_light_tile(g_ui.light_count);
+      ++g_ui.light_count;
+    }
+  }
+  // 照明パネルは常に最後(カードは dash に後から足されるので押し出される)。
+  lv_obj_move_to_index(g_ui.lights_panel, -1);
+}
+
+void refresh_dashboard() {
+  if (dash_set_changed()) {
+    rebuild_dashboard();
+  }
+  lv_obj_set_flag(g_ui.lbl_dash_empty, LV_OBJ_FLAG_HIDDEN, g_ui.card_count != 0);
+  lv_obj_set_flag(g_ui.lights_panel, LV_OBJ_FLAG_HIDDEN, g_ui.light_count == 0);
+
+  size_t ci = 0, li = 0;
+  for (size_t i = 0; i < g_snap.node_count; ++i) {
+    const sm_ui_node_t &n = g_snap.nodes[i];
+    if (n.kind == SM_UI_KIND_SENSOR) {
+      if (ci >= g_ui.card_count) {
+        continue;
+      }
+      SensorCard &c = g_ui.cards[ci++];
+      lv_label_set_text_fmt(c.lbl_title, "AirQ 0x..%04x",
+                            (unsigned)(uint16_t)(n.node_id & 0xFFFFull));
+      if (n.last_update_ms == 0 || g_snap.now_ms < n.last_update_ms) {
+        lv_label_set_text(c.lbl_age, n.busy ? "reading ..." : "never updated");
+      } else {
+        uint32_t age = (uint32_t)((g_snap.now_ms - n.last_update_ms) / 1000ull);
+        lv_label_set_text_fmt(c.lbl_age, "updated %us ago", (unsigned)(age > 99999 ? 99999 : age));
+      }
+
+      // AirQuality(既存 AQ_STYLE を流用。未取得 / Unknown はグレーの "-")。
+      const uint8_t aq = (n.has_aq && n.aq <= 6) ? n.aq : 0;
+      set_tile(c.tiles[SM_UI_SLOT_AQ], aq != 0 ? AQ_STYLE[aq].name : "-", "",
+               aq != 0 ? AQ_STYLE[aq].color : COL_TILE_NONE);
+
+      // 数値 4 枚。**%f は使わない**(整数演算で桁を作る。§12.5 と同じ流儀)。
+      char buf[16];
+      if (n.has_co2) {
+        snprintf(buf, sizeof(buf), "%d", clamp_i((int)(n.co2 + 0.5f), 0, 99999));
+        set_tile(c.tiles[SM_UI_SLOT_CO2], buf, "ppm", co2_color(n.co2));
+      } else {
+        set_tile(c.tiles[SM_UI_SLOT_CO2], "-", "ppm", COL_TILE_NONE);
+      }
+      if (n.has_pm25) {
+        int t = clamp_i((int)(n.pm25 * 10.0f + 0.5f), 0, 99999);
+        snprintf(buf, sizeof(buf), "%d.%d", t / 10, t % 10);
+        set_tile(c.tiles[SM_UI_SLOT_PM25], buf, "ug/m3", pm25_color(n.pm25));
+      } else {
+        set_tile(c.tiles[SM_UI_SLOT_PM25], "-", "ug/m3", COL_TILE_NONE);
+      }
+      if (n.has_temp) {
+        int t = clamp_i((int)(n.temp_c100 / 10), -9999, 9999); // 0.1 ℃ 単位
+        int a = t < 0 ? -t : t;
+        snprintf(buf, sizeof(buf), "%s%d.%d", t < 0 ? "-" : "", a / 10, a % 10);
+        set_tile(c.tiles[SM_UI_SLOT_TEMP], buf, "C", COL_TILE_NEUTRAL);
+      } else {
+        set_tile(c.tiles[SM_UI_SLOT_TEMP], "-", "C", COL_TILE_NONE);
+      }
+      if (n.has_hum) {
+        snprintf(buf, sizeof(buf), "%d", clamp_i((int)(n.hum_p100 / 100), 0, 100));
+        set_tile(c.tiles[SM_UI_SLOT_HUM], buf, "%", COL_TILE_NEUTRAL);
+      } else {
+        set_tile(c.tiles[SM_UI_SLOT_HUM], "-", "%", COL_TILE_NONE);
+      }
+    } else {
+      if (li >= g_ui.light_count) {
+        continue;
+      }
+      LightTile &t = g_ui.lights[li++];
+      lv_label_set_text_fmt(t.lbl_id, "0x..%04x", (unsigned)(uint16_t)(n.node_id & 0xFFFFull));
+      if (n.onoff > 0) {
+        lv_obj_set_style_bg_color(t.badge, lv_color_hex(COL_ON), 0);
+        lv_label_set_text(t.lbl_badge, "ON");
+      } else if (n.onoff == 0) {
+        lv_obj_set_style_bg_color(t.badge, lv_color_hex(COL_OFF), 0);
+        lv_label_set_text(t.lbl_badge, "OFF");
+      } else {
+        lv_obj_set_style_bg_color(t.badge, lv_color_hex(COL_WARN), 0);
+        lv_label_set_text(t.lbl_badge, "?");
+      }
+    }
+  }
+}
+
 void refresh_network_tab() {
   const char *role = (g_snap.role >= 0 && g_snap.role <= 4) ? ROLE_NAME[g_snap.role] : "?";
   lv_label_set_text_fmt(g_ui.lbl_net,
@@ -692,6 +987,7 @@ void refresh_pair_dialog() {
 void tick_cb(lv_timer_t *) {
   sm_app_snapshot_get(&g_snap);
   refresh_status_bar();
+  refresh_dashboard();
   refresh_devices();
   refresh_network_tab();
   refresh_pair_dialog();
@@ -737,16 +1033,45 @@ void sm_ui_create() {
   lv_obj_set_style_bg_color(tv, lv_color_hex(COL_BG), 0);
   lv_obj_set_style_text_font(lv_tabview_get_tab_bar(tv), &lv_font_montserrat_24, 0);
 
+  // Dashboard を **先頭**に足す(= 既定表示。T6 §14.1)。Devices / Network は現状維持。
+  lv_obj_t *tab_dash = lv_tabview_add_tab(tv, "Dashboard");
   lv_obj_t *tab_dev = lv_tabview_add_tab(tv, "Devices");
   lv_obj_t *tab_net = lv_tabview_add_tab(tv, "Network");
-  lv_obj_set_style_bg_color(tab_dev, lv_color_hex(COL_BG), 0);
-  lv_obj_set_style_bg_opa(tab_dev, LV_OPA_COVER, 0);
-  lv_obj_set_style_bg_color(tab_net, lv_color_hex(COL_BG), 0);
-  lv_obj_set_style_bg_opa(tab_net, LV_OPA_COVER, 0);
-  lv_obj_set_style_pad_all(tab_dev, 12, 0);
-  lv_obj_set_style_pad_all(tab_net, 12, 0);
+  lv_obj_t *tabs[] = {tab_dash, tab_dev, tab_net};
+  for (lv_obj_t *t : tabs) {
+    lv_obj_set_style_bg_color(t, lv_color_hex(COL_BG), 0);
+    lv_obj_set_style_bg_opa(t, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(t, 12, 0);
+  }
 
-  // --- 2a. Devices タブ ---
+  // --- 2a. Dashboard タブ ---
+  g_ui.dash = tab_dash;
+  lv_obj_set_flex_flow(tab_dash, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(tab_dash, 12, 0);
+  lv_obj_set_scroll_dir(tab_dash, LV_DIR_VER); // センサ 3 台以上でスクロール
+
+  g_ui.lbl_dash_empty =
+      make_label(tab_dash, &lv_font_montserrat_24, COL_DIM,
+                 "No sensor yet - pair one from the Devices tab.\n"
+                 "An air-quality node is detected automatically (AirQuality cluster on EP1).");
+
+  g_ui.lights_panel = lv_obj_create(tab_dash);
+  style_panel(g_ui.lights_panel, COL_PANEL);
+  lv_obj_set_size(g_ui.lights_panel, LV_PCT(100), LIGHT_TILE_H + 34 + 8 + 20);
+  lv_obj_remove_flag(g_ui.lights_panel, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(g_ui.lights_panel, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(g_ui.lights_panel, 8, 0);
+  make_label(g_ui.lights_panel, &lv_font_montserrat_24, COL_TEXT, "Lights");
+  g_ui.lights_wrap = lv_obj_create(g_ui.lights_panel);
+  lv_obj_remove_style_all(g_ui.lights_wrap);
+  lv_obj_set_size(g_ui.lights_wrap, LV_PCT(100), LIGHT_TILE_H);
+  lv_obj_set_flex_flow(g_ui.lights_wrap, LV_FLEX_FLOW_ROW_WRAP);
+  lv_obj_set_flex_align(g_ui.lights_wrap, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_START);
+  lv_obj_set_style_pad_column(g_ui.lights_wrap, 12, 0);
+  lv_obj_add_flag(g_ui.lights_panel, LV_OBJ_FLAG_HIDDEN);
+
+  // --- 2b. Devices タブ ---
   lv_obj_set_flex_flow(tab_dev, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_row(tab_dev, 12, 0);
 
@@ -776,7 +1101,7 @@ void sm_ui_create() {
                               "Attach a device to this Thread network (see the Network tab for\n"
                               "the active dataset), then use \"Pair new device\".");
 
-  // --- 2b. Network タブ ---
+  // --- 2c. Network タブ ---
   lv_obj_set_flex_flow(tab_net, LV_FLEX_FLOW_ROW);
   lv_obj_set_style_pad_column(tab_net, 16, 0);
 

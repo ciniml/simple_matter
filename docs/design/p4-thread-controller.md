@@ -1460,3 +1460,185 @@ T5a(コンソール REPL)の上に **GUI リモート操作(T5b)** と
   base64 行は `usb_serial_jtag_write_bytes`(空き待ちでブロック)で直接書く方式にし、
   行に連番(`B<hex4>:`)を付けて PC 側が欠落を検出できるようにした。
   結果: 1/2 間引き **3.4 秒**、フル **12.7 秒**、6/6 回欠落ゼロ。
+
+## 14. T6: センサダッシュボード(Tab5 UI)
+
+Status: 設計(2026-08-25)。T4 の Devices タブは「操作用の一覧」で、センサ値は 1 行の
+サマリに詰めている。展示・常時表示に耐える**ダッシュボード画面**を足す。
+
+### 14.1 画面構成(1280×720 横)
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ ステータスバー(既存 96px)                                         │
+├─ Dashboard ─┬─ Devices ─┬─ Network ───────────────────────────────┤ ← タブ 64px
+│ ┌ AirQ 0x…11 ──────────────────────── updated 8s ago ─────────┐   │
+│ │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────┐ │   │
+│ │  │ Air      │ │ CO2      │ │ PM2.5    │ │ Temp     │ │ RH │ │   │  タイル高 ≈ 260px
+│ │  │ Quality  │ │  701     │ │  1.9     │ │  28.8    │ │ 44 │ │   │  数値は 48px フォント
+│ │  │  GOOD    │ │  ppm     │ │  µg/m³   │ │  °C      │ │ %  │ │   │  単位は 20px
+│ │  └──────────┘ └──────────┘ └──────────┘ └──────────┘ └────┘ │   │
+│ └──────────────────────────────────────────────────────────────┘   │
+│ ┌ Lights ───────────────────────────────────────────────────────┐   │
+│ │  [ 0x…22   ON  ] [Toggle]     (照明ノードは横並びの小タイル)      │   │  ≈ 120px
+│ └──────────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+- **Dashboard タブを先頭・既定表示**にする(Devices / Network は現状維持)。
+- センサノード 1 台 = 1 カード。カード見出しに NodeId 短縮(下位 4 桁)と
+  「updated N s ago」(スナップショットに `last_update_ms` を追加)。
+  5 タイル: AirQuality(6 段階の色 + 名称、既存 AQ_STYLE 流用)/ CO2(ppm)/ PM2.5
+  (µg/m³)/ 温度(℃、×0.01 → 小数 1 桁)/ 湿度(%)。**値はタイル色で状態を示す**
+  (CO2: <800 緑 / <1000 黄 / <1500 橙 / それ以上 赤。PM2.5: <12 / <35 / <55 / 以上。
+  温湿度は中立色)。未取得は "—" + グレー。
+- 照明ノードは下段に小タイル(NodeId 短縮 + ON/OFF バッジ + Toggle ボタン。
+  操作は既存の SM_UI_OP_TOGGLE を post するだけ)。
+- センサノード 2 台以上ならカードを縦に積む(3 台目以降はスクロール)。0 台なら
+  「No sensor yet — pair one from the Devices tab」。
+- フォント: 数値用に `CONFIG_LV_FONT_MONTSERRAT_48=y`(+32 があれば見出しに)。
+  LVGL の `%f` は使わない(既存どおり整数演算で桁を作る)。
+
+### 14.2 データ供給(pump 側)
+
+- センサノードの周期 poll を「1 周期 1 属性」から **「1 周期で 5 属性まとめ読み」**
+  (`do_read_sensor_all`)に変更(CASE 済みなら 5 属性 ≈ 1 秒。ダッシュボードの
+  鮮度 = 10 秒周期)。照明ノードは従来どおり OnOff 1 本。
+- `sm_ui_node_t` に `last_update_ms`(センサ値の最終成功時刻)を追加。UI は
+  `esp_timer` 相当の現在時刻(pump が snapshot に `now_ms` を入れる)との差を表示。
+- 単線契約は不変(UI は snapshot を読むだけ、操作は op を post するだけ)。
+
+### 14.3 ゲート
+
+1. esp32p4 docker ビルド green(Rust 無変更)。
+2. 実機(自走): `tab5ctl.py screenshot` でダッシュボードの目視、`ui-dump` に
+   5 タイルの値が入る、Toggle タイルで NanoC6 が反転、10 秒周期で updated が進む。
+
+### 14.4 実装記録(T6、2026-08-25)
+
+**結論**: §14.1(Dashboard タブ)+ §14.2(まとめ読み + 鮮度)を実装。変更は
+`tab5_ctrl_app/` のみ(Rust / crates は無変更、他 example の変更ゼロ)。
+esp32p4 docker ビルド green。
+
+#### 変更ファイル
+
+| ファイル | 変更 |
+|---|---|
+| `main/app_state.hpp` | `sm_ui_node_t` に `last_update_ms`(センサ値の最終成功時刻)、`sm_ui_snapshot_t` に `now_ms`(pump の現在時刻)を追加 |
+| `main/ctrl_pump.cpp` | 周期 poll のセンサ分岐を `do_read_sensor_slot`(順繰り 1 属性)→ **`do_read_sensor_all`(5 属性まとめ読み)**に変更。順繰りカーソル(`SensorCursor` / `g_cursor` / `cursor_for`)を削除。`mark_node_updated()` を追加して read 成立ごとに時刻を打つ。`now_ms` をスナップショットへ(500ms 刻み + `refresh_thread_status`) |
+| `main/ui.cpp` | Dashboard タブ(先頭・既定表示)。センサカード + 5 タイル + 照明の小タイル。しきい値色 `co2_color()` / `pm25_color()` |
+| `main/console_dbg.cpp` | `nodes` に `SENSORAGE <node> <秒>` 行を追加(自走検証用。`-1` = 未取得) |
+| `sdkconfig.defaults` | `CONFIG_LV_FONT_MONTSERRAT_32=y` / `CONFIG_LV_FONT_MONTSERRAT_48=y` |
+| `README.md` | 「画面」節に Dashboard タブを追記 |
+
+#### レイアウト実測(1280×720)
+
+- タブ本体の可視領域 = 720 − 96(ステータスバー)− 64(タブバー)− 12×2(pad)= **536px**。
+- センサカード = `LV_PCT(100)` × **272px**(見出し 34 + 隙間 8 + タイル 210 + pad 10×2)。
+- 幅の内訳: 1280 − 24(タブ pad)= 1256 → カード pad 10×2 → 1236。
+  タイル **236×5 + 隙間 12×4 = 1228 ≤ 1236**。
+- 照明パネル = 154px(見出し 34 + 隙間 8 + タイル 92 + pad 20)。小タイルは
+  **400×92**(NodeId 120 + バッジ 80 + Toggle 140 + 隙間 12×2 + pad 20 = 384 ≤ 400)を
+  `LV_FLEX_FLOW_ROW_WRAP` で 3 枚/行(400×3 + 12×2 = 1224 ≤ 1236)。
+- センサ 1 台 + 照明 = 272 + 12 + 154 = **438 ≤ 536**(スクロール無し)。2 台で 722 >
+  536 になるのでタブ本体に `lv_obj_set_scroll_dir(LV_DIR_VER)` を張ってある。
+- ビルド成果物: `tab5_ctrl_app.bin` = **0x230af0(2.30MB)**、app partition 45% 空き
+  (T5c 時点の 0x20cd60 から +約 150KB = Montserrat 32/48 のビットマップ分)。
+
+#### 踏んだ罠
+
+1. **`for (lv_obj_t *t : {a,b,c})`(初期化子リストの範囲 for)は
+   `#include <initializer_list>` が要る**。IDF の C++ 構成では自動では入らず
+   `deducing from brace-enclosed initializer list requires ...` でコンパイルエラー。
+   素の配列 `lv_obj_t *tabs[] = {...}` に直した。
+2. **フォント追加は `sdkconfig` の再生成が必須**(§13.6 の罠 1 と同じ)。
+   `rm -f sdkconfig` → `set-target esp32p4` → `build` の順でないと
+   `lv_font_montserrat_48` がリンクエラーになる。
+3. **µ / ³ / ° / — は Montserrat の内蔵レンジに無い**(LVGL 内蔵フォントは
+   ASCII + 一部シンボルのみ)。設計図の `µg/m³` `℃` `—` はそのまま出すと
+   豆腐になるので、表示は `ug/m3` / `C` / `-`(既存 Devices 行と同じ流儀)。
+4. **`lv_obj_move_to_index(panel, -1)`** で照明パネルを常に最後に置く。カードは
+   `dash` の子として後から append されるため、これが無いと照明がカードの上に来る。
+5. **ダッシュボードのボタンの `user_data` は Devices 行の `row_ids` と別配列**
+   (`g_ui.light_ids`)にした。両者はスナップショットの並びが同じでも
+   作り直しの契機が違うので、共有すると片方の再構築で index がずれる。
+6. **鮮度の基準時刻は pump が入れる**(`snapshot.now_ms`)。UI 側で `lv_tick_get()`
+   を使うと pump の `esp_timer` と原点が揃わない。pump のループが 20 秒の CASE で
+   止まっている間は `now_ms` も止まる = 「updated N s ago」が凍る仕様(そのほうが
+   「pump が詰まっている」ことが画面に出るので都合がよい)。
+
+#### 契約の維持
+
+- UI は `sm_app_snapshot_get()` を読み、`SM_UI_OP_TOGGLE` を post するだけ
+  (Dashboard の Toggle も Devices タブと同じ既存 op)。`sm_ctrl_*` は一切呼ばない。
+- pump の 10 秒周期・2 分バックオフ・`start_op_clean`・照明の OnOff poll は不変。
+  センサだけが「1 周期 1 属性」→「1 周期 5 属性」に変わった(1 本落ちたら打ち切るので、
+  死んだノードでの CASE 再試行回数は従来どおり 1 周期 1 回)。
+- 500ms の `tick_cb` が `refresh_dashboard()` → `refresh_devices()` の順に回る。
+
+#### ゲート実測
+
+| ゲート | 結果 |
+|---|---|
+| tab5_ctrl_app esp32p4 docker build(`rm -f sdkconfig` → set-target → build) | **green**(0x230af0 バイト、45% 空き) |
+| Rust / crates の変更 | ゼロ |
+| 他 example の変更 | ゼロ |
+
+#### 実機で見るべき点
+
+1. `tab5ctl.py screenshot --div 2` で Dashboard が既定表示、5 タイルが読めること。
+2. `tab5ctl.py ui-dump` に数値がラベルとして出ること(タイルは
+   `label` 3 行 = 名称 / 値 / 単位。canvas は使っていない)。
+3. 10 秒周期で `updated N s ago` が 0 付近へ戻ること(`nodes` の `SENSORAGE` 行でも可)。
+4. 下段 `Lights` の `Toggle` タイルをタップ(`tap x y`)して NanoC6 が反転すること。
+5. まとめ読みでセンサ 1 周期が ≈1 秒に収まり、照明の Toggle 応答が阻害されないこと。
+
+## 15. T7: NanoC6 本体ボタンでの on/off トグル(デバイス側)
+
+Status: 設計(2026-08-25)。onoff_light_cpp には `CmdKind::LocalToggle`(ローカル操作 →
+`stack.onoff_set(!get)` + LED 反映)のハンドラだけがあり、**送り手が居ない**。
+
+- M5 NanoC6 の本体ボタン = **GPIO9(BOOT、active-low、内部プルアップ)**。
+  Kconfig `SM_BUTTON_GPIO`(既定 9、-1 で無効。S3 等は既定 -1)を追加。
+- 実装: GPIO 入力 + プルアップ、**ボタンタスク(小)で 20ms ポーリング + デバウンス
+  (3 回連続 Low で押下確定、離すまで再発火しない)** → `Cmd{LocalToggle}` を
+  `g_cmd_queue` へ post(ISR は使わない。BOOT ピンはストラップなので起動時の
+  状態を読まないよう 1 秒待ってから監視開始)。
+- 期待動作: 押すたびに LED が反転し、OnOff 属性が変わる(`sm_onoff_set` 経由なので
+  購読者への変化レポート / Tab5 の次回 read に反映)。Tab5 側は既存の 10 秒 poll で
+  バッジが追従する(即時性が欲しければ Subscribe だが v1 では poll)。
+- ゲート: esp32c6 thread 構成の docker ビルド green(他構成も壊さない)。実機は
+  親が焼いて、ユーザがボタンを押す → NanoC6 ログ `EVENT kind=1`(ONOFF_CHANGED)と
+  Tab5 の `nodes` で onoff が反転することを確認。
+
+### 15.1 実装記録(T7、2026-08-25)
+
+変更ファイル(いずれも `ports/esp-idf/examples/onoff_light_cpp/`):
+
+- `main/Kconfig.projbuild`: `SM_BUTTON_GPIO`(int、既定 9 / `IDF_TARGET_ESP32S3` は
+  既定 -1、-1 で無効)を `SM_LED_GPIO` の直後に追加。
+- `main/main.cpp`:
+  - `#define SM_BUTTON_GPIO CONFIG_SM_BUTTON_GPIO`(未定義構成向けに `-1`
+    フォールバック)を `SM_LED_GPIO` の隣に追加。
+  - LED セクション直後に `button_task`(`#if SM_BUTTON_GPIO >= 0`)を追加。
+    `gpio_config` で INPUT + `GPIO_PULLUP_ENABLE` + `GPIO_INTR_DISABLE` →
+    `vTaskDelay(1000ms)`(BOOT ストラップ期間を回避)→ 20ms 周期ポーリング。
+    3 回連続 Low で押下確定 → `Cmd c{}; c.kind = CmdKind::LocalToggle;`
+    `xQueueSend(g_cmd_queue, &c, 0)`。3 回連続 High を見るまで `pressed` を
+    落とさないので押しっぱなしでは再発火しない。ISR 不使用。
+  - `app_main` 末尾で `xTaskCreate(&button_task, "button", 3 * 1024, nullptr, 2, nullptr)`
+    (`#if SM_BUTTON_GPIO >= 0` のときのみ)。matter タスク(優先度 5)より低い。
+
+既存の `CmdKind::LocalToggle` ハンドラ(`stack.onoff_set(!stack.onoff_get(), now)` +
+`led_set`)をそのまま使うので、LED 反映・変化レポート経路は無改造。ネットワーク
+(Thread / WiFi / BLE)側のコードには一切触れていない。
+
+ゲート: esp32c6 + thread 構成の docker ビルド **green**
+(`sdkconfig.defaults;sdkconfig.defaults.esp32c6;sdkconfig.defaults.thread;sdkconfig.local`、
+bin 0x183360 バイト / app パーティション 39% free)。生成 sdkconfig に
+`CONFIG_SM_BUTTON_GPIO=9` を確認。
+
+実機確認手順(NanoC6): 焼いて起動 → ログに
+`button task started (gpio=9, active-low)` が出るのを待つ(起動 +1 秒)→ 本体
+ボタンを押す → `button pressed -> local toggle` と `EVENT kind=1`(ONOFF_CHANGED)、
+LED 反転。Tab5 側は既存の 10 秒 poll でバッジが追従する。

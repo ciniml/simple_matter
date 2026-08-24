@@ -44,6 +44,11 @@ int cmd_nodes(int, char **) {
              n.has_pm25 ? "" : "-", n.has_pm25 ? n.pm25 : 0.0f, n.has_temp ? "" : "-",
              n.has_temp ? (long)n.temp_c100 : 0L, n.has_hum ? "" : "-",
              n.has_hum ? (long)n.hum_p100 : 0L);
+      // T6: ダッシュボードの鮮度と同じ値(pump の now_ms との差、秒)。
+      printf("SENSORAGE %016llx %lld\n", (unsigned long long)n.node_id,
+             n.last_update_ms == 0 || snap.now_ms < n.last_update_ms
+                 ? -1LL
+                 : (long long)((snap.now_ms - n.last_update_ms) / 1000ull));
     }
   }
   printf("OK\n");

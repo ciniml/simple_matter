@@ -100,11 +100,19 @@ struct sm_ui_node_t {
   uint8_t has_temp;   //
   int32_t hum_p100;   // % ×100
   uint8_t has_hum;    //
+
+  // --- T6: ダッシュボードの鮮度表示(§14.2)---
+  // センサ値の read が最後に成立した時刻(pump の now_ms 基準。0 = 一度も成功していない)。
+  // UI は snapshot の `now_ms` との差を「updated N s ago」に使う。
+  uint64_t last_update_ms;
 };
 
 // pump → UI のスナップショット(丸ごとコピーして使う)。
 struct sm_ui_snapshot_t {
   uint32_t seq; // 更新のたびに増える(UI は変化検知に使ってよい)
+
+  // pump の現在時刻(esp_timer 由来の ms)。UI は last_update_ms との差で鮮度を出す(T6)。
+  uint64_t now_ms;
 
   // --- Thread ---
   int role;         // otDeviceRole

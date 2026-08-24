@@ -440,29 +440,14 @@ void set_node_sensor(uint64_t node_id, uint8_t slot, bool has, uint64_t raw) {
   sm_app_unlock();
 }
 
-// センサ属性の順繰り位置(NodeId で引く小さな表。行の並び替えに巻き込まれない)。
-struct SensorCursor {
-  uint64_t node_id;
-  uint8_t slot;
-};
-SensorCursor g_cursor[SM_UI_MAX_NODES] = {};
-
-uint8_t *cursor_for(uint64_t node_id) {
-  for (SensorCursor &c : g_cursor) {
-    if (c.node_id == node_id) {
-      return &c.slot;
-    }
+// センサ値の最終成功時刻を打つ(T6 §14.2。UI は snapshot の now_ms との差を表示する)。
+void mark_node_updated(uint64_t node_id) {
+  sm_ui_snapshot_t *s = sm_app_lock();
+  size_t i = node_index(s, node_id);
+  if (i < SM_UI_MAX_NODES) {
+    s->nodes[i].last_update_ms = now_ms();
   }
-  for (SensorCursor &c : g_cursor) {
-    if (c.node_id == 0) {
-      c.node_id = node_id;
-      c.slot = 0;
-      return &c.slot;
-    }
-  }
-  g_cursor[0].node_id = node_id; // 表が埋まったら先頭を再利用(実害なし)
-  g_cursor[0].slot = 0;
-  return &g_cursor[0].slot;
+  sm_app_unlock();
 }
 
 void clear_node_sensors(uint64_t node_id) {
@@ -471,6 +456,7 @@ void clear_node_sensors(uint64_t node_id) {
   if (i < SM_UI_MAX_NODES) {
     sm_ui_node_t &n = s->nodes[i];
     n.has_aq = n.has_co2 = n.has_pm25 = n.has_temp = n.has_hum = 0;
+    n.last_update_ms = 0;
   }
   sm_app_unlock();
 }
@@ -568,6 +554,7 @@ void refresh_thread_status() {
   sm_ot_status_t st;
   sm_ot_hub_get_status(&st);
   sm_ui_snapshot_t *s = sm_app_lock();
+  s->now_ms = now_ms(); // T6: UI の「updated N s ago」の基準時刻
   s->role = st.role;
   s->rloc16 = st.rloc16;
   s->channel = st.channel;
@@ -716,6 +703,7 @@ bool do_read_sensor_slot(uint64_t node_id, uint8_t slot, bool quiet, uint64_t ti
   ESP_LOGI(TAG, "sensor slot %s = raw 0x%llx%s", p.name, (unsigned long long)raw,
            is_null ? " (null)" : "");
   set_node_sensor(node_id, slot, !is_null, raw);
+  mark_node_updated(node_id); // 鮮度は「通信が成立した時刻」(null 応答も成立扱い。T6)
   if (!quiet) {
     sm_app_set_status("read %s of %016llx OK", p.name, (unsigned long long)node_id);
   }
@@ -779,7 +767,6 @@ uint8_t resolve_node_kind(uint64_t node_id, uint64_t timeout_ms) {
 void after_pair_complete(uint64_t node_id) {
   uint8_t kind = resolve_node_kind(node_id, 20000);
   if (kind == SM_UI_KIND_SENSOR) {
-    *cursor_for(node_id) = 0;
     do_read_sensor_all(node_id, true, 20000);
   }
   // LIGHT は probe_node_kind が OnOff を読んだ時点でバッジが埋まっている。
@@ -1764,6 +1751,7 @@ void pump_task(void *) {
 
   // --- 4. 定常ループ: UI の操作を 1 件ずつ + 周期タスク ---
   uint64_t next_status = 0;
+  uint64_t next_clock = 0;
   uint64_t next_poll = now_ms() + 30000; // 起動直後は WiFi/Thread 収束待ち(5 秒だと初回が必ず落ちて 2 分退避)
   size_t poll_index = 0;
   for (;;) {
@@ -1779,7 +1767,6 @@ void pump_task(void *) {
         set_node_busy(op.node_id, true);
         // 種別で分岐。センサ行の Read は「全属性の再読込」(§12.3 の 3)。
         if (node_kind(op.node_id) == SM_UI_KIND_SENSOR) {
-          *cursor_for(op.node_id) = 0; // 順繰りも先頭へ戻す
           do_read_sensor_all(op.node_id, false, 20000);
         } else {
           do_read_onoff(op.node_id, false, 20000);
@@ -1814,6 +1801,13 @@ void pump_task(void *) {
     pump_once(g_udp, 50);
 
     uint64_t now = now_ms();
+    // T6: 鮮度表示の基準時刻だけは細かく進める(500ms。lock は取るが中身は 1 語)。
+    if (now >= next_clock) {
+      next_clock = now + 500;
+      sm_ui_snapshot_t *s = sm_app_lock();
+      s->now_ms = now;
+      sm_app_unlock();
+    }
     if (now >= next_status) {
       next_status = now + 2000;
       refresh_thread_status();
@@ -1863,9 +1857,11 @@ void pump_task(void *) {
           if (kind == SM_UI_KIND_UNKNOWN) {
             ok = resolve_node_kind(id, 10000) != SM_UI_KIND_UNKNOWN;
           } else if (kind == SM_UI_KIND_SENSOR) {
-            uint8_t *cur = cursor_for(id);
-            ok = do_read_sensor_slot(id, *cur, true, 10000);
-            *cur = (uint8_t)((*cur + 1) % SM_UI_SLOT_COUNT);
+            // T6(§14.2): ダッシュボードの 5 タイルを同時に進めたいので、順繰り 1 属性
+            // ではなく **1 周期で 5 属性まとめ読み**する(CASE 済みなら ≈1 秒)。
+            // 1 本落ちたら do_read_sensor_all が打ち切るので、死んだノードでの
+            // CASE 再試行は 1 回で済む(バックオフ契約は不変)。
+            ok = do_read_sensor_all(id, true, 10000);
           } else {
             ok = do_read_onoff(id, true, 10000);
           }

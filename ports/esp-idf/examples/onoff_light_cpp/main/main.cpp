@@ -54,6 +54,11 @@ static const char *TAG = "onoff_cpp";
 #define SM_WIFI_SSID CONFIG_SM_WIFI_SSID
 #define SM_WIFI_PASS CONFIG_SM_WIFI_PASSWORD
 #define SM_LED_GPIO CONFIG_SM_LED_GPIO
+#ifdef CONFIG_SM_BUTTON_GPIO
+#define SM_BUTTON_GPIO CONFIG_SM_BUTTON_GPIO
+#else
+#define SM_BUTTON_GPIO (-1)
+#endif
 #define SM_NVS_NAMESPACE "smatter"
 
 // 工場出荷 factory データパーティションのラベル(未定義時は既定 "nvs_factory")。
@@ -544,6 +549,59 @@ static void led_init() {
 
 static void led_set(bool on) { gpio_set_level((gpio_num_t)SM_LED_GPIO, on ? 1 : 0); }
 
+// ---- 本体ボタン(T7、docs/design/p4-thread-controller.md §15)---------------
+//
+// active-low + 内部プルアップ。ISR は使わず 20ms ポーリング + デバウンス
+// (3 回連続 Low で押下確定、3 回連続 High で離した扱い → 押しっぱなしで再発火しない)。
+// BOOT ピンはストラップなので起動直後の状態は読まない(1 秒待ってから監視開始)。
+
+#if SM_BUTTON_GPIO >= 0
+static void button_task(void *) {
+  gpio_config_t io{};
+  io.pin_bit_mask = 1ULL << SM_BUTTON_GPIO;
+  io.mode = GPIO_MODE_INPUT;
+  io.pull_up_en = GPIO_PULLUP_ENABLE;
+  io.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  io.intr_type = GPIO_INTR_DISABLE;
+  gpio_config(&io);
+
+  vTaskDelay(pdMS_TO_TICKS(1000)); // ストラップ期間をやり過ごす
+
+  ESP_LOGI(TAG, "button task started (gpio=%d, active-low)", (int)SM_BUTTON_GPIO);
+
+  int low_run = 0;   // 連続 Low 回数
+  int high_run = 0;  // 連続 High 回数
+  bool pressed = false;
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(20));
+    bool low = gpio_get_level((gpio_num_t)SM_BUTTON_GPIO) == 0;
+    if (low) {
+      high_run = 0;
+      if (low_run < 3) {
+        low_run++;
+      }
+      if (!pressed && low_run >= 3) {
+        pressed = true;
+        ESP_LOGI(TAG, "button pressed -> local toggle");
+        Cmd c{};
+        c.kind = CmdKind::LocalToggle;
+        if (g_cmd_queue) {
+          xQueueSend(g_cmd_queue, &c, 0);
+        }
+      }
+    } else {
+      low_run = 0;
+      if (high_run < 3) {
+        high_run++;
+      }
+      if (pressed && high_run >= 3) {
+        pressed = false;
+      }
+    }
+  }
+}
+#endif
+
 // ---- カスタムクラスタ(F4b、EP2、vendor 領域クラスタ)-----------------------
 //
 // docs/design/c-ffi-shim.md §8。sm_init より前に登録する。値の所有はここ(C++ 側)。
@@ -992,4 +1050,9 @@ extern "C" void app_main() {
   // コミッショニング中の P-256 署名チェーンも深い(ベアメタル実測 ~70KB)。
   // 8KB だと WiFi 開始直後に即リセットループになる。
   xTaskCreate(&matter_task, "matter", 128 * 1024, nullptr, 5, nullptr);
+
+#if SM_BUTTON_GPIO >= 0
+  // 本体ボタン(T7): ポーリングのみなのでスタック小・優先度低。
+  xTaskCreate(&button_task, "button", 3 * 1024, nullptr, 2, nullptr);
+#endif
 }
