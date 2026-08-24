@@ -30,3 +30,18 @@ lv_display_t *sm_display_lvgl_start(void);
 // timeout_ms = 0 は無限待ち。
 bool sm_display_lock(uint32_t timeout_ms);
 void sm_display_unlock(void);
+
+// --- 合成ポインタ注入(T5b、§13.1)-------------------------------------------
+//
+// デバッグコンソール(main/console_dbg.cpp)から「タップ / スワイプ」を注入する。
+// 実体は indev の read_cb 内の状態機械で、LVGL タスクが自分の文脈で拾う
+// (= コンソールタスクから lv_* を呼ばない。§13.2 の契約)。
+// 注入中は実タッチを無視する(合成と実指の混線を防ぐ)。
+//
+// (x1,y1) で押下 → ms かけて (x2,y2) へ線形移動 → 離す。
+// tap は x1==x2 / y1==y2 / ms=80 の縮退形。
+// 戻り値: 受け付けたら true(前の注入が未完了 = busy、または LVGL 未起動なら false)。
+bool sm_display_inject_pointer(int32_t x1, int32_t y1, int32_t x2, int32_t y2, uint32_t ms);
+
+// 注入が進行中(まだ「離す」が LVGL に届いていない)なら true。
+bool sm_display_inject_busy(void);

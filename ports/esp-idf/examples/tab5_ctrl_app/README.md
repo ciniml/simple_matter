@@ -150,6 +150,64 @@ BLE の場合は 3〜4 の代わりに: デバイスを factory reset して BLE
 `Discriminator`(既定 3840)に変わる → `Start pairing`。進捗は
 `scanning → connected → subscribed → BTP+PASE → handoff → CASE → done` で出る。
 
+## デバッグコンソール(T5、§13)
+
+USB-Serial-JTAG(ログと同じ ttyACM)に `esp_console` の REPL が載っている
+(`main/console_dbg.cpp`)。**入力は CRLF 必須**(LF だけでは linenoise が確定しない)。
+出力は全て「1 行 1 レコード + `OK` / `ERR` 終端」。
+
+| コマンド | 用途 |
+|---|---|
+| `nodes` / `status` | スナップショットのテキストダンプ(T5a) |
+| `toggle <node>` / `read <node>` / `refresh <node>` / `setaddr <node> <ip> [wifi\|thread]` | UI と同じ操作キューへ post(T5a) |
+| `pair <ip> <node> [thread\|wifi] [passcode]` / `pairble <disc> <node> [wifi\|thread] [passcode]` | コミッショニング(T5a) |
+| `udptest <port> <secs>` | RX 切り分け(T5a) |
+| **`tap <x> <y>`** | 合成タップ(押下 80ms → 離す)を indev に注入(T5b) |
+| **`swipe <x1> <y1> <x2> <y2> [ms]`** | 合成スワイプ(既定 300ms)(T5b) |
+| **`ui-dump`** | アクティブスクリーンのウィジェットツリー(T5b) |
+| **`screenshot [1\|2]`** | 画面を RGB565 base64 で転送(T5c。`2` = 640x360 に間引き) |
+
+`ui-dump` の 1 行:
+
+```
+UI <depth> <class> x=.. y=.. w=.. h=.. hidden=0/1 text="..."
+```
+
+深さは 8 まで、1 ノードの子は 64 件まで。`class` は `label` / `button` / `textarea` /
+`dropdown` / `keyboard` / `tabview` / `qrcode` / `obj` など。`x,y` は**画面絶対座標**なので、
+そのまま `tap` に食わせられる(ボタン中心なら `x + w/2`、`y + h/2`)。
+
+`screenshot` のフレーミング:
+
+```
+SCREENSHOT <w> <h> RGB565 <base64桁数>
+<base64 76 桁/行>...
+END
+OK
+```
+
+撮影は `sm_display_lock()` 内(LVGL タスクと排他)、転送はロック外なので UI は固まらない。
+バッファは PSRAM(1280x720x2B ≒ 1.8MB)。USB-Serial-JTAG の実効速度で
+`div=1` は数十秒、`div=2` はその約 1/4。
+
+### PC 側クライアント `scripts/tab5ctl.py`
+
+```sh
+pip install pyserial Pillow
+
+scripts/tab5ctl.py -p /dev/ttyACM3 status
+scripts/tab5ctl.py -p /dev/ttyACM3 nodes
+scripts/tab5ctl.py -p /dev/ttyACM3 ui-dump
+scripts/tab5ctl.py -p /dev/ttyACM3 tap 640 360
+scripts/tab5ctl.py -p /dev/ttyACM3 swipe 900 400 300 400 400
+scripts/tab5ctl.py -p /dev/ttyACM3 screenshot --div 2 -o shot.png
+scripts/tab5ctl.py -p /dev/ttyACM3 send "pair 192.168.1.23 11 wifi"
+```
+
+ポート既定は `/dev/ttyACM3`、115200。送信は CRLF、応答は `OK`/`ERR`(`screenshot` は
+`END` → `OK`)で切る。アプリのログ行(`I (12345) tag: ...`)は既定で捨てる
+(`--keep-logs` で残す)。`screenshot` は RGB565(LE)を Pillow で PNG 化する。
+
 ## 踏んだ罠(次に触る人へ)
 
 1. **Espressif BSP(`espressif/m5stack_tab5` 1.2.0 + `esp_lvgl_port`)は実機で画面が

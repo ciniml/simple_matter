@@ -1366,3 +1366,92 @@ NanoC6 Thread 照明を 1 台の Tab5 で)を実機で成立**させた。検証
    数回で tx_pool 枯渇 → `start_case` が -4 で二度と通らない。全 close 箇所で release。
    検証: 3 台の FW を更新後、**Tab5 を 60 秒間隔で 3 回連続再起動 → NanoC6 Toggle OK ×2、
    AirQ 5 属性 read OK**(デバイス側の再起動なし)。
+
+### 13.6 実装記録(T5b/T5c、2026-08-25)
+
+T5a(コンソール REPL)の上に **GUI リモート操作(T5b)** と
+**スクリーンショット(T5c)** を載せた。これでエージェントは「操作 → 画面で検証」まで
+シリアル 1 本で自走できる(タッチ手番と目視手番の両方が消える)。
+
+#### 変更 / 追加ファイル
+
+| ファイル | 中身 |
+|---|---|
+| `main/display_gfx.{hpp,cpp}` | 合成ポインタ注入。`sm_display_inject_pointer(x1,y1,x2,y2,ms)` / `sm_display_inject_busy()`。実体は indev の `read_cb` 内の状態機械(押下 → 線形補間で移動 → 離す)。注入中は実タッチを完全に無視(排他) |
+| `main/console_dbg.cpp` | `tap` / `swipe` / `ui-dump` / `screenshot` を追加 |
+| `sdkconfig.defaults` | `CONFIG_LV_USE_SNAPSHOT=y` |
+| `scripts/tab5ctl.py`(新規) | PC 側クライアント(pyserial + Pillow) |
+| `ports/esp-idf/examples/tab5_ctrl_app/README.md` | 「デバッグコンソール(T5)」節を追加 |
+
+#### コマンド仕様(1 行 1 レコード + `OK`/`ERR` 終端は T5a と同じ)
+
+- `tap <x> <y>` — 押下 80ms → 離す。コンソールタスクは注入完了 + 150ms を待ってから
+  `TAP <x> <y>` / `OK` を返すので、直後の `ui-dump` / `screenshot` は
+  タップ後の画面を映す。
+- `swipe <x1> <y1> <x2> <y2> [ms]` — 既定 300ms(上限 5000ms)。
+- `ui-dump` — `UI <depth> <class> x=.. y=.. w=.. h=.. hidden=0/1 text="..."` を
+  深さ 8 / 子 64 件まで。`x,y,w,h` は**画面絶対座標**(`lv_obj_get_coords`)なので
+  そのまま `tap` の座標計算に使える。`text` は label / textarea / dropdown から取り、
+  ボタン内ラベルは子として別行に出る。
+- `screenshot [1|2]` — `SCREENSHOT <w> <h> RGB565 <base64桁数>` → base64 76 桁/行 →
+  `END` → `OK`。`2` は 640x360 への単純間引き。
+
+#### 設計判断(なぜこうしたか)
+
+1. **クラス名は `lv_obj_check_type()` で当てる**。`obj->class_p->name` は
+   `lv_obj_class_private.h` の中で、公開ヘッダから触れない。既知クラス
+   (label/button/textarea/dropdown/keyboard/buttonmatrix/tabview/qrcode/image)を
+   派生 → 基底の順に判定し、外れたら `obj`。private ヘッダを引かないので LVGL の
+   マイナー更新で壊れない。
+2. **snapshot バッファは自前で PSRAM から取る**。`lv_snapshot_take()` は
+   `lv_draw_buf_create()` → LVGL の malloc(この構成では `CONFIG_LV_USE_CLIB_MALLOC=y`
+   = 内蔵 RAM)へ行き、1.8MB は**内蔵 RAM に載らない**。よって
+   `heap_caps_malloc(MALLOC_CAP_SPIRAM)` + 64B アラインした領域を
+   `lv_draw_buf_init()` で包み、`lv_snapshot_take_to_draw_buf()` に渡す
+   (`lv_draw_buf_reshape` が `LV_STRIDE_AUTO` で stride を決め、
+   `size > data_size` なら弾いてくれるので安全)。
+3. **撮影は lock 内 / 転送は lock 外**。`sm_display_lock(10000)` を取って
+   snapshot を撮り、unlock してから base64 を吐く。数十秒の転送中も UI は生きている。
+4. **base64 は自前**(64 文字テーブル + 57 バイト → 76 桁の 1 行)。mbedtls を
+   main の `REQUIRES` に足さずに済む。
+
+#### 踏んだ罠
+
+1. **`lv_snapshot_*` は既定 `n`**(`CONFIG_LV_USE_SNAPSHOT`)。有効化を忘れると
+   ヘッダは通るのに実体が無くリンクエラーになる。`sdkconfig` が既にあると
+   `sdkconfig.defaults` の変更が反映されないので、**`rm -f sdkconfig` してから
+   set-target し直す**(F8 の罠 7 と同じ)。
+2. **合成タップは「PRESSED を最低 1 回 LVGL に見せてから離す」必要がある**。
+   indev の読み取り周期(~16-33ms)より短い押下だと read_cb が 1 度も
+   PRESSED を返さずクリックが生成されない。`press_reads` カウンタで
+   「1 回も押していないなら期限を過ぎていても押す」ようにしてある。
+3. **`ui-dump` は再帰**。REPL スタックは 16KB なので 1 段あたりの自動変数を
+   小さく保ち、文字列バッファは `static`(§13.5 の罠 5 と同じ理由。コンソールは単一タスク)。
+4. **PC 側は送信 CRLF**(§13.4)。加えてコマンドのエコーバックとプロンプト
+   `tab5>` が同じ行に来ることがあるので、`tab5ctl.py` は正規表現で剥がしてから
+   終端マーカ判定をする。ログ行(`I (12345) tag:`)は既定で捨てる。
+
+#### ゲート実測
+
+1. `tab5_ctrl_app` esp32p4 docker ビルド **green**
+   (`SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.local"`、
+   `rm -f sdkconfig` → set-target → build。bin 0x20cd60 = 2.05MB、パーティション 49% 空き)。
+   Rust には触っていないので staticlib の消去は不要。
+2. `python3 -m py_compile scripts/tab5ctl.py` **OK**。
+3. 実機(親): 書き込み → `ui-dump` にラベルが出ること、`tap` で
+   `+ Pair new device` ダイアログが開くこと、`screenshot --div 2` の PNG が
+   画面と目視一致すること。
+
+#### 13.6 補足: 実機確認(親、2026-08-25)
+
+- `ui-dump` → `tap`(「Pair new device」ラベル中心 182,204)→ ダイアログのラベルが
+  `ui-dump` に出る → `tap` Close で閉じる、まで自走で成立(T5b OK)。
+  ラベルの LVGL シンボル(`+` 等の私用領域文字)はダンプで落ちるので、文字列照合は
+  部分一致で行う。
+- `screenshot`: 1/2 間引き(640×360)**≈5 秒**、フル(1280×720)**≈20 秒**で PNG 復元、
+  目視一致(T5c OK)。実機で発覚した罠 2 つ: (1) OpenThread のログは `I(12345)`
+  (スペース無し)形式で PC 側フィルタをすり抜ける、(2) ログ行が base64 行の**途中に
+  癒着する**ことがある(行単位の原子性は無い)→ 本文行に `B:` 接頭辞を付け、PC は行内から
+  `B:([base64]{1,76})` を抽出する方式に変更(欠落ゼロを確認)。
+- 以降の実機デバッグは `scripts/tab5ctl.py` で「操作 → ui-dump/screenshot で検証」を
+  エージェントが自走できる(§13.3 ゲート 3 達成)。

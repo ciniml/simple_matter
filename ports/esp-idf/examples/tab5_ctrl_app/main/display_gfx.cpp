@@ -51,11 +51,53 @@ void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
   lv_display_flush_ready(disp);
 }
 
+// 合成ポインタ(T5b)。read_cb 内だけで進む状態機械なので、LVGL タスク以外は
+// 「起動(active を立てる)」と「完了待ち(active を読む)」しかしない。
+struct SynthPointer {
+  int32_t x1, y1, x2, y2;
+  int64_t t0_us, t1_us;
+  uint32_t press_reads; // 最低 1 回は PRESSED を LVGL に見せてから離す
+  bool released_sent;
+  volatile bool active;
+};
+SynthPointer g_synth = {};
+
 // タッチ。M5GFX の getTouch() は setRotation() を反映した「画面座標」を返すので、
 // BSP 経路で必要だった回転シム(SM_UI_TOUCH_MIRROR_X/Y 含む)は不要になった。
 int g_touch_log_left = 5;
 void lvgl_touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
   (void)indev;
+  // 合成注入中は実タッチを完全に無視する(排他)。
+  if (g_synth.active) {
+    const int64_t now = esp_timer_get_time();
+    if (now < g_synth.t1_us || g_synth.press_reads == 0) {
+      const int64_t span = g_synth.t1_us - g_synth.t0_us;
+      const int64_t el = now - g_synth.t0_us;
+      int32_t k = (span > 0) ? static_cast<int32_t>((el * 1000) / span) : 1000;
+      if (k < 0) {
+        k = 0;
+      }
+      if (k > 1000) {
+        k = 1000;
+      }
+      data->point.x = g_synth.x1 + (g_synth.x2 - g_synth.x1) * k / 1000;
+      data->point.y = g_synth.y1 + (g_synth.y2 - g_synth.y1) * k / 1000;
+      data->state = LV_INDEV_STATE_PRESSED;
+      ++g_synth.press_reads;
+      return;
+    }
+    if (!g_synth.released_sent) {
+      data->point.x = g_synth.x2;
+      data->point.y = g_synth.y2;
+      data->state = LV_INDEV_STATE_RELEASED;
+      g_synth.released_sent = true;
+      return;
+    }
+    // 「離す」まで LVGL に届いた。次の読みから実タッチへ戻す。
+    g_synth.active = false;
+    data->state = LV_INDEV_STATE_RELEASED;
+    return;
+  }
   int32_t x = 0;
   int32_t y = 0;
   if (M5.Display.getTouch(&x, &y)) {
@@ -193,3 +235,32 @@ void sm_display_unlock(void) {
     xSemaphoreGiveRecursive(g_lvgl_mutex);
   }
 }
+
+bool sm_display_inject_pointer(int32_t x1, int32_t y1, int32_t x2, int32_t y2, uint32_t ms) {
+  if (g_disp == nullptr) {
+    return false;
+  }
+  if (g_synth.active) {
+    return false; // 前の注入がまだ終わっていない
+  }
+  const int32_t w = lv_display_get_horizontal_resolution(g_disp);
+  const int32_t h = lv_display_get_vertical_resolution(g_disp);
+  auto clamp = [](int32_t v, int32_t lo, int32_t hi) { return v < lo ? lo : (v > hi ? hi : v); };
+  g_synth.x1 = clamp(x1, 0, w - 1);
+  g_synth.y1 = clamp(y1, 0, h - 1);
+  g_synth.x2 = clamp(x2, 0, w - 1);
+  g_synth.y2 = clamp(y2, 0, h - 1);
+  if (ms == 0) {
+    ms = 1;
+  }
+  g_synth.t0_us = esp_timer_get_time();
+  g_synth.t1_us = g_synth.t0_us + static_cast<int64_t>(ms) * 1000;
+  g_synth.press_reads = 0;
+  g_synth.released_sent = false;
+  // フィールドの書き込みが active=true より前に見えるようにする。
+  __sync_synchronize();
+  g_synth.active = true;
+  return true;
+}
+
+bool sm_display_inject_busy(void) { return g_synth.active; }

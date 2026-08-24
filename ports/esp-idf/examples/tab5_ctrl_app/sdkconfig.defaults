@@ -80,6 +80,10 @@ CONFIG_LV_USE_QRCODE=y
 # オンスクリーンキーボード(IPv6 / passcode 入力)。
 CONFIG_LV_USE_KEYBOARD=y
 CONFIG_LV_USE_TEXTAREA=y
+# スクリーンショット(T5c、§13.1)。lv_snapshot_take_to_draw_buf を使う。
+# 出力バッファは console_dbg.cpp が PSRAM から確保する(1280x720x2B ≒ 1.8MB)ので、
+# LVGL 内蔵の draw_buf 確保(= 内蔵 RAM)には行かない。
+CONFIG_LV_USE_SNAPSHOT=y
 
 # LVGL の描画バッファは display_gfx.cpp が PSRAM から確保する
 # (1280x72 x2B x2 枚 ≒ 360KB)。内蔵 RAM は pump の静的スタック 128KB と
