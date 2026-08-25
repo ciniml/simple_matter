@@ -1642,3 +1642,130 @@ bin 0x183360 バイト / app パーティション 39% free)。生成 sdkconfig 
 `button task started (gpio=9, active-low)` が出るのを待つ(起動 +1 秒)→ 本体
 ボタンを押す → `button pressed -> local toggle` と `EVENT kind=1`(ONOFF_CHANGED)、
 LED 反転。Tab5 側は既存の 10 秒 poll でバッジが追従する。
+
+## 16. T8: 属性 Subscribe による Tab5 表示の即時更新(NanoC6 OnOff → 将来 AirQ センサ)
+
+Status: 設計(2026-08-26)。T7 §15 で「v1 では poll」と見送った Subscribe 化。
+NanoC6 の本体ボタン/他コントローラからの操作が Tab5 のバッジに **1 秒以内**で反映される
+ことが目標。**AirQ のセンサ 5 属性も同じ仕組みで購読する**ことを前提に、shim の購読を
+「ノード複数 × パス複数」に一般化する。
+
+### 16.1 現状と制約
+
+- Tab5(`ctrl_pump.cpp` 定常ループ)は 10 秒周期でノードを **交互に 1 台** read(2 台なら
+  鮮度 ≤20 秒)。IM Subscribe は未使用。
+- shim [`sm_ctrl_subscribe`](../../crates/simple-matter-cffi/include/simple_matter.h) は
+  **単一パス・購読 1 本**(`CtrlShim::sub_path: Option<(ep,cluster,attr)>`)。
+  `SM_CTRL_EV_REPORT` は `node_id` を `nodes.first()` で埋める暫定実装(複数ノード不可)。
+- コア `ImClient` は `MAX_CLIENT_SUBSCRIPTIONS = 4` 本の購読テーブルを持ち、
+  `start_subscribe(ex, paths: &[AttributePath], ..)` で **1 購読に複数パス**を載せられる。
+  レポートは `SubscriptionReport { subscription_id }` + `sub_reports()`(AttributeReportIB 列)、
+  keep-alive 途絶(`last_report + max_interval + 猶予`)で `SubscriptionLost`。
+- shim は単一トランザクション直列(`Activity`)。購読レポートは **Idle 中は
+  `drain_subscription_reports`、op 進行中は `drive_awaitop` が `im_take_event` で取る**ので、
+  op 中に届いた購読イベントを落とさない経路が要る。
+
+### 16.2 shim の変更(`crates/simple-matter-cffi`)
+
+**購読テーブル**(`sub_path` を置換):
+
+```rust
+const SUB_MAX_PATHS: usize = 8;                           // AirQ 5 属性 + 余裕
+struct SubEntry { id: u32, node_id: u64, paths: heapless::Vec<(u16, u32, u32), SUB_MAX_PATHS> }
+subs: heapless::Vec<SubEntry, MAX_CLIENT_SUBSCRIPTIONS>   // コアと同容量(4)
+pending_sub_paths: heapless::Vec<(u16,u32,u32), SUB_MAX_PATHS>  // 進行中 Subscribe の引数(op_args と同格)
+```
+
+**C API**(既存 `sm_ctrl_subscribe` は 1 パスの薄いラッパとして残す):
+
+```c
+typedef struct { uint16_t endpoint; uint32_t cluster; uint32_t attribute; } sm_attr_path_t;
+// 複数パスを 1 購読で張る。同一ノードの既存購読があれば **先に捨てる**(二重購読しない)。
+// 戻り値: 0 / -1 未初期化 / -3 未知ノード / -4 CASE 失敗 / -10 busy / -11 パス数超過 /
+//         -12 購読テーブル満杯。
+int32_t sm_ctrl_subscribe_paths(uint64_t node_id, const sm_attr_path_t *paths, size_t n,
+                                uint16_t min_interval_s, uint16_t max_interval_s, uint64_t now_ms);
+// ノードの購読をローカルで破棄する(デバイスへは何も送らない。keep-alive 途絶で自然消滅)。
+// 戻り値 = 破棄した本数。
+int32_t sm_ctrl_unsubscribe(uint64_t node_id);
+// ノードの購読が生きていれば true(UI の「subscribed」表示・poll 抑止の判定用)。
+bool sm_ctrl_is_subscribed(uint64_t node_id);
+```
+
+**イベント**(`sm_ctrl_event_t` 末尾にフィールド追加 = ABI 変更。ヘッダと Rust `repr(C)` の
+両方を更新し、Tab5/他 example を再ビルド):
+
+```c
+  // REPORT / SUBSCRIPTION_LOST の対象パス(REPORT のみ有効)。
+  uint16_t endpoint; uint32_t cluster; uint32_t attribute;
+```
+
+- `SM_CTRL_EV_SUBSCRIBE_DONE`: `node_id`、`value_u64` = 購読 ID。**その前に**プライミング
+  レポートに含まれる各属性を `SM_CTRL_EV_REPORT` として 1 属性 1 イベントで積む
+  (初期値が READ と同じ経路で表示に入る)。
+- `SM_CTRL_EV_REPORT`: `node_id` + `endpoint/cluster/attribute` + `value_u64/value_is_null`。
+  デバイス発レポート 1 通に複数属性があれば **属性ごとに 1 イベント**。購読テーブルに
+  無い属性(パス外)は捨てる。`phase` = 購読 ID 下位 8bit(従来通り、診断用)。
+- `SM_CTRL_EV_SUBSCRIPTION_LOST = 17`(新設): `node_id`、`value_u64` = 購読 ID。
+  テーブルから除去済み。C++ 側はここから poll フォールバック/再購読に入る。
+- `EV_CAP` を 16 → 32(センサ 1 レポート = 5 イベント。ring 溢れで落とさない)。
+
+**取り回し**:
+
+- `SubscriptionReport` / `SubscriptionLost` の処理を `handle_sub_event(s, ev)` に一本化し、
+  `drain_subscription_reports`(Idle)と `drive_awaitop` / `drive_connecting` 等の
+  **全 `im_take_event` 経路**から呼ぶ(op 中に届いた購読イベントを `_ => {}` で捨てない)。
+- 購読 ID → node_id はテーブルで引く(`nodes.first()` 撤廃)。
+- `start_operation` が古いセッションを捨てて CASE を張り直すとき、そのノードの購読は
+  旧セッションに残ったまま keep-alive 途絶で `SubscriptionLost` になる(コア任せ)。
+  即時に整合させたければ `sm_ctrl_unsubscribe` を C++ が呼ぶ。
+- `sm_ctrl_abort_op` で Subscribe 進行中を中断したら `pending_sub_paths` を捨てる。
+- サイズ: `sm_ctrl_context_size` が増える(PSRAM 供給なので許容。値をログで確認)。
+
+**テスト**(`controller.rs` の既存 loopback テスト流儀): (a) 2 パス購読 → priming で
+REPORT×2 + DONE、デバイス側 `mark_dirty` 1 属性 → REPORT×1 に正しい path/node_id、
+(b) 2 ノード分の購読を同時保持し、レポートが正しい node_id に振り分く、(c) keep-alive 途絶 →
+SUBSCRIPTION_LOST + テーブル除去、(d) 購読中に別 op(read)を発行し、その最中に届いた
+レポートが落ちない、(e) 既存 `sm_ctrl_subscribe` 回帰。
+
+### 16.3 Tab5 の変更(`ports/esp-idf/examples/tab5_ctrl_app`)
+
+- ノードごとに購読状態を持つ: `g_sub[slot] = {NONE, ACTIVE}` + `g_sub_retry_until[slot]`。
+- **購読の張り方**(既存 10 秒 poll tick の中で行う。CASE 込みで数秒かかるので run_until 直列):
+  - 種別 LIGHT: `sm_ctrl_subscribe_paths(node, {EP1/0x0006/0}, min=0, max=60)`。
+  - 種別 SENSOR: `SENSOR_ATTRS` 5 本を 1 購読(min=1, max=60)。
+  - `SUBSCRIBE_DONE` → ACTIVE、note "subscribed"。`SUBSCRIBE_FAILED` / rc<0 → 従来の
+    2 分バックオフへ(`g_backoff_until`)。この間の表示更新は従来 read で賄う。
+- **poll の役割変更**: ACTIVE のノードは周期 read しない(keep-alive はコア)。NONE の
+  ノードだけ従来通り交互 read(+購読再試行)。
+- **非同期イベントの受け皿** `consume_async_event(const sm_ctrl_event_t&)`: `REPORT` →
+  path で `set_node_onoff` / `set_node_sensor`(f32 の 2 本は既存 `f32_from_value`)、
+  `SUBSCRIPTION_LOST` → NONE + note "subscription lost"。定常ループの `pump_once` 直後に
+  `while (sm_ctrl_take_event(&ev)) consume_async_event(ev);` を追加。**`run_until` と
+  各 `do_*` の「stale イベント捨て」ループも REPORT/LOST を捨てずにここへ流す**
+  (op 中のレポートを落とさない)。
+- `run_until` の終端判定は kind ベースなので REPORT が混ざっても壊れないが、非終端
+  イベントは `consume_async_event` に通す。
+- `do_refresh_addr`(⟳)は `sm_ctrl_unsubscribe(node)` してから種別再検出(旧購読の残骸を
+  切る)。`do_toggle` 後の追加 read は不要になる(レポートで返る)が、現状維持で可。
+- UI: `sm_ui_node_t` に `uint8_t subscribed` を足し、行に小さな "●sub" 表示(任意)。
+  鮮度表示(`updated N s ago`)は REPORT でも更新する。
+
+### 16.4 デバイス側の確認事項
+
+- NanoC6(onoff_light_cpp): `MatterStack` の SUBS 容量 ≥ 1、`sm_onoff_set` → dirty →
+  レポート送出は T7 で成立済み。Tab5 が再起動を繰り返すと旧購読がデバイス側に残る
+  (`SUBS` 枯渇で SubscribeResponse が失敗しうる)ので、デバイスの購読 max_interval 超過
+  回収が働くことを `pools:` ログで確認する。
+- AirQ(Rust ポート): センサ更新時に該当属性を dirty にしているか(していなければ
+  レポートは max_interval ごと=60 秒になる)。未対応なら **本タスクでは「購読は張るが
+  鮮度は max_interval」**として動かし、AirQ 側の dirty 化は別タスクにする。
+
+### 16.5 ゲート
+
+1. `cargo test -p simple-matter-cffi`(新テスト 5 本含む)+ workspace 全緑、`cargo clippy` 警告なし。
+2. docker ビルド: tab5_ctrl_app(P4)、onoff_light_cpp(C6)が green。ヘッダ変更で
+   他 example(thread_ctrl_hub_cpp 等)が壊れないこと。
+3. 実機: NanoC6 ボタン押下 → Tab5 バッジ反転が **1 秒以内**。Tab5 の `nodes` に
+   "subscribed"。NanoC6 `pools:` で ex/hs が安定、購読数が 1 で頭打ち(Tab5 再起動 3 回)。
+   AirQ は購読確立と 60 秒以内の値更新を確認(dirty 対応済みなら即時)。

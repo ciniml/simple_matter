@@ -36,8 +36,10 @@ int cmd_nodes(int, char **) {
   printf("NODES %u\n", (unsigned)snap.node_count);
   for (size_t i = 0; i < snap.node_count && i < SM_UI_MAX_NODES; ++i) {
     const sm_ui_node_t &n = snap.nodes[i];
-    printf("NODE %016llx kind=%u onoff=%d aq=%u addr=%s note=\"%s\"\n",
-           (unsigned long long)n.node_id, n.kind, (int)n.onoff, n.aq, n.addr, n.note);
+    // T8(§16.3): subscribed=1 なら周期 read は止まっており、値はレポート由来。
+    printf("NODE %016llx kind=%u onoff=%d aq=%u subscribed=%u addr=%s note=\"%s\"\n",
+           (unsigned long long)n.node_id, n.kind, (int)n.onoff, n.aq, n.subscribed, n.addr,
+           n.note);
     if (n.kind == 2) {
       printf("SENSOR %016llx co2=%s%.1f pm25=%s%.1f temp_c100=%s%ld hum_p100=%s%ld\n",
              (unsigned long long)n.node_id, n.has_co2 ? "" : "-", n.has_co2 ? n.co2 : 0.0f,

@@ -78,6 +78,25 @@ float f32_from_value(uint64_t v) {
 
 uint64_t now_ms() { return (uint64_t)esp_timer_get_time() / 1000ull; }
 
+// ---- T8: ノード別の購読状態(§16.3)----
+//
+// 添字は **スナップショットの行 index**(g_backoff_until と同じ流儀)。
+// ACTIVE の行は周期 read を止め、表示はデバイス発レポート(SM_CTRL_EV_REPORT)で
+// 更新する。購読が切れたら(SM_CTRL_EV_SUBSCRIPTION_LOST)NONE に戻り、次の
+// poll tick で再購読を試みつつ従来 read で表示を賄う。
+enum SubState : uint8_t {
+  SUB_NONE = 0,
+  SUB_ACTIVE = 1,
+};
+uint8_t g_sub[SM_UI_MAX_NODES] = {};
+// 購読の再試行を控える時刻(失敗時 2 分。read のバックオフとは独立)。
+uint64_t g_sub_retry_until[SM_UI_MAX_NODES] = {};
+
+// 非同期イベント(REPORT / SUBSCRIPTION_LOST)をスナップショットへ反映する。
+// **イベントを捨てる全ての場所からこれを通す**(op 進行中に届いたレポートを落とさない)。
+// 実体は「スナップショット更新ヘルパ」節の後(set_node_* を使うため)。
+bool consume_async_event(const sm_ctrl_event_t &ev);
+
 // ---- KVS コールバック(NVS namespace "smctl"、cast/nods/rsm*)----
 // thread_ctrl_hub_cpp と同一実装。キー互換なので hub で作った CA / ノード帳 /
 // resumption 素材をそのまま引き継げる(= 実機の 0xaabbccdd が一覧に出る)。
@@ -279,6 +298,9 @@ bool run_until(int fd, uint64_t timeout_ms, sm_ctrl_event_t &out_ev,
         s->pair_phase = ev.phase;
         sm_app_unlock();
       }
+      // T8(§16.3): op 進行中に届いた購読レポート / 購読喪失は捨てない。
+      // 終端判定は kind ベースなので REPORT が混ざっても壊れない。
+      consume_async_event(ev);
       if (is_terminal(ev)) {
         out_ev = ev;
         if (ev.kind == SM_CTRL_EV_INVOKE_FAILED || ev.kind == SM_CTRL_EV_READ_FAILED ||
@@ -324,6 +346,10 @@ bool term_invoke(const sm_ctrl_event_t &e) {
 }
 bool term_read(const sm_ctrl_event_t &e) {
   return e.kind == SM_CTRL_EV_READ_DONE || e.kind == SM_CTRL_EV_READ_FAILED;
+}
+// T8: 購読確立の終端(プライミングの REPORT 群はこの前に流れてくる)。
+bool term_subscribe(const sm_ctrl_event_t &e) {
+  return e.kind == SM_CTRL_EV_SUBSCRIBE_DONE || e.kind == SM_CTRL_EV_SUBSCRIBE_FAILED;
 }
 
 // ---- スナップショット更新ヘルパ ----
@@ -465,6 +491,74 @@ void mark_node_updated(uint64_t node_id) {
   sm_app_unlock();
 }
 
+// ---- T8: 購読状態(§16.3)----
+
+// 行 index を引く(見つからなければ SM_UI_MAX_NODES)。
+size_t slot_of(uint64_t node_id) {
+  sm_ui_snapshot_t *s = sm_app_lock();
+  size_t i = node_index(s, node_id);
+  sm_app_unlock();
+  return i;
+}
+
+void set_node_subscribed(uint64_t node_id, bool on) {
+  sm_ui_snapshot_t *s = sm_app_lock();
+  size_t i = node_index(s, node_id);
+  if (i < SM_UI_MAX_NODES) {
+    s->nodes[i].subscribed = on ? 1 : 0;
+  }
+  sm_app_unlock();
+}
+
+// 購読状態を NONE に落とす(喪失 / ⟳ / 明示解除)。
+void mark_unsubscribed(uint64_t node_id, uint64_t retry_until) {
+  size_t slot = slot_of(node_id);
+  if (slot < SM_UI_MAX_NODES) {
+    g_sub[slot] = SUB_NONE;
+    g_sub_retry_until[slot] = retry_until;
+  }
+  set_node_subscribed(node_id, false);
+}
+
+// SM_CTRL_EV_REPORT / SM_CTRL_EV_SUBSCRIPTION_LOST をスナップショットへ反映する。
+// 戻り値 = このイベントを購読の文脈で消費したか(ログ用。呼び出し側は無視してよい)。
+bool consume_async_event(const sm_ctrl_event_t &ev) {
+  if (ev.kind == SM_CTRL_EV_SUBSCRIPTION_LOST) {
+    ESP_LOGW(TAG, "sub: lost node=%016llx id=%llu", (unsigned long long)ev.node_id,
+             (unsigned long long)ev.value_u64);
+    mark_unsubscribed(ev.node_id, 0); // 次の poll tick で即再試行してよい
+    set_node_note(ev.node_id, "subscription lost");
+    return true;
+  }
+  if (ev.kind != SM_CTRL_EV_REPORT) {
+    return false;
+  }
+  // OnOff(照明)。
+  if (ev.endpoint == EP_ONOFF && ev.cluster == CL_ONOFF && ev.attribute == ATTR_ONOFF) {
+    int8_t v = ev.value_is_null ? (int8_t)-1 : (int8_t)(ev.value_u64 != 0 ? 1 : 0);
+    set_node_onoff(ev.node_id, v);
+    mark_node_updated(ev.node_id);
+    ESP_LOGI(TAG, "sub: report node=%016llx OnOff=%s", (unsigned long long)ev.node_id,
+             v < 0 ? "null" : (v ? "On" : "Off"));
+    return true;
+  }
+  // センサ 5 属性(f32 の 2 本は set_node_sensor が f32_from_value で戻す)。
+  for (uint8_t slot = 0; slot < SM_UI_SLOT_COUNT; ++slot) {
+    const SensorAttrPath &p = SENSOR_ATTRS[slot];
+    if (ev.endpoint == p.ep && ev.cluster == p.cluster && ev.attribute == p.attr) {
+      set_node_sensor(ev.node_id, slot, !ev.value_is_null, ev.value_u64);
+      mark_node_updated(ev.node_id);
+      ESP_LOGI(TAG, "sub: report node=%016llx %s raw=0x%llx%s", (unsigned long long)ev.node_id,
+               p.name, (unsigned long long)ev.value_u64, ev.value_is_null ? " (null)" : "");
+      return true;
+    }
+  }
+  ESP_LOGW(TAG, "sub: report for an unknown path ep%u/0x%04lx/0x%04lx (node=%016llx)",
+           (unsigned)ev.endpoint, (unsigned long)ev.cluster, (unsigned long)ev.attribute,
+           (unsigned long long)ev.node_id);
+  return true;
+}
+
 void clear_node_sensors(uint64_t node_id) {
   sm_ui_snapshot_t *s = sm_app_lock();
   size_t i = node_index(s, node_id);
@@ -561,6 +655,16 @@ void rebuild_node_list() {
     }
     ++s->node_count;
   }
+  // T8: 行 index が動きうるので、購読状態はシムに聞き直して張り直す
+  //(g_sub / g_sub_retry_until は行 index 添字。§16.3)。
+  for (size_t i = 0; i < SM_UI_MAX_NODES; ++i) {
+    bool active = i < s->node_count && sm_ctrl_is_subscribed(s->nodes[i].node_id);
+    g_sub[i] = active ? (uint8_t)SUB_ACTIVE : (uint8_t)SUB_NONE;
+    g_sub_retry_until[i] = 0;
+    if (i < s->node_count) {
+      s->nodes[i].subscribed = active ? 1 : 0;
+    }
+  }
   sm_app_unlock();
   ESP_LOGI(TAG, "node list: %u shown / %u in controller node book", (unsigned)n, (unsigned)known);
 }
@@ -623,6 +727,7 @@ template <typename F> int32_t start_op_clean(F start) {
   for (;;) {
     sm_ctrl_event_t stale;
     while (sm_ctrl_take_event(&stale)) {
+      consume_async_event(stale); // T8: 残骸に混ざった購読レポートは捨てない
     }
     rc = start();
     if (rc != -10 || now_ms() >= until) {
@@ -671,6 +776,7 @@ bool do_read_scalar(uint64_t node_id, const SensorAttrPath &p, uint64_t timeout_
   for (;;) {
     sm_ctrl_event_t stale;
     while (sm_ctrl_take_event(&stale)) {
+      consume_async_event(stale); // T8: 同上
     }
     src = sm_ctrl_read_scalar(node_id, p.ep, p.cluster, p.attr, now_ms());
     if (src != -10 || now_ms() >= until) {
@@ -778,6 +884,67 @@ uint8_t resolve_node_kind(uint64_t node_id, uint64_t timeout_ms) {
   return kind;
 }
 
+// ---- T8: 属性 Subscribe(§16.3)----
+
+// ノード 1 台に購読を張る(CASE 込みで数秒かかるので run_until で直列に駆動する)。
+// 種別 LIGHT: OnOff 1 パス(min=0/max=60)。SENSOR: SENSOR_ATTRS 5 パス(min=1/max=60)。
+// プライミングのレポートは run_until 経由で consume_async_event に入るので、
+// 購読確立の時点で表示は最新になっている。
+bool do_subscribe_node(uint64_t node_id, uint8_t kind, uint64_t timeout_ms) {
+  sm_attr_path_t paths[SM_UI_SLOT_COUNT];
+  size_t n = 0;
+  uint16_t min_i = 0;
+  uint16_t max_i = 60;
+  if (kind == SM_UI_KIND_SENSOR) {
+    for (uint8_t slot = 0; slot < SM_UI_SLOT_COUNT; ++slot) {
+      paths[n].endpoint = SENSOR_ATTRS[slot].ep;
+      paths[n].cluster = SENSOR_ATTRS[slot].cluster;
+      paths[n].attribute = SENSOR_ATTRS[slot].attr;
+      ++n;
+    }
+    min_i = 1; // センサはバースト抑制のため最小 1 秒
+  } else if (kind == SM_UI_KIND_LIGHT) {
+    paths[n].endpoint = EP_ONOFF;
+    paths[n].cluster = CL_ONOFF;
+    paths[n].attribute = ATTR_ONOFF;
+    ++n;
+    min_i = 0; // ボタン押下を即座に受けたい
+  } else {
+    return false; // 種別未確定のノードには張らない
+  }
+
+  ESP_LOGI(TAG, "sub: subscribing node=%016llx kind=%u paths=%u min=%u max=%u",
+           (unsigned long long)node_id, (unsigned)kind, (unsigned)n, (unsigned)min_i,
+           (unsigned)max_i);
+  int32_t rc = start_op_clean(
+      [&] { return sm_ctrl_subscribe_paths(node_id, paths, n, min_i, max_i, now_ms()); });
+  if (rc != 0) {
+    ESP_LOGW(TAG, "sub: start rejected node=%016llx rc=%ld", (unsigned long long)node_id,
+             (long)rc);
+    return false;
+  }
+  sm_ctrl_event_t ev;
+  if (!run_until(g_udp, timeout_ms, ev, term_subscribe) ||
+      ev.kind != SM_CTRL_EV_SUBSCRIBE_DONE) {
+    ESP_LOGW(TAG, "sub: failed node=%016llx (kind=%d status=%u)", (unsigned long long)node_id,
+             (int)ev.kind, (unsigned)ev.status);
+    return false;
+  }
+  ESP_LOGI(TAG, "sub: active node=%016llx id=%llu", (unsigned long long)node_id,
+           (unsigned long long)ev.value_u64);
+  return true;
+}
+
+// 購読を捨てる(デバイスへは何も送らない。⟳ / 種別再検出の前に呼ぶ)。
+void drop_subscription(uint64_t node_id) {
+  int32_t dropped = sm_ctrl_unsubscribe(node_id);
+  if (dropped > 0) {
+    ESP_LOGI(TAG, "sub: dropped %ld subscription(s) of node=%016llx", (long)dropped,
+             (unsigned long long)node_id);
+  }
+  mark_unsubscribed(node_id, 0);
+}
+
 // ペア完了直後の初期化(§12.3 の 1: 「ペア完了時に判定」)。行が既にある前提。
 void after_pair_complete(uint64_t node_id) {
   uint8_t kind = resolve_node_kind(node_id, 20000);
@@ -832,6 +999,7 @@ void do_set_addr(const sm_ui_op_t &op) {
   int rc = sm_ctrl_set_node_addr(op.node_id, &a);
   sm_ctrl_event_t ev;
   while (sm_ctrl_take_event(&ev)) {
+    consume_async_event(ev); // T8
   }
   refresh_node_addr_view(op.node_id);
   set_node_note(op.node_id, rc == 0 ? "addr set" : "setaddr failed");
@@ -839,6 +1007,8 @@ void do_set_addr(const sm_ui_op_t &op) {
 }
 
 void do_refresh_addr(uint64_t node_id) {
+  // T8(§16.3): 旧アドレス / 旧セッションに紐づく購読の残骸を先に切る。
+  drop_subscription(node_id);
   sm_app_set_status("SRP lookup for %016llx ...", (unsigned long long)node_id);
   uint8_t ip[16];
   if (!sm_ot_hub_srp_lookup(node_id, ip)) {
@@ -852,6 +1022,7 @@ void do_refresh_addr(uint64_t node_id) {
       bool ok = resolve_via_mdns(node_id, widx, 8000);
       sm_ctrl_event_t ev;
       while (sm_ctrl_take_event(&ev)) {
+        consume_async_event(ev); // T8
       }
       refresh_node_addr_view(node_id);
       set_node_note(node_id, ok ? "addr updated (mDNS)" : "not found");
@@ -872,6 +1043,7 @@ void do_refresh_addr(uint64_t node_id) {
   // RESOLVE_DONE を吸い出す(次の run_until のイベント読みを汚さない)。
   sm_ctrl_event_t ev;
   while (sm_ctrl_take_event(&ev)) {
+    consume_async_event(ev); // T8
   }
   refresh_node_addr_view(node_id);
   set_node_note(node_id, rc == 0 ? "addr updated" : "set_node_addr failed");
@@ -1100,6 +1272,7 @@ bool replay_mdns_cache() {
     if (sm_ctrl_mdns_rx(g_mdns_cache[i].buf, g_mdns_cache[i].len, nullptr, now_ms()) == 0) {
       sm_ctrl_event_t ev;
       while (sm_ctrl_take_event(&ev)) {
+        consume_async_event(ev); // T8
         if (ev.kind == SM_CTRL_EV_RESOLVE_DONE) {
           ESP_LOGI(TAG, "resolved from a cached announce (#%u)", (unsigned)i);
           return true;
@@ -1125,6 +1298,7 @@ bool feed_rx_once(int fd) {
   if (rc == 0) {
     sm_ctrl_event_t ev;
     while (sm_ctrl_take_event(&ev)) {
+      consume_async_event(ev); // T8
       if (ev.kind == SM_CTRL_EV_RESOLVE_DONE) {
         // **WiFi デバイスは IPv4 を運用アドレスにする**(T5 実機で確定):
         // esp-radio(Rust FW)は NS/マルチキャストを受信できず IPv6 の近隣解決が
@@ -1142,6 +1316,7 @@ bool feed_rx_once(int fd) {
           ESP_LOGI(TAG, "operational address pinned to IPv4 %s (responder source)", ip);
           sm_ctrl_event_t drop;
           while (sm_ctrl_take_event(&drop)) {
+            consume_async_event(drop); // T8
           }
         }
         return true;
@@ -1403,6 +1578,7 @@ bool drive_ble_phase(const sm_ui_op_t &op, uint64_t timeout_ms) {
     }
     sm_ctrl_event_t ev;
     while (sm_ctrl_take_event(&ev)) {
+      consume_async_event(ev); // T8
       if (ev.kind == SM_CTRL_EV_PAIR_PHASE) {
         ESP_LOGI(TAG, "  BLE phase %u", ev.phase);
         sm_ui_snapshot_t *s = sm_app_lock();
@@ -1504,6 +1680,7 @@ void do_pair_ble(const sm_ui_op_t &op) {
     pump_once(g_udp, 200); // 進行中の交換を進めて畳ませる
     sm_ctrl_event_t drop;
     while (sm_ctrl_take_event(&drop)) {
+      consume_async_event(drop); // T8
     }
   }
   if (rc != 0) {
@@ -1528,6 +1705,7 @@ void do_pair_ble(const sm_ui_op_t &op) {
   {
     sm_ctrl_event_t stale;
     while (sm_ctrl_take_event(&stale)) {
+      consume_async_event(stale); // T8
     }
   }
 
@@ -1814,6 +1992,13 @@ void pump_task(void *) {
 
     // 操作が無い間も UDP は回す(MRP の ACK / 再送で無音にならないように)。
     pump_once(g_udp, 50);
+    // T8(§16.3): デバイス発の購読レポート / 購読喪失をここで拾う。
+    {
+      sm_ctrl_event_t aev;
+      while (sm_ctrl_take_event(&aev)) {
+        consume_async_event(aev);
+      }
+    }
 
     uint64_t now = now_ms();
     // T6: 鮮度表示の基準時刻だけは細かく進める(500ms。lock は取るが中身は 1 語)。
@@ -1848,12 +2033,30 @@ void pump_task(void *) {
       size_t count = s->node_count;
       sm_app_unlock();
       if (count > 0) {
-        // バックオフ中でないノードを 1 件選ぶ(全員バックオフ中ならスキップ)。
+        // T8(§16.3): 購読の生死をシムに合わせ直す(喪失イベントを取りこぼしても
+        // ここで NONE に戻り、次の tick から従来 read + 再購読に落ちる)。
+        {
+          sm_ui_snapshot_t *s2 = sm_app_lock();
+          for (size_t i = 0; i < s2->node_count && i < SM_UI_MAX_NODES; ++i) {
+            bool active = sm_ctrl_is_subscribed(s2->nodes[i].node_id);
+            if (!active && g_sub[i] == SUB_ACTIVE) {
+              g_sub_retry_until[i] = 0;
+            }
+            g_sub[i] = active ? (uint8_t)SUB_ACTIVE : (uint8_t)SUB_NONE;
+            s2->nodes[i].subscribed = active ? 1 : 0;
+          }
+          sm_app_unlock();
+        }
+        // バックオフ中でない **未購読の** ノードを 1 件選ぶ(購読中のノードは
+        // 周期 read しない = keep-alive はコア任せ。全員対象外ならスキップ)。
         uint64_t id = 0;
         size_t slot = 0;
         for (size_t tries = 0; tries < count; ++tries) {
           size_t idx = poll_index % count;
           poll_index = (poll_index + 1) % count;
+          if (idx < SM_UI_MAX_NODES && g_sub[idx] == SUB_ACTIVE) {
+            continue;
+          }
           if (idx < SM_UI_MAX_NODES && now < g_backoff_until[idx]) {
             continue;
           }
@@ -1869,6 +2072,22 @@ void pump_task(void *) {
           // (AirQuality → OnOff の 2 read。以後は NVS キャッシュで再判定しない)。
           bool ok;
           uint8_t kind = node_kind(id);
+          // T8(§16.3): 種別が確定していて未購読なら、**この 1 周期を購読確立に使う**。
+          // 成立すれば以後の周期 read は止まり、表示はレポートで更新される。
+          // 失敗したら 2 分は再試行を控え、その間の表示は従来 read が賄う。
+          if (kind != SM_UI_KIND_UNKNOWN && slot < SM_UI_MAX_NODES &&
+              g_sub[slot] == SUB_NONE && now >= g_sub_retry_until[slot]) {
+            bool sub_ok = do_subscribe_node(id, kind, 20000);
+            g_sub[slot] = sub_ok ? (uint8_t)SUB_ACTIVE : (uint8_t)SUB_NONE;
+            g_sub_retry_until[slot] = sub_ok ? 0 : now + 120000;
+            set_node_subscribed(id, sub_ok);
+            set_node_note(id, sub_ok ? "subscribed" : "subscribe failed");
+            if (sub_ok) {
+              g_backoff_until[slot] = 0; // 通信は成立している
+            }
+            set_node_busy(id, false);
+            continue; // read はしない(成功ならプライミング、失敗なら次の tick で read)
+          }
           if (kind == SM_UI_KIND_UNKNOWN) {
             ok = resolve_node_kind(id, 10000) != SM_UI_KIND_UNKNOWN;
           } else if (kind == SM_UI_KIND_SENSOR) {

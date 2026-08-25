@@ -89,6 +89,11 @@ struct sm_ui_node_t {
   // --- T4: ノード種別とセンサ値(§12.3 の 4)---
   uint8_t kind; // sm_ui_node_kind_t
 
+  // --- T8: 属性 Subscribe(§16.3)---
+  // 1 = このノードへの購読が生きている(= 周期 read を止めており、表示は
+  // デバイス発レポートで更新される)。0 = 未購読(従来の交互 read)。
+  uint8_t subscribed;
+
   // 「未取得 / null」は has_* = 0 で表す(値そのものに番兵を使わない)。
   uint8_t aq;         // AirQualityEnum 0..6(0 = Unknown)
   uint8_t has_aq;     //

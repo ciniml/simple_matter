@@ -107,8 +107,13 @@ typedef enum {
   SM_CTRL_EV_SUBSCRIBE_DONE = 14,
   // Subscribe 開始に失敗した(`node_id`)。
   SM_CTRL_EV_SUBSCRIBE_FAILED = 15,
-  // 購読レポートを受理した(`node_id`、`value_u64` / `value_is_null` に最新スカラ値)。
+  // 購読レポートを受理した(§16.2)。`node_id` + `endpoint` / `cluster` / `attribute` が
+  // 対象パス、`value_u64` / `value_is_null` が最新スカラ値。1 通のレポートに複数属性が
+  // 載っていれば **属性ごとに 1 イベント**。`phase` = 購読 ID 下位 8bit(診断用)。
   SM_CTRL_EV_REPORT = 16,
+  // 購読が失われた(keep-alive 途絶。§16.2)。`node_id`、`value_u64` = 購読 ID。
+  // シムの購読テーブルからは除去済みなので、C++ 側は poll フォールバック / 再購読へ。
+  SM_CTRL_EV_SUBSCRIPTION_LOST = 17,
 } sm_ctrl_event_kind_t;
 
 // アプリイベント種別(`docs/design/c-ffi-shim.md` §1)。
@@ -290,6 +295,22 @@ typedef struct {
   uint32_t scope_id;
 } sm_addr_t;
 
+// 各プールの使用量([`sm_pool_stats`])。C 側 `sm_pool_stats_t` と同レイアウト。
+typedef struct {
+  // exchange 会話数 / 容量。
+  uint16_t exchanges;
+  uint16_t exchanges_cap;
+  // セッション数(平文・予約含む)/ 容量。
+  uint16_t sessions;
+  uint16_t sessions_cap;
+  // 進行中ハンドシェイク数 / 容量。
+  uint16_t handshakes;
+  uint16_t handshakes_cap;
+  // 使用中の再送バッファ数 / 容量。
+  uint16_t tx_bufs;
+  uint16_t tx_bufs_cap;
+} sm_pool_stats_t;
+
 // アプリイベント(立った順にリングから取り出す)。
 typedef struct {
   sm_event_kind_t kind;
@@ -393,7 +414,23 @@ typedef struct {
   bool value_is_null;
   // CASE が resumption(Sigma2Resume)経由で確立したか(CASE_ESTABLISHED)。
   bool resumed;
+  // 対象パスのエンドポイント(REPORT のみ有効。§16.2)。
+  uint16_t endpoint;
+  // 対象パスのクラスタ(REPORT のみ有効)。
+  uint32_t cluster;
+  // 対象パスの属性(REPORT のみ有効)。
+  uint32_t attribute;
 } sm_ctrl_event_t;
+
+// 購読する属性パス 1 本(`sm_ctrl_subscribe_paths` の引数。§16.2)。
+typedef struct {
+  // エンドポイント ID。
+  uint16_t endpoint;
+  // クラスタ ID。
+  uint32_t cluster;
+  // 属性 ID。
+  uint32_t attribute;
+} sm_attr_path_t;
 
 #ifdef __cplusplus
 extern "C" {
@@ -418,18 +455,14 @@ size_t sm_poll(uint64_t now_ms,
                size_t tx_cap,
                sm_addr_t *tx_dst);
 
+// コアの各プール使用量を `out` に書く(診断用。未初期化・NULL は 0 埋め)。
+//
+// 実機で「受信はするが応答しない」枯渇状態(exchange / セッション / handshake slot)を
+// ログから見分けるための足場(2026-08-25 NanoC6 調査)。
+void sm_pool_stats(sm_pool_stats_t *out);
+
 // 次に sm_poll を呼ぶべき時刻(ms)。SM_NO_DEADLINE(=UINT64_MAX)= 期限なし。
 uint64_t sm_next_deadline(uint64_t now_ms);
-
-// コアの各プール使用量(診断用)。「受信はするが応答しない」枯渇状態
-// (exchange / セッション / handshake slot / 再送バッファ)をログから見分ける。
-typedef struct sm_pool_stats {
-  uint16_t exchanges, exchanges_cap;
-  uint16_t sessions, sessions_cap;
-  uint16_t handshakes, handshakes_cap;
-  uint16_t tx_bufs, tx_bufs_cap;
-} sm_pool_stats_t;
-void sm_pool_stats(sm_pool_stats_t *out);
 
 // DHCP 後のアドレス反映(A/AAAA 更新)。NULL は「未設定」。
 void sm_set_addrs(const uint8_t *ipv4, const uint8_t *ipv6_ll);
@@ -597,12 +630,6 @@ int32_t sm_ctrl_init(uint8_t *mem,
 // 二重 init 防止フラグを解除する(同一プロセスでの再初期化 = プロセス再起動相当が可能になる)。
 void sm_ctrl_deinit(void);
 
-// 進行中の運用操作(CASE 確立待ち / 応答待ち / pairing)を外部都合で中断し Idle に戻す。
-// C++ 側の待ち(run_until 等)がタイムアウトしたときに呼ぶ。呼ばないと不達ノード宛の
-// CASE が HANDSHAKE_TIMEOUT(60s)まで内部で粘り、その間の全操作が busy(-10)で弾かれる。
-// 戻り値: 1=中断した、0=元々 Idle、-1=未初期化。
-int32_t sm_ctrl_abort_op(void);
-
 // コミッショニングを開始する(UDP 直接 PASE。§11.1)。
 //
 // 戻り値: 0=OK、-1=未初期化/NULL、-2=busy(他トランザクション進行中)、-3=commission 拒否。
@@ -686,11 +713,9 @@ int32_t sm_ctrl_write_scalar(uint64_t node_id,
                              const sm_attr_value_t *value,
                              uint64_t now_ms);
 
-// 運用ノードのスカラ属性を subscribe する(§11.1 の拡張)。
+// 運用ノードのスカラ属性 1 本を subscribe する([`sm_ctrl_subscribe_paths`] の薄いラッパ)。
 //
-// プライミング完了で SUBSCRIBE_DONE(`value_u64` = 購読 ID)、以降デバイス発レポートごとに
-// SM_CTRL_EV_REPORT(`value_u64` / `value_is_null` = 最新値)。購読は 1 本のみ保持する。
-// 戻り値: 0=OK、-1=未初期化、-3=未知ノード、-4=CASE 開始失敗、-10=busy。
+// 戻り値・イベントは [`sm_ctrl_subscribe_paths`] と同じ。
 int32_t sm_ctrl_subscribe(uint64_t node_id,
                           uint16_t endpoint,
                           uint32_t cluster,
@@ -698,6 +723,34 @@ int32_t sm_ctrl_subscribe(uint64_t node_id,
                           uint16_t min_interval_s,
                           uint16_t max_interval_s,
                           uint64_t now_ms);
+
+// 運用ノードの複数属性を **1 本の購読**で subscribe する(§16.2)。
+//
+// プライミング完了で、まず含まれる属性ごとに SM_CTRL_EV_REPORT(`node_id` +
+// `endpoint`/`cluster`/`attribute` + `value_u64`/`value_is_null`)、続いて
+// SUBSCRIBE_DONE(`value_u64` = 購読 ID)。以降のデバイス発レポートも属性ごとに
+// SM_CTRL_EV_REPORT。keep-alive 途絶で SM_CTRL_EV_SUBSCRIPTION_LOST。
+//
+// 同一ノードの既存購読があれば**先に捨てる**(二重購読しない)。購読テーブルは
+// コアと同容量(4 ノード分)、1 購読あたりのパスは 8 本まで。
+//
+// 戻り値: 0=OK、-1=未初期化 / NULL、-3=未知ノード、-4=CASE 開始失敗、-10=busy、
+// -11=パス数超過(0 本を含む)、-12=購読テーブル満杯。
+int32_t sm_ctrl_subscribe_paths(uint64_t node_id,
+                                const sm_attr_path_t *paths,
+                                size_t n,
+                                uint16_t min_interval_s,
+                                uint16_t max_interval_s,
+                                uint64_t now_ms);
+
+// ノードの購読をローカルで破棄する(§16.2)。戻り値 = 破棄した本数。
+//
+// デバイスへは何も送らない(相手側の購読は keep-alive 途絶で自然消滅する)。以降その
+// ノードのレポートは捨てられ、SM_CTRL_EV_SUBSCRIPTION_LOST も上がらない。
+int32_t sm_ctrl_unsubscribe(uint64_t node_id);
+
+// ノードの購読が生きていれば true(UI 表示・poll 抑止の判定用。§16.2)。
+bool sm_ctrl_is_subscribed(uint64_t node_id);
 
 // operational(`_matter._tcp`)解決クエリを生成する(§11.1)。戻り値 = クエリ長(0 = 失敗)。
 //
@@ -733,6 +786,18 @@ bool sm_ctrl_node_addr(uint64_t node_id,
 // 戻り値: 0=OK、-1=未初期化/NULL、-2=ノード帳に `node_id` なし。
 int32_t sm_ctrl_set_node_addr(uint64_t node_id,
                               const sm_addr_t *addr);
+
+// 進行中の運用操作を外部都合で中断し Idle に戻す(C++ の待ちがタイムアウトしたとき用)。
+//
+// 不達ノード宛の CASE は initiator の HANDSHAKE_TIMEOUT(60s)まで内部で粘り、
+// その間の全操作が busy(-10)で弾かれる(T5 実機)。ハンドシェイクスロット・予約
+// セッション・exchange は [`ControllerStack::abort_handshake`] で解放する。
+// 応答待ち中(AwaitOp)の IM トランザクションは [`ControllerStack::abort_op`] で畳み、
+// exchange を即時回収する(「MRP の諦めで自然解放」は要求が standalone ACK 済みだと
+// 成り立たず、exchange が永久に残る — 実機 2026-08-25 の「両デバイス不達」の真因)。
+//
+// 戻り値: 1=中断した、0=元々 Idle、-1=未初期化。
+int32_t sm_ctrl_abort_op(void);
 
 // 現在の管理ノード数(ノード帳のエントリ数)。
 size_t sm_ctrl_node_count(void);

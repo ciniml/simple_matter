@@ -142,6 +142,7 @@ struct NodeRowWidgets {
   lv_obj_t *lbl_addr = nullptr;
   lv_obj_t *lbl_sensor = nullptr; // センサ行の 2 行目サマリ(照明行では隠す)
   lv_obj_t *badge = nullptr;
+  lv_obj_t *lbl_sub = nullptr; // T8: 購読中マーカ("* sub")
   lv_obj_t *lbl_note = nullptr;
   lv_obj_t *btn_toggle = nullptr;
 };
@@ -531,8 +532,8 @@ void build_node_row(size_t idx) {
   // ROW_H は 96 のまま(20+14+16 の 3 行 = 約 60px < ROW_H-20)。
   lv_obj_t *col = lv_obj_create(w.root);
   lv_obj_remove_style_all(col);
-  // 幅は行の総和が画面に収まるように: 480 + 150(badge) + 120(note) + 160 + 120 + 150
-  // (ボタン)+ 隙間 12×5 = 1240 < 1280。
+  // 幅は行の総和が画面に収まるように: 480 + 150(badge) + 40(sub) + 120(note) +
+  // 130 + 120 + 150(ボタン)+ 隙間 12×6 = 1262 < 1280。
   lv_obj_set_size(col, 480, ROW_H - 20);
   lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
@@ -550,11 +551,15 @@ void build_node_row(size_t idx) {
   lv_obj_center(bl);
   lv_obj_set_user_data(w.badge, bl);
 
+  // T8(§16.3): 購読中の行に小さなマーカを出す(未購読なら空)。
+  w.lbl_sub = make_label(w.root, &lv_font_montserrat_14, COL_ACCENT, "");
+  lv_obj_set_width(w.lbl_sub, 40);
+
   w.lbl_note = make_label(w.root, &lv_font_montserrat_14, COL_DIM, "");
   lv_obj_set_width(w.lbl_note, 120);
 
   void *ud = (void *)(uintptr_t)idx;
-  w.btn_toggle = make_button(w.root, "Toggle", 160, COL_ACCENT, on_toggle, ud);
+  w.btn_toggle = make_button(w.root, "Toggle", 130, COL_ACCENT, on_toggle, ud);
   make_button(w.root, "Read", 120, COL_OFF, on_read, ud);
   make_button(w.root, LV_SYMBOL_REFRESH " Addr", 150, COL_OFF, on_refresh_addr, ud);
 }
@@ -704,6 +709,7 @@ void refresh_devices() {
     // Toggle は照明行だけ(センサに OnOff は無い)。隠した要素は flex 配置から外れる。
     lv_obj_set_flag(w.btn_toggle, LV_OBJ_FLAG_HIDDEN, sensor);
 
+    lv_label_set_text(w.lbl_sub, n.subscribed ? "* sub" : "");
     lv_label_set_text(w.lbl_note, n.busy ? "working ..." : n.note);
   }
 }

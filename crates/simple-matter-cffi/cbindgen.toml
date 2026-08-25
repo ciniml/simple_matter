@@ -49,6 +49,8 @@ exclude = [
   "Activity",
   "PendingOp",
   "NodeEntry",
+  "SubEntry",
+  "SubPath",
   "TxItem",
   "CtrlBackend",
   "CCreds",

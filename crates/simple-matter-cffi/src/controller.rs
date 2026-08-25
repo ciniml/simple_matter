@@ -44,7 +44,7 @@ use simple_matter::crypto::rustcrypto::RustCrypto;
 use simple_matter::discovery::client::MdnsClient;
 use simple_matter::discovery::{MATTER_PORT, MDNS_PORT};
 use simple_matter::dm::meta::{AttributeId, ClusterId, CommandId, EndpointId};
-use simple_matter::im::client::{AttrReports, ImClient, ImEvent};
+use simple_matter::im::client::{AttrReports, ImClient, ImEvent, MAX_CLIENT_SUBSCRIPTIONS};
 use simple_matter::im::wire::{AttributePath, AttributeReportRef, CommandPath};
 use simple_matter::kvs::Kvs;
 use simple_matter::sc::case::common::{CASE_RESUMPTION_ID_LEN, SHARED_SECRET_LEN};
@@ -87,8 +87,11 @@ const CTRL_RESULT: usize = 1280;
 const MAX_NODES: usize = 8;
 /// 内部 TX キュー段数(コミッショナ駆動で 1 サイクルに複数の送信が生じるため)。
 const TX_Q_CAP: usize = 4;
-/// イベントリング容量(コミッショニングはフェーズごとにイベントを積む)。
-const EV_CAP: usize = 16;
+/// イベントリング容量(コミッショニングはフェーズごとにイベントを積む。センサ 1 レポート =
+/// 5 属性 → 5 イベントになるため、購読の一般化(§16.2)に合わせて 32 段へ広げた)。
+const EV_CAP: usize = 32;
+/// 1 購読に載せられる属性パス数の上限(AirQ センサ 5 属性 + 余裕。§16.2)。
+const SUB_MAX_PATHS: usize = 8;
 /// 1 回の invoke に渡せる引数(context tag 0..)の上限。
 pub const MAX_OP_ARGS: usize = 4;
 /// BTP central の window(コアの参照実装 `ble-commissioner.rs` / デバイス側シムと同じ 6)。
@@ -183,8 +186,25 @@ pub enum sm_ctrl_event_kind_t {
     SM_CTRL_EV_SUBSCRIBE_DONE = 14,
     /// Subscribe 開始に失敗した(`node_id`)。
     SM_CTRL_EV_SUBSCRIBE_FAILED = 15,
-    /// 購読レポートを受理した(`node_id`、`value_u64` / `value_is_null` に最新スカラ値)。
+    /// 購読レポートを受理した(§16.2)。`node_id` + `endpoint` / `cluster` / `attribute` が
+    /// 対象パス、`value_u64` / `value_is_null` が最新スカラ値。1 通のレポートに複数属性が
+    /// 載っていれば **属性ごとに 1 イベント**。`phase` = 購読 ID 下位 8bit(診断用)。
     SM_CTRL_EV_REPORT = 16,
+    /// 購読が失われた(keep-alive 途絶。§16.2)。`node_id`、`value_u64` = 購読 ID。
+    /// シムの購読テーブルからは除去済みなので、C++ 側は poll フォールバック / 再購読へ。
+    SM_CTRL_EV_SUBSCRIPTION_LOST = 17,
+}
+
+/// 購読する属性パス 1 本(`sm_ctrl_subscribe_paths` の引数。§16.2)。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct sm_attr_path_t {
+    /// エンドポイント ID。
+    pub endpoint: u16,
+    /// クラスタ ID。
+    pub cluster: u32,
+    /// 属性 ID。
+    pub attribute: u32,
 }
 
 /// コントローライベント(立った順にリングから取り出す)。
@@ -207,6 +227,12 @@ pub struct sm_ctrl_event_t {
     pub value_is_null: bool,
     /// CASE が resumption(Sigma2Resume)経由で確立したか(CASE_ESTABLISHED)。
     pub resumed: bool,
+    /// 対象パスのエンドポイント(REPORT のみ有効。§16.2)。
+    pub endpoint: u16,
+    /// 対象パスのクラスタ(REPORT のみ有効)。
+    pub cluster: u32,
+    /// 対象パスの属性(REPORT のみ有効)。
+    pub attribute: u32,
 }
 
 // ==========================================================================
@@ -232,14 +258,26 @@ enum PendingOp {
         cluster: u32,
         attr: u32,
     },
-    /// 単一属性 Subscribe(プライミング完了で SUBSCRIBE_DONE)。
+    /// 複数パス Subscribe(パスは `CtrlShim::pending_sub_paths`。プライミング完了で
+    /// priming の REPORT 群 → SUBSCRIBE_DONE の順にイベントを積む。§16.2)。
     Subscribe {
-        ep: u16,
-        cluster: u32,
-        attr: u32,
         min_s: u16,
         max_s: u16,
     },
+}
+
+/// 購読 1 本の属性パス(endpoint, cluster, attribute)。
+type SubPath = (u16, u32, u32);
+
+/// 確立済み購読 1 本(§16.2)。ノードごと複数パスを 1 購読に載せる。
+#[cfg_attr(test, derive(Debug))]
+struct SubEntry {
+    /// コアが払い出した購読 ID。
+    id: u32,
+    /// 対象ノードの運用 NodeId(レポートの振り分けに使う)。
+    node_id: u64,
+    /// 購読したパス(レポートのフィルタに使う)。
+    paths: heapless::Vec<SubPath, SUB_MAX_PATHS>,
 }
 
 /// コントローラの活動状態(単一トランザクションを直列実行する)。
@@ -303,8 +341,10 @@ struct CtrlShim {
     last_pair_phase: u8,
     /// 進行中の operation の引数(invoke 引数 / write 値)。単一トランザクション直列なので 1 組。
     op_args: heapless::Vec<sm_attr_value_t, MAX_OP_ARGS>,
-    /// 購読中のパス(SubscriptionReport の値抽出に使う)。
-    sub_path: Option<(u16, u32, u32)>,
+    /// 確立済み購読テーブル(コアの `MAX_CLIENT_SUBSCRIPTIONS` と同容量。§16.2)。
+    subs: heapless::Vec<SubEntry, MAX_CLIENT_SUBSCRIPTIONS>,
+    /// 進行中 Subscribe の引数パス(`op_args` と同格。SUBSCRIBE_DONE でテーブルへ移す)。
+    pending_sub_paths: heapless::Vec<SubPath, SUB_MAX_PATHS>,
     // --- BLE central(F7b、§11.4)。BTP central を C++ の NimBLE central から給餌する ---
     /// BTP central 状態機械(同時 1 接続。デバイス側シムの鏡像)。
     #[cfg(feature = "ble")]
@@ -406,6 +446,9 @@ impl CtrlShim {
             value_u64: 0,
             value_is_null: false,
             resumed: false,
+            endpoint: 0,
+            cluster: 0,
+            attribute: 0,
         }
     }
 
@@ -537,7 +580,7 @@ fn resumption_key(node_id: u64, out: &mut [u8; 19]) {
 /// 現在の活動状態を 1 ステップ進める(rx / poll のたびに呼ぶ)。送信は TX キューへ積む。
 fn pump(s: &mut CtrlShim, now: u64) {
     match s.activity {
-        Activity::Idle => drain_subscription_reports(s),
+        Activity::Idle => drain_sub_events(s),
         Activity::Pairing { node_id, addr } => drive_pairing(s, node_id, addr, now),
         Activity::Connecting { node_id, addr, op } => drive_connecting(s, node_id, addr, op, now),
         Activity::AwaitOp { node_id, op } => drive_awaitop(s, node_id, op),
@@ -640,6 +683,10 @@ fn drive_connecting(s: &mut CtrlShim, node_id: u64, addr: SocketAddr, op: Pendin
         }
         _ => {}
     }
+    // CASE 確立待ちの最中に届いた購読レポートも落とさない(§16.2)。
+    if matches!(s.activity, Activity::Connecting { .. }) {
+        drain_sub_events(s);
+    }
 }
 
 /// 運用トランザクションの応答(IM イベント)を処理する。
@@ -647,6 +694,10 @@ fn drive_awaitop(s: &mut CtrlShim, node_id: u64, op: PendingOp) {
     let Some(ev) = s.stack.im_take_event() else {
         return;
     };
+    // op 進行中に割り込んだ購読イベントは捨てずに処理し、op はそのまま待ち続ける(§16.2)。
+    if handle_sub_event(s, &ev) {
+        return;
+    }
     match (op, ev) {
         (PendingOp::Invoke { .. }, ImEvent::InvokeDone { status }) => {
             let kind = if status.is_success() {
@@ -692,23 +743,21 @@ fn drive_awaitop(s: &mut CtrlShim, node_id: u64, op: PendingOp) {
             s.activity = Activity::Idle;
         }
         (
-            PendingOp::Subscribe {
-                ep, cluster, attr, ..
-            },
+            PendingOp::Subscribe { .. },
             ImEvent::SubscribeDone {
                 subscription_id, ..
             },
         ) => {
-            s.sub_path = Some((ep, cluster, attr));
+            register_subscription(s, node_id, subscription_id);
+            // プライミングレポートの各属性を **SUBSCRIBE_DONE の前に** REPORT として積む
+            // (初期値が READ と同じ経路で表示に入る。§16.2)。
+            if let Some(idx) = sub_index_by_id(s, subscription_id) {
+                let items = collect_priming_values(s);
+                emit_sub_reports(s, idx, &items);
+            }
             let mut e = CtrlShim::ev(sm_ctrl_event_kind_t::SM_CTRL_EV_SUBSCRIBE_DONE);
             e.node_id = node_id;
             e.value_u64 = subscription_id as u64;
-            // プライミングレポートの値を READ 同様に載せる(初期値の確認用)。
-            if let Some((v, is_null)) = sub_scalar_value(s, ep, cluster, attr) {
-                e.value_is_null = is_null;
-                e.status = 0;
-                let _ = v;
-            }
             s.push_event(e);
             s.activity = Activity::Idle;
         }
@@ -753,6 +802,7 @@ fn issue_op(
 ) -> simple_matter::error::Result<SendDirective> {
     // クロージャがスタックを可変借用するため、引数はローカルへコピーしてから渡す。
     let args = s.op_args.clone();
+    let sub_paths = s.pending_sub_paths.clone();
     match op {
         PendingOp::Invoke { ep, cluster, cmd } => s.stack.start_invoke(
             session,
@@ -789,24 +839,21 @@ fn issue_op(
                 scratch,
             )
         }
-        PendingOp::Subscribe {
-            ep,
-            cluster,
-            attr,
-            min_s,
-            max_s,
-        } => s.stack.start_subscribe(
-            session,
-            &[AttributePath::concrete(
-                EndpointId(ep),
-                ClusterId(cluster),
-                AttributeId(attr),
-            )],
-            min_s,
-            max_s,
-            now,
-            scratch,
-        ),
+        PendingOp::Subscribe { min_s, max_s } => {
+            let mut paths: heapless::Vec<AttributePath, SUB_MAX_PATHS> = heapless::Vec::new();
+            for (ep, cluster, attr) in sub_paths.iter().copied() {
+                let _ = paths.push(AttributePath::concrete(
+                    EndpointId(ep),
+                    ClusterId(cluster),
+                    AttributeId(attr),
+                ));
+            }
+            if paths.is_empty() {
+                return Err(simple_matter::error::Error::InvalidState);
+            }
+            s.stack
+                .start_subscribe(session, &paths, min_s, max_s, now, scratch)
+        }
     }
 }
 
@@ -853,32 +900,128 @@ fn error_code(e: simple_matter::error::Error) -> u8 {
     }
 }
 
-/// 直近 Read 応答から対象属性のスカラ値を取り出す(u64 ビットパターン + null フラグ)。
-fn sub_scalar_value(s: &CtrlShim, ep: u16, cluster: u32, attr: u32) -> Option<(u64, bool)> {
-    scalar_from_reports(s.stack.sub_reports(), ep, cluster, attr)
+// ==========================================================================
+// 購読テーブル(§16.2): ノード複数 × パス複数
+// ==========================================================================
+
+/// 購読 ID からテーブル添字を引く。
+fn sub_index_by_id(s: &CtrlShim, id: u32) -> Option<usize> {
+    s.subs.iter().position(|e| e.id == id)
 }
 
-/// アイドル中に届いた購読レポートを [`sm_ctrl_event_kind_t::SM_CTRL_EV_REPORT`] へ写す。
-fn drain_subscription_reports(s: &mut CtrlShim) {
-    while let Some(ev) = s.stack.im_take_event() {
-        match ev {
-            ImEvent::SubscriptionReport { subscription_id } => {
-                let mut e = CtrlShim::ev(sm_ctrl_event_kind_t::SM_CTRL_EV_REPORT);
+/// ノードの購読エントリを全て捨てる(戻り値 = 捨てた本数)。
+fn drop_subs_for_node(s: &mut CtrlShim, node_id: u64) -> usize {
+    let before = s.subs.len();
+    s.subs.retain(|e| e.node_id != node_id);
+    before - s.subs.len()
+}
+
+/// SUBSCRIBE_DONE で購読テーブルへ登録する(同一ノードの旧エントリは先に捨てる)。
+fn register_subscription(s: &mut CtrlShim, node_id: u64, id: u32) {
+    drop_subs_for_node(s, node_id);
+    // 満杯なら最古を捨てる(API 側で事前検査するが、素の sm_ctrl_subscribe 経由の保険)。
+    if s.subs.is_full() {
+        let _ = s.subs.swap_remove(0);
+    }
+    let paths = core::mem::take(&mut s.pending_sub_paths);
+    let _ = s.subs.push(SubEntry { id, node_id, paths });
+}
+
+/// 直近の購読レポート本文から (パス, 値, null) を取り出す(借用を切ってから push する)。
+fn collect_sub_values(s: &CtrlShim) -> heapless::Vec<(SubPath, u64, bool), SUB_MAX_PATHS> {
+    collect_values(s.stack.sub_reports())
+}
+
+/// プライミングレポート(Subscribe トランザクションの ReportData)から同上を取り出す。
+///
+/// コアはプライミング分を **read と同じ結果バッファ**へ積む(`sub_report` は確立後の
+/// デバイス発レポート専用)ので、SUBSCRIBE_DONE 時はこちらを見る。
+fn collect_priming_values(s: &CtrlShim) -> heapless::Vec<(SubPath, u64, bool), SUB_MAX_PATHS> {
+    collect_values(s.stack.read_reports())
+}
+
+/// AttributeReportIB 列から (パス, 値, null) を取り出す(read / subscribe 共通)。
+fn collect_values(reports: AttrReports<'_>) -> heapless::Vec<(SubPath, u64, bool), SUB_MAX_PATHS> {
+    let mut out: heapless::Vec<(SubPath, u64, bool), SUB_MAX_PATHS> = heapless::Vec::new();
+    for report in reports {
+        let Ok(AttributeReportRef::Data(d)) = report else {
+            continue;
+        };
+        let Some(c) = d.path.to_concrete() else {
+            continue;
+        };
+        let mut v = d.value();
+        let Ok(Some(e)) = v.read_next() else {
+            continue;
+        };
+        let (val, is_null) = scalar_from_tlv(&e.value);
+        if out
+            .push(((c.endpoint.0, c.cluster.0, c.attribute.0), val, is_null))
+            .is_err()
+        {
+            break;
+        }
+    }
+    out
+}
+
+/// 取り出した属性値を購読テーブルのパスで濾し、**属性ごとに 1 件**の REPORT を積む。
+fn emit_sub_reports(s: &mut CtrlShim, idx: usize, items: &[(SubPath, u64, bool)]) {
+    let Some(entry) = s.subs.get(idx) else {
+        return;
+    };
+    let node_id = entry.node_id;
+    let phase = (entry.id & 0xFF) as u8;
+    let paths = entry.paths.clone();
+    for &((ep, cluster, attr), val, is_null) in items {
+        if !paths.contains(&(ep, cluster, attr)) {
+            continue; // 購読していないパス(ワイルドカードの巻き添え等)は捨てる。
+        }
+        let mut e = CtrlShim::ev(sm_ctrl_event_kind_t::SM_CTRL_EV_REPORT);
+        e.phase = phase;
+        e.node_id = node_id;
+        e.endpoint = ep;
+        e.cluster = cluster;
+        e.attribute = attr;
+        e.value_u64 = val;
+        e.value_is_null = is_null;
+        s.push_event(e);
+    }
+}
+
+/// 購読系 IM イベント(レポート / ロスト)を一手に処理する(§16.2)。
+///
+/// 戻り値 `true` = 購読イベントとして処理した(呼び出し側は op の応答として扱わない)。
+/// Idle / op 進行中 / CASE 確立中のいずれの `im_take_event` 経路からも呼ぶ。
+fn handle_sub_event(s: &mut CtrlShim, ev: &ImEvent) -> bool {
+    match *ev {
+        ImEvent::SubscriptionReport { subscription_id } => {
+            if let Some(idx) = sub_index_by_id(s, subscription_id) {
+                let items = collect_sub_values(s);
+                emit_sub_reports(s, idx, &items);
+            }
+            true
+        }
+        ImEvent::SubscriptionLost { subscription_id } => {
+            if let Some(idx) = sub_index_by_id(s, subscription_id) {
+                let entry = s.subs.swap_remove(idx);
+                let mut e = CtrlShim::ev(sm_ctrl_event_kind_t::SM_CTRL_EV_SUBSCRIPTION_LOST);
+                e.node_id = entry.node_id;
+                e.value_u64 = subscription_id as u64;
                 e.phase = (subscription_id & 0xFF) as u8;
-                if let Some((ep, cluster, attr)) = s.sub_path {
-                    e.node_id = s.nodes.first().map(|n| n.node_id).unwrap_or(0);
-                    if let Some((v, is_null)) = sub_scalar_value(s, ep, cluster, attr) {
-                        e.value_u64 = v;
-                        e.value_is_null = is_null;
-                    }
-                }
                 s.push_event(e);
             }
-            ImEvent::SubscriptionLost { .. } => {
-                s.sub_path = None;
-            }
-            _ => {}
+            true
         }
+        _ => false,
+    }
+}
+
+/// 溜まった IM イベントを排出し、購読系だけをイベントリングへ写す(Idle / CASE 確立中)。
+fn drain_sub_events(s: &mut CtrlShim) {
+    while let Some(ev) = s.stack.im_take_event() {
+        // 購読系以外(進行中 op を持たない状態で届いた残骸)は従来どおり捨てる。
+        let _ = handle_sub_event(s, &ev);
     }
 }
 
@@ -1084,7 +1227,8 @@ pub extern "C" fn sm_ctrl_init(
         addr_of_mut!((*sp).compressed_fabric).write(compressed);
         addr_of_mut!((*sp).last_pair_phase).write(u8::MAX);
         addr_of_mut!((*sp).op_args).write(heapless::Vec::new());
-        addr_of_mut!((*sp).sub_path).write(None);
+        addr_of_mut!((*sp).subs).write(heapless::Vec::new());
+        addr_of_mut!((*sp).pending_sub_paths).write(heapless::Vec::new());
         #[cfg(feature = "ble")]
         {
             addr_of_mut!((*sp).btp).write(Btp::new(BtpRole::Central));
@@ -1475,11 +1619,9 @@ pub extern "C" fn sm_ctrl_write_scalar(
     rc
 }
 
-/// 運用ノードのスカラ属性を subscribe する(§11.1 の拡張)。
+/// 運用ノードのスカラ属性 1 本を subscribe する([`sm_ctrl_subscribe_paths`] の薄いラッパ)。
 ///
-/// プライミング完了で SUBSCRIBE_DONE(`value_u64` = 購読 ID)、以降デバイス発レポートごとに
-/// SM_CTRL_EV_REPORT(`value_u64` / `value_is_null` = 最新値)。購読は 1 本のみ保持する。
-/// 戻り値: 0=OK、-1=未初期化、-3=未知ノード、-4=CASE 開始失敗、-10=busy。
+/// 戻り値・イベントは [`sm_ctrl_subscribe_paths`] と同じ。
 #[no_mangle]
 pub extern "C" fn sm_ctrl_subscribe(
     node_id: u64,
@@ -1490,19 +1632,64 @@ pub extern "C" fn sm_ctrl_subscribe(
     max_interval_s: u16,
     now_ms: u64,
 ) -> i32 {
-    if !CTRL_INITED.load(Ordering::SeqCst) {
+    let path = sm_attr_path_t {
+        endpoint,
+        cluster,
+        attribute,
+    };
+    sm_ctrl_subscribe_paths(node_id, &path, 1, min_interval_s, max_interval_s, now_ms)
+}
+
+/// 運用ノードの複数属性を **1 本の購読**で subscribe する(§16.2)。
+///
+/// プライミング完了で、まず含まれる属性ごとに SM_CTRL_EV_REPORT(`node_id` +
+/// `endpoint`/`cluster`/`attribute` + `value_u64`/`value_is_null`)、続いて
+/// SUBSCRIBE_DONE(`value_u64` = 購読 ID)。以降のデバイス発レポートも属性ごとに
+/// SM_CTRL_EV_REPORT。keep-alive 途絶で SM_CTRL_EV_SUBSCRIPTION_LOST。
+///
+/// 同一ノードの既存購読があれば**先に捨てる**(二重購読しない)。購読テーブルは
+/// コアと同容量(4 ノード分)、1 購読あたりのパスは 8 本まで。
+///
+/// 戻り値: 0=OK、-1=未初期化 / NULL、-3=未知ノード、-4=CASE 開始失敗、-10=busy、
+/// -11=パス数超過(0 本を含む)、-12=購読テーブル満杯。
+#[no_mangle]
+pub extern "C" fn sm_ctrl_subscribe_paths(
+    node_id: u64,
+    paths: *const sm_attr_path_t,
+    n: usize,
+    min_interval_s: u16,
+    max_interval_s: u16,
+    now_ms: u64,
+) -> i32 {
+    if !CTRL_INITED.load(Ordering::SeqCst) || paths.is_null() {
         return -1;
     }
-    // SAFETY: 単線契約。
+    if n == 0 || n > SUB_MAX_PATHS {
+        return -11;
+    }
+    // SAFETY: 単線契約。paths は n 要素を指す契約。
     let s = unsafe { ctrl_shim() };
+    if !matches!(s.activity, Activity::Idle) {
+        return -10; // busy(単一トランザクション直列。テーブルを触る前に弾く)。
+    }
+    // 同一ノードの旧購読は先に捨てる(二重購読しない)。
+    drop_subs_for_node(s, node_id);
+    if s.subs.is_full() {
+        return -12;
+    }
     s.op_args.clear();
+    s.pending_sub_paths.clear();
+    for i in 0..n {
+        // SAFETY: 上の契約。
+        let p = unsafe { *paths.add(i) };
+        let _ = s
+            .pending_sub_paths
+            .push((p.endpoint, p.cluster, p.attribute));
+    }
     let rc = start_operation(
         s,
         node_id,
         PendingOp::Subscribe {
-            ep: endpoint,
-            cluster,
-            attr: attribute,
             min_s: min_interval_s,
             max_s: max_interval_s,
         },
@@ -1510,8 +1697,35 @@ pub extern "C" fn sm_ctrl_subscribe(
     );
     if rc == 0 {
         pump(s, now_ms);
+    } else {
+        s.pending_sub_paths.clear();
     }
     rc
+}
+
+/// ノードの購読をローカルで破棄する(§16.2)。戻り値 = 破棄した本数。
+///
+/// デバイスへは何も送らない(相手側の購読は keep-alive 途絶で自然消滅する)。以降その
+/// ノードのレポートは捨てられ、SM_CTRL_EV_SUBSCRIPTION_LOST も上がらない。
+#[no_mangle]
+pub extern "C" fn sm_ctrl_unsubscribe(node_id: u64) -> i32 {
+    if !CTRL_INITED.load(Ordering::SeqCst) {
+        return 0;
+    }
+    // SAFETY: 単線契約。
+    let s = unsafe { ctrl_shim() };
+    drop_subs_for_node(s, node_id) as i32
+}
+
+/// ノードの購読が生きていれば true(UI 表示・poll 抑止の判定用。§16.2)。
+#[no_mangle]
+pub extern "C" fn sm_ctrl_is_subscribed(node_id: u64) -> bool {
+    if !CTRL_INITED.load(Ordering::SeqCst) {
+        return false;
+    }
+    // SAFETY: 単線契約。
+    let s = unsafe { ctrl_shim() };
+    s.subs.iter().any(|e| e.node_id == node_id)
 }
 
 /// operational(`_matter._tcp`)解決クエリを生成する(§11.1)。戻り値 = クエリ長(0 = 失敗)。
@@ -1690,6 +1904,8 @@ pub extern "C" fn sm_ctrl_abort_op() -> i32 {
     s.stack.abort_handshake();
     s.stack.abort_op();
     s.comm = None;
+    // 中断した Subscribe の引数を捨てる(次の Subscribe に混ざらないように。§16.2)。
+    s.pending_sub_paths.clear();
     #[cfg(feature = "ble")]
     {
         s.ble_hs_out.clear();
@@ -2238,6 +2454,9 @@ mod tests {
             value_u64: 0,
             value_is_null: false,
             resumed: false,
+            endpoint: 0,
+            cluster: 0,
+            attribute: 0,
         };
         assert!(!sm_ctrl_take_event(&mut ev));
 
@@ -2474,6 +2693,9 @@ mod tests {
                 value_u64: 0,
                 value_is_null: false,
                 resumed: false,
+                endpoint: 0,
+                cluster: 0,
+                attribute: 0,
             };
             assert!(sm_ctrl_take_event(&mut ev));
             assert_eq!(ev.kind, sm_ctrl_event_kind_t::SM_CTRL_EV_PAIR_PHASE);
@@ -2581,6 +2803,143 @@ mod tests {
 
             sm_ctrl_deinit();
         }
+
+        // --- T8 §16.2: 購読テーブル(ノード複数 × パス複数)の単体検証 ---
+        // (b) 2 ノードの購読を同時保持し、レポートが正しい node_id に振り分かれること、
+        // (c) keep-alive 途絶 → SUBSCRIPTION_LOST + テーブル除去、を確かめる。
+        // 実 IM レポート往復は loopback E2E(`tests/composed_e2e.rs`)側で担保し、
+        // ここでは購読テーブルと振り分けロジックを直接叩く(2 台のデバイスを
+        // 同一プロセスに立てられないため。デバイスシムは単一 static)。
+        assert_eq!(sm_ctrl_init(mem, size, &cfg, 0), 0);
+        {
+            // SAFETY: 初期化済み・単線。
+            let s = unsafe { ctrl_shim() };
+            let node_a: u64 = 0x1111;
+            let node_b: u64 = 0x2222;
+            let mut pa: heapless::Vec<SubPath, SUB_MAX_PATHS> = heapless::Vec::new();
+            pa.push((1, 0x0006, 0x0000)).unwrap();
+            let mut pb: heapless::Vec<SubPath, SUB_MAX_PATHS> = heapless::Vec::new();
+            pb.push((1, 0x040D, 0x0000)).unwrap();
+            pb.push((2, 0x0405, 0x0000)).unwrap();
+            s.subs
+                .push(SubEntry {
+                    id: 0x1001,
+                    node_id: node_a,
+                    paths: pa,
+                })
+                .unwrap();
+            s.subs
+                .push(SubEntry {
+                    id: 0x2002,
+                    node_id: node_b,
+                    paths: pb,
+                })
+                .unwrap();
+            assert!(sm_ctrl_is_subscribed(node_a));
+            assert!(sm_ctrl_is_subscribed(node_b));
+            assert!(!sm_ctrl_is_subscribed(0x3333));
+
+            // ノード B の購読 ID で 3 属性ぶんの値が届いた(1 本はパス外 = 捨てる)。
+            let idx_b = sub_index_by_id(s, 0x2002).unwrap();
+            let items = [
+                ((1u16, 0x040Du32, 0x0000u32), 812, false),
+                ((2u16, 0x0405u32, 0x0000u32), 0, true),
+                ((9u16, 0x0006u32, 0x0000u32), 1, false), // 購読していないパス。
+            ];
+            emit_sub_reports(s, idx_b, &items);
+            let mut got = Vec::new();
+            while sm_ctrl_take_event(&mut ev) {
+                got.push(ev);
+            }
+            assert_eq!(got.len(), 2, "パス外の属性は捨てる(属性ごとに 1 イベント)");
+            for e in &got {
+                assert_eq!(e.kind, sm_ctrl_event_kind_t::SM_CTRL_EV_REPORT);
+                assert_eq!(e.node_id, node_b, "購読 ID からノードを引く");
+                assert_eq!(e.phase, 0x02, "phase = 購読 ID 下位 8bit");
+            }
+            assert_eq!(
+                (got[0].endpoint, got[0].cluster, got[0].attribute),
+                (1, 0x040D, 0x0000)
+            );
+            assert_eq!(got[0].value_u64, 812);
+            assert!(got[1].value_is_null, "null 値もそのまま載る");
+
+            // ノード A の購読 ID なら node_a に振り分かれる。
+            let idx_a = sub_index_by_id(s, 0x1001).unwrap();
+            emit_sub_reports(s, idx_a, &[((1, 0x0006, 0x0000), 1, false)]);
+            assert!(sm_ctrl_take_event(&mut ev));
+            assert_eq!(ev.node_id, node_a);
+            assert_eq!(ev.value_u64, 1);
+            assert!(!sm_ctrl_take_event(&mut ev));
+
+            // (c) keep-alive 途絶 → SUBSCRIPTION_LOST + テーブルから除去。
+            assert!(handle_sub_event(
+                s,
+                &ImEvent::SubscriptionLost {
+                    subscription_id: 0x1001
+                }
+            ));
+            assert!(sm_ctrl_take_event(&mut ev));
+            assert_eq!(ev.kind, sm_ctrl_event_kind_t::SM_CTRL_EV_SUBSCRIPTION_LOST);
+            assert_eq!(ev.node_id, node_a);
+            assert_eq!(ev.value_u64, 0x1001);
+            assert!(!sm_ctrl_is_subscribed(node_a), "テーブルから除去済み");
+            assert!(sm_ctrl_is_subscribed(node_b), "他ノードの購読は残る");
+            // 未知 ID のロストは無視(イベントを積まない)。
+            assert!(handle_sub_event(
+                s,
+                &ImEvent::SubscriptionLost {
+                    subscription_id: 0xDEAD
+                }
+            ));
+            assert!(!sm_ctrl_take_event(&mut ev));
+            // 未知 ID のレポートも捨てる。
+            assert!(handle_sub_event(
+                s,
+                &ImEvent::SubscriptionReport {
+                    subscription_id: 0xDEAD
+                }
+            ));
+            assert!(!sm_ctrl_take_event(&mut ev));
+            // 購読系以外は「未処理」として返す(op の応答として扱われる)。
+            assert!(!handle_sub_event(s, &ImEvent::ReadDone));
+
+            // ローカル解除は本数を返し、冪等。
+            assert_eq!(sm_ctrl_unsubscribe(node_b), 1);
+            assert_eq!(sm_ctrl_unsubscribe(node_b), 0);
+            assert!(!sm_ctrl_is_subscribed(node_b));
+
+            // 購読テーブル満杯 → -12(コアと同容量 = MAX_CLIENT_SUBSCRIPTIONS)。
+            for i in 0..MAX_CLIENT_SUBSCRIPTIONS {
+                s.subs
+                    .push(SubEntry {
+                        id: 0x100 + i as u32,
+                        node_id: 0xF000 + i as u64,
+                        paths: heapless::Vec::new(),
+                    })
+                    .unwrap();
+            }
+            let path = sm_attr_path_t {
+                endpoint: 1,
+                cluster: 0x0006,
+                attribute: 0,
+            };
+            assert_eq!(sm_ctrl_subscribe_paths(0xAAAA, &path, 1, 0, 60, 0), -12);
+            // 引数チェック(0 本 / 超過 / NULL)は満杯より先に効く。
+            assert_eq!(sm_ctrl_subscribe_paths(0xAAAA, &path, 0, 0, 60, 0), -11);
+            assert_eq!(
+                sm_ctrl_subscribe_paths(0xAAAA, &path, SUB_MAX_PATHS + 1, 0, 60, 0),
+                -11
+            );
+            assert_eq!(
+                sm_ctrl_subscribe_paths(0xAAAA, core::ptr::null(), 1, 0, 60, 0),
+                -1
+            );
+            // 満杯でも同一ノードの張り直しは通る(旧エントリを捨ててから検査するため、
+            // ここでは未知ノードとして -3 まで進む)。
+            assert_eq!(sm_ctrl_subscribe_paths(0xF000, &path, 1, 0, 60, 0), -3);
+        }
+        sm_ctrl_deinit();
 
         // SAFETY: alloc と同じ layout で解放する。
         unsafe { dealloc(mem, layout) };

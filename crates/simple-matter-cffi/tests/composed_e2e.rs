@@ -141,6 +141,9 @@ fn null_event() -> sm_ctrl_event_t {
         value_u64: 0,
         value_is_null: false,
         resumed: false,
+        endpoint: 0,
+        cluster: 0,
+        attribute: 0,
     }
 }
 
@@ -265,6 +268,80 @@ impl Loopback {
         }
         None
     }
+}
+
+impl Loopback {
+    /// `want` が立つまで駆動し、**途中で積まれた非終端イベントを全て集めて**返す
+    /// (購読の priming REPORT / op 中に割り込んだ REPORT を落とさないことの検証用)。
+    fn collect_until(
+        &mut self,
+        want: sm_ctrl_event_kind_t,
+        fail: sm_ctrl_event_kind_t,
+    ) -> (Vec<sm_ctrl_event_t>, sm_ctrl_event_t) {
+        let mut seen: Vec<sm_ctrl_event_t> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while Instant::now() < deadline {
+            let now = now_ms();
+            self.emit(now);
+            self.drain(now);
+            let mut ev = null_event();
+            while sm_ctrl_take_event(&mut ev) {
+                if ev.kind == want {
+                    return (seen, ev);
+                }
+                if ev.kind == fail {
+                    panic!("unexpected {:?} (status={})", ev.kind, ev.status);
+                }
+                seen.push(ev);
+            }
+            let cur = now_ms();
+            let nd = sm_ctrl_next_deadline(cur).min(sm_next_deadline(cur));
+            let wait = if nd == SM_NO_DEADLINE {
+                2
+            } else {
+                nd.saturating_sub(cur).min(50)
+            };
+            std::thread::sleep(Duration::from_millis(wait.max(1)));
+        }
+        panic!("timeout waiting for {want:?}");
+    }
+}
+
+impl Loopback {
+    /// 指定パスの REPORT が立つまで駆動する(他パスの REPORT は読み飛ばす)。
+    fn wait_report(&mut self, ep: u16, cluster: u32, attr: u32) -> sm_ctrl_event_t {
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while Instant::now() < deadline {
+            let now = now_ms();
+            self.emit(now);
+            self.drain(now);
+            let mut ev = null_event();
+            while sm_ctrl_take_event(&mut ev) {
+                if ev.kind == sm_ctrl_event_kind_t::SM_CTRL_EV_REPORT
+                    && ev.endpoint == ep
+                    && ev.cluster == cluster
+                    && ev.attribute == attr
+                {
+                    return ev;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("timeout waiting for REPORT({ep}/{cluster:#06x}/{attr})");
+    }
+}
+
+/// 収集したイベントから (kind, ep, cluster, attr) 一致の REPORT を探す。
+fn report_of(evs: &[sm_ctrl_event_t], ep: u16, cluster: u32, attr: u32) -> Option<sm_ctrl_event_t> {
+    evs.iter()
+        .rev()
+        .find(|e| {
+            e.kind == sm_ctrl_event_kind_t::SM_CTRL_EV_REPORT
+                && e.endpoint == ep
+                && e.cluster == cluster
+                && e.attribute == attr
+        })
+        .copied()
 }
 
 /// 属性 read を 1 往復させて値を返す。
@@ -480,16 +557,27 @@ fn composed_device_commission_read_write_invoke_subscribe() {
         "write が反映される"
     );
 
-    // ---- subscribe: EP2 温度 → sm_attr_set_value の push がレポートで届く ----
+    // ---- (e) subscribe 回帰: 既存 1 パス API `sm_ctrl_subscribe` ----
+    // T8 §16.2 で `sm_ctrl_subscribe_paths` の薄いラッパになった後も、SUBSCRIBE_DONE →
+    // レポート の流れが変わらないこと(priming REPORT が DONE の前に積まれる点だけ追加)。
+    assert!(
+        !sm_ctrl_is_subscribed(node_id),
+        "購読前は subscribed でない"
+    );
     assert_eq!(
         sm_ctrl_subscribe(node_id, 2, CL_TEMP, 0x0000, 0, 5, now_ms()),
         0
     );
-    lb.drive_until(
+    let (priming, done) = lb.collect_until(
         sm_ctrl_event_kind_t::SM_CTRL_EV_SUBSCRIBE_DONE,
         sm_ctrl_event_kind_t::SM_CTRL_EV_SUBSCRIBE_FAILED,
-    )
-    .expect("SUBSCRIBE_DONE");
+    );
+    assert!(done.value_u64 > 0, "SUBSCRIBE_DONE は購読 ID を載せる");
+    let prime_t = report_of(&priming, 2, CL_TEMP, 0x0000)
+        .expect("priming REPORT(温度)が SUBSCRIBE_DONE の前に積まれる");
+    assert_eq!(prime_t.value_u64 as i16, 2350, "priming 値 = 現在値");
+    assert_eq!(prime_t.node_id, node_id);
+    assert!(sm_ctrl_is_subscribed(node_id));
     CHANGES.lock().unwrap().clear();
     // HAL 相当のセンサ値 push。
     let t = i16v(1234);
@@ -503,6 +591,12 @@ fn composed_device_commission_read_write_invoke_subscribe() {
         )
         .expect("SM_CTRL_EV_REPORT");
     assert_eq!(rep.value_u64 as i16, 1234, "push した温度が購読で届く");
+    // T8: REPORT は対象パスと node_id を載せる。
+    assert_eq!(
+        (rep.endpoint, rep.cluster, rep.attribute),
+        (2, CL_TEMP, 0x0000)
+    );
+    assert_eq!(rep.node_id, node_id);
     // アプリ発の書き込みでは on_cluster_change は鳴らない(HAL ループ防止)。
     assert_eq!(change_of(2, CL_TEMP, 0x0000), None);
 
@@ -512,6 +606,128 @@ fn composed_device_commission_read_write_invoke_subscribe() {
     assert_eq!(
         read_scalar(&mut lb, node_id, 2, CL_HUM, 0x0000),
         (6100, false)
+    );
+
+    // ======================================================================
+    // T8 §16.2: ノード複数 × パス複数の購読
+    // ======================================================================
+
+    // ---- (a) 2 パスを 1 購読で張る: priming で REPORT×2 → SUBSCRIBE_DONE ----
+    // 同一ノードの旧購読(上の 1 パス購読)は張り直しで捨てられる。
+    let paths = [
+        sm_attr_path_t {
+            endpoint: 2,
+            cluster: CL_TEMP,
+            attribute: 0x0000,
+        },
+        sm_attr_path_t {
+            endpoint: 2,
+            cluster: CL_HUM,
+            attribute: 0x0000,
+        },
+    ];
+    assert_eq!(
+        sm_ctrl_subscribe_paths(
+            node_id,
+            paths.as_ptr(),
+            paths.len(),
+            0,
+            60, // keep-alive の巻き添えで検証が緩まないよう長めに取る。
+            now_ms()
+        ),
+        0
+    );
+    let (priming, done) = lb.collect_until(
+        sm_ctrl_event_kind_t::SM_CTRL_EV_SUBSCRIBE_DONE,
+        sm_ctrl_event_kind_t::SM_CTRL_EV_SUBSCRIBE_FAILED,
+    );
+    let sub_id = done.value_u64;
+    assert!(sub_id > 0);
+    let pt = report_of(&priming, 2, CL_TEMP, 0x0000).expect("priming REPORT(温度)");
+    let ph = report_of(&priming, 2, CL_HUM, 0x0000).expect("priming REPORT(湿度)");
+    assert_eq!(pt.value_u64 as i16, 1234, "priming の温度は現在値");
+    assert_eq!(ph.value_u64 as u16, 6100, "priming の湿度は現在値");
+    assert_eq!((pt.node_id, ph.node_id), (node_id, node_id));
+    assert_eq!(
+        pt.phase as u64,
+        sub_id & 0xFF,
+        "phase = 購読 ID 下位 8bit(診断用)"
+    );
+    assert!(sm_ctrl_is_subscribed(node_id));
+
+    // ---- (a 続き) デバイス側の 1 属性 dirty → その属性の REPORT が 1 件 ----
+    let t = i16v(1500);
+    assert_eq!(sm_attr_set_value(2, CL_TEMP, 0x0000, &t), 0);
+    let rep = lb.wait_report(2, CL_TEMP, 0x0000);
+    assert_eq!(
+        (
+            rep.node_id,
+            rep.endpoint,
+            rep.cluster,
+            rep.attribute,
+            rep.value_u64 as i16
+        ),
+        (node_id, 2, CL_TEMP, 0x0000, 1500)
+    );
+
+    // ---- (d) 購読中に別 op(read)を発行し、その最中に届いたレポートを落とさない ----
+    // 直前のレポートで積まれた残イベント(同じ 1 通に載った他属性)を掃く。
+    {
+        let mut e = null_event();
+        while sm_ctrl_take_event(&mut e) {}
+    }
+    // デバイス側を先に dirty にしてから read を発行する(レポートと Read 応答が同じ
+    // 駆動サイクルで交錯し、レポートは AwaitOp 中の `im_take_event` で拾われる)。
+    let h2 = u16v(4321);
+    assert_eq!(sm_attr_set_value(2, CL_HUM, 0x0000, &h2), 0);
+    assert_eq!(
+        sm_ctrl_read_scalar(node_id, 1, CL_ONOFF, 0x0000, now_ms()),
+        0,
+        "read start(購読中)"
+    );
+    let (during, read_done) = lb.collect_until(
+        sm_ctrl_event_kind_t::SM_CTRL_EV_READ_DONE,
+        sm_ctrl_event_kind_t::SM_CTRL_EV_READ_FAILED,
+    );
+    assert_eq!(read_done.value_u64, 1, "read の値は据え置き(OnOff=On)");
+    // op と交錯した購読レポートが落ちていないこと(READ_DONE の前後どちらに積まれるかは
+    // デバイスの送出順で決まる。コアの `take_event` は txn イベントを優先するため、
+    // 読み出し応答が先に処理されれば REPORT は READ_DONE の直後になる)。
+    let hum_rep =
+        report_of(&during, 2, CL_HUM, 0x0000).unwrap_or_else(|| lb.wait_report(2, CL_HUM, 0x0000));
+    assert_eq!(
+        (
+            hum_rep.node_id,
+            hum_rep.endpoint,
+            hum_rep.cluster,
+            hum_rep.attribute,
+            hum_rep.value_u64 as u16
+        ),
+        (node_id, 2, CL_HUM, 0x0000, 4321)
+    );
+
+    // ---- ローカル解除 ----
+    assert_eq!(sm_ctrl_unsubscribe(node_id), 1, "1 本捨てる");
+    assert!(!sm_ctrl_is_subscribed(node_id));
+    assert_eq!(sm_ctrl_unsubscribe(node_id), 0, "冪等");
+
+    // 引数チェック(パス数超過 / NULL)。
+    assert_eq!(
+        sm_ctrl_subscribe_paths(node_id, paths.as_ptr(), 0, 0, 60, now_ms()),
+        -11
+    );
+    assert_eq!(
+        sm_ctrl_subscribe_paths(node_id, paths.as_ptr(), 9, 0, 60, now_ms()),
+        -11
+    );
+    assert_eq!(
+        sm_ctrl_subscribe_paths(node_id, std::ptr::null(), 1, 0, 60, now_ms()),
+        -1
+    );
+    assert_eq!(
+        sm_ctrl_subscribe_paths(0xDEAD, paths.as_ptr(), 1, 0, 60, now_ms()),
+        -3,
+        "未知ノード"
     );
 
     sm_ctrl_deinit();
