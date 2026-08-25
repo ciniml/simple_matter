@@ -78,11 +78,27 @@ else()
             "toolchain with the ${SM_RUST_TARGET} target.")
     endif()
     message(STATUS "simple_matter: building staticlib via cargo (${SM_RUST_TARGET})")
+    # cargo 実行に **Rust ソースの DEPENDS を張る**。以前は OUTPUT が .a だけで DEPENDS が
+    # 無かったため、.a が一度生成されると Rust を変えても ninja が custom command を
+    # スキップし、古い .a のまま ELF がリンクされていた(2026-08-25: 両 triple の .a が
+    # 丸一日古いまま「実機検証」していた恒久対処)。CONFIGURE_DEPENDS で .rs の増減も
+    # 追う(configure 時に glob 再評価)。cargo 自身も差分ビルドなので、無変更なら
+    # ninja がここを飛ばし、走っても cargo が即 no-op で .a の mtime は変わらない。
+    file(GLOB_RECURSE SM_RUST_SOURCES CONFIGURE_DEPENDS
+        "${SM_REPO_ROOT}/crates/simple-matter/src/*.rs"
+        "${SM_REPO_ROOT}/crates/simple-matter-cffi/src/*.rs")
+    set(SM_RUST_DEPS
+        ${SM_RUST_SOURCES}
+        "${SM_REPO_ROOT}/crates/simple-matter/Cargo.toml"
+        "${SM_REPO_ROOT}/crates/simple-matter-cffi/Cargo.toml"
+        "${SM_REPO_ROOT}/Cargo.toml"
+        "${SM_REPO_ROOT}/Cargo.lock")
     add_custom_command(
         OUTPUT "${SM_STATICLIB}"
         COMMAND "${CARGO_EXECUTABLE}" build -p simple-matter-cffi --release
                 --target "${SM_RUST_TARGET}" --features panic-abort
         WORKING_DIRECTORY "${SM_REPO_ROOT}"
+        DEPENDS ${SM_RUST_DEPS}
         COMMENT "Building simple-matter-cffi staticlib (${SM_RUST_TARGET})"
         VERBATIM)
     add_custom_target(simple_matter_cargo DEPENDS "${SM_STATICLIB}")
