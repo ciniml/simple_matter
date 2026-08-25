@@ -998,6 +998,21 @@ static void matter_task(void *) {
 
     // 時間駆動の送出・イベント・mDNS announce。
     stack.pump(now, udp_send);
+
+    // 診断(2026-08-25 不達調査): コアの各プール使用量を 30 秒ごとに残す。
+    // 「受信はするが応答しない」= exchange / セッション / handshake slot の枯渇を
+    // ログだけで見分けるため。
+    {
+      static uint64_t s_last_pool_log = 0;
+      if (now - s_last_pool_log >= 30000) {
+        s_last_pool_log = now;
+        sm_pool_stats_t st = {};
+        sm_pool_stats(&st);
+        ESP_LOGI(TAG, "pools: ex=%u/%u sess=%u/%u hs=%u/%u tx=%u/%u heap=%lu", st.exchanges,
+                 st.exchanges_cap, st.sessions, st.sessions_cap, st.handshakes, st.handshakes_cap,
+                 st.tx_bufs, st.tx_bufs_cap, (unsigned long)esp_get_free_heap_size());
+      }
+    }
 #if CONFIG_SM_ENABLE_BLE
     // BLE 宛の下りフラグメント(handshake resp / データ / 遅延 ConnectNetworkResponse /
     // keep-alive ACK)を C2 indication で直列排出する(indicate 完了まで待つ)。

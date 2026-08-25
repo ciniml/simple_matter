@@ -716,13 +716,25 @@ fn drive_awaitop(s: &mut CtrlShim, node_id: u64, op: PendingOp) {
             let mut e = CtrlShim::ev(op_failed_kind(op));
             e.node_id = node_id;
             e.status = status.to_u8();
+            e.phase = 0xF0; // 診断: IM Failed 経路。
             s.push_event(e);
             s.activity = Activity::Idle;
         }
         // 予期しないイベント: 失敗扱いで終端する。
-        (op, _) => {
+        (op, other) => {
             let mut e = CtrlShim::ev(op_failed_kind(op));
             e.node_id = node_id;
+            // 診断: 0xD0 | 受け取ったイベント種別(残骸イベントの誤消費を見分ける)。
+            e.phase = 0xD0
+                | match other {
+                    ImEvent::ReadDone => 1,
+                    ImEvent::InvokeDone { .. } => 2,
+                    ImEvent::WriteDone { .. } => 3,
+                    ImEvent::SubscribeDone { .. } => 4,
+                    ImEvent::SubscriptionReport { .. } => 5,
+                    ImEvent::SubscriptionLost { .. } => 6,
+                    _ => 0xF,
+                };
             s.push_event(e);
             s.activity = Activity::Idle;
         }
@@ -817,12 +829,27 @@ fn launch_op(s: &mut CtrlShim, node_id: u64, session: SessionId, op: PendingOp, 
             s.queue_tx(&scratch[..dir.len], dir);
             s.activity = Activity::AwaitOp { node_id, op };
         }
-        Err(_) => {
+        Err(err) => {
             let mut e = CtrlShim::ev(op_failed_kind(op));
             e.node_id = node_id;
+            // 診断: 失敗経路を phase に載せる(0xE0 | Error 種別。2026-08-25 不達調査)。
+            e.phase = 0xE0 | (error_code(err) & 0x0F);
             s.push_event(e);
             s.activity = Activity::Idle;
         }
+    }
+}
+
+/// [`simple_matter::error::Error`] を 4bit の診断コードへ写す(`phase` 下位に載せる)。
+fn error_code(e: simple_matter::error::Error) -> u8 {
+    use simple_matter::error::Error as E;
+    match e {
+        E::NoSpace => 1,
+        E::NotFound => 2,
+        E::InvalidState => 3,
+        E::Crypto => 4,
+        E::Decode => 5,
+        _ => 0xF,
     }
 }
 

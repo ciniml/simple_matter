@@ -1908,8 +1908,10 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize> Pr
     ) -> Result<HandlerAction> {
         let acc = match access_from_session(sessions, rx.exchange.session(), now_ms) {
             Ok(a) => a,
-            // 未認証/PlainText 等はサイレントドロップ(panic しない)。
-            Err(_) => return Ok(HandlerAction::None),
+            // 未認証/PlainText 等はサイレントドロップ(panic しない)。`Err` で返して
+            // exchange 層に会話を終端予約させる(`Ok(None)` だと新規 responder 会話が
+            // 残留して EXCHANGES を食い潰す)。
+            Err(_) => return Err(Error::InvalidState),
         };
         match ImOpCode::from_u8(rx.header.proto_opcode)? {
             ImOpCode::ReadRequest => self.read_open(rx, tx, &acc, now_ms),
@@ -1919,7 +1921,8 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize> Pr
             ImOpCode::TimedRequest => self.timed_open(rx, tx, now_ms),
             ImOpCode::StatusResponse => self.on_status(rx, tx, now_ms),
             // ReportData/SubscribeResponse/WriteResponse/InvokeResponse は client→device では不正。
-            _ => Ok(HandlerAction::None),
+            // `Err` で exchange 層に終端予約させる(上記と同じ理由)。
+            _ => Err(Error::InvalidState),
         }
     }
 }

@@ -12,6 +12,8 @@
 //     実機 P9 の発見。xTaskCreateStatic の形は hub と同じ)
 
 #include "ctrl_pump.hpp"
+#include <errno.h>
+#include <lwip/inet.h>
 
 #include "simple_matter.h"
 
@@ -190,7 +192,14 @@ void send_sm(int fd, const uint8_t *buf, size_t len, const sm_addr_t &dst) {
     m.sin6_addr.un.u8_addr[11] = 0xff;
     memcpy(&m.sin6_addr.un.u8_addr[12], dst.ip, 4);
   }
-  sendto(fd, buf, len, 0, (struct sockaddr *)&m, sizeof(m));
+  int rc = sendto(fd, buf, len, 0, (struct sockaddr *)&m, sizeof(m));
+  if (rc < 0) {
+    // 送信失敗は握りつぶさない(2026-08-25 不達調査: 宛先・scope・errno を残す)。
+    char ip[48] = {0};
+    inet_ntop(AF_INET6, &m.sin6_addr, ip, sizeof(ip));
+    ESP_LOGW(TAG, "sendto %u B -> [%s]:%u scope=%lu failed: errno=%d", (unsigned)len, ip,
+             (unsigned)dst.port, (unsigned long)m.sin6_scope_id, errno);
+  }
 }
 
 sm_addr_t sockaddr_to_smaddr(const struct sockaddr_in6 &s6) {
@@ -272,6 +281,12 @@ bool run_until(int fd, uint64_t timeout_ms, sm_ctrl_event_t &out_ev,
       }
       if (is_terminal(ev)) {
         out_ev = ev;
+        if (ev.kind == SM_CTRL_EV_INVOKE_FAILED || ev.kind == SM_CTRL_EV_READ_FAILED ||
+            ev.kind == SM_CTRL_EV_PAIR_FAILED) {
+          ESP_LOGW(TAG, "run_until: terminal FAILED kind=%d status=%u phase=%u node=%016llx",
+                   (int)ev.kind, (unsigned)ev.status, (unsigned)ev.phase,
+                   (unsigned long long)ev.node_id);
+        }
         for (int i = 0; i < 50; ++i) {
           drain_tx(fd);
           if (sm_ctrl_next_deadline(now_ms()) == SM_NO_DEADLINE) {

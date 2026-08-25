@@ -581,12 +581,24 @@ impl<H, const EXCHANGES: usize> ExchangeManager<H, EXCHANGES> {
             exchange: handle,
             role,
         };
-        if let Ok(action) = self
+        match self
             .handler
             .dispatch(phdr.proto_id, &rx, tx, sessions, now_ms)
         {
-            report.action = action;
-            report.dispatched = true;
+            Ok(action) => {
+                report.action = action;
+                report.dispatched = true;
+            }
+            Err(_) => {
+                // ハンドラが処理を拒否した(未対応 Protocol ID / opcode、状態違反、
+                // 復号・デコード失敗など)。この会話に後続の責務は無いので終端予約する。
+                // 予約しないと、特にこの受信で新規生成した responder 会話が
+                // 「closing でも再送中でもない」まま永久に残り、standalone ACK
+                // (SC 0x10)や迷子の要求を数回受けるだけで EXCHANGES が枯渇して
+                // 新規 Sigma1/PBKDFParamRequest を黙って捨てる(2026-08-25 NanoC6 実機)。
+                // 未送 ACK があれば poll が送ってから回収する(is_quiescent)。
+                self.exchanges[idx].closing = true;
+            }
         }
         Ok(report)
     }

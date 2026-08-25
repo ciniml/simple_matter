@@ -226,6 +226,11 @@ impl<'c, C: Crypto, R: Rng, F, const H: usize> SecureChannel<'c, C, R, F, H> {
         n
     }
 
+    /// 進行中のハンドシェイク slot 数(診断用。[`crate::stack::MatterStack::pool_usage`])。
+    pub fn handshakes_in_use(&self) -> usize {
+        self.pool.len()
+    }
+
     /// 期限切れハンドシェイク slot を **1 つ**回収し、予約セッションを解放して、その
     /// ハンドシェイクを運んでいた exchange を返す(統合層が exchange を close する)。
     ///

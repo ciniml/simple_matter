@@ -127,6 +127,27 @@ pub struct MatterStack<
 }
 
 /// groupcast 送信元 `(fabric, node)` ごとの trust-first カウンタ状態。
+/// [`MatterStack::pool_usage`] の結果(各プールの使用数と容量)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolUsage {
+    /// exchange 会話数。
+    pub exchanges: usize,
+    /// exchange プール容量。
+    pub exchanges_cap: usize,
+    /// セッション数(平文・予約含む)。
+    pub sessions: usize,
+    /// セッションテーブル容量。
+    pub sessions_cap: usize,
+    /// 進行中の PASE/CASE ハンドシェイク数。
+    pub handshakes: usize,
+    /// ハンドシェイク slot 容量。
+    pub handshakes_cap: usize,
+    /// 使用中の再送バッファ数。
+    pub tx_bufs: usize,
+    /// 再送バッファ容量。
+    pub tx_bufs_cap: usize,
+}
+
 #[derive(Debug, Clone)]
 struct GroupPeer {
     fabric_idx: NonZeroU8,
@@ -301,6 +322,21 @@ impl<
         kvs: &mut K,
     ) -> crate::error::Result<usize> {
         self.mgr.handler_mut().sc.load_resumptions_from(kvs)
+    }
+
+    /// 各プールの使用量(診断用。実機で「Sigma1 を黙って捨てる」枯渇状態を
+    /// 見分けるためにログへ出す。2026-08-25 NanoC6 調査)。
+    pub fn pool_usage(&self) -> PoolUsage {
+        PoolUsage {
+            exchanges: self.mgr.len(),
+            exchanges_cap: EXCHANGES,
+            sessions: self.sessions.len(),
+            sessions_cap: SESSIONS,
+            handshakes: self.mgr.handler().sc.handshakes_in_use(),
+            handshakes_cap: HANDSHAKES,
+            tx_bufs: self.tx_pool.in_use(),
+            tx_bufs_cap: TX_BUFS,
+        }
     }
 
     /// 次に [`poll`](Self::poll) すべき最も早い絶対時刻(ミリ秒)。

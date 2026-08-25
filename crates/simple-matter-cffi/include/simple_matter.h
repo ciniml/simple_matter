@@ -421,6 +421,16 @@ size_t sm_poll(uint64_t now_ms,
 // 次に sm_poll を呼ぶべき時刻(ms)。SM_NO_DEADLINE(=UINT64_MAX)= 期限なし。
 uint64_t sm_next_deadline(uint64_t now_ms);
 
+// コアの各プール使用量(診断用)。「受信はするが応答しない」枯渇状態
+// (exchange / セッション / handshake slot / 再送バッファ)をログから見分ける。
+typedef struct sm_pool_stats {
+  uint16_t exchanges, exchanges_cap;
+  uint16_t sessions, sessions_cap;
+  uint16_t handshakes, handshakes_cap;
+  uint16_t tx_bufs, tx_bufs_cap;
+} sm_pool_stats_t;
+void sm_pool_stats(sm_pool_stats_t *out);
+
 // DHCP 後のアドレス反映(A/AAAA 更新)。NULL は「未設定」。
 void sm_set_addrs(const uint8_t *ipv4, const uint8_t *ipv6_ll);
 

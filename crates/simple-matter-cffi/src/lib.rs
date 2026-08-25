@@ -1934,6 +1934,53 @@ fn take_sdu(btp: &mut Btp<BTP_WINDOW>, out: &mut [u8]) -> Option<usize> {
     Some(n)
 }
 
+/// 各プールの使用量([`sm_pool_stats`])。C 側 `sm_pool_stats_t` と同レイアウト。
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct sm_pool_stats_t {
+    /// exchange 会話数 / 容量。
+    pub exchanges: u16,
+    pub exchanges_cap: u16,
+    /// セッション数(平文・予約含む)/ 容量。
+    pub sessions: u16,
+    pub sessions_cap: u16,
+    /// 進行中ハンドシェイク数 / 容量。
+    pub handshakes: u16,
+    pub handshakes_cap: u16,
+    /// 使用中の再送バッファ数 / 容量。
+    pub tx_bufs: u16,
+    pub tx_bufs_cap: u16,
+}
+
+/// コアの各プール使用量を `out` に書く(診断用。未初期化・NULL は 0 埋め)。
+///
+/// 実機で「受信はするが応答しない」枯渇状態(exchange / セッション / handshake slot)を
+/// ログから見分けるための足場(2026-08-25 NanoC6 調査)。
+#[no_mangle]
+pub extern "C" fn sm_pool_stats(out: *mut sm_pool_stats_t) {
+    if out.is_null() {
+        return;
+    }
+    let mut st = sm_pool_stats_t::default();
+    if INITED.load(Ordering::SeqCst) {
+        // SAFETY: 単線契約。
+        let s = unsafe { shim() };
+        let u = s.stack.pool_usage();
+        st = sm_pool_stats_t {
+            exchanges: u.exchanges as u16,
+            exchanges_cap: u.exchanges_cap as u16,
+            sessions: u.sessions as u16,
+            sessions_cap: u.sessions_cap as u16,
+            handshakes: u.handshakes as u16,
+            handshakes_cap: u.handshakes_cap as u16,
+            tx_bufs: u.tx_bufs as u16,
+            tx_bufs_cap: u.tx_bufs_cap as u16,
+        };
+    }
+    // SAFETY: caller が有効な out を渡す契約(NULL は上で除外)。
+    unsafe { out.write(st) };
+}
+
 /// 次に sm_poll を呼ぶべき時刻(ms)。SM_NO_DEADLINE(=UINT64_MAX)= 期限なし。
 #[no_mangle]
 pub extern "C" fn sm_next_deadline(now_ms: u64) -> u64 {
