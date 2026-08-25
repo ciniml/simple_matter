@@ -1645,7 +1645,9 @@ pub extern "C" fn sm_ctrl_set_node_addr(node_id: u64, addr: *const sm_addr_t) ->
 /// 不達ノード宛の CASE は initiator の HANDSHAKE_TIMEOUT(60s)まで内部で粘り、
 /// その間の全操作が busy(-10)で弾かれる(T5 実機)。ハンドシェイクスロット・予約
 /// セッション・exchange は [`ControllerStack::abort_handshake`] で解放する。
-/// 応答待ち中(AwaitOp)の IM exchange は MRP の諦めで自然に解放される。
+/// 応答待ち中(AwaitOp)の IM トランザクションは [`ControllerStack::abort_op`] で畳み、
+/// exchange を即時回収する(「MRP の諦めで自然解放」は要求が standalone ACK 済みだと
+/// 成り立たず、exchange が永久に残る — 実機 2026-08-25 の「両デバイス不達」の真因)。
 ///
 /// 戻り値: 1=中断した、0=元々 Idle、-1=未初期化。
 #[no_mangle]
@@ -1659,6 +1661,7 @@ pub extern "C" fn sm_ctrl_abort_op() -> i32 {
         return 0;
     }
     s.stack.abort_handshake();
+    s.stack.abort_op();
     s.comm = None;
     #[cfg(feature = "ble")]
     {

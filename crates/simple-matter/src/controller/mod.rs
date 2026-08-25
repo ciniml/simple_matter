@@ -310,7 +310,24 @@ impl<
                 self.tx_pool.release(freed);
             }
         }
-        self.mgr.handler_mut().im.on_tick(now_ms);
+        // 期限切れ IM トランザクションの exchange も閉じる(要求が standalone ACK 済みだと
+        // 再送スロットが空で MRP の諦めが走らず、閉じない限り exchange が永久に残る。
+        // Tab5 実機で 8 回の不達 read/invoke 後に全ノード宛 start_* が NoSpace になった真因)。
+        if let Some(ex) = self.mgr.handler_mut().im.on_tick(now_ms) {
+            if let Some(freed) = self.mgr.close(ex) {
+                self.tx_pool.release(freed);
+            }
+        }
+    }
+
+    /// 進行中の IM トランザクション(Invoke/Read/Write/Subscribe)を外部都合で中断し、
+    /// exchange と再送バッファを解放する。何も進行していなければ no-op。
+    pub fn abort_op(&mut self) {
+        if let Some(ex) = self.mgr.handler_mut().im.abort_txn() {
+            if let Some(freed) = self.mgr.close(ex) {
+                self.tx_pool.release(freed);
+            }
+        }
     }
 
     /// 受信 datagram を処理し、応答があれば [`SendDirective`] を返す(sans-IO、§7.2)。

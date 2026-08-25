@@ -2796,6 +2796,227 @@ mod controller_e2e {
         let _ = ctrl.poll(NOW + 1, &mut out);
         assert!(ctrl.sc_take_event().is_none());
     }
+    /// **IM トランザクションのタイムアウトで initiator exchange がリークしない**こと
+    /// (Tab5 実機 2026-08-25: 応答しないノードへの read/invoke を繰り返すうちに
+    /// `open_initiator` が NoSpace → 全ノード宛 start_case/start_invoke が -4 で
+    /// 「両デバイス不達」になった症状の回帰テスト)。
+    ///
+    /// 経路: 要求は standalone ACK で受領される(再送スロットが空く)が応答が来ない
+    /// → `ImClient::on_tick` が CLIENT_TXN_TIMEOUT_MS で txn を捨てる。このとき exchange
+    /// を close しないと、MRP の諦め(GiveUp)経路も走らない exchange が永久に残る。
+    #[test]
+    fn im_txn_timeout_releases_initiator_exchange() {
+        let crypto = RustCrypto::new(SeqRng(0xC0FF_EE00_1234_5679));
+        let fabrics: RefCell<FabricTable<Crb, 5>> = RefCell::new(FabricTable::new());
+        let config = PaseConfig::from_passcode(PASSCODE, &SALT, ITERATIONS).unwrap();
+        let dev_creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
+        let sc = SecureChannel::new(&crypto, SeqRng(0x5C00_0002), config, dev_creds);
+        let im = InteractionModel::new(build_device(&fabrics));
+        let mut dev: TestStack = MatterStack::new(&crypto, sc, im);
+        let ca = Ca::<Crb>::generate(&crypto, &mut SeqRng(0xCA00_0003), FABRIC_ID, COMM_NODE, 0xFFF1, 0)
+            .expect("Ca::generate");
+        let ctrl_creds = ControllerCreds::new(&ca, &crypto, 0);
+        let sc_init = ScInitiator::new(&crypto, SeqRng(0x1C00_0003), ctrl_creds);
+        let mut ctrl: Ctrl = ControllerStack::new(&crypto, sc_init, ImClient::new());
+        let mut comm = Commissioner::new(&ca, &crypto, AttestationPolicy::Skip);
+        comm.commission(peer(), PASSCODE, DEVICE_NODE, NOW).unwrap();
+        let mut tx = [0u8; 1700];
+        let mut final_phase = comm.phase();
+        for _ in 0..60 {
+            let out = comm.drive(&mut ctrl, NOW, &mut tx);
+            final_phase = out.phase;
+            if let Some(d) = out.send {
+                deliver_and_settle(&mut ctrl, &mut dev, NOW, &tx, d.len);
+            }
+            if matches!(out.phase, Phase::Done { .. } | Phase::Failed { .. }) {
+                break;
+            }
+        }
+        let case_session = match final_phase {
+            Phase::Done { session } => session,
+            other => panic!("commissioning did not complete: {other:?}"),
+        };
+
+        // テスト Ctrl の EXCHANGES=6。7 回以上「ACK あり・応答なし・タイムアウト」を繰り返し、
+        // 毎回 start_invoke が受理されること(= exchange が回収されていること)を確認する。
+        let toggle = CommandPath::new(EndpointId(1), ClusterId(0x0006), CommandId(0x02));
+        for i in 0..8u64 {
+            let t0 = NOW + 10_000 + i * 120_000;
+            let dir = ctrl
+                .start_invoke(case_session, toggle, |w, t| { w.start_struct(t)?; w.end_container() }, t0, &mut tx)
+                .unwrap_or_else(|e| panic!("start_invoke #{i} rejected: {e:?} (exchange leak?)"));
+            // 要求をデバイスへ届けるが、応答は落とす。
+            let mut req = [0u8; 1700];
+            req[..dir.len].copy_from_slice(&tx[..dir.len]);
+            let mut txd = [0u8; 1700];
+            let _ = dev.handle_rx(&mut req[..dir.len], ctrl_addr(), t0, &mut txd);
+            // controller の再送 → device は重複と見て standalone ACK を武装。
+            // device 発のうち standalone ACK(短い)だけ controller に届け、応答再送は落とす。
+            let mut acked = false;
+            let mut now = t0;
+            'outer: for _ in 0..40 {
+                now += 300;
+                let mut o = [0u8; 1700];
+                while let Some(d) = ctrl.poll(now, &mut o) {
+                    let mut b = [0u8; 1700];
+                    b[..d.len].copy_from_slice(&o[..d.len]);
+                    let _ = dev.handle_rx(&mut b[..d.len], ctrl_addr(), now, &mut txd);
+                }
+                while let Some(d) = dev.poll(now, &mut o) {
+                    if d.len < 60 {
+                        let mut b = [0u8; 1700];
+                        b[..d.len].copy_from_slice(&o[..d.len]);
+                        let r = ctrl.handle_rx(&mut b[..d.len], peer(), now, &mut txd);
+                        assert!(r.is_none(), "standalone ACK must not elicit a reply");
+                        acked = true;
+                        break 'outer;
+                    }
+                }
+            }
+            assert!(acked, "iteration {i}: no standalone ACK observed (test harness assumption broken)");
+            assert!(ctrl.im_take_event().is_none(), "iteration {i}: txn should still be pending");
+            // 再送スロットは空 → MRP 由来の deadline は無い(GiveUp 経路は走らない)。
+            assert!(ctrl.transport_deadline().is_none(), "iteration {i}: retrans slot should be released by the ACK");
+            // CLIENT_TXN_TIMEOUT_MS を跨ぐ → txn 期限切れ。
+            let t1 = now + crate::im::client::CLIENT_TXN_TIMEOUT_MS + 1_000;
+            let mut o = [0u8; 1700];
+            while ctrl.poll(t1, &mut o).is_some() {}
+            assert_eq!(
+                ctrl.im_take_event(),
+                Some(ImEvent::Failed { status: ImStatus::Timeout }),
+                "iteration {i}: txn timeout"
+            );
+            // device 側の応答再送を捨て切る。
+            while dev.poll(t1, &mut o).is_some() {}
+            while dev.poll(t1 + 60_000, &mut o).is_some() {}
+        }
+    }
+
+    /// Tab5 実機 2026-08-25 の NanoC6 ログを再現するデバイス側ストレス: コントローラの
+    /// 「CASE resumption バースト(Sigma1 再送 ×3 → StatusReport)」「20 秒周期の read」
+    /// 「コントローラ再起動(resumption 素材持ち越しの新インスタンス)」を繰り返しても、
+    /// デバイスが新規 Sigma1 に応答し続けること(プール枯渇の黙殺が起きないこと)。
+    #[test]
+    fn device_survives_controller_resume_bursts_and_reboots() {
+        let crypto = RustCrypto::new(SeqRng(0xC0FF_EE00_1234_567A));
+        let fabrics: RefCell<FabricTable<Crb, 5>> = RefCell::new(FabricTable::new());
+        let config = PaseConfig::from_passcode(PASSCODE, &SALT, ITERATIONS).unwrap();
+        let dev_creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
+        let sc = SecureChannel::new(&crypto, SeqRng(0x5C00_0003), config, dev_creds);
+        let im = InteractionModel::new(build_device(&fabrics));
+        let mut dev: TestStack = MatterStack::new(&crypto, sc, im);
+        let ca = Ca::<Crb>::generate(&crypto, &mut SeqRng(0xCA00_0004), FABRIC_ID, COMM_NODE, 0xFFF1, 0)
+            .expect("Ca::generate");
+        let ctrl_creds = ControllerCreds::new(&ca, &crypto, 0);
+        let sc_init = ScInitiator::new(&crypto, SeqRng(0x1C00_0004), ctrl_creds);
+        let mut ctrl: Ctrl = ControllerStack::new(&crypto, sc_init, ImClient::new());
+        let mut comm = Commissioner::new(&ca, &crypto, AttestationPolicy::Skip);
+        comm.commission(peer(), PASSCODE, DEVICE_NODE, NOW).unwrap();
+        let mut tx = [0u8; 1700];
+        let mut final_phase = comm.phase();
+        for _ in 0..60 {
+            let out = comm.drive(&mut ctrl, NOW, &mut tx);
+            final_phase = out.phase;
+            if let Some(d) = out.send {
+                deliver_and_settle(&mut ctrl, &mut dev, NOW, &tx, d.len);
+            }
+            if matches!(out.phase, Phase::Done { .. } | Phase::Failed { .. }) {
+                break;
+            }
+        }
+        let mut session = match final_phase {
+            Phase::Done { session } => session,
+            other => panic!("commissioning did not complete: {other:?}"),
+        };
+        let fidx = crate::controller::CONTROLLER_FABRIC_INDEX;
+        let onoff = AttributePath::concrete(EndpointId(1), ClusterId(0x0006), AttributeId(0x0000));
+
+        // 1 回の read(Tab5 の 20 秒ポーリング相当)。
+        fn do_read(ctrl: &mut Ctrl<'_>, dev: &mut TestStack<'_>, s: crate::transport::session::SessionId, now: u64, p: AttributePath, label: &str) -> bool {
+            let mut tx = [0u8; 1700];
+            let dir = ctrl.start_read(s, &[p], now, &mut tx).unwrap_or_else(|e| panic!("{label}: start_read {e:?}"));
+            deliver_and_settle(ctrl, dev, now, &tx, dir.len);
+            match ctrl.im_take_event() {
+                Some(ImEvent::ReadDone) => true,
+                other => { let _ = other; false }
+            }
+        }
+        // resumption バースト: Sigma1 を出し、Sigma2_Resume を「取りこぼして」Sigma1 を 2 回再送し、
+        // その後に Sigma2_Resume を受理して StatusReport で確立する。
+        fn resume_burst(ctrl: &mut Ctrl<'_>, dev: &mut TestStack<'_>, now: u64, fidx: NonZeroU8, label: &str) -> crate::transport::session::SessionId {
+            let mut tx = [0u8; 1700];
+            let mut txd = [0u8; 1700];
+            ctrl.abort_handshake();
+            ctrl.abort_op();
+            let dir = ctrl.start_case(peer(), fidx, DEVICE_NODE, now, &mut tx)
+                .unwrap_or_else(|e| panic!("{label}: start_case {e:?}"));
+            let mut s1 = [0u8; 1700];
+            s1[..dir.len].copy_from_slice(&tx[..dir.len]);
+            let first = dev.handle_rx(&mut s1[..dir.len], ctrl_addr(), now, &mut txd)
+                .unwrap_or_else(|| panic!("{label}: device silent on Sigma1 (wedged?)"));
+            let mut held = [0u8; 1700];
+            held[..first.len].copy_from_slice(&txd[..first.len]);
+            // 再送 2 回(初回 300ms, 次 600ms 相当): デバイス側の応答は捨てる。
+            let mut t = now;
+            let mut retrans = 0;
+            for _ in 0..12 {
+                t += 300;
+                let mut o = [0u8; 1700];
+                while let Some(d) = ctrl.poll(t, &mut o) {
+                    let mut b = [0u8; 1700];
+                    b[..d.len].copy_from_slice(&o[..d.len]);
+                    let _ = dev.handle_rx(&mut b[..d.len], ctrl_addr(), t, &mut txd);
+                    retrans += 1;
+                }
+                // デバイス側の再送/standalone ACK も捨てる。
+                while dev.poll(t, &mut o).is_some() {}
+                if retrans >= 2 { break; }
+            }
+            // 取りこぼしていた Sigma2_Resume を受理 → StatusReport → 確立。
+            ping_pong(ctrl, dev, t, &held[..first.len], false);
+            flush(ctrl, dev, t);
+            match ctrl.sc_take_event() {
+                Some(crate::sc::initiator::ScEvent::CaseEstablished { session, resumed }) => {
+                    assert!(resumed, "{label}: expected resumption");
+                    session
+                }
+                other => panic!("{label}: CASE not established: {other:?}"),
+            }
+        }
+
+        let mut now = NOW + 1_000;
+        for round in 0..8u64 {
+            // 20 秒周期 read ×5。
+            for k in 0..5 {
+                now += 20_000;
+                assert!(do_read(&mut ctrl, &mut dev, session, now, onoff, "read"), "round {round}: read {k} failed (device silent?)");
+            }
+            // resumption バースト ×2(2 分間隔)。
+            for b in 0..2 {
+                now += 120_000;
+                session = resume_burst(&mut ctrl, &mut dev, now, fidx, "burst");
+                now += 200;
+                assert!(do_read(&mut ctrl, &mut dev, session, now, onoff, "post-burst read"), "round {round}: read after burst {b} failed");
+            }
+            // コントローラ再起動(resumption 素材だけ持ち越した新インスタンス)。
+            let (rid, ss) = ctrl.resumption_export(fidx, DEVICE_NODE).expect("resumption material");
+            let ctrl_creds = ControllerCreds::new(&ca, &crypto, 0);
+            let sc_init = ScInitiator::new(&crypto, SeqRng(0x1C00_1000 + round), ctrl_creds);
+            ctrl = ControllerStack::new(&crypto, sc_init, ImClient::new());
+            ctrl.resumption_import(fidx, DEVICE_NODE, &rid, &ss);
+            now += 60_000;
+            let dir = ctrl.start_case(peer(), fidx, DEVICE_NODE, now, &mut tx).expect("start_case after reboot");
+            deliver_and_settle(&mut ctrl, &mut dev, now, &tx, dir.len);
+            session = match ctrl.sc_take_event() {
+                Some(crate::sc::initiator::ScEvent::CaseEstablished { session, .. }) => session,
+                other => panic!("round {round}: CASE after reboot failed: {other:?} (device wedged?)"),
+            };
+        }
+        // 最後に read が通ること。
+        now += 20_000;
+        assert!(do_read(&mut ctrl, &mut dev, session, now, onoff, "final read"));
+    }
+
 }
 
 // ==========================================================================
@@ -2939,4 +3160,5 @@ fn groupcast_toggle_end_to_end() {
     let n = build(105, GID, gkh, &mut wire);
     stack.handle_rx(&mut wire[..n], peer(), NOW + 60, &mut tx);
     assert!(!stack.device().onoff.is_on());
+
 }
