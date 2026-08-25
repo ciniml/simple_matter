@@ -127,6 +127,27 @@ pub struct MatterStack<
 }
 
 /// groupcast 送信元 `(fabric, node)` ごとの trust-first カウンタ状態。
+/// [`MatterStack::pool_usage`] の結果(各プールの使用数と容量)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolUsage {
+    /// exchange 会話数。
+    pub exchanges: usize,
+    /// exchange プール容量。
+    pub exchanges_cap: usize,
+    /// セッション数(平文・予約含む)。
+    pub sessions: usize,
+    /// セッションテーブル容量。
+    pub sessions_cap: usize,
+    /// 進行中の PASE/CASE ハンドシェイク数。
+    pub handshakes: usize,
+    /// ハンドシェイク slot 容量。
+    pub handshakes_cap: usize,
+    /// 使用中の再送バッファ数。
+    pub tx_bufs: usize,
+    /// 再送バッファ容量。
+    pub tx_bufs_cap: usize,
+}
+
 #[derive(Debug, Clone)]
 struct GroupPeer {
     fabric_idx: NonZeroU8,
@@ -303,6 +324,21 @@ impl<
         self.mgr.handler_mut().sc.load_resumptions_from(kvs)
     }
 
+    /// 各プールの使用量(診断用。実機で「Sigma1 を黙って捨てる」枯渇状態を
+    /// 見分けるためにログへ出す。2026-08-25 NanoC6 調査)。
+    pub fn pool_usage(&self) -> PoolUsage {
+        PoolUsage {
+            exchanges: self.mgr.len(),
+            exchanges_cap: EXCHANGES,
+            sessions: self.sessions.len(),
+            sessions_cap: SESSIONS,
+            handshakes: self.mgr.handler().sc.handshakes_in_use(),
+            handshakes_cap: HANDSHAKES,
+            tx_bufs: self.tx_pool.in_use(),
+            tx_bufs_cap: TX_BUFS,
+        }
+    }
+
     /// 次に [`poll`](Self::poll) すべき最も早い絶対時刻(ミリ秒)。
     ///
     /// MRP 再送/ACK 期限([`ExchangeManager::next_deadline`])と IM 購読レポート期限
@@ -328,10 +364,20 @@ impl<
 
     /// 時間駆動の内部掃引(SC ハンドシェイクタイムアウト・IM 掃除・fail-safe 期限)。
     fn drive_ticks(&mut self, now_ms: u64) {
-        self.mgr
+        // 期限切れハンドシェイクは予約セッションだけでなく **exchange も閉じる**
+        // (再送バッファも回収)。閉じないと相手が途中で消えた半端な CASE/PASE の
+        // responder exchange が残り、コントローラの再起動数回で exchange 枯渇 →
+        // 新規 Sigma1 を黙って捨てる(T5 実機で NanoC6 が「デバイス再起動まで応答しない」)。
+        while let Some(ex) = self
+            .mgr
             .handler_mut()
             .sc
-            .on_tick(&mut self.sessions, now_ms);
+            .expire_one(&mut self.sessions, now_ms)
+        {
+            if let Some(freed) = self.mgr.close(ex) {
+                self.tx_pool.release(freed);
+            }
+        }
         self.mgr.handler_mut().im.on_tick(now_ms);
         let _ = self.mgr.handler_mut().im.data_model_mut().on_tick(now_ms);
         // fail-safe タイマ経過で fabric を巻き戻していたら(Core Spec §11.10)、その fabric の

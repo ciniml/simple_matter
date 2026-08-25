@@ -1,0 +1,13 @@
+# generic_matter_cpp のパーティションテーブル(ESP32-C6 / S3、4MB flash 想定)。
+# docs/design/generic-firmware.md §9.2「app 2.5MB / nvs / factory / smscript(raw 256KB)」。
+#
+#   nvs         コア KVS(namespace "smatter")+ 設定 blob(namespace "smgen")
+#   factory     アプリ本体(2.5MB。Thread 構成の openthread を含めても収まる)
+#   nvs_factory esp-matter-mfg-tool 互換の factory データ(CONFIG_SM_FACTORY_DATA)
+#   smscript    スクリプト格納用の raw パーティション(Phase D/G4 用。Phase B では未使用)
+# Name,        Type, SubType, Offset,   Size,     Flags
+nvs,           data, nvs,     0x9000,   0x6000,
+phy_init,      data, phy,     0xf000,   0x1000,
+factory,       app,  factory, 0x10000,  0x280000,
+nvs_factory,   data, nvs,     0x290000, 0x6000,
+smscript,      data, 0x40,    0x296000, 0x40000,

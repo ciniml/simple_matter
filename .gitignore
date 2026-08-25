@@ -7,3 +7,7 @@ ports/*/target/
 !ports/esp32/Cargo.lock
 !ports/esp32s3/Cargo.lock
 ca-state.bin
+crates/sm-script-api/examples-wasm/*/target/
+tools/wasm-harness/.wamr/
+tools/wasm-harness/build/
+/JOURNAL.md

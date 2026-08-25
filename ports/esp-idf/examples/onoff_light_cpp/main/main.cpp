@@ -54,6 +54,11 @@ static const char *TAG = "onoff_cpp";
 #define SM_WIFI_SSID CONFIG_SM_WIFI_SSID
 #define SM_WIFI_PASS CONFIG_SM_WIFI_PASSWORD
 #define SM_LED_GPIO CONFIG_SM_LED_GPIO
+#ifdef CONFIG_SM_BUTTON_GPIO
+#define SM_BUTTON_GPIO CONFIG_SM_BUTTON_GPIO
+#else
+#define SM_BUTTON_GPIO (-1)
+#endif
 #define SM_NVS_NAMESPACE "smatter"
 
 // 工場出荷 factory データパーティションのラベル(未定義時は既定 "nvs_factory")。
@@ -544,6 +549,59 @@ static void led_init() {
 
 static void led_set(bool on) { gpio_set_level((gpio_num_t)SM_LED_GPIO, on ? 1 : 0); }
 
+// ---- 本体ボタン(T7、docs/design/p4-thread-controller.md §15)---------------
+//
+// active-low + 内部プルアップ。ISR は使わず 20ms ポーリング + デバウンス
+// (3 回連続 Low で押下確定、3 回連続 High で離した扱い → 押しっぱなしで再発火しない)。
+// BOOT ピンはストラップなので起動直後の状態は読まない(1 秒待ってから監視開始)。
+
+#if SM_BUTTON_GPIO >= 0
+static void button_task(void *) {
+  gpio_config_t io{};
+  io.pin_bit_mask = 1ULL << SM_BUTTON_GPIO;
+  io.mode = GPIO_MODE_INPUT;
+  io.pull_up_en = GPIO_PULLUP_ENABLE;
+  io.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  io.intr_type = GPIO_INTR_DISABLE;
+  gpio_config(&io);
+
+  vTaskDelay(pdMS_TO_TICKS(1000)); // ストラップ期間をやり過ごす
+
+  ESP_LOGI(TAG, "button task started (gpio=%d, active-low)", (int)SM_BUTTON_GPIO);
+
+  int low_run = 0;   // 連続 Low 回数
+  int high_run = 0;  // 連続 High 回数
+  bool pressed = false;
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(20));
+    bool low = gpio_get_level((gpio_num_t)SM_BUTTON_GPIO) == 0;
+    if (low) {
+      high_run = 0;
+      if (low_run < 3) {
+        low_run++;
+      }
+      if (!pressed && low_run >= 3) {
+        pressed = true;
+        ESP_LOGI(TAG, "button pressed -> local toggle");
+        Cmd c{};
+        c.kind = CmdKind::LocalToggle;
+        if (g_cmd_queue) {
+          xQueueSend(g_cmd_queue, &c, 0);
+        }
+      }
+    } else {
+      low_run = 0;
+      if (high_run < 3) {
+        high_run++;
+      }
+      if (pressed && high_run >= 3) {
+        pressed = false;
+      }
+    }
+  }
+}
+#endif
+
 // ---- カスタムクラスタ(F4b、EP2、vendor 領域クラスタ)-----------------------
 //
 // docs/design/c-ffi-shim.md §8。sm_init より前に登録する。値の所有はここ(C++ 側)。
@@ -662,7 +720,7 @@ static void matter_task(void *) {
   // sm_config を組む。
   sm_config_t cfg;
   memset(&cfg, 0, sizeof(cfg));
-  cfg.discriminator = 3840;
+  cfg.discriminator = 2560; // 3840 は同一環境の別実験ボードと混信するため変更(T4 実機)
   // passcode はデバイスに置かない(verifier 指定時は無視される)。
   cfg.passcode = 0;
   cfg.verifier_iterations = 2000;
@@ -782,12 +840,17 @@ static void matter_task(void *) {
 #endif
 
 #if CONFIG_SM_NETWORK_THREAD
-  // コミッショニング済みなら保存済み dataset で自動 attach(再起動後の運用復帰)。
-  if (stack.fabric_count() > 0) {
+  // 保存済み dataset があれば fabric の有無によらず自動 attach する。
+  //   - fabric>0: 再起動後の運用復帰(従来どおり)
+  //   - fabric=0: 「Thread には居るが未コミッショニング」の commissionable デバイス。
+  //     fail-safe 失効ロールバック後や、on-network PASE(P4 ハブの F8 経路 =
+  //     dataset プリセット運用)がこの状態を前提にする(実機 P9 で発覚)。
+  {
     uint8_t ds[256];
     size_t n = sizeof(ds);
     if (load_thread_dataset(ds, &n)) {
-      ESP_LOGI(TAG, "fabric restored; auto-attaching saved Thread dataset (%u B)", (unsigned)n);
+      ESP_LOGI(TAG, "auto-attaching saved Thread dataset (%u B, fabrics=%u)", (unsigned)n,
+               (unsigned)stack.fabric_count());
       sm_ot_apply_dataset(ds, n);
     }
   }
@@ -935,6 +998,21 @@ static void matter_task(void *) {
 
     // 時間駆動の送出・イベント・mDNS announce。
     stack.pump(now, udp_send);
+
+    // 診断(2026-08-25 不達調査): コアの各プール使用量を 30 秒ごとに残す。
+    // 「受信はするが応答しない」= exchange / セッション / handshake slot の枯渇を
+    // ログだけで見分けるため。
+    {
+      static uint64_t s_last_pool_log = 0;
+      if (now - s_last_pool_log >= 30000) {
+        s_last_pool_log = now;
+        sm_pool_stats_t st = {};
+        sm_pool_stats(&st);
+        ESP_LOGI(TAG, "pools: ex=%u/%u sess=%u/%u hs=%u/%u tx=%u/%u heap=%lu", st.exchanges,
+                 st.exchanges_cap, st.sessions, st.sessions_cap, st.handshakes, st.handshakes_cap,
+                 st.tx_bufs, st.tx_bufs_cap, (unsigned long)esp_get_free_heap_size());
+      }
+    }
 #if CONFIG_SM_ENABLE_BLE
     // BLE 宛の下りフラグメント(handshake resp / データ / 遅延 ConnectNetworkResponse /
     // keep-alive ACK)を C2 indication で直列排出する(indicate 完了まで待つ)。
@@ -987,4 +1065,9 @@ extern "C" void app_main() {
   // コミッショニング中の P-256 署名チェーンも深い(ベアメタル実測 ~70KB)。
   // 8KB だと WiFi 開始直後に即リセットループになる。
   xTaskCreate(&matter_task, "matter", 128 * 1024, nullptr, 5, nullptr);
+
+#if SM_BUTTON_GPIO >= 0
+  // 本体ボタン(T7): ポーリングのみなのでスタック小・優先度低。
+  xTaskCreate(&button_task, "button", 3 * 1024, nullptr, 2, nullptr);
+#endif
 }

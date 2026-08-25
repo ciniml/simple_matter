@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>simple-matter Web Configurator</title>
+    <link rel="stylesheet" href="css/app.css" />
+  </head>
+  <body>
+    <header>
+      <h1>simple-matter Web Configurator</h1>
+      <p class="sub">
+        汎用 Matter ファームウェアの構成・個体プロビジョニング・書き込みをブラウザだけで行う
+        (<code>docs/design/generic-firmware.md</code> §6.3 / §9.5)。
+        <strong>Chrome / Edge 系のみ</strong>(Web Serial)。すべてクライアントサイドで完結し、
+        鍵や passcode が外部に出ることはありません。
+      </p>
+      <p id="env-warning" class="warn hidden"></p>
+    </header>
+
+    <main>
+      <!-- ① 構成 -->
+      <section id="sec-composition">
+        <h2>① 構成(エンドポイント / クラスタ / バインディング)</h2>
+        <div class="row">
+          <label for="preset">プリセット</label>
+          <select id="preset"></select>
+          <button id="preset-apply" type="button">適用</button>
+        </div>
+
+        <h3>エンドポイント</h3>
+        <div id="endpoints"></div>
+        <button id="ep-add" type="button">+ エンドポイントを追加</button>
+
+        <h3>バインディング(クラスタ ⇔ ハードウェア)</h3>
+        <div id="bindings"></div>
+        <button id="bind-add" type="button">+ バインディングを追加</button>
+
+        <div id="comp-errors" class="errors"></div>
+
+        <h3>生成された TLV</h3>
+        <div class="row">
+          <label>comp</label>
+          <output id="comp-hex" class="hex"></output>
+        </div>
+        <div class="row">
+          <label>bind</label>
+          <output id="bind-hex" class="hex"></output>
+        </div>
+        <p class="hint">
+          コンソール経由で試すときは <code>cfg-comp &lt;hex&gt;</code> /
+          <code>cfg-bind &lt;hex&gt;</code>。書き込みでは NVS パーティション
+          (<code>0x9000</code>、namespace <code>smgen</code>)として焼きます。
+        </p>
+      </section>
+
+      <!-- ② 個体情報 -->
+      <section id="sec-device">
+        <h2>② 個体情報(discriminator / passcode / SPAKE2+ verifier)</h2>
+        <div class="grid">
+          <label>Vendor ID<input id="vid" type="text" value="0xFFF1" /></label>
+          <label>Product ID<input id="pid" type="text" value="0x8001" /></label>
+          <label>Vendor Name<input id="vendor-name" type="text" value="SimpleMatter" /></label>
+          <label>Product Name<input id="product-name" type="text" value="GenericDevice" /></label>
+          <label>Hardware Version<input id="hw-ver" type="number" value="1" min="0" /></label>
+          <label>HW Version 文字列<input id="hw-ver-str" type="text" value="HW1" /></label>
+          <label>Serial Number<input id="serial" type="text" value="SM-GEN-0001" /></label>
+          <label>PBKDF2 iterations<input id="iterations" type="number" value="10000" min="1000" max="100000" /></label>
+          <label>Discriminator (12bit)<input id="discriminator" type="number" min="0" max="4095" /></label>
+          <label>Setup passcode<input id="passcode" type="number" min="1" max="99999998" /></label>
+          <label class="wide">Salt (hex, 16..32 B)<input id="salt" type="text" /></label>
+          <label>Discovery capability
+            <select id="discovery">
+              <option value="4">On-network (0x04)</option>
+              <option value="2">BLE (0x02)</option>
+              <option value="6">BLE + On-network (0x06)</option>
+              <option value="1">SoftAP (0x01)</option>
+            </select>
+          </label>
+          <label>DAC(attestation)
+            <select id="dac-source">
+              <option value="dev">同梱の開発用テスト DAC(VID 0xFFF1 / PID 0x8001)</option>
+              <option value="none">入れない(dev 資格情報にフォールバック)</option>
+              <option value="upload">ファイル指定(dac.der / pai.der / dac_key.bin)</option>
+            </select>
+          </label>
+        </div>
+        <div id="dac-upload" class="grid hidden">
+          <label>dac.der<input id="dac-der" type="file" /></label>
+          <label>pai.der<input id="pai-der" type="file" /></label>
+          <label>dac_key.bin (32B)<input id="dac-key" type="file" /></label>
+        </div>
+        <div class="row">
+          <button id="regen" type="button">乱数で再生成</button>
+          <button id="build-device" type="button">verifier と factory NVS を生成</button>
+        </div>
+        <div id="device-errors" class="errors"></div>
+        <div class="row">
+          <label>w0‖L</label>
+          <output id="verifier-hex" class="hex"></output>
+        </div>
+        <p class="hint">
+          デバイスへ渡すのは <code>iterations / salt / w0‖L</code> だけで、passcode は焼きません
+          (Matter のセキュリティ要件)。検算: <code>cargo run -p smctl -- pase-verifier &lt;passcode&gt;
+          --salt &lt;hex&gt; --iterations &lt;n&gt;</code>
+        </p>
+      </section>
+
+      <!-- ③ QR / MPC -->
+      <section id="sec-onboarding">
+        <h2>③ オンボーディング(QR / Manual Pairing Code)</h2>
+        <div class="onboarding">
+          <div id="qr"></div>
+          <div class="codes">
+            <p><span class="k">QR payload</span><output id="qr-text"></output></p>
+            <p><span class="k">Manual code</span><output id="manual-code"></output></p>
+            <p><span class="k">Discriminator</span><output id="show-disc"></output></p>
+            <p><span class="k">Passcode</span><output id="show-pass"></output></p>
+            <button id="print" type="button">ラベルを印刷</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ④ スクリプト -->
+      <section id="sec-script">
+        <h2>④ スクリプト(WASM → smscript イメージ)</h2>
+        <p class="hint">
+          ブラウザ内 AssemblyScript コンパイル(<code>asc</code>)は vendor 容量の都合で
+          <strong>Phase E' に分離</strong>しました(binaryen だけで 13.6 MB)。当面は
+          ローカルで <code>npx asc</code> / <code>cargo build --target wasm32-unknown-unknown</code>
+          してできた <code>.wasm</code> をここに投入してください。
+          エディタの内容はローカル保存用で、コンパイルはしません。
+        </p>
+        <div class="row">
+          <label>.wasm ファイル<input id="wasm-file" type="file" accept=".wasm" /></label>
+          <label>version<input id="wasm-ver" type="number" value="1" min="1" max="65535" /></label>
+          <label>スロット
+            <select id="wasm-slot">
+              <option value="a">slot A (0x296000)</option>
+              <option value="b">slot B (0x2B6000)</option>
+            </select>
+          </label>
+        </div>
+        <div id="script-status" class="hint"></div>
+        <details>
+          <summary>AssemblyScript エディタ(下書き / ダウンロード用)</summary>
+          <textarea id="as-source" rows="14" spellcheck="false"></textarea>
+          <div class="row">
+            <button id="as-download" type="button">.ts をダウンロード</button>
+            <span class="hint">型宣言は <code>web/sdk/sm.d.ts</code>、サンプルは
+              <code>web/sdk/momentary-toggle.ts</code>。</span>
+          </div>
+        </details>
+      </section>
+
+      <!-- ⑤ 書き込み -->
+      <section id="sec-flash">
+        <h2>⑤ 書き込み(esptool-js / Web Serial)</h2>
+        <div class="grid">
+          <label>bootloader.bin<input id="fw-bootloader" type="file" /></label>
+          <label>partition-table.bin<input id="fw-parttable" type="file" /></label>
+          <label>アプリ (generic_matter_cpp.bin)<input id="fw-app" type="file" /></label>
+          <label class="wide">URL から取得(任意)
+            <input id="fw-url" type="url" placeholder="https://github.com/.../generic_matter_cpp.bin" />
+          </label>
+        </div>
+        <div class="row">
+          <button id="fw-fetch" type="button">URL を取得 → アプリに設定</button>
+          <span class="hint">
+            GitHub Release の asset は CORS 応答が無く <code>fetch</code> に失敗することがあります
+            (その場合はダウンロードしてローカルファイル指定へ)。
+          </span>
+        </div>
+        <div class="row">
+          <label><input id="write-nvs" type="checkbox" checked /> 設定 NVS(0x9000、既存の
+            commissioning データは消えます)</label>
+        </div>
+        <div class="row">
+          <label><input id="write-factory" type="checkbox" checked /> factory NVS(0x290000)</label>
+          <label><input id="erase-all" type="checkbox" /> 先に全消去</label>
+          <label>baud
+            <select id="baud">
+              <option>921600</option>
+              <option selected>460800</option>
+              <option>115200</option>
+            </select>
+          </label>
+        </div>
+
+        <h3>書き込みプラン</h3>
+        <table id="plan">
+          <thead>
+            <tr><th>オフセット</th><th>内容</th><th>サイズ</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+
+        <div class="row">
+          <button id="connect" type="button">シリアルポートに接続</button>
+          <button id="flash" type="button" disabled>書き込む</button>
+          <button id="download-all" type="button">生成物をダウンロード</button>
+        </div>
+        <progress id="progress" value="0" max="100" class="hidden"></progress>
+        <pre id="log"></pre>
+      </section>
+    </main>
+
+    <footer>
+      <p>
+        vendor: esptool-js (Apache-2.0) / @noble/curves (MIT) / qrcode-generator (MIT)。
+        CDN 参照なし・ビルドステップなし。詳細は <code>web/configurator/README.md</code>。
+      </p>
+    </footer>
+
+    <script type="module" src="js/app.js"></script>
+  </body>
+</html>

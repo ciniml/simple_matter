@@ -111,7 +111,7 @@ esp_bootloader_esp_idf::esp_app_desc!();
 /// コミッショニングパスコード(PC example と同値)。
 /// SPAKE2+ 検証子導出のソルト(PC example と同値)。
 /// コミッショニング discriminator(12 ビット、PC example と同値)。
-const DISCRIMINATOR: u16 = 3840;
+const DISCRIMINATOR: u16 = 2340; // 3840 は同一環境の別実験ボードと混信するため変更(T4 実機)
 /// fabric テーブル容量(`DefaultStack` の NF と一致させる)。
 const NF: usize = 5;
 
@@ -804,7 +804,9 @@ async fn pump(
                     // (RFC 6762 §5.4)。QM は受信ファミリに合わせてマルチキャスト。
                     let qu = r.query_wants_unicast(&mdns_rx[..n]);
                     let src_is_v6 = src.socket_addr().map(|s| s.is_ipv6()).unwrap_or(false);
+                    println!("[mdns] rx {} B from {:?} qu={}", n, src, qu);
                     if let Some(len) = r.handle_query(&mdns_rx[..n], &mut mdns_tx) {
+                        println!("[mdns] responding {} B", len);
                         let dst = if qu {
                             src
                         } else if src_is_v6 {
@@ -1255,7 +1257,16 @@ async fn main(_spawner: Spawner) {
                 }
                 None => println!("[kvs] wifi credentials record invalid; ignoring"),
             },
-            Ok(None) => {}
+            Ok(None) => {
+                // ビルド時プリセット(`SM_WIFI_SSID=... SM_WIFI_PASS=... cargo build`)。
+                // BLE を使わない on-network コミッショニング(pairing address)の入口。
+                if let (Some(ssid), Some(pass)) =
+                    (option_env!("SM_WIFI_SSID"), option_env!("SM_WIFI_PASS"))
+                {
+                    println!("[wifi] using build-time preset credentials (ssid={})", ssid);
+                    EspWifiDriver.connect(ssid.as_bytes(), pass.as_bytes());
+                }
+            }
             Err(e) => println!("[kvs] wifi credentials read failed: {:?}", e),
         }
     }

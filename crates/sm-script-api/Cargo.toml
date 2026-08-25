@@ -1,0 +1,13 @@
+[package]
+name = "sm-script-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "simple-matter WASM script SDK (host imports + hook ABI for the generic firmware)"
+
+[lib]
+# 実行対象は wasm32-unknown-unknown だが、ホスト(x86_64)でも lib としてビルドできる
+# (import は未対応スタブになる)。これで `cargo test --workspace` が壊れない。
+crate-type = ["rlib"]
+
+[dependencies]

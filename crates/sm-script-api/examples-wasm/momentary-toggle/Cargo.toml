@@ -1,0 +1,32 @@
+# momentary-toggle — モーメンタリスイッチを OnOff トグルに変える実用サンプル(§9.3)。
+#
+# ワークスペースからは **除外**(ルート Cargo.toml の exclude)。no_std + panic_handler +
+# cdylib はホストの cargo test / clippy と同居できないため。
+#
+#   rustup target add wasm32-unknown-unknown
+#   cargo build --release --target wasm32-unknown-unknown
+#   -> target/wasm32-unknown-unknown/release/momentary_toggle.wasm
+# 独立ワークスペース(ルートの exclude と対で、ホストのビルドグラフから完全に分離する)。
+[workspace]
+
+[package]
+name = "momentary-toggle"
+version = "0.1.0"
+edition = "2021"
+license = "BSL-1.0"
+publish = false
+
+[lib]
+name = "momentary_toggle"
+crate-type = ["cdylib"]
+
+[dependencies]
+sm-script-api = { path = "../.." }
+
+# スクリプトは数 KB に収める(§6「オフライン開発なら Rust も第一級」)。
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

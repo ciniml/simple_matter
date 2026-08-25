@@ -18,7 +18,7 @@
 //! 全面改修になる。かといって最初から 3 分岐する enum は UDP 専用の現状では過剰で
 //! ある。現状 variant 1 個の enum なら分岐コストはほぼゼロで、拡張点だけ確保できる。
 
-use core::net::{IpAddr, SocketAddr};
+use core::net::{IpAddr, SocketAddr, SocketAddrV6};
 
 use crate::error::Result;
 
@@ -81,14 +81,27 @@ impl PeerAddr {
     }
 }
 
-/// IPv4-mapped IPv6 アドレスを IPv4 へ畳み込んで正規化する。
+/// ピアアドレスを比較用に正規化する。
 ///
-/// それ以外のアドレスはそのまま返す。ポート番号は保持する。
+/// - IPv4-mapped IPv6 は IPv4 へ畳み込む。
+/// - **リンクローカル(fe80::/10)以外の IPv6 は scope_id / flowinfo をゼロにする**。
+///   scope はリンクローカルの曖昧性解消にのみ意味があり、ULA/GUA では送信側が
+///   便宜的に付けた netif index と、受信スタックが付けない 0 が混在して同一ピアの
+///   照合が壊れる(P4 Thread ハブで実測: 送信先に OT netif の scope=2 を与えると
+///   ULA からの応答(scope=0)がセッション NotFound で黙って落ちる。P9)。
+/// - ポート番号は保持する。
 pub fn canonical_socket_addr(addr: SocketAddr) -> SocketAddr {
     match addr {
         SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
             Some(v4) => SocketAddr::new(IpAddr::V4(v4), v6.port()),
-            None => addr,
+            None => {
+                let is_link_local = (v6.ip().segments()[0] & 0xffc0) == 0xfe80;
+                if is_link_local {
+                    addr
+                } else {
+                    SocketAddr::V6(SocketAddrV6::new(*v6.ip(), v6.port(), 0, 0))
+                }
+            }
         },
         SocketAddr::V4(_) => addr,
     }
@@ -177,6 +190,22 @@ mod tests {
         assert_eq!(canonical_socket_addr(v4), v4);
         let v6 = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1234, 0, 0));
         assert_eq!(canonical_socket_addr(v6), v6);
+    }
+
+    /// リンクローカル以外の v6 は scope_id/flowinfo を比較から除外する(P9: Thread の
+    /// ULA で送信側の scope=netif index と受信側の scope=0 が食い違い、セッション照合が
+    /// 壊れて PASE 応答が黙って落ちる)。リンクローカルは scope が意味を持つので保持。
+    #[test]
+    fn zeroes_scope_for_non_link_local_v6() {
+        let ula = Ipv6Addr::new(0xfd1c, 0x95e6, 0x1cb6, 0xf38e, 0, 0, 0, 1);
+        let with_scope = SocketAddr::V6(SocketAddrV6::new(ula, 5540, 7, 2));
+        let without = SocketAddr::V6(SocketAddrV6::new(ula, 5540, 0, 0));
+        assert_eq!(canonical_socket_addr(with_scope), without);
+
+        // fe80 は scope を保持する(異なる scope は別ピア)。
+        let ll = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let ll2 = SocketAddr::V6(SocketAddrV6::new(ll, 5540, 0, 2));
+        assert_eq!(canonical_socket_addr(ll2), ll2);
     }
 
     /// `&mut T` へのブランケット実装が合成に使えることを型レベルで確認する。

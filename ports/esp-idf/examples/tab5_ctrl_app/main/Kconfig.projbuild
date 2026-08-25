@@ -1,0 +1,89 @@
+menu "tab5_ctrl_app configuration"
+
+    comment "RCP (ESP32-H2) connection -- defaults are the values confirmed on hardware (P9)"
+
+    config SM_OT_UART_PORT
+        int "UART port to the 802.15.4 RCP"
+        default 1
+        help
+            H2(ot_rcp)と spinel をやり取りする P4 側の UART ポート番号。
+            UART0 はコンソールに使うため既定は 1。
+
+    config SM_OT_UART_RX_PIN
+        int "UART RX pin (P4 side, connect to RCP TX)"
+        default 54
+        help
+            M5Stack Tab5 の Port A(Grove)の RX = GPIO54。実機 P9 で確定
+            (53/54 を逆にすると spinel が無応答になる)。
+
+    config SM_OT_UART_TX_PIN
+        int "UART TX pin (P4 side, connect to RCP RX)"
+        default 53
+        help
+            M5Stack Tab5 の Port A(Grove)の TX = GPIO53。実機 P9 で確定。
+
+    config SM_OT_UART_BAUD
+        int "UART baud rate to the RCP"
+        default 460800
+        help
+            scripts/otbr/build-ot-rcp-h2.sh でビルドする RCP 側の設定と一致させること。
+
+    comment "Thread network"
+
+    config SM_THREAD_DATASET_TLV_HEX
+        string "Active dataset TLV (hex, empty = create a new network)"
+        default ""
+        help
+            空にすると起動時に otDatasetCreateNewNetwork で新規ネットワークを生成する
+            (生成された TLV は起動ログと画面の Network タブに出る)。
+            NVS に保存済みの dataset があればそちらが優先される。
+
+    comment "WiFi (on-board ESP32-C6 over SDIO -- esp_hosted / esp_wifi_remote)"
+
+    config SM_WIFI_SSID
+        string "WiFi SSID (empty = WiFi disabled, Thread only)"
+        default ""
+        help
+            空にすると sm_wifi_start() が何もせず戻る(Thread だけで動く)。
+            C6 の slave FW が esp_hosted 2.x でない個体では、ここを設定しても
+            SDIO の CMD5 が通らず初期化に失敗する(画面の WiFi 表示が "failed")。
+
+    config SM_WIFI_PASSWORD
+        string "WiFi password (empty = open AP)"
+        default ""
+
+    comment "Matter"
+
+    config SM_TARGET_PORT
+        int "Matter UDP port of the devices"
+        default 5540
+        help
+            PASE / CASE の宛先ポート。標準は 5540。
+
+    config SM_UI_DEFAULT_PASSCODE
+        int "Default passcode shown in the pair dialog"
+        default 20202021
+
+    config SM_UI_DEFAULT_DISCRIMINATOR
+        int "Default discriminator shown in the pair dialog (BLE)"
+        default 3840
+        help
+            BLE コミッショニング(via = BLE)のときに 1 番目の入力欄へ出す既定値。
+            Matter の既定 discriminator は 3840(= 0xF00)。
+
+    config SM_UI_DEFAULT_NODE_ID
+        hex "First NodeId offered by the pair dialog"
+        default 0xAABBCCDD
+        help
+            Pair ダイアログの NodeId 初期値。既に同じ ID のノードが居る場合は
+            +1 して自動採番する(ダイアログ上で編集も可)。
+
+    config SM_UI_FALLBACK_NODE_ID
+        hex "Fallback NodeId when the node book blob cannot be parsed"
+        default 0xAABBCCDD
+        help
+            NVS の "smctl"/"nods" が読めないのにシムがノードを持っている場合、
+            この NodeId だけ sm_ctrl_node_addr で当たりを取って一覧に出す
+            (実機の NanoC6 = 0xaabbccdd の救済)。
+
+endmenu

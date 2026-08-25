@@ -698,10 +698,10 @@ fn transaction_times_out() {
     assert!(im.is_busy());
 
     // 期限ちょうどでは掃除しない。
-    assert!(!im.on_tick(CLIENT_TXN_TIMEOUT_MS));
+    assert!(im.on_tick(CLIENT_TXN_TIMEOUT_MS).is_none());
     assert!(im.is_busy());
     // 期限超過で破棄し Failed(Timeout)。
-    assert!(im.on_tick(CLIENT_TXN_TIMEOUT_MS + 1));
+    assert!(im.on_tick(CLIENT_TXN_TIMEOUT_MS + 1).is_some());
     assert_eq!(
         im.take_event(),
         Some(ImEvent::Failed {

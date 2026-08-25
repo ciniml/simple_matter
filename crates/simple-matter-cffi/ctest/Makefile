@@ -18,8 +18,11 @@ CXX      := g++
 CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -I$(INCDIR)
 LDLIBS   := -lpthread -ldl -lm
 
-.PHONY: all lib run clean
-all: onoff_light controller ble_loopback
+.PHONY: all lib run check check-generic check-wasm clean
+
+# `make check` の作業ディレクトリ(状態ディレクトリを分離する)。
+RUNDIR := ./run
+all: onoff_light controller ble_loopback composed_loopback compose_check scriptstore_loopback
 
 lib:
 	cargo build -p simple-matter-cffi --release --features std --target $(TARGET)
@@ -35,8 +38,54 @@ controller: controller.cpp lib
 ble_loopback: ble_loopback.cpp lib
 	$(CXX) $(CXXFLAGS) -o $@ ble_loopback.cpp $(STATICLIB) $(LDLIBS)
 
+# composition モード(Phase A)のループバックハーネス(合成デバイス ↔ コントローラ)。
+composed_loopback: composed_loopback.cpp lib
+	$(CXX) $(CXXFLAGS) -o $@ composed_loopback.cpp $(STATICLIB) $(LDLIBS)
+
+# composition / binding blob のホスト検算(Phase B、generic_matter_cpp の README hex 例)。
+# binding パーサはファームと同一ヘッダ(generic_matter_cpp/main/bind_tlv.hpp)を使う。
+GENDIR := $(ROOT)/ports/esp-idf/examples/generic_matter_cpp/main
+compose_check: compose_check.cpp lib $(GENDIR)/bind_tlv.hpp
+	$(CXX) $(CXXFLAGS) -I$(GENDIR) -o $@ compose_check.cpp $(STATICLIB) $(LDLIBS)
+
+# ScriptStore(Phase D / G4)のループバック。受信ステートマシンはファームと同一ヘッダ
+# (generic_matter_cpp/main/script_store.hpp)を使い、esp_partition の代わりに
+# メモリ backend を注入する。
+scriptstore_loopback: scriptstore_loopback.cpp lib $(GENDIR)/script_store.hpp $(GENDIR)/script_img.hpp
+	$(CXX) $(CXXFLAGS) -I$(GENDIR) -o $@ scriptstore_loopback.cpp $(STATICLIB) $(LDLIBS)
+
 run: onoff_light
 	./onoff_light $(ARGS)
 
+# 自己完結ハーネスの一括実行(ネットワーク・無線なしで green/red が決まる)。
+#   make check
+check: ble_loopback composed_loopback compose_check scriptstore_loopback
+	rm -rf $(RUNDIR) && mkdir -p $(RUNDIR)
+	./ble_loopback wifi --dev-dir $(RUNDIR)/ble-wifi-dev --ctrl-dir $(RUNDIR)/ble-wifi-ctrl
+	./ble_loopback thread --dev-dir $(RUNDIR)/ble-thr-dev --ctrl-dir $(RUNDIR)/ble-thr-ctrl
+	./composed_loopback --dev-dir $(RUNDIR)/comp-dev --ctrl-dir $(RUNDIR)/comp-ctrl
+	./scriptstore_loopback --dev-dir $(RUNDIR)/ss-dev --ctrl-dir $(RUNDIR)/ss-ctrl
+	$(MAKE) check-generic
+
+# generic_matter_cpp README の設定例(scripts/smgen-tlv.py examples の出力)を検算する。
+# sm_init はプロセス 1 回きりなので、例ごとに別プロセスで走らせる。
+check-generic: compose_check
+	./compose_check \
+	  --comp 1715250001002601000100002402023603060300000006040000000606000000181818 \
+	  --bind 17152500010026010600000024020135032400072801181818 \
+	  --expect 1:0003,1:0004,1:0006
+	./compose_check \
+	  --comp 1715250001002601010100002402033603060300000006040000000606000000060800000018181525000200260102030000240202360306020400000605040000181818 \
+	  --bind 17152500010026010800000024020335032400002401062602e803000018181525000200260102040000240204350324000824010925028813181818 \
+	  --expect 1:0003,1:0004,1:0006,1:0008,2:0402,2:0405
+
+# Phase C(WASM スクリプト)のホストゲート。ファームと同一の script_vm.cpp を Linux 用
+# WAMR にリンクし、サンプル .wasm(momentary-toggle)でフックのラウンドトリップと
+# 暴走スクリプトの打ち切りを検証する。初回のみ WAMR 取得でネットワークが要るので
+# `check` には含めない(docs/design/generic-firmware.md §9.3)。
+check-wasm:
+	$(ROOT)/tools/wasm-harness/run.sh
+
 clean:
-	rm -f onoff_light controller ble_loopback
+	rm -f onoff_light controller ble_loopback composed_loopback compose_check scriptstore_loopback
+	rm -rf $(RUNDIR)

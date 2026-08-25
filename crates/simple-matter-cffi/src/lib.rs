@@ -64,12 +64,24 @@ use simple_matter::tlv::TlvTag;
 use simple_matter::transport::net::PeerAddr;
 
 mod custom;
-use custom::{sm_cluster_def_t, CustomCluster, PendingRegistry};
+use custom::{CustomCluster, PendingRegistry};
+// C ABI 型は crate ルートへ再輸出する(Rust 側の利用者・統合テスト向け)。`custom`
+// モジュール自体は非公開のまま(内部型 CustomCluster / PendingRegistry を公開
+// API にしないため)。C ヘッダは cbindgen が custom.rs から直接生成する。
+pub use custom::{
+    sm_attr_bytes, sm_attr_def_t, sm_attr_type_t, sm_attr_value_data, sm_attr_value_t,
+    sm_cluster_def_t, sm_cmd_def_t, SmClusterInvoke, SmClusterRead, SmClusterWrite,
+    SM_ATTR_NULLABLE, SM_ATTR_TIMED, SM_ATTR_WRITABLE, SM_CMD_TIMED,
+};
+
+// composition モード(Phase A、docs/design/generic-firmware.md §9.1)。
+pub mod compose;
+use compose::Composed;
 
 // コントローラ(commissioner)側の C FFI(F7a、docs/design/c-ffi-shim.md §11)。
 // デバイス側スタックとは独立したインスタンス(呼び出し側供給メモリに構築)。
 #[cfg(feature = "controller")]
-mod controller;
+pub mod controller;
 
 // ---- BLE(BTP)+ WiFi プロビジョン(F3、docs/design/c-ffi-shim.md §9)----
 #[cfg(feature = "ble")]
@@ -243,8 +255,8 @@ const BTP_WINDOW: usize = 6;
 const NF: usize = 5;
 /// ACL テーブル容量(fabric 5 × per-fabric 上限 4)。
 const NACL: usize = 20;
-/// マージ後の総エンドポイント数上限(プリセット EP0/EP1 + カスタム)。
-const MAX_EP_TOTAL: usize = 2 + custom::MAX_CUSTOM_ENDPOINTS;
+/// マージ後の総エンドポイント数上限(EP0 + プリセット EP1 or 合成 EP + カスタム)。
+const MAX_EP_TOTAL: usize = 1 + compose::MAX_COMPOSED_EPS + custom::MAX_CUSTOM_ENDPOINTS;
 /// 1 エンドポイントあたりのサーバクラスタ ID 上限(合成 Descriptor 用)。
 const MAX_SERVERS: usize = 16;
 /// SPAKE2+ ソルト(PC example と同じ開発用固定値。passcode フォールバック時のみ使用)。
@@ -529,6 +541,18 @@ pub type SmKvsSet = Option<
 pub type SmKvsDelete = Option<unsafe extern "C" fn(ctx: *mut c_void, key: *const c_char) -> i32>;
 /// RNG コールバック(esp_fill_random 等)。
 pub type SmRngFill = Option<unsafe extern "C" fn(ctx: *mut c_void, buf: *mut u8, len: usize)>;
+/// 属性値変化コールバック(composition モードの汎用フック。§9.1)。
+///
+/// IM write / コマンドでクラスタの状態が変わると、変化した属性ごとに 1 回呼ばれる。
+pub type SmClusterChange = Option<
+    unsafe extern "C" fn(
+        ctx: *mut c_void,
+        endpoint: u16,
+        cluster_id: u32,
+        attr_id: u32,
+        value: *const sm_attr_value_t,
+    ),
+>;
 
 /// プリセット NetworkCommissioning の種別(`docs/design/c-ffi-shim.md` §10.1)。
 ///
@@ -613,6 +637,24 @@ pub struct sm_config_t {
     pub dac_sign: SmDacSign,
     /// `dac_sign` の ctx。
     pub dac_sign_ctx: *mut c_void,
+
+    // --- composition モード(`docs/design/generic-firmware.md` §9.1)---
+    /// エンドポイント構成 blob(Matter TLV)。**NULL = 従来の固定 OnOff ライト構成**
+    /// (EP1 = Identify/Groups/OnOff/Descriptor。既存 example と完全互換)。
+    ///
+    /// 非 NULL のときは EP1 以降を blob の宣言どおりに合成する(EP0 のシステムクラスタは
+    /// 固定)。スキーマは `crate::compose` のモジュールドキュメント。パース失敗は
+    /// `sm_init` が `-7`、容量超過/未対応クラスタは `-8` を返す。
+    pub composition: *const u8,
+    /// `composition` の長さ(バイト)。
+    pub composition_len: usize,
+    /// 属性値が IM write / コマンドで変化したときのコールバック(NULL 可)。
+    ///
+    /// 合成クラスタ(および従来構成の EP1 OnOff)の監視対象属性が変化すると発火する。
+    /// `sm_attr_set_value` による**アプリ発の変化では発火しない**(HAL のループを避けるため)。
+    pub on_cluster_change: SmClusterChange,
+    /// `on_cluster_change` の ctx。
+    pub cluster_change_ctx: *mut c_void,
 }
 
 /// v4/v6 両対応の datagram 宛先/送信元。
@@ -829,13 +871,15 @@ struct Light {
     desc1: DescriptorCluster,
     groups: &'static RefCell<DefaultGroupStore>,
     removed_fabric: Option<NonZeroU8>,
+    /// composition モードの合成クラスタプール(空 = 従来の固定ライト構成。§9.1)。
+    composed: Composed,
     // ---- カスタムクラスタ(F4b、docs/design/c-ffi-shim.md §8)----
     /// C 登録のカスタムクラスタ(read/write/invoke を C vtable へ委譲)。
     custom_clusters: heapless::Vec<CustomCluster, { custom::MAX_CUSTOM_CLUSTERS }>,
-    /// カスタムエンドポイント用に自動合成した Descriptor(0x001D)。
-    custom_descs: heapless::Vec<DescriptorCluster, { custom::MAX_CUSTOM_ENDPOINTS }>,
+    /// 自動合成した Descriptor(0x001D)。カスタム EP と composition モードの合成 EP 用。
+    custom_descs: heapless::Vec<DescriptorCluster, MAX_EP_TOTAL>,
     /// `custom_descs` と並行するエンドポイント ID。
-    custom_ep_ids: heapless::Vec<u16, { custom::MAX_CUSTOM_ENDPOINTS }>,
+    custom_ep_ids: heapless::Vec<u16, MAX_EP_TOTAL>,
     /// マージ後の全エンドポイントメタ([`DataModel::endpoints`] が返す)。
     endpoint_metas: heapless::Vec<EndpointMeta, MAX_EP_TOTAL>,
     /// 各エンドポイントのサーバクラスタ ID(`endpoint_metas` が `&'static` で借用する裏付け)。
@@ -876,11 +920,21 @@ impl DataModel for Light {
             (0, 0x003E) => return Some(&self.opcreds),
             (0, 0x003F) => return Some(&self.gkm),
             (0, 0x001D) => return Some(&self.desc0),
-            (1, 0x0003) => return Some(&self.identify),
-            (1, 0x0004) => return Some(&self.groups_cl),
-            (1, 0x0006) => return Some(&self.onoff),
-            (1, 0x001D) => return Some(&self.desc1),
             _ => {}
+        }
+        if self.composed.is_active() {
+            // composition モード: EP1 以降は合成プールから引く(EP1 固定構成は使わない)。
+            if let Some(c) = self.composed.cluster(ep.0, cl.0) {
+                return Some(c);
+            }
+        } else {
+            match (ep.0, cl.0) {
+                (1, 0x0003) => return Some(&self.identify),
+                (1, 0x0004) => return Some(&self.groups_cl),
+                (1, 0x0006) => return Some(&self.onoff),
+                (1, 0x001D) => return Some(&self.desc1),
+                _ => {}
+            }
         }
         // カスタムエンドポイントの合成 Descriptor。
         if cl.0 == 0x001D {
@@ -904,11 +958,21 @@ impl DataModel for Light {
             (0, 0x003E) => return Some(&mut self.opcreds),
             (0, 0x003F) => return Some(&mut self.gkm),
             (0, 0x001D) => return Some(&mut self.desc0),
-            (1, 0x0003) => return Some(&mut self.identify),
-            (1, 0x0004) => return Some(&mut self.groups_cl),
-            (1, 0x0006) => return Some(&mut self.onoff),
-            (1, 0x001D) => return Some(&mut self.desc1),
             _ => {}
+        }
+        if self.composed.is_active() {
+            // composition モード(cluster() の鏡像)。借用チェッカのため 2 段で引く。
+            if self.composed.cluster(ep.0, cl.0).is_some() {
+                return self.composed.cluster_mut(ep.0, cl.0);
+            }
+        } else {
+            match (ep.0, cl.0) {
+                (1, 0x0003) => return Some(&mut self.identify),
+                (1, 0x0004) => return Some(&mut self.groups_cl),
+                (1, 0x0006) => return Some(&mut self.onoff),
+                (1, 0x001D) => return Some(&mut self.desc1),
+                _ => {}
+            }
         }
         if cl.0 == 0x001D {
             if let Some(i) = self.custom_ep_ids.iter().position(|&cep| cep == ep.0) {
@@ -928,8 +992,13 @@ impl DataModel for Light {
         }
         let _ = self.admin.on_tick(now_ms);
         let next = tick_clusters(self, now_ms);
-        let identifying = self.identify.is_identifying();
-        self.groups_cl.set_identifying(identifying);
+        if self.composed.is_active() {
+            self.composed.couple_on_off();
+            self.composed.sync_identify();
+        } else {
+            let identifying = self.identify.is_identifying();
+            self.groups_cl.set_identifying(identifying);
+        }
         next
     }
     fn group_endpoints(&self, fabric: NonZeroU8, group_id: u16, idx: usize) -> Option<EndpointId> {
@@ -961,12 +1030,21 @@ impl Light {
     fn install_custom(&mut self, pending: PendingRegistry) {
         self.custom_clusters = pending.clusters;
 
-        // 1) エンドポイント集合(0/1 + カスタムクラスタの EP + 登録 EP)を昇順で確定。
+        // 1) エンドポイント集合(0 + [EP1 固定 or 合成 EP] + カスタムクラスタの EP + 登録 EP)
+        //    を昇順で確定。
         let mut ep_ids: heapless::Vec<u16, MAX_EP_TOTAL> = heapless::Vec::new();
         let _ = ep_ids.push(0);
-        let _ = ep_ids.push(1);
+        if self.composed.is_active() {
+            for e in self.composed.endpoints() {
+                if !ep_ids.contains(&e.ep) {
+                    let _ = ep_ids.push(e.ep);
+                }
+            }
+        } else {
+            let _ = ep_ids.push(1);
+        }
         for c in &self.custom_clusters {
-            if c.endpoint > 1 && !ep_ids.contains(&c.endpoint) {
+            if c.endpoint != 0 && !ep_ids.contains(&c.endpoint) {
                 let _ = ep_ids.push(c.endpoint);
             }
         }
@@ -983,30 +1061,33 @@ impl Light {
         for &ep in ep_ids.iter() {
             let mut servers: heapless::Vec<ClusterId, MAX_SERVERS> = heapless::Vec::new();
             let mut dts: heapless::Vec<DeviceType, 2> = heapless::Vec::new();
-            match ep {
-                0 => {
-                    for c in EP0_SERVERS {
-                        let _ = servers.push(*c);
-                    }
-                    for d in EP0_DT {
-                        let _ = dts.push(*d);
-                    }
+            if ep == 0 {
+                for c in EP0_SERVERS {
+                    let _ = servers.push(*c);
                 }
-                1 => {
-                    for c in EP1_SERVERS {
-                        let _ = servers.push(*c);
-                    }
-                    for d in EP1_DT {
-                        let _ = dts.push(*d);
-                    }
+                for d in EP0_DT {
+                    let _ = dts.push(*d);
                 }
-                _ => {
-                    // 新規エンドポイント: 登録デバイスタイプ + 合成 Descriptor(0x001D)。
-                    if let Some(er) = pending.endpoints.iter().find(|e| e.endpoint == ep) {
-                        let _ = dts.push(DeviceType::new(er.device_type, er.dt_revision));
-                    }
-                    let _ = servers.push(ClusterId(0x001D));
+            } else if let Some(ce) = self.composed.endpoints().iter().find(|e| e.ep == ep) {
+                // 合成エンドポイント: 宣言クラスタ + 自動 Descriptor(0x001D)。
+                for &c in ce.clusters.iter() {
+                    let _ = servers.push(ClusterId(c));
                 }
+                let _ = servers.push(ClusterId(0x001D));
+                let _ = dts.push(DeviceType::new(ce.device_type, ce.dt_rev));
+            } else if ep == 1 && !self.composed.is_active() {
+                for c in EP1_SERVERS {
+                    let _ = servers.push(*c);
+                }
+                for d in EP1_DT {
+                    let _ = dts.push(*d);
+                }
+            } else {
+                // 新規エンドポイント: 登録デバイスタイプ + 合成 Descriptor(0x001D)。
+                if let Some(er) = pending.endpoints.iter().find(|e| e.endpoint == ep) {
+                    let _ = dts.push(DeviceType::new(er.device_type, er.dt_revision));
+                }
+                let _ = servers.push(ClusterId(0x001D));
             }
             for c in &self.custom_clusters {
                 if c.endpoint == ep && !servers.iter().any(|s| s.0 == c.cluster_id()) {
@@ -1047,7 +1128,7 @@ impl Light {
                     let parts: &'static [EndpointId] = unsafe { static_slice(&self.ep0_parts) };
                     self.desc0 = DescriptorCluster::new(EndpointId(0), dts, servers, &[], parts);
                 }
-                1 => {
+                1 if !self.composed.is_active() => {
                     self.desc1 = DescriptorCluster::new(EndpointId(1), dts, servers, &[], &[]);
                 }
                 _ => {
@@ -1057,6 +1138,48 @@ impl Light {
                 }
             }
         }
+    }
+
+    /// composition blob を合成プールへ取り込む(`install_custom` より前に呼ぶ)。
+    ///
+    /// `Err` は `sm_init` の戻り値へ写す(パース失敗 = `-7`、容量/未対応 = `-8`)。
+    fn install_composition(
+        &mut self,
+        spec: &compose::CompositionSpec,
+        groups: &'static RefCell<DefaultGroupStore>,
+    ) -> Result<(), compose::ParseError> {
+        self.composed.install(spec, groups)
+    }
+
+    /// カスタムクラスタ(F4b)の read ハンドラ経由で値を取る(`sm_attr_get_value`)。
+    fn custom_get_value(
+        &self,
+        ep: u16,
+        cluster_id: u32,
+        attr_id: u32,
+    ) -> Result<sm_attr_value_t, i32> {
+        let c = self
+            .custom_clusters
+            .iter()
+            .find(|c| c.endpoint == ep && c.cluster_id() == cluster_id)
+            .ok_or(compose::RC_NO_CLUSTER)?;
+        c.call_read(attr_id)
+    }
+
+    /// カスタムクラスタ(F4b)の write ハンドラ経由で値を書く(`sm_attr_set_value`)。
+    fn custom_set_value(
+        &mut self,
+        ep: u16,
+        cluster_id: u32,
+        attr_id: u32,
+        v: &sm_attr_value_t,
+    ) -> Result<(), i32> {
+        let c = self
+            .custom_clusters
+            .iter_mut()
+            .find(|c| c.endpoint == ep && c.cluster_id() == cluster_id)
+            .ok_or(compose::RC_NO_CLUSTER)?;
+        c.call_write(attr_id, v)
     }
 
     /// C からの dirty 通知(`sm_attr_mark_dirty`)を該当カスタムクラスタへ橋渡しする。
@@ -1118,6 +1241,7 @@ fn build_light(o: &'static Owned, rng: CRng, network: sm_network_t, dac: ShimDac
         desc1: DescriptorCluster::new(EndpointId(1), EP1_DT, EP1_SERVERS, &[], EP1_PARTS),
         removed_fabric: None,
         groups: &o.groups,
+        composed: Composed::new(),
         custom_clusters: heapless::Vec::new(),
         custom_descs: heapless::Vec::new(),
         custom_ep_ids: heapless::Vec::new(),
@@ -1161,6 +1285,10 @@ struct Shim {
     /// 現在 commissionable(BLE 広告すべき)なら Some(discriminator)、無ければ None。
     /// mDNS の set_commissionable と同じ場所で更新し、BLE 広告(§9.1)の生成元にする。
     commissionable_disc: Option<u16>,
+    /// 属性値変化コールバック(§9.1、`sm_config_t.on_cluster_change`)。
+    on_cluster_change: SmClusterChange,
+    /// `on_cluster_change` の ctx。
+    cluster_change_ctx: *mut c_void,
     events: EventRing,
     // ---- BLE(BTP)給餌(F3、docs/design/c-ffi-shim.md §9)----
     /// BTP 状態機械(peripheral)。同時 1 接続。
@@ -1274,14 +1402,39 @@ impl Shim {
         self.rebuild_mdns(now);
     }
 
+    /// `on_cluster_change` を 1 件発火する(未登録なら no-op)。
+    fn notify_cluster_change(&self, ep: u16, cluster: u32, attr: u32, v: &sm_attr_value_t) {
+        if let Some(cb) = self.on_cluster_change {
+            // SAFETY: 呼び出し側が有効なコールバックと ctx を与える契約(sm_config_t)。
+            unsafe { cb(self.cluster_change_ctx, ep, cluster, attr, v) };
+        }
+    }
+
+    /// 代表 OnOff クラスタ(合成モードは最小 EP の OnOff、従来構成は EP1)。
+    ///
+    /// 戻り値 = (エンドポイント, 現在値)。合成構成に OnOff が無ければ `None`。
+    fn primary_onoff(&self) -> Option<(u16, bool)> {
+        let dev = self.stack.device();
+        if dev.composed.is_active() {
+            let (ep, _) = dev.composed.primary_onoff()?;
+            Some((ep, dev.composed.onoff_get()?))
+        } else {
+            Some((1, dev.onoff.is_on()))
+        }
+    }
+
     /// PC example の pump 相当: 世代変化での永続化・広告切替、窓イベント、OnOff イベント。
     fn housekeep(&mut self, now: u64) {
+        // composition: LevelControl ↔ OnOff 連動を先に反映する(コマンド直後の値を確定)。
+        if self.stack.device().composed.is_active() {
+            self.stack.device_mut().composed.couple_on_off();
+        }
         // OnOff 状態変化 → イベント post + リング push。
-        let on_now = self.stack.device().onoff.is_on();
+        let (onoff_ep, on_now) = self.primary_onoff().unwrap_or((1, self.last_on));
         if on_now != self.last_on {
             self.last_on = on_now;
             let _ = self.stack.post_event(
-                EndpointId(1),
+                EndpointId(onoff_ep),
                 ClusterId(0x0006),
                 EventId(0),
                 PRIORITY_INFO,
@@ -1294,6 +1447,25 @@ impl Shim {
             );
             self.events
                 .push(sm_event_kind_t::SM_EV_ONOFF_CHANGED, on_now as u8);
+            // 従来構成でも汎用フックを鳴らす(合成構成は poll_changes が担う)。
+            if !self.stack.device().composed.is_active() {
+                self.notify_cluster_change(onoff_ep, 0x0006, 0x0000, &compose::v_bool(on_now));
+            }
+        }
+
+        // composition: IM write / コマンドで変化した属性を `on_cluster_change` へ通知する。
+        if self.stack.device().composed.is_active() {
+            let cb = self.on_cluster_change;
+            let ctx = self.cluster_change_ctx;
+            self.stack
+                .device_mut()
+                .composed
+                .poll_changes(|ep, cluster, attr, v| {
+                    if let Some(cb) = cb {
+                        // SAFETY: 呼び出し側が有効なコールバックと ctx を与える契約。
+                        unsafe { cb(ctx, ep, cluster, attr, v) };
+                    }
+                });
         }
 
         // fabric 世代変化 → 永続化 + operational/commissionable 広告切替。
@@ -1615,6 +1787,8 @@ pub extern "C" fn sm_init(cfg: *const sm_config_t, now_ms: u64) -> i32 {
         addr_of_mut!((*sp).last_on).write(false);
         addr_of_mut!((*sp).boot_window_open).write(true);
         addr_of_mut!((*sp).commissionable_disc).write(None);
+        addr_of_mut!((*sp).on_cluster_change).write(cfg.on_cluster_change);
+        addr_of_mut!((*sp).cluster_change_ctx).write(cfg.cluster_change_ctx);
         addr_of_mut!((*sp).events).write(EventRing::new());
         #[cfg(feature = "ble")]
         {
@@ -1625,6 +1799,25 @@ pub extern "C" fn sm_init(cfg: *const sm_config_t, now_ms: u64) -> i32 {
             addr_of_mut!((*sp).ble_adv).write(None);
             addr_of_mut!((*sp).wifi_req_signaled).write(false);
             addr_of_mut!((*sp).thread_req_signaled).write(false);
+        }
+
+        // composition blob(非 NULL)を最終位置の Light へ合成する(Phase A、§9.1)。
+        if !cfg.composition.is_null() && cfg.composition_len > 0 {
+            let blob = core::slice::from_raw_parts(cfg.composition, cfg.composition_len);
+            let spec = match compose::parse(blob) {
+                Ok(s) => s,
+                Err(compose::ParseError::Capacity) => return -8,
+                Err(_) => return -7,
+            };
+            match (*sp)
+                .stack
+                .device_mut()
+                .install_composition(&spec, &o.groups)
+            {
+                Ok(()) => {}
+                Err(compose::ParseError::Capacity) => return -8,
+                Err(_) => return -7,
+            }
         }
 
         // カスタム登録(sm_init 前にステージング)を最終位置の Light へ取り込む(F4b、§8)。
@@ -1739,6 +1932,53 @@ fn take_sdu(btp: &mut Btp<BTP_WINDOW>, out: &mut [u8]) -> Option<usize> {
     let n = sdu.len();
     out[..n].copy_from_slice(sdu);
     Some(n)
+}
+
+/// 各プールの使用量([`sm_pool_stats`])。C 側 `sm_pool_stats_t` と同レイアウト。
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct sm_pool_stats_t {
+    /// exchange 会話数 / 容量。
+    pub exchanges: u16,
+    pub exchanges_cap: u16,
+    /// セッション数(平文・予約含む)/ 容量。
+    pub sessions: u16,
+    pub sessions_cap: u16,
+    /// 進行中ハンドシェイク数 / 容量。
+    pub handshakes: u16,
+    pub handshakes_cap: u16,
+    /// 使用中の再送バッファ数 / 容量。
+    pub tx_bufs: u16,
+    pub tx_bufs_cap: u16,
+}
+
+/// コアの各プール使用量を `out` に書く(診断用。未初期化・NULL は 0 埋め)。
+///
+/// 実機で「受信はするが応答しない」枯渇状態(exchange / セッション / handshake slot)を
+/// ログから見分けるための足場(2026-08-25 NanoC6 調査)。
+#[no_mangle]
+pub extern "C" fn sm_pool_stats(out: *mut sm_pool_stats_t) {
+    if out.is_null() {
+        return;
+    }
+    let mut st = sm_pool_stats_t::default();
+    if INITED.load(Ordering::SeqCst) {
+        // SAFETY: 単線契約。
+        let s = unsafe { shim() };
+        let u = s.stack.pool_usage();
+        st = sm_pool_stats_t {
+            exchanges: u.exchanges as u16,
+            exchanges_cap: u.exchanges_cap as u16,
+            sessions: u.sessions as u16,
+            sessions_cap: u.sessions_cap as u16,
+            handshakes: u.handshakes as u16,
+            handshakes_cap: u.handshakes_cap as u16,
+            tx_bufs: u.tx_bufs as u16,
+            tx_bufs_cap: u.tx_bufs_cap as u16,
+        };
+    }
+    // SAFETY: caller が有効な out を渡す契約(NULL は上で除外)。
+    unsafe { out.write(st) };
 }
 
 /// 次に sm_poll を呼ぶべき時刻(ms)。SM_NO_DEADLINE(=UINT64_MAX)= 期限なし。
@@ -1875,6 +2115,8 @@ pub extern "C" fn sm_take_event(out: *mut sm_event_t) -> bool {
 }
 
 /// ローカル操作の OnOff 書き戻し(物理スイッチ等)。
+///
+/// composition モードでは**最小 EP の OnOff クラスタ**が対象(無ければ no-op)。
 #[no_mangle]
 pub extern "C" fn sm_onoff_set(on: bool, now_ms: u64) {
     if !INITED.load(Ordering::SeqCst) {
@@ -1882,11 +2124,16 @@ pub extern "C" fn sm_onoff_set(on: bool, now_ms: u64) {
     }
     // SAFETY: 単線契約。
     let s = unsafe { shim() };
-    s.stack.device_mut().onoff.set(on);
+    let dev = s.stack.device_mut();
+    if dev.composed.is_active() {
+        dev.composed.onoff_set(on);
+    } else {
+        dev.onoff.set(on);
+    }
     s.housekeep(now_ms);
 }
 
-/// 現在の OnOff 状態。
+/// 現在の OnOff 状態(composition モードは最小 EP の OnOff。無ければ false)。
 #[no_mangle]
 pub extern "C" fn sm_onoff_get() -> bool {
     if !INITED.load(Ordering::SeqCst) {
@@ -1894,7 +2141,108 @@ pub extern "C" fn sm_onoff_get() -> bool {
     }
     // SAFETY: 単線契約。
     let s = unsafe { shim() };
-    s.stack.device().onoff.is_on()
+    let dev = s.stack.device();
+    if dev.composed.is_active() {
+        dev.composed.onoff_get().unwrap_or(false)
+    } else {
+        dev.onoff.is_on()
+    }
+}
+
+// ==========================================================================
+// 汎用値アクセス(composition モード、docs/design/generic-firmware.md §9.1)
+// ==========================================================================
+
+/// 属性値を書く(センサ値 push・ローカル操作の書き戻し)。
+///
+/// 対象は composition で合成したクラスタ、従来構成の EP1 OnOff、および F4b の
+/// CustomCluster(登録された write ハンドラへ委譲)。書き込みは購読へ反映される
+/// (クラスタが dirty になる)が、`on_cluster_change` は**発火しない**
+/// (アプリ発の変化で HAL がループしないため)。
+///
+/// 戻り値: 0=OK、-1=未初期化/NULL、-2=対象クラスタ無し、-3=属性が非対応、-4=型不一致。
+#[no_mangle]
+pub extern "C" fn sm_attr_set_value(
+    endpoint: u16,
+    cluster_id: u32,
+    attr_id: u32,
+    value: *const sm_attr_value_t,
+) -> i32 {
+    if !INITED.load(Ordering::SeqCst) || value.is_null() {
+        return -1;
+    }
+    // SAFETY: caller が有効な sm_attr_value_t を与える契約。単線契約。
+    let s = unsafe { shim() };
+    let v = unsafe { &*value };
+    let dev = s.stack.device_mut();
+    if dev.composed.is_active() {
+        match dev.composed.set_value(endpoint, cluster_id, attr_id, v) {
+            Ok(()) => return 0,
+            Err(compose::RC_NO_CLUSTER) => {} // カスタムクラスタへフォールバック。
+            Err(rc) => return rc,
+        }
+    } else if endpoint == 1 && cluster_id == 0x0006 && attr_id == 0x0000 {
+        let Some(on) = (
+            // SAFETY: union は type タグに従って読む。
+            unsafe {
+                match v.r#type {
+                    custom::sm_attr_type_t::SM_T_BOOL => Some(v.v.b),
+                    custom::sm_attr_type_t::SM_T_U8
+                    | custom::sm_attr_type_t::SM_T_U16
+                    | custom::sm_attr_type_t::SM_T_U32
+                    | custom::sm_attr_type_t::SM_T_U64 => Some(v.v.u != 0),
+                    _ => None,
+                }
+            }
+        ) else {
+            return -4;
+        };
+        dev.onoff.set(on);
+        return 0;
+    }
+    // カスタムクラスタ(F4b): 登録済み write ハンドラへ委譲する。
+    match dev.custom_set_value(endpoint, cluster_id, attr_id, v) {
+        Ok(()) => 0,
+        Err(rc) => rc,
+    }
+}
+
+/// 属性値を読む(HAL / スクリプトからの状態取得)。
+///
+/// 対象は [`sm_attr_set_value`] と同じ。戻り値の意味も同じ(-3 = 属性が非対応)。
+#[no_mangle]
+pub extern "C" fn sm_attr_get_value(
+    endpoint: u16,
+    cluster_id: u32,
+    attr_id: u32,
+    out: *mut sm_attr_value_t,
+) -> i32 {
+    if !INITED.load(Ordering::SeqCst) || out.is_null() {
+        return -1;
+    }
+    // SAFETY: 単線契約。out は有効な sm_attr_value_t を指す契約。
+    let s = unsafe { shim() };
+    let dev = s.stack.device();
+    if dev.composed.is_active() {
+        match dev.composed.get_value(endpoint, cluster_id, attr_id) {
+            Ok(v) => {
+                unsafe { *out = v };
+                return 0;
+            }
+            Err(compose::RC_NO_CLUSTER) => {} // カスタムクラスタへフォールバック。
+            Err(rc) => return rc,
+        }
+    } else if endpoint == 1 && cluster_id == 0x0006 && attr_id == 0x0000 {
+        unsafe { *out = compose::v_bool(dev.onoff.is_on()) };
+        return 0;
+    }
+    match dev.custom_get_value(endpoint, cluster_id, attr_id) {
+        Ok(v) => {
+            unsafe { *out = v };
+            0
+        }
+        Err(rc) => rc,
+    }
 }
 
 /// コミッション済み fabric 数。

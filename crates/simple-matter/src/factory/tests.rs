@@ -92,6 +92,49 @@ fn factory_has_no_cert_declaration() {
     assert!(fd().cert_declaration().is_none());
 }
 
+// --- Web Configurator(web/configurator)が生成した factory NVS ---
+
+/// `node web/configurator/tools/gen-test-fixture.js` が生成した factory パーティション。
+///
+/// ブラウザ側 JS(`web/configurator/js/nvs.js`)の NVS ライタが mfg-tool 互換であり、
+/// 本パーサでそのまま読めることを確認する(docs/design/generic-firmware.md §9.5)。
+/// 個体情報は固定値: discriminator=2748 / passcode=43708557 / iteration-count=10000 /
+/// salt 32 B / DAC は同梱の開発用テスト鍵(fixture `factory-fff1-8001.bin` と同じもの)。
+const WEBCFG: &[u8] = include_bytes!("../../tests/fixtures/factory-webconfig.bin");
+
+fn webcfg() -> FactoryData<'static> {
+    FactoryData::parse(WEBCFG).expect("web configurator NVS has the chip-factory namespace")
+}
+
+#[test]
+fn web_configurator_nvs_parses() {
+    let fd = webcfg();
+    assert_eq!(fd.discriminator().unwrap(), 2748);
+    assert_eq!(fd.iteration_count().unwrap(), 10000);
+    assert_eq!(fd.vendor_id().unwrap(), 0xFFF1);
+    assert_eq!(fd.product_id().unwrap(), 0x8001);
+
+    let mut salt = [0u8; 32];
+    assert_eq!(fd.salt(&mut salt).unwrap(), 32);
+    assert_eq!(
+        salt,
+        [
+            0x55, 0xa3, 0xcb, 0x8b, 0x1e, 0xd2, 0xb5, 0xb1, 0xc0, 0xfd, 0xa2, 0xb9, 0xd9, 0xa3,
+            0xd0, 0xe2, 0xf1, 0xc4, 0xb7, 0xa6, 0x8d, 0x5e, 0x3f, 0x20, 0x11, 0x22, 0x33, 0x44,
+            0x55, 0x66, 0x77, 0x88,
+        ]
+    );
+
+    let mut w0l = [0u8; 97];
+    fd.verifier(&mut w0l).unwrap();
+    assert_eq!(w0l[32], 0x04, "L は SEC1 非圧縮点");
+
+    // DAC 一式(同梱の開発用テスト鍵)も blob として読める。
+    assert_eq!(fd.dac_cert().unwrap().len(), 518);
+    assert_eq!(fd.pai_cert().unwrap().len(), 466);
+    assert_eq!(fd.dac_key().unwrap().len(), 32);
+}
+
 // --- rustcrypto backend が要るテスト ---
 
 #[cfg(feature = "rustcrypto")]
@@ -124,6 +167,40 @@ mod with_crypto {
         fd.verifier(&mut w0l).unwrap();
         assert_eq!(&derived.w0, &w0l[..32], "w0 mismatch");
         assert_eq!(&derived.l, &w0l[32..], "L mismatch");
+    }
+
+    /// Web Configurator(ブラウザ JS)が計算した verifier が、コアの
+    /// [`compute_verifier`] と**同一**であること(JS の SPAKE2+ 実装の検算)。
+    #[test]
+    fn web_configurator_verifier_matches_passcode_derivation() {
+        let fd = webcfg();
+        let mut salt = [0u8; 32];
+        let n = fd.salt(&mut salt).unwrap();
+        let derived =
+            compute_verifier(43708557, &salt[..n], fd.iteration_count().unwrap()).unwrap();
+        let mut w0l = [0u8; 97];
+        fd.verifier(&mut w0l).unwrap();
+        assert_eq!(&derived.w0, &w0l[..32], "w0 mismatch");
+        assert_eq!(&derived.l, &w0l[32..], "L mismatch");
+    }
+
+    /// Web Configurator 生成 NVS から PaseConfig と DacProvider が構築できる
+    /// (= 実機の `sm_config_t` へそのまま供給できる形になっている)。
+    #[test]
+    fn web_configurator_builds_pase_and_dac() {
+        let fd = webcfg();
+        let _cfg = fd.pase_config().expect("pase config");
+        let crypto = RustCrypto::new(ZeroRng);
+        let provider = fd.dac_provider(&crypto, &[]).expect("dac provider");
+        assert_eq!(provider.dac_der().len(), 518);
+
+        let msg = b"attestation-tbs-example";
+        let mut sig = [0u8; 64];
+        provider.sign_with_dac(msg, &mut sig).unwrap();
+        use crate::crypto::Crypto;
+        let pub_raw = fd.nvs.get_blob(NS, "dac-pub-key").expect("dac-pub-key");
+        let pubkey = crypto.p256_public_key_from_bytes(pub_raw).expect("pubkey");
+        assert!(pubkey.verify(msg, &sig).unwrap(), "signature verifies");
     }
 
     /// factory の verifier / salt / iter から PaseConfig が構築できる。

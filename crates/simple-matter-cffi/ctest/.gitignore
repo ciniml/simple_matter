@@ -2,3 +2,7 @@
 /onoff_light_lcg
 /controller
 /ble_loopback
+/composed_loopback
+/run/
+/compose_check
+/scriptstore_loopback

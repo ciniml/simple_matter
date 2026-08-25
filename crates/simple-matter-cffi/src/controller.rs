@@ -44,16 +44,17 @@ use simple_matter::crypto::rustcrypto::RustCrypto;
 use simple_matter::discovery::client::MdnsClient;
 use simple_matter::discovery::{MATTER_PORT, MDNS_PORT};
 use simple_matter::dm::meta::{AttributeId, ClusterId, CommandId, EndpointId};
-use simple_matter::im::client::{ImClient, ImEvent};
+use simple_matter::im::client::{AttrReports, ImClient, ImEvent};
 use simple_matter::im::wire::{AttributePath, AttributeReportRef, CommandPath};
 use simple_matter::kvs::Kvs;
 use simple_matter::sc::case::common::{CASE_RESUMPTION_ID_LEN, SHARED_SECRET_LEN};
 use simple_matter::sc::initiator::{ScEvent, ScInitiator};
 use simple_matter::stack::{SendDirective, MAX_PACKET_SIZE};
-use simple_matter::tlv::TlvValue;
+use simple_matter::tlv::{TlvTag, TlvValue};
 use simple_matter::transport::net::PeerAddr;
 use simple_matter::transport::session::SessionId;
 
+use crate::custom::{sm_attr_value_t, write_value};
 use crate::{
     addr_to_peer, multicast_dst, peer_to_addr, sm_addr_t, CKvs, CRng, SmKvsDelete, SmKvsGet,
     SmKvsSet, SmRngFill, SM_NO_DEADLINE,
@@ -88,6 +89,8 @@ const MAX_NODES: usize = 8;
 const TX_Q_CAP: usize = 4;
 /// イベントリング容量(コミッショニングはフェーズごとにイベントを積む)。
 const EV_CAP: usize = 16;
+/// 1 回の invoke に渡せる引数(context tag 0..)の上限。
+pub const MAX_OP_ARGS: usize = 4;
 /// BTP central の window(コアの参照実装 `ble-commissioner.rs` / デバイス側シムと同じ 6)。
 #[cfg(feature = "ble")]
 const CTRL_BTP_WINDOW: usize = 6;
@@ -172,6 +175,16 @@ pub enum sm_ctrl_event_kind_t {
     /// ([`sm_ctrl_resolve_start`] / [`sm_ctrl_mdns_rx`])してから運用 UDP で pump を回す
     /// (CASE → CommissioningComplete → PAIR_COMPLETE。ble-commissioner `--udp-handoff` の流儀)。
     SM_CTRL_EV_BLE_DONE = 11,
+    /// Write 完了(`node_id`、`status` = IM ステータス。0 = 成功)。
+    SM_CTRL_EV_WRITE_DONE = 12,
+    /// Write 失敗(`node_id`、`status`)。
+    SM_CTRL_EV_WRITE_FAILED = 13,
+    /// Subscribe のプライミングが完了した(`node_id`、`value_u64` = 購読 ID)。
+    SM_CTRL_EV_SUBSCRIBE_DONE = 14,
+    /// Subscribe 開始に失敗した(`node_id`)。
+    SM_CTRL_EV_SUBSCRIBE_FAILED = 15,
+    /// 購読レポートを受理した(`node_id`、`value_u64` / `value_is_null` に最新スカラ値)。
+    SM_CTRL_EV_REPORT = 16,
 }
 
 /// コントローライベント(立った順にリングから取り出す)。
@@ -203,8 +216,30 @@ pub struct sm_ctrl_event_t {
 /// 進行中の運用操作(live セッションが無いときは CASE 確立後に実行する)。
 #[derive(Clone, Copy)]
 enum PendingOp {
-    Invoke { ep: u16, cluster: u32, cmd: u32 },
-    Read { ep: u16, cluster: u32, attr: u32 },
+    Invoke {
+        ep: u16,
+        cluster: u32,
+        cmd: u32,
+    },
+    Read {
+        ep: u16,
+        cluster: u32,
+        attr: u32,
+    },
+    /// 単一属性 Write(値は `CtrlShim::op_args[0]`)。
+    Write {
+        ep: u16,
+        cluster: u32,
+        attr: u32,
+    },
+    /// 単一属性 Subscribe(プライミング完了で SUBSCRIBE_DONE)。
+    Subscribe {
+        ep: u16,
+        cluster: u32,
+        attr: u32,
+        min_s: u16,
+        max_s: u16,
+    },
 }
 
 /// コントローラの活動状態(単一トランザクションを直列実行する)。
@@ -266,6 +301,10 @@ struct CtrlShim {
     compressed_fabric: [u8; 8],
     /// 直近に PAIR_PHASE として通知したフェーズコード(重複通知の抑止。pump は毎回呼ばれる)。
     last_pair_phase: u8,
+    /// 進行中の operation の引数(invoke 引数 / write 値)。単一トランザクション直列なので 1 組。
+    op_args: heapless::Vec<sm_attr_value_t, MAX_OP_ARGS>,
+    /// 購読中のパス(SubscriptionReport の値抽出に使う)。
+    sub_path: Option<(u16, u32, u32)>,
     // --- BLE central(F7b、§11.4)。BTP central を C++ の NimBLE central から給餌する ---
     /// BTP central 状態機械(同時 1 接続。デバイス側シムの鏡像)。
     #[cfg(feature = "ble")]
@@ -498,7 +537,7 @@ fn resumption_key(node_id: u64, out: &mut [u8; 19]) {
 /// 現在の活動状態を 1 ステップ進める(rx / poll のたびに呼ぶ)。送信は TX キューへ積む。
 fn pump(s: &mut CtrlShim, now: u64) {
     match s.activity {
-        Activity::Idle => {}
+        Activity::Idle => drain_subscription_reports(s),
         Activity::Pairing { node_id, addr } => drive_pairing(s, node_id, addr, now),
         Activity::Connecting { node_id, addr, op } => drive_connecting(s, node_id, addr, op, now),
         Activity::AwaitOp { node_id, op } => drive_awaitop(s, node_id, op),
@@ -640,10 +679,11 @@ fn drive_awaitop(s: &mut CtrlShim, node_id: u64, op: PendingOp) {
             s.push_event(e);
             s.activity = Activity::Idle;
         }
-        (op, ImEvent::Failed { status }) => {
-            let kind = match op {
-                PendingOp::Invoke { .. } => sm_ctrl_event_kind_t::SM_CTRL_EV_INVOKE_FAILED,
-                PendingOp::Read { .. } => sm_ctrl_event_kind_t::SM_CTRL_EV_READ_FAILED,
+        (PendingOp::Write { .. }, ImEvent::WriteDone { status }) => {
+            let kind = if status.is_success() {
+                sm_ctrl_event_kind_t::SM_CTRL_EV_WRITE_DONE
+            } else {
+                sm_ctrl_event_kind_t::SM_CTRL_EV_WRITE_FAILED
             };
             let mut e = CtrlShim::ev(kind);
             e.node_id = node_id;
@@ -651,33 +691,81 @@ fn drive_awaitop(s: &mut CtrlShim, node_id: u64, op: PendingOp) {
             s.push_event(e);
             s.activity = Activity::Idle;
         }
-        // 予期しないイベント: 失敗扱いで終端する。
-        (op, _) => {
-            let kind = match op {
-                PendingOp::Invoke { .. } => sm_ctrl_event_kind_t::SM_CTRL_EV_INVOKE_FAILED,
-                PendingOp::Read { .. } => sm_ctrl_event_kind_t::SM_CTRL_EV_READ_FAILED,
-            };
-            let mut e = CtrlShim::ev(kind);
+        (
+            PendingOp::Subscribe {
+                ep, cluster, attr, ..
+            },
+            ImEvent::SubscribeDone {
+                subscription_id, ..
+            },
+        ) => {
+            s.sub_path = Some((ep, cluster, attr));
+            let mut e = CtrlShim::ev(sm_ctrl_event_kind_t::SM_CTRL_EV_SUBSCRIBE_DONE);
             e.node_id = node_id;
+            e.value_u64 = subscription_id as u64;
+            // プライミングレポートの値を READ 同様に載せる(初期値の確認用)。
+            if let Some((v, is_null)) = sub_scalar_value(s, ep, cluster, attr) {
+                e.value_is_null = is_null;
+                e.status = 0;
+                let _ = v;
+            }
+            s.push_event(e);
+            s.activity = Activity::Idle;
+        }
+        (op, ImEvent::Failed { status }) => {
+            let mut e = CtrlShim::ev(op_failed_kind(op));
+            e.node_id = node_id;
+            e.status = status.to_u8();
+            e.phase = 0xF0; // 診断: IM Failed 経路。
+            s.push_event(e);
+            s.activity = Activity::Idle;
+        }
+        // 予期しないイベント: 失敗扱いで終端する。
+        (op, other) => {
+            let mut e = CtrlShim::ev(op_failed_kind(op));
+            e.node_id = node_id;
+            // 診断: 0xD0 | 受け取ったイベント種別(残骸イベントの誤消費を見分ける)。
+            e.phase = 0xD0
+                | match other {
+                    ImEvent::ReadDone => 1,
+                    ImEvent::InvokeDone { .. } => 2,
+                    ImEvent::WriteDone { .. } => 3,
+                    ImEvent::SubscribeDone { .. } => 4,
+                    ImEvent::SubscriptionReport { .. } => 5,
+                    ImEvent::SubscriptionLost { .. } => 6,
+                    _ => 0xF,
+                };
             s.push_event(e);
             s.activity = Activity::Idle;
         }
     }
 }
 
-/// 確立済みセッション上で `op`(invoke/read)を発行し、応答待ちへ遷移する。
-fn launch_op(s: &mut CtrlShim, node_id: u64, session: SessionId, op: PendingOp, now: u64) {
-    let mut scratch = [0u8; MAX_PACKET_SIZE];
-    let res = match op {
+/// 確立済みセッション上で `op` を 1 本発行する(invoke/read/write/subscribe 共通)。
+///
+/// 引数(invoke)/ 値(write)は `s.op_args` から取る(単一トランザクション直列)。
+fn issue_op(
+    s: &mut CtrlShim,
+    session: SessionId,
+    op: PendingOp,
+    now: u64,
+    scratch: &mut [u8],
+) -> simple_matter::error::Result<SendDirective> {
+    // クロージャがスタックを可変借用するため、引数はローカルへコピーしてから渡す。
+    let args = s.op_args.clone();
+    match op {
         PendingOp::Invoke { ep, cluster, cmd } => s.stack.start_invoke(
             session,
             CommandPath::new(EndpointId(ep), ClusterId(cluster), CommandId(cmd)),
             |w, t| {
                 w.start_struct(t)?;
+                for (i, a) in args.iter().enumerate() {
+                    write_value(w, &TlvTag::ContextSpecific(i as u8), a)?;
+                }
                 w.end_container()
             },
             now,
-            &mut scratch,
+            scratch,
         ),
         PendingOp::Read { ep, cluster, attr } => s.stack.start_read(
             session,
@@ -687,30 +775,125 @@ fn launch_op(s: &mut CtrlShim, node_id: u64, session: SessionId, op: PendingOp, 
                 AttributeId(attr),
             )],
             now,
-            &mut scratch,
+            scratch,
         ),
-    };
+        PendingOp::Write { ep, cluster, attr } => {
+            let val = *args
+                .first()
+                .ok_or(simple_matter::error::Error::InvalidState)?;
+            s.stack.start_write(
+                session,
+                &AttributePath::concrete(EndpointId(ep), ClusterId(cluster), AttributeId(attr)),
+                |w, t| write_value(w, t, &val),
+                now,
+                scratch,
+            )
+        }
+        PendingOp::Subscribe {
+            ep,
+            cluster,
+            attr,
+            min_s,
+            max_s,
+        } => s.stack.start_subscribe(
+            session,
+            &[AttributePath::concrete(
+                EndpointId(ep),
+                ClusterId(cluster),
+                AttributeId(attr),
+            )],
+            min_s,
+            max_s,
+            now,
+            scratch,
+        ),
+    }
+}
+
+/// `op` に対応する失敗イベント種別。
+fn op_failed_kind(op: PendingOp) -> sm_ctrl_event_kind_t {
+    match op {
+        PendingOp::Invoke { .. } => sm_ctrl_event_kind_t::SM_CTRL_EV_INVOKE_FAILED,
+        PendingOp::Read { .. } => sm_ctrl_event_kind_t::SM_CTRL_EV_READ_FAILED,
+        PendingOp::Write { .. } => sm_ctrl_event_kind_t::SM_CTRL_EV_WRITE_FAILED,
+        PendingOp::Subscribe { .. } => sm_ctrl_event_kind_t::SM_CTRL_EV_SUBSCRIBE_FAILED,
+    }
+}
+
+/// 確立済みセッション上で `op` を発行し、応答待ちへ遷移する。
+fn launch_op(s: &mut CtrlShim, node_id: u64, session: SessionId, op: PendingOp, now: u64) {
+    let mut scratch = [0u8; MAX_PACKET_SIZE];
+    let res = issue_op(s, session, op, now, &mut scratch);
     match res {
         Ok(dir) => {
             s.queue_tx(&scratch[..dir.len], dir);
             s.activity = Activity::AwaitOp { node_id, op };
         }
-        Err(_) => {
-            let kind = match op {
-                PendingOp::Invoke { .. } => sm_ctrl_event_kind_t::SM_CTRL_EV_INVOKE_FAILED,
-                PendingOp::Read { .. } => sm_ctrl_event_kind_t::SM_CTRL_EV_READ_FAILED,
-            };
-            let mut e = CtrlShim::ev(kind);
+        Err(err) => {
+            let mut e = CtrlShim::ev(op_failed_kind(op));
             e.node_id = node_id;
+            // 診断: 失敗経路を phase に載せる(0xE0 | Error 種別。2026-08-25 不達調査)。
+            e.phase = 0xE0 | (error_code(err) & 0x0F);
             s.push_event(e);
             s.activity = Activity::Idle;
         }
     }
 }
 
+/// [`simple_matter::error::Error`] を 4bit の診断コードへ写す(`phase` 下位に載せる)。
+fn error_code(e: simple_matter::error::Error) -> u8 {
+    use simple_matter::error::Error as E;
+    match e {
+        E::NoSpace => 1,
+        E::NotFound => 2,
+        E::InvalidState => 3,
+        E::Crypto => 4,
+        E::Decode => 5,
+        _ => 0xF,
+    }
+}
+
 /// 直近 Read 応答から対象属性のスカラ値を取り出す(u64 ビットパターン + null フラグ)。
+fn sub_scalar_value(s: &CtrlShim, ep: u16, cluster: u32, attr: u32) -> Option<(u64, bool)> {
+    scalar_from_reports(s.stack.sub_reports(), ep, cluster, attr)
+}
+
+/// アイドル中に届いた購読レポートを [`sm_ctrl_event_kind_t::SM_CTRL_EV_REPORT`] へ写す。
+fn drain_subscription_reports(s: &mut CtrlShim) {
+    while let Some(ev) = s.stack.im_take_event() {
+        match ev {
+            ImEvent::SubscriptionReport { subscription_id } => {
+                let mut e = CtrlShim::ev(sm_ctrl_event_kind_t::SM_CTRL_EV_REPORT);
+                e.phase = (subscription_id & 0xFF) as u8;
+                if let Some((ep, cluster, attr)) = s.sub_path {
+                    e.node_id = s.nodes.first().map(|n| n.node_id).unwrap_or(0);
+                    if let Some((v, is_null)) = sub_scalar_value(s, ep, cluster, attr) {
+                        e.value_u64 = v;
+                        e.value_is_null = is_null;
+                    }
+                }
+                s.push_event(e);
+            }
+            ImEvent::SubscriptionLost { .. } => {
+                s.sub_path = None;
+            }
+            _ => {}
+        }
+    }
+}
+
 fn read_scalar_value(s: &CtrlShim, ep: u16, cluster: u32, attr: u32) -> Option<(u64, bool)> {
-    for report in s.stack.read_reports() {
+    scalar_from_reports(s.stack.read_reports(), ep, cluster, attr)
+}
+
+/// AttributeReportIB 列から指定パスのスカラ値を取り出す(read / subscribe 共通)。
+fn scalar_from_reports(
+    reports: AttrReports<'_>,
+    ep: u16,
+    cluster: u32,
+    attr: u32,
+) -> Option<(u64, bool)> {
+    for report in reports {
         let Ok(AttributeReportRef::Data(d)) = report else {
             continue;
         };
@@ -722,16 +905,28 @@ fn read_scalar_value(s: &CtrlShim, ep: u16, cluster: u32, attr: u32) -> Option<(
         }
         let mut v = d.value();
         if let Ok(Some(e)) = v.read_next() {
-            return Some(match e.value {
-                TlvValue::Boolean(b) => (b as u64, false),
-                TlvValue::UnsignedInteger(u) => (u, false),
-                TlvValue::SignedInteger(i) => (i as u64, false),
-                TlvValue::Null => (0, true),
-                _ => (0, false),
-            });
+            return Some(scalar_from_tlv(&e.value));
         }
     }
     None
+}
+
+/// TLV 要素 1 個を `(value_u64, is_null)` に落とす(C ABI は u64 1 本のまま)。
+///
+/// 浮動小数点は **`f32::to_bits()` のビットパターン**を載せる(§12.2)。イベントに
+/// 型情報は足さない(ABI 維持)ので、C++ 側は「このパスは f32」と知っている前提で
+/// `memcpy` により下位 32bit を `f32` へ戻す。Double は f32 へ丸めてから載せる
+/// (Matter の計測系属性は single 前提。C++ 側の読み替えを 1 通りに保つ)。
+fn scalar_from_tlv(v: &TlvValue<'_>) -> (u64, bool) {
+    match *v {
+        TlvValue::Boolean(b) => (b as u64, false),
+        TlvValue::UnsignedInteger(u) => (u, false),
+        TlvValue::SignedInteger(i) => (i as u64, false),
+        TlvValue::Float(f) => (f.to_bits() as u64, false),
+        TlvValue::Double(d) => ((d as f32).to_bits() as u64, false),
+        TlvValue::Null => (0, true),
+        _ => (0, false),
+    }
 }
 
 /// 運用操作を開始する(live セッションがあれば即発行、無ければ CASE 自動確立)。0=OK、負値=失敗。
@@ -746,28 +941,7 @@ fn start_operation(s: &mut CtrlShim, node_id: u64, op: PendingOp, now: u64) -> i
     // live セッションがあれば直接発行を試みる。
     if let Some(session) = s.nodes[idx].session {
         let mut scratch = [0u8; MAX_PACKET_SIZE];
-        let res = match op {
-            PendingOp::Invoke { ep, cluster, cmd } => s.stack.start_invoke(
-                session,
-                CommandPath::new(EndpointId(ep), ClusterId(cluster), CommandId(cmd)),
-                |w, t| {
-                    w.start_struct(t)?;
-                    w.end_container()
-                },
-                now,
-                &mut scratch,
-            ),
-            PendingOp::Read { ep, cluster, attr } => s.stack.start_read(
-                session,
-                &[AttributePath::concrete(
-                    EndpointId(ep),
-                    ClusterId(cluster),
-                    AttributeId(attr),
-                )],
-                now,
-                &mut scratch,
-            ),
-        };
+        let res = issue_op(s, session, op, now, &mut scratch);
         if let Ok(dir) = res {
             s.queue_tx(&scratch[..dir.len], dir);
             s.activity = Activity::AwaitOp { node_id, op };
@@ -909,6 +1083,8 @@ pub extern "C" fn sm_ctrl_init(
         let compressed = (*sp).owned.ca.compressed_fabric_id_bytes();
         addr_of_mut!((*sp).compressed_fabric).write(compressed);
         addr_of_mut!((*sp).last_pair_phase).write(u8::MAX);
+        addr_of_mut!((*sp).op_args).write(heapless::Vec::new());
+        addr_of_mut!((*sp).sub_path).write(None);
         #[cfg(feature = "ble")]
         {
             addr_of_mut!((*sp).btp).write(Btp::new(BtpRole::Central));
@@ -1085,7 +1261,9 @@ pub extern "C" fn sm_ctrl_poll(
     //    smctl の settle→drive 分離と同義: 受信応答の遅延 ACK を送り切ってから次の exchange
     //    を開始する(デバイス IM responder は同時 1 トランザクションのため、ACK 前に次の
     //    リクエストを送るとデバイスが busy で無応答になる = Timeout)。
-    if s.stack.next_deadline(now_ms).is_some() {
+    // 判定は **MRP 由来の期限だけ**(`transport_deadline`)で行う。`next_deadline` は購読
+    // 確立後に keep-alive 期限で常に Some になり、pump に永久に到達しなくなる(実測)。
+    if s.stack.transport_deadline().is_some() {
         return 0; // まだ保留中(ACK 期限など)。呼び出し側は期限まで待って再度 poll する。
     }
     pump(s, now_ms);
@@ -1204,6 +1382,129 @@ pub extern "C" fn sm_ctrl_read_scalar(
             ep: endpoint,
             cluster,
             attr: attribute,
+        },
+        now_ms,
+    );
+    if rc == 0 {
+        pump(s, now_ms);
+    }
+    rc
+}
+
+/// 引数付きコマンドを invoke する(LevelControl MoveToLevel 等。§11.1 の拡張)。
+///
+/// `args` は context tag 0..`n_args`-1 の順に平坦化されたスカラ列
+/// ([`sm_attr_value_t`]。`sm_cluster_def_t` の invoke ハンドラと同じ表現)。`n_args` の
+/// 上限は 4。`args` が NULL / `n_args` = 0 なら [`sm_ctrl_invoke`] と等価。
+/// 完了は INVOKE_DONE / INVOKE_FAILED。
+///
+/// 戻り値: 0=OK、-1=未初期化、-3=未知ノード、-4=CASE 開始失敗、-5=引数過多、-10=busy。
+#[no_mangle]
+pub extern "C" fn sm_ctrl_invoke_args(
+    node_id: u64,
+    endpoint: u16,
+    cluster: u32,
+    command: u32,
+    args: *const sm_attr_value_t,
+    n_args: usize,
+    now_ms: u64,
+) -> i32 {
+    if !CTRL_INITED.load(Ordering::SeqCst) {
+        return -1;
+    }
+    if n_args > MAX_OP_ARGS || (n_args > 0 && args.is_null()) {
+        return -5;
+    }
+    // SAFETY: 単線契約。args は n_args 要素を指す契約。
+    let s = unsafe { ctrl_shim() };
+    s.op_args.clear();
+    for i in 0..n_args {
+        let v = unsafe { *args.add(i) };
+        let _ = s.op_args.push(v);
+    }
+    let rc = start_operation(
+        s,
+        node_id,
+        PendingOp::Invoke {
+            ep: endpoint,
+            cluster,
+            cmd: command,
+        },
+        now_ms,
+    );
+    if rc == 0 {
+        pump(s, now_ms);
+    }
+    rc
+}
+
+/// 運用ノードのスカラ属性へ write する(§11.1 の拡張)。
+///
+/// 完了は [`sm_ctrl_take_event`] の WRITE_DONE / WRITE_FAILED(`status` = IM ステータス)。
+/// 戻り値: 0=OK、-1=未初期化/NULL、-3=未知ノード、-4=CASE 開始失敗、-10=busy。
+#[no_mangle]
+pub extern "C" fn sm_ctrl_write_scalar(
+    node_id: u64,
+    endpoint: u16,
+    cluster: u32,
+    attribute: u32,
+    value: *const sm_attr_value_t,
+    now_ms: u64,
+) -> i32 {
+    if !CTRL_INITED.load(Ordering::SeqCst) || value.is_null() {
+        return -1;
+    }
+    // SAFETY: 単線契約。value は有効な sm_attr_value_t を指す契約。
+    let s = unsafe { ctrl_shim() };
+    let v = unsafe { *value };
+    s.op_args.clear();
+    let _ = s.op_args.push(v);
+    let rc = start_operation(
+        s,
+        node_id,
+        PendingOp::Write {
+            ep: endpoint,
+            cluster,
+            attr: attribute,
+        },
+        now_ms,
+    );
+    if rc == 0 {
+        pump(s, now_ms);
+    }
+    rc
+}
+
+/// 運用ノードのスカラ属性を subscribe する(§11.1 の拡張)。
+///
+/// プライミング完了で SUBSCRIBE_DONE(`value_u64` = 購読 ID)、以降デバイス発レポートごとに
+/// SM_CTRL_EV_REPORT(`value_u64` / `value_is_null` = 最新値)。購読は 1 本のみ保持する。
+/// 戻り値: 0=OK、-1=未初期化、-3=未知ノード、-4=CASE 開始失敗、-10=busy。
+#[no_mangle]
+pub extern "C" fn sm_ctrl_subscribe(
+    node_id: u64,
+    endpoint: u16,
+    cluster: u32,
+    attribute: u32,
+    min_interval_s: u16,
+    max_interval_s: u16,
+    now_ms: u64,
+) -> i32 {
+    if !CTRL_INITED.load(Ordering::SeqCst) {
+        return -1;
+    }
+    // SAFETY: 単線契約。
+    let s = unsafe { ctrl_shim() };
+    s.op_args.clear();
+    let rc = start_operation(
+        s,
+        node_id,
+        PendingOp::Subscribe {
+            ep: endpoint,
+            cluster,
+            attr: attribute,
+            min_s: min_interval_s,
+            max_s: max_interval_s,
         },
         now_ms,
     );
@@ -1364,6 +1665,38 @@ pub extern "C" fn sm_ctrl_set_node_addr(node_id: u64, addr: *const sm_addr_t) ->
     s.push_event(ev);
     s.persist_nodes();
     0
+}
+
+/// 進行中の運用操作を外部都合で中断し Idle に戻す(C++ の待ちがタイムアウトしたとき用)。
+///
+/// 不達ノード宛の CASE は initiator の HANDSHAKE_TIMEOUT(60s)まで内部で粘り、
+/// その間の全操作が busy(-10)で弾かれる(T5 実機)。ハンドシェイクスロット・予約
+/// セッション・exchange は [`ControllerStack::abort_handshake`] で解放する。
+/// 応答待ち中(AwaitOp)の IM トランザクションは [`ControllerStack::abort_op`] で畳み、
+/// exchange を即時回収する(「MRP の諦めで自然解放」は要求が standalone ACK 済みだと
+/// 成り立たず、exchange が永久に残る — 実機 2026-08-25 の「両デバイス不達」の真因)。
+///
+/// 戻り値: 1=中断した、0=元々 Idle、-1=未初期化。
+#[no_mangle]
+pub extern "C" fn sm_ctrl_abort_op() -> i32 {
+    if !CTRL_INITED.load(Ordering::SeqCst) {
+        return -1;
+    }
+    // SAFETY: 単線契約。
+    let s = unsafe { ctrl_shim() };
+    if matches!(s.activity, Activity::Idle) {
+        return 0;
+    }
+    s.stack.abort_handshake();
+    s.stack.abort_op();
+    s.comm = None;
+    #[cfg(feature = "ble")]
+    {
+        s.ble_hs_out.clear();
+        s.btp.reset();
+    }
+    s.activity = Activity::Idle;
+    1
 }
 
 /// 現在の管理ノード数(ノード帳のエントリ数)。
@@ -1679,6 +2012,21 @@ pub extern "C" fn sm_ctrl_ble_event(
                 s.ble_subscribed = false;
                 s.ble_hs_out.clear();
                 s.btp.reset();
+                // BLE フェーズ(BLE_DONE 前)の切断は、このセッションでは回復できない
+                // (C++ 側は再接続を試みない設計)。Activity を畳んで PAIR_FAILED を
+                // 立てないと、以降の pair/invoke が永久に busy(-2/-10)で弾かれる
+                // (T4 実機で発覚。BleHandoff は BLE 切断後が正常経路なので触らない)。
+                if let Activity::BlePairing { node_id } = s.activity {
+                    // 進行中の PASE handshake(initiator は単一スロット)を畳む。
+                    // 畳まないと次の ble_pair_start は受理されるのに start_pase が
+                    // NoSpace で沈黙する(2 回目以降の BLE 試行が止まる実機症状の真因)。
+                    s.stack.abort_handshake();
+                    s.comm = None;
+                    let mut e = CtrlShim::ev(sm_ctrl_event_kind_t::SM_CTRL_EV_PAIR_FAILED);
+                    e.node_id = node_id;
+                    s.push_event(e);
+                    s.activity = Activity::Idle;
+                }
                 0
             }
             sm_ble_event_kind_t::SM_BLE_C2_SUBSCRIBED => {
@@ -2135,10 +2483,140 @@ mod tests {
             let plen = sm_ctrl_ble_poll(1000, frag.as_mut_ptr(), frag.len());
             assert!(plen > 0, "PBKDFParamRequest fragment expected");
 
+            // (6) BLE 切断で中断 → PAIR_FAILED が立ち Idle に戻る(T4 実機の abort 対処)。
+            assert_eq!(
+                sm_ctrl_ble_event(
+                    sm_ble_event_kind_t::SM_BLE_DISCONNECTED,
+                    0,
+                    core::ptr::null(),
+                    0,
+                    2000
+                ),
+                0
+            );
+            let mut saw_failed = false;
+            while sm_ctrl_take_event(&mut ev) {
+                if ev.kind == sm_ctrl_event_kind_t::SM_CTRL_EV_PAIR_FAILED {
+                    saw_failed = true;
+                }
+            }
+            assert!(
+                saw_failed,
+                "DISCONNECTED during BlePairing must raise PAIR_FAILED"
+            );
+
+            // (7) **2 回目のセッション**が 1 回目と同じ形で進むこと(実機で「2 回目以降は
+            //     handshake が出ず 3 バイトの書き込みだけ繰り返す」症状があった)。
+            assert_eq!(
+                sm_ctrl_ble_pair_start(
+                    node_id,
+                    20202021,
+                    0,
+                    ssid.as_ptr(),
+                    ssid.len(),
+                    pass.as_ptr(),
+                    pass.len(),
+                    3000
+                ),
+                0,
+                "second ble_pair_start must be accepted after abort"
+            );
+            assert_eq!(
+                sm_ctrl_ble_event(
+                    sm_ble_event_kind_t::SM_BLE_CONNECTED,
+                    mtu,
+                    core::ptr::null(),
+                    0,
+                    3000
+                ),
+                0
+            );
+            let hlen2 = sm_ctrl_ble_poll(3000, frag.as_mut_ptr(), frag.len());
+            assert_eq!(
+                hlen2, hlen,
+                "second session must emit a full handshake request (got {hlen2} B)"
+            );
+            let mut peripheral2 = Btp::<6>::new(BtpRole::Peripheral);
+            peripheral2
+                .process_incoming(&frag[..hlen2], Some(mtu), 3000)
+                .unwrap();
+            let rlen2 = peripheral2
+                .process_outgoing(&mut resp, Some(mtu), 3000)
+                .unwrap();
+            assert!(rlen2 > 0);
+            assert_eq!(
+                sm_ctrl_ble_event(
+                    sm_ble_event_kind_t::SM_BLE_C2_SUBSCRIBED,
+                    0,
+                    core::ptr::null(),
+                    0,
+                    3000
+                ),
+                0
+            );
+            assert_eq!(
+                sm_ctrl_ble_event(
+                    sm_ble_event_kind_t::SM_BLE_C1_WRITE,
+                    0,
+                    resp.as_ptr(),
+                    rlen2,
+                    3000,
+                ),
+                0
+            );
+            let mut saw_pase = false;
+            while sm_ctrl_take_event(&mut ev) {
+                if ev.kind == sm_ctrl_event_kind_t::SM_CTRL_EV_PAIR_PHASE
+                    && ev.phase == phase_code(Phase::Pase)
+                {
+                    saw_pase = true;
+                }
+            }
+            assert!(saw_pase, "second session must reach PASE");
+            let plen2 = sm_ctrl_ble_poll(3000, frag.as_mut_ptr(), frag.len());
+            assert!(
+                plen2 > 3,
+                "second session must emit PBKDFParamRequest, not a 3-byte ACK (got {plen2} B)"
+            );
+
             sm_ctrl_deinit();
         }
 
         // SAFETY: alloc と同じ layout で解放する。
         unsafe { dealloc(mem, layout) };
+    }
+
+    /// スカラ read の TLV → `value_u64` 変換(§12.2 の f32 対応を含む)。
+    ///
+    /// f32 属性(CO2 / PM2.5 の MeasuredValue)は `f32::to_bits()` のビットパターンが
+    /// そのまま載り、C++ 側の `memcpy` で元の値に戻ること。
+    #[test]
+    fn scalar_from_tlv_covers_floats() {
+        // 整数系・bool・null は従来どおり。
+        assert_eq!(scalar_from_tlv(&TlvValue::Boolean(true)), (1, false));
+        assert_eq!(
+            scalar_from_tlv(&TlvValue::UnsignedInteger(4100)),
+            (4100, false)
+        );
+        assert_eq!(
+            scalar_from_tlv(&TlvValue::SignedInteger(-2650)),
+            (-2650i64 as u64, false)
+        );
+        assert_eq!(scalar_from_tlv(&TlvValue::Null), (0, true));
+
+        // f32: ビットパターンが下位 32bit に載り、C++ 側の memcpy で復元できる。
+        let co2 = 812.5f32;
+        let (bits, is_null) = scalar_from_tlv(&TlvValue::Float(co2));
+        assert!(!is_null);
+        assert_eq!(bits, co2.to_bits() as u64);
+        assert_eq!(bits >> 32, 0, "上位 32bit は 0(C++ は下位 32bit だけ見る)");
+        assert_eq!(f32::from_bits(bits as u32), co2);
+
+        // f64 は f32 へ丸めてから載せる(読み替えを 1 通りに保つ)。
+        let (bits, _) = scalar_from_tlv(&TlvValue::Double(3.25f64));
+        assert_eq!(f32::from_bits(bits as u32), 3.25f32);
+
+        // 対象外の型は従来どおり (0, false)。
+        assert_eq!(scalar_from_tlv(&TlvValue::Utf8String("x")), (0, false));
     }
 }

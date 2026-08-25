@@ -244,6 +244,46 @@ fn tlv_to_value(v: TlvValue<'_>) -> sm_attr_value_t {
     out
 }
 
+/// [`sm_attr_value_t`] を TLV へ書く(コントローラ側の write / invoke 引数。§11.1)。
+///
+/// `AttrEncoder` を介さない生の [`TlvWriter`] 版([`CustomCluster::encode_value`] の対)。
+/// コントローラ側 FFI(`sm_ctrl_write_scalar` / `sm_ctrl_invoke_args`)専用。
+#[cfg(feature = "controller")]
+pub(crate) fn write_value(
+    w: &mut simple_matter::tlv::TlvWriter<'_>,
+    tag: &TlvTag,
+    v: &sm_attr_value_t,
+) -> simple_matter::error::Result<()> {
+    if v.is_null {
+        return w.write_null(tag);
+    }
+    // SAFETY: union フィールドは `type` タグに従って読む(C 側の契約)。
+    unsafe {
+        match v.r#type {
+            sm_attr_type_t::SM_T_BOOL => w.write_bool(tag, v.v.b),
+            sm_attr_type_t::SM_T_U8 => w.write_u8(tag, v.v.u as u8),
+            sm_attr_type_t::SM_T_U16 => w.write_u16(tag, v.v.u as u16),
+            sm_attr_type_t::SM_T_U32 => w.write_u32(tag, v.v.u as u32),
+            sm_attr_type_t::SM_T_U64 => w.write_u64(tag, v.v.u),
+            sm_attr_type_t::SM_T_I8 => w.write_i8(tag, v.v.i as i8),
+            sm_attr_type_t::SM_T_I16 => w.write_i16(tag, v.v.i as i16),
+            sm_attr_type_t::SM_T_I32 => w.write_i32(tag, v.v.i as i32),
+            sm_attr_type_t::SM_T_I64 => w.write_i64(tag, v.v.i),
+            sm_attr_type_t::SM_T_F32 => w.write_f32(tag, v.v.f),
+            sm_attr_type_t::SM_T_STRING => {
+                let n = (v.v.bytes.len as usize).min(STR_CAP);
+                let s = core::str::from_utf8(&v.v.bytes.buf[..n])
+                    .map_err(|_| simple_matter::error::Error::Decode)?;
+                w.write_utf8(tag, s)
+            }
+            sm_attr_type_t::SM_T_OCTETS => {
+                let n = (v.v.bytes.len as usize).min(STR_CAP);
+                w.write_bytes(tag, &v.v.bytes.buf[..n])
+            }
+        }
+    }
+}
+
 /// バイト列を値バッファへコピー(64B で切り詰め)。
 fn copy_bytes(out: &mut sm_attr_value_t, src: &[u8]) {
     let n = src.len().min(STR_CAP);
@@ -381,6 +421,40 @@ impl CustomCluster {
             cmds,
             &[],
         );
+    }
+
+    /// 登録済み read ハンドラを直接呼ぶ(`sm_attr_get_value` の委譲先)。
+    ///
+    /// `Err` は `sm_attr_get_value` の戻り値(-3 = 属性/ハンドラ無し)。
+    pub fn call_read(&self, attr_id: u32) -> Result<sm_attr_value_t, i32> {
+        if self.attr_index(AttributeId(attr_id)).is_none() {
+            return Err(-3);
+        }
+        let cb = self.read.ok_or(-3)?;
+        let mut out = sm_attr_value_t::zero();
+        // SAFETY: 単線契約下で C の read ハンドラを呼ぶ。
+        let code = unsafe { cb(self.ctx, attr_id, &mut out) };
+        if code == 0 {
+            Ok(out)
+        } else {
+            Err(-3)
+        }
+    }
+
+    /// 登録済み write ハンドラを直接呼ぶ(`sm_attr_set_value` の委譲先)。dirty も立てる。
+    pub fn call_write(&mut self, attr_id: u32, v: &sm_attr_value_t) -> Result<(), i32> {
+        if self.attr_index(AttributeId(attr_id)).is_none() {
+            return Err(-3);
+        }
+        let cb = self.write.ok_or(-3)?;
+        // SAFETY: 単線契約下で C の write ハンドラを呼ぶ。
+        let code = unsafe { cb(self.ctx, attr_id, v) };
+        if code == 0 {
+            self.dirty = true;
+            Ok(())
+        } else {
+            Err(-3)
+        }
     }
 
     fn attr_index(&self, attr: AttributeId) -> Option<usize> {

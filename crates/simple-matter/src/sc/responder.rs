@@ -19,7 +19,7 @@ use zeroize::Zeroizing;
 use crate::crypto::spake2p::{compute_verifier, Spake2pVerifier, Spake2pVerifierParams};
 use crate::crypto::{Crypto, P256Keypair, P256PublicKey, Rng, Sha256};
 use crate::error::{Error, Result};
-use crate::exchange::{HandlerAction, ProtocolHandler, RxMessage};
+use crate::exchange::{ExchangeId, HandlerAction, ProtocolHandler, RxMessage};
 use crate::kvs::Kvs;
 use crate::transport::session::{SessionInit, SessionManager, SessionMode};
 
@@ -224,6 +224,31 @@ impl<'c, C: Crypto, R: Rng, F, const H: usize> SecureChannel<'c, C, R, F, H> {
             n += 1;
         }
         n
+    }
+
+    /// 進行中のハンドシェイク slot 数(診断用。[`crate::stack::MatterStack::pool_usage`])。
+    pub fn handshakes_in_use(&self) -> usize {
+        self.pool.len()
+    }
+
+    /// 期限切れハンドシェイク slot を **1 つ**回収し、予約セッションを解放して、その
+    /// ハンドシェイクを運んでいた exchange を返す(統合層が exchange を close する)。
+    ///
+    /// [`on_tick`](Self::on_tick) は exchange を閉じないため、相手が途中で消えた
+    /// (コントローラ再起動など)半端な CASE/PASE の responder exchange がプールに残り、
+    /// 数回の再起動で exchange 枯渇 → 新規 Sigma1 を黙って捨てる(T5 実機:
+    /// Tab5 の連続再起動後に NanoC6 が二度と応答しなくなり、デバイス再起動で復旧)。
+    /// `None` を返すまで繰り返し呼ぶ。
+    pub fn expire_one<const S: usize>(
+        &mut self,
+        sessions: &mut SessionManager<S>,
+        now_ms: u64,
+    ) -> Option<ExchangeId> {
+        let slot = self
+            .pool
+            .take_expired(now_ms, PASE_SESSION_EST_TIMEOUT_MS)?;
+        sessions.remove(slot.reserved());
+        Some(slot.exchange())
     }
 
     /// Busy StatusReport を `tx` に書き、終端アクションを返す(§6.4)。

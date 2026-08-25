@@ -1,0 +1,28 @@
+# ESP32-C6 専用の既定(sdkconfig.defaults に加えて IDF が自動連結する)。
+# BLE(NimBLE)コミッショニング(pairing ble-wifi)= onoff_light_cpp と同一。
+
+# Bluetooth LE + NimBLE ホスト(peripheral のみ。central/observer は不要 = RAM 削減)。
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+
+# WiFi/BLE 同時運用(coex)。commissioning 中は BLE、その後 WiFi 運用へ遷移する。
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+
+# WASM プール(SM_SCRIPT_POOL_KB)を定常ヒープに収めるための WiFi バッファ削減
+# (実機 P6: BLE スキップ後の定常 free ≈61KB。線形メモリ 1 ページ = 64KB が下限のため、
+#  バッファを削って 72KB プールを確保する)
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=12
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=12
+CONFIG_SM_SCRIPT_POOL_KB=24
+# WiFi コードの IRAM 常駐を止めて SRAM を WASM プールへ回す(C6 は IRAM/DRAM 共有。
+# スループットより RAM を優先する)
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+# WAMR プールも静的確保(pump スタック静的化とセットで、ヒープの大口需要を
+# スクリプト線形メモリ 64KB だけにする。P6)
+CONFIG_SM_SCRIPT_POOL_STATIC=y

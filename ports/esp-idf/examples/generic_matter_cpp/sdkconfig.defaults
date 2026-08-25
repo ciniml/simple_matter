@@ -1,0 +1,39 @@
+# generic_matter_cpp 既定設定(ターゲット非依存: esp32c6 / esp32s3)。
+# ターゲットは `idf.py set-target <esp32c6|esp32s3>` で選ぶ。
+
+# カスタムパーティション(partitions.csv): app 2.5MB + nvs_factory + smscript。
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# 設定コンソールは USB-Serial-JTAG(§9.2)。ログも同じ口に出る。
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# メインタスクは軽い(pump は別タスク、console は REPL タスク)。
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
+
+# lwIP: IPv6 + マルチキャスト(mDNS の v4 IGMP / v6 MLD join)を有効化。
+CONFIG_LWIP_IPV6=y
+CONFIG_LWIP_IPV6_AUTOCONFIG=y
+CONFIG_LWIP_SO_REUSE=y
+CONFIG_LWIP_MAX_SOCKETS=10
+
+# C++: 例外・RTTI は不要(コード量/バイナリ削減)。C++17 は IDF v5.4 既定。
+CONFIG_COMPILER_CXX_EXCEPTIONS=n
+CONFIG_COMPILER_CXX_RTTI=n
+
+# ---- WAMR(WASM スクリプト VM、§9.3)----------------------------------------
+# 最小構成: classic interpreter のみ。AOT / WASI / libc-builtin / app-framework は落とす。
+# lib-pthread は残す = WAMR の thread-manager が入り、CHECK_SUSPEND_FLAGS 経由で
+# wasm_runtime_terminate が**無限ループ中のスクリプトも打ち切れる**(罠。§10 Phase C)。
+CONFIG_WAMR_ENABLE_INTERP=y
+CONFIG_WAMR_INTERP_CLASSIC=y
+CONFIG_WAMR_INTERP_LOADER_NORMAL=y
+CONFIG_WAMR_ENABLE_AOT=n
+CONFIG_WAMR_ENABLE_LIBC_WASI=n
+CONFIG_WAMR_ENABLE_LIBC_BUILTIN=n
+CONFIG_WAMR_ENABLE_APP_FRAMEWORK=n
+CONFIG_WAMR_ENABLE_LIB_PTHREAD=y
+CONFIG_WAMR_ENABLE_MULTI_MODULE=n
+CONFIG_WAMR_ENABLE_SHARED_MEMORY=n
+CONFIG_WAMR_ENABLE_REF_TYPES=n

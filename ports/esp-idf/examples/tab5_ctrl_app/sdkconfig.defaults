@@ -1,0 +1,165 @@
+# tab5_ctrl_app 既定設定(ターゲットは esp32p4 = M5Stack Tab5)。
+# docs/design/p4-thread-controller.md §9(T1)。
+#
+# thread_ctrl_hub_cpp の sdkconfig.defaults(F8c、実機で確定)を土台に、
+# M5Unified/M5GFX + 自前 LVGL9 ポート(T1b、§9.5)の要件を足したもの。
+#
+# 注意: idf.py は sdkconfig が既に存在すると sdkconfig.defaults の変更を反映しない。
+#       設定を足したら `rm -f sdkconfig` してから set-target し直すこと(F8 の罠 7)。
+
+# --- パーティション / flash(Tab5 = 16MB flash / 32MB PSRAM)---
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# app_main は表示初期化 + タスク起動だけ(sm_ctrl は専用の静的スタックタスク)。
+# M5.begin()(MIPI-DSI / I2C / io expander / タッチ)がそこそこ積むので 8KB。
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# --- OpenThread(FTD。radio は H2 の RCP に spinel over UART で繋ぐ)---
+CONFIG_OPENTHREAD_ENABLED=y
+CONFIG_OPENTHREAD_FTD=y
+CONFIG_OPENTHREAD_RADIO_SPINEL_UART=y
+CONFIG_OPENTHREAD_DNS_CLIENT=y
+# SRP サーバ(このハブがデバイスの _matter._tcp 登録を受ける)。v5.4 では
+# OPENTHREAD_CONFIG_SRP_SERVER_ENABLE が CONFIG_OPENTHREAD_BORDER_ROUTER の中でしか
+# 1 にならないため、custom header で SRP サーバだけを有効化する(F8 の罠 3)。
+CONFIG_OPENTHREAD_HEADER_CUSTOM=y
+CONFIG_OPENTHREAD_CUSTOM_HEADER_PATH="main"
+CONFIG_OPENTHREAD_CUSTOM_HEADER_FILE_NAME="esp_ot_custom_config.h"
+CONFIG_OPENTHREAD_SRP_CLIENT=n
+CONFIG_OPENTHREAD_CLI=n
+CONFIG_OPENTHREAD_CONSOLE_ENABLE=n
+
+# OpenThread は eventfd を使う(radio / netif / task queue の 3 本)。
+CONFIG_VFS_SUPPORT_IO=y
+
+# --- lwIP(Thread は IPv6 のみ)---
+CONFIG_LWIP_IPV6=y
+CONFIG_LWIP_IPV6_AUTOCONFIG=y
+# openthread の lwIP netif は 12 を要求する(8 だとコンパイルで #error。F8 の罠 2)。
+CONFIG_LWIP_IPV6_NUM_ADDRESSES=12
+CONFIG_LWIP_MULTICAST_PING=y
+CONFIG_LWIP_SO_REUSE=y
+CONFIG_LWIP_MAX_SOCKETS=10
+
+# --- C++ ---
+CONFIG_COMPILER_CXX_EXCEPTIONS=n
+CONFIG_COMPILER_CXX_RTTI=n
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# --- PSRAM(Tab5 = 32MB hex PSRAM。sm_ctrl の供給メモリと LVGL のバッファの置き場)---
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_HEX=y
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_FETCH_INSTRUCTIONS=y
+CONFIG_SPIRAM_RODATA=y
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+
+# FreeRTOS 1kHz(LVGL のタイマ精度とタッチ応答)。
+CONFIG_FREERTOS_HZ=1000
+
+# --- LVGL9(自前ポート。main/display_gfx.cpp が lv_display / lv_indev を作る)---
+CONFIG_LV_CONF_SKIP=y
+CONFIG_LV_BUILD_EXAMPLES=n
+# LVGL のヒープは C ライブラリ(= heap_caps)に委譲する。LVGL 内蔵アロケータの
+# 固定プールだと 1280x720 の UI で足りなくなるため。
+CONFIG_LV_USE_CLIB_MALLOC=y
+CONFIG_LV_USE_CLIB_SPRINTF=y
+CONFIG_LV_USE_CLIB_STRING=y
+# 5 インチ / 1280x720 を指で押す前提のフォント。
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_16=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_24=y
+# T6(§14.1): センサダッシュボードのタイル。数値 48px / 見出し・AirQuality 名 32px。
+CONFIG_LV_FONT_MONTSERRAT_32=y
+CONFIG_LV_FONT_MONTSERRAT_48=y
+CONFIG_LV_FONT_DEFAULT_MONTSERRAT_20=y
+# dataset を QR で出す(デバイス側プリセットの転記用)。
+CONFIG_LV_USE_QRCODE=y
+# オンスクリーンキーボード(IPv6 / passcode 入力)。
+CONFIG_LV_USE_KEYBOARD=y
+CONFIG_LV_USE_TEXTAREA=y
+# スクリーンショット(T5c、§13.1)。lv_snapshot_take_to_draw_buf を使う。
+# 出力バッファは console_dbg.cpp が PSRAM から確保する(1280x720x2B ≒ 1.8MB)ので、
+# LVGL 内蔵の draw_buf 確保(= 内蔵 RAM)には行かない。
+CONFIG_LV_USE_SNAPSHOT=y
+
+# LVGL の描画バッファは display_gfx.cpp が PSRAM から確保する
+# (1280x72 x2B x2 枚 ≒ 360KB)。内蔵 RAM は pump の静的スタック 128KB と
+# OT/lwIP/mbedTLS に残す。
+
+# 自前ポートは lv_tick_set_cb(esp_timer)を使うので LVGL 内蔵 tick は不要。
+CONFIG_LV_DEF_REFR_PERIOD=16
+
+# --- WiFi(T2、§10): 基板上の ESP32-C6 を SDIO 経由で使う ---------------------
+#
+# 以下の hosted/SDIO 設定は参照プロジェクト `~/repos/tab5_claude_client` の
+# `sdkconfig.defaults.esp32p4`(同一個体の Tab5 で WiFi 実証済み)からの転記。
+# ピン割当は M5Tab5-UserDemo の既定と同じ。
+CONFIG_ESP_HOSTED_ENABLED=y
+CONFIG_ESP_HOSTED_IDF_SLAVE_TARGET="esp32c6"
+CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
+# CONFIG_ESP_HOSTED_SPI_HOST_INTERFACE is not set
+CONFIG_ESP_HOSTED_SDIO_4_BIT_BUS=y
+# CONFIG_ESP_HOSTED_SDIO_1_BIT_BUS is not set
+# reset の極性: Tab5 の GPIO15 は C6 の CHIP_EN(HIGH = run / LOW = reset)。
+# esp_hosted 2.x の reset_slave は X -> !X -> X で、終了時にピンを "ACTIVE" 側に
+# 残す。よって「ACTIVE = HIGH」と教えると波形が HIGH -> LOW -> HIGH になり、
+# sdmmc_card_init の CMD5 が通る状態(= C6 が走っている)で抜けられる。
+# 名前の上では「active low reset」の慣習と逆だが、実機ではこちらが正しい。
+# CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_LOW is not set
+CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_HIGH=y
+CONFIG_ESP_HOSTED_SDIO_OPTIMIZATION_RX_STREAMING_MODE=y
+CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE=15
+# 実際のピン割当(slot 1、4-bit)。CONFIG_ESP_HOSTED_SDIO_PIN_* は
+# これらから計算される Kconfig 値なので、書くのは PRIV_ の方。
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_CMD_SLOT_1=13
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_CLK_SLOT_1=12
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D0_SLOT_1=11
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D1_4BIT_BUS_SLOT_1=10
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D2_4BIT_BUS_SLOT_1=9
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D3_4BIT_BUS_SLOT_1=8
+# SDIO クロックは 40MHz 既定から 20MHz へ落とす(参照 repo で 40MHz は CMD5 が
+# 繰り返しタイムアウトした)。リンクが安定していると確認できたら戻してよい。
+CONFIG_ESP_HOSTED_SDIO_CLOCK_FREQ_KHZ=20000
+
+# --- BLE(T3、§11): NimBLE を host-only で動かし HCI を C6 へ VHCI で流す ------
+#
+# P4 には BT controller が無いので、NimBLE の **ホストだけ** を P4 で動かし、
+# HCI パケットを esp_hosted(WiFi と同じ SDIO リンク)経由で C6 の controller に
+# 渡す。以下 6 行は esp_hosted 同梱例
+# `managed_components/espressif__esp_hosted/examples/host_nimble_bleprph_host_only_vhci/
+#  sdkconfig.defaults` からの転記(そこが「正」)。
+#
+# esp_hosted の Kconfig ガードは
+#   BT_ENABLED && BT_NIMBLE_ENABLED && !BT_CONTROLLER_ENABLED && !BT_NIMBLE_TRANSPORT_UART
+# なので、この 4 条件を満たさないと ESP_HOSTED_ENABLE_BT_NIMBLE が現れない。
+# なお IDF 5.4 の `BT_ENABLED` は `SOC_BT_SUPPORTED` に依存しない(依存するのは
+# `BT_CONTROLLER_ENABLED` の方)ため、P4 でも host-only 構成が成立する。
+CONFIG_BT_ENABLED=y
+CONFIG_BT_CONTROLLER_DISABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=n
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_TRANSPORT_UART=n
+CONFIG_ESP_HOSTED_ENABLE_BT_NIMBLE=y
+CONFIG_ESP_HOSTED_NIMBLE_HCI_VHCI=y
+CONFIG_ESP_WIFI_REMOTE_LIBRARY_HOSTED=y
+
+# central / observer のみ(コミッショナは scan + connect + GATT client だけ)。
+# controller_hub_cpp の sdkconfig.defaults.ble(F7b、S3 実機検証済み)と同値。
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=n
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
+# BTP は 244B SDU を 1 接続で流すだけ。既定より切り詰めて内蔵 RAM を
+# pump の静的スタック 128KB / OT / lwIP / mbedTLS に残す。
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=5120
+
+# --- デバッグコンソール(T5a、§13): USB-Serial-JTAG をプライマリコンソールに ---
+# (ログと同じ ttyACM に esp_console REPL を載せる。generic_matter_cpp と同じ構成)
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

@@ -106,6 +106,11 @@ fn ffi_lifecycle_roundtrip() {
         dac_privkey: core::ptr::null(),
         dac_sign: None,
         dac_sign_ctx: core::ptr::null_mut(),
+        // composition=NULL = 従来の固定ライト構成(後方互換経路の回帰)。
+        composition: core::ptr::null(),
+        composition_len: 0,
+        on_cluster_change: None,
+        cluster_change_ctx: core::ptr::null_mut(),
     };
     assert_eq!(sm_init(&cfg, 0), 0);
     // 二重初期化は拒否。
@@ -481,6 +486,411 @@ mod thread_shim {
         } else {
             panic!("expected Thread variant");
         }
+    }
+}
+
+// ==========================================================================
+// Phase A: composition モード(Composed レベルの単体テスト。グローバル状態非依存)
+// docs/design/generic-firmware.md §9.1
+// ==========================================================================
+
+/// composition TLV blob を組み立てるテストヘルパ(C 側 ctest と同じスキーマ)。
+#[cfg(test)]
+pub(crate) fn build_composition(buf: &mut [u8]) -> usize {
+    use simple_matter::tlv::{ContainerType, TlvTag, TlvWriter};
+    let mut w = TlvWriter::new(buf);
+    w.start_container(&TlvTag::Anonymous, ContainerType::List)
+        .unwrap();
+    // EP1 = dimmable light(Identify/Groups/OnOff/LevelControl)。
+    w.start_struct(&TlvTag::Anonymous).unwrap();
+    w.write_u16(&TlvTag::ContextSpecific(0), 1).unwrap();
+    w.write_u32(&TlvTag::ContextSpecific(1), 0x0101).unwrap();
+    w.write_u8(&TlvTag::ContextSpecific(2), 3).unwrap();
+    w.start_container(&TlvTag::ContextSpecific(3), ContainerType::Array)
+        .unwrap();
+    for id in [0x0003u32, 0x0004, 0x0006, 0x0008] {
+        w.write_u32(&TlvTag::Anonymous, id).unwrap();
+    }
+    w.end_container().unwrap();
+    w.end_container().unwrap();
+    // EP2 = 温湿度センサ(Temperature + RelativeHumidity)。options で初期温度を与える。
+    w.start_struct(&TlvTag::Anonymous).unwrap();
+    w.write_u16(&TlvTag::ContextSpecific(0), 2).unwrap();
+    w.write_u32(&TlvTag::ContextSpecific(1), 0x0302).unwrap();
+    w.write_u8(&TlvTag::ContextSpecific(2), 2).unwrap();
+    w.start_container(&TlvTag::ContextSpecific(3), ContainerType::Array)
+        .unwrap();
+    for id in [0x0402u32, 0x0405] {
+        w.write_u32(&TlvTag::Anonymous, id).unwrap();
+    }
+    w.end_container().unwrap();
+    w.start_container(&TlvTag::ContextSpecific(4), ContainerType::Array)
+        .unwrap();
+    w.start_struct(&TlvTag::Anonymous).unwrap();
+    w.write_u32(&TlvTag::ContextSpecific(0), 0x0402).unwrap();
+    w.write_u32(&TlvTag::ContextSpecific(1), 0x0000).unwrap();
+    w.write_i16(&TlvTag::ContextSpecific(2), 2350).unwrap();
+    w.end_container().unwrap();
+    w.end_container().unwrap();
+    w.end_container().unwrap();
+    w.end_container().unwrap();
+    w.len()
+}
+
+/// Descriptor(DeviceTypeList / ServerList / PartsList)が合成結果と整合すること。
+///
+/// `Light` を(シム static ではなく)leak したヒープ上に組んで検証する
+/// (`sm_init` は 1 プロセス 1 回なのでグローバルは使えない。位置が不動であれば
+/// `install` の `&'static` 自己参照の前提は満たされる)。
+#[test]
+fn descriptor_synthesis_matches_composition() {
+    use simple_matter::dm::codec::AttrEncoder;
+    use simple_matter::dm::meta::{AccessContext, AttributeId, Privilege, SessionKind};
+    use simple_matter::dm::DataModel;
+    use simple_matter::tlv::{TlvReader, TlvTag, TlvValue, TlvWriter};
+
+    let rng = CRng {
+        fill: test_rng,
+        ctx: core::ptr::null_mut(),
+    };
+    let owned: &'static Owned = Box::leak(Box::new(Owned {
+        crypto: RustCrypto::new(rng),
+        fabrics: RefCell::new(FabricTable::new()),
+        acl: RefCell::new(AclTable::new()),
+        window: RefCell::new(CommissioningWindow::new()),
+        groups: RefCell::new(DefaultGroupStore::new()),
+        dac_store: DacStore::default(),
+    }));
+    let dac = ShimDac::Test(TestDacProvider::new(&RustCrypto::new(rng)).unwrap());
+    let light: &'static mut Light = Box::leak(Box::new(build_light(
+        owned,
+        rng,
+        sm_network_t::SM_NET_ETHERNET,
+        dac,
+    )));
+
+    let mut buf = [0u8; 256];
+    let n = build_composition(&mut buf);
+    let spec = compose::parse(&buf[..n]).unwrap();
+    light.install_composition(&spec, &owned.groups).unwrap();
+    light.install_custom(custom::PendingRegistry::new());
+
+    // EndpointMeta は EP0 + 合成 EP1/EP2。
+    let eps: Vec<u16> = light.endpoints().iter().map(|m| m.id.0).collect();
+    assert_eq!(eps, vec![0, 1, 2]);
+    // 合成 EP の ServerList には宣言クラスタ + 自動 Descriptor が入る。
+    let ep1: Vec<u32> = light
+        .clusters_on(EndpointId(1))
+        .iter()
+        .map(|c| c.0)
+        .collect();
+    assert_eq!(ep1, vec![0x0003, 0x0004, 0x0006, 0x0008, 0x001D]);
+    let ep2: Vec<u32> = light
+        .clusters_on(EndpointId(2))
+        .iter()
+        .map(|c| c.0)
+        .collect();
+    assert_eq!(ep2, vec![0x0402, 0x0405, 0x001D]);
+
+    // Descriptor 属性を実際に read して整合を確かめる。
+    let acc = AccessContext::new(
+        SessionKind::Case,
+        core::num::NonZeroU8::new(1),
+        0,
+        Privilege::Administer,
+    )
+    .with_env(0, [0u8; 16]);
+    let read = |ep: u16, attr: u32, out: &mut [u8]| -> usize {
+        let mut w = TlvWriter::new(out);
+        {
+            let mut e = AttrEncoder::new(&mut w, TlvTag::Anonymous);
+            light
+                .cluster(EndpointId(ep), ClusterId(0x001D))
+                .expect("descriptor")
+                .read_attribute(AttributeId(attr), &mut e, &acc)
+                .expect("read");
+        }
+        w.len()
+    };
+    /// TLV 配列から符号なし整数を集める(struct 内は tag 0 の値のみ拾う)。
+    fn u_list(buf: &[u8]) -> Vec<u64> {
+        let mut r = TlvReader::new(buf);
+        let mut out = Vec::new();
+        let mut depth = 0usize;
+        while let Ok(Some(e)) = r.read_next() {
+            match e.value {
+                TlvValue::ContainerStart(_) => depth += 1,
+                TlvValue::ContainerEnd => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                // DeviceTypeList は {0: type, 1: revision} の struct 列 → revision を除く。
+                TlvValue::UnsignedInteger(u) if !matches!(e.tag, TlvTag::ContextSpecific(1)) => {
+                    out.push(u)
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    let mut b = [0u8; 256];
+    // EP0 PartsList(0x0003)= 合成した全 EP。
+    let n = read(0, 0x0003, &mut b);
+    assert_eq!(u_list(&b[..n]), vec![1, 2]);
+    // EP1 DeviceTypeList(0x0000)= blob の device type(0x0101)。
+    let n = read(1, 0x0000, &mut b);
+    assert_eq!(u_list(&b[..n]), vec![0x0101]);
+    // EP1 ServerList(0x0001)。
+    let n = read(1, 0x0001, &mut b);
+    assert_eq!(
+        u_list(&b[..n]),
+        vec![0x0003, 0x0004, 0x0006, 0x0008, 0x001D]
+    );
+    // EP2 DeviceTypeList / ServerList。
+    let n = read(2, 0x0000, &mut b);
+    assert_eq!(u_list(&b[..n]), vec![0x0302]);
+    let n = read(2, 0x0001, &mut b);
+    assert_eq!(u_list(&b[..n]), vec![0x0402, 0x0405, 0x001D]);
+}
+
+mod compose_mode {
+    use super::super::compose::*;
+    use super::super::custom::{sm_attr_type_t, sm_attr_value_t};
+    use core::cell::RefCell;
+    use core::num::NonZeroU8;
+    use simple_matter::dm::codec::CmdResponder;
+    use simple_matter::dm::meta::{AccessContext, Privilege, SessionKind};
+    use simple_matter::groups::DefaultGroupStore;
+    use simple_matter::tlv::{TlvReader, TlvWriter};
+
+    /// テスト用の `&'static` グループストア(Composed::install が要求する)。
+    fn group_store() -> &'static RefCell<DefaultGroupStore> {
+        Box::leak(Box::new(RefCell::new(DefaultGroupStore::new())))
+    }
+
+    fn spec() -> CompositionSpec {
+        let mut buf = [0u8; 256];
+        let n = super::build_composition(&mut buf);
+        parse(&buf[..n]).expect("composition parse")
+    }
+
+    fn installed() -> Composed {
+        let mut c = Composed::new();
+        c.install(&spec(), group_store()).expect("install");
+        c
+    }
+
+    fn acc() -> AccessContext {
+        AccessContext::new(
+            SessionKind::Case,
+            NonZeroU8::new(1),
+            0,
+            Privilege::Administer,
+        )
+        .with_env(1234, [0u8; 16])
+    }
+
+    #[test]
+    fn parse_schema() {
+        let s = spec();
+        assert_eq!(s.eps.len(), 2);
+        assert_eq!(s.eps[0].ep, 1);
+        assert_eq!(s.eps[0].device_type, 0x0101);
+        assert_eq!(s.eps[0].dt_rev, 3);
+        assert_eq!(
+            s.eps[0].clusters.as_slice(),
+            &[CL_IDENTIFY, CL_GROUPS, CL_ONOFF, CL_LEVEL]
+        );
+        assert_eq!(s.eps[1].ep, 2);
+        assert_eq!(s.eps[1].clusters.as_slice(), &[CL_TEMP, CL_HUM]);
+        // options は EP を継承する。
+        assert_eq!(s.opts.len(), 1);
+        assert_eq!(
+            (s.opts[0].ep, s.opts[0].cluster, s.opts[0].attr),
+            (2, CL_TEMP, 0)
+        );
+    }
+
+    #[test]
+    fn parse_rejects_garbage_and_ep0() {
+        assert!(parse(&[0xFF, 0xFF, 0xFF]).is_err());
+        // EP0 の宣言(システム EP は予約)は Decode エラー。
+        let mut buf = [0u8; 32];
+        let n = {
+            use simple_matter::tlv::{ContainerType, TlvTag};
+            let mut w = TlvWriter::new(&mut buf);
+            w.start_container(&TlvTag::Anonymous, ContainerType::List)
+                .unwrap();
+            w.start_struct(&TlvTag::Anonymous).unwrap();
+            w.write_u16(&TlvTag::ContextSpecific(0), 0).unwrap();
+            w.end_container().unwrap();
+            w.end_container().unwrap();
+            w.len()
+        };
+        assert_eq!(parse(&buf[..n]).err(), Some(ParseError::Decode));
+    }
+
+    #[test]
+    fn install_allocates_and_dispatches() {
+        let c = installed();
+        assert!(c.is_active());
+        assert_eq!(c.endpoints().len(), 2);
+        // 宣言したクラスタは引ける。
+        for (ep, cl) in [
+            (1, CL_IDENTIFY),
+            (1, CL_GROUPS),
+            (1, CL_ONOFF),
+            (1, CL_LEVEL),
+            (2, CL_TEMP),
+            (2, CL_HUM),
+        ] {
+            assert!(c.cluster(ep, cl).is_some(), "ep{ep} cl{cl:#x}");
+        }
+        // 宣言していないクラスタ/EP は無い。
+        assert!(c.cluster(1, CL_COLOR).is_none());
+        assert!(c.cluster(3, CL_ONOFF).is_none());
+        // meta が正しいクラスタ実体を指す。
+        assert_eq!(c.cluster(1, CL_ONOFF).unwrap().meta().id.0, CL_ONOFF);
+        assert_eq!(c.cluster(2, CL_HUM).unwrap().meta().id.0, CL_HUM);
+    }
+
+    #[test]
+    fn options_apply_initial_values() {
+        let c = installed();
+        let v = c.get_value(2, CL_TEMP, 0x0000).unwrap();
+        assert!(!v.is_null);
+        assert_eq!(unsafe { v.v.i }, 2350);
+        // options を持たない湿度は null 初期値。
+        assert!(c.get_value(2, CL_HUM, 0x0000).unwrap().is_null);
+    }
+
+    #[test]
+    fn value_access_roundtrip_and_dirty() {
+        let mut c = installed();
+        // OnOff。
+        c.set_value(1, CL_ONOFF, 0x0000, &v_bool(true)).unwrap();
+        assert!(unsafe { c.get_value(1, CL_ONOFF, 0x0000).unwrap().v.b });
+        // センサ値 push → 値反映 + dirty(購読レポートの契機)。
+        c.set_value(2, CL_HUM, 0x0000, &v_u(sm_attr_type_t::SM_T_U16, 5500))
+            .unwrap();
+        assert_eq!(unsafe { c.get_value(2, CL_HUM, 0x0000).unwrap().v.u }, 5500);
+        assert!(c.cluster_mut(2, CL_HUM).unwrap().take_dirty());
+        // null 書き込み。
+        let mut nullv = sm_attr_value_t::zero();
+        nullv.r#type = sm_attr_type_t::SM_T_I16;
+        nullv.is_null = true;
+        c.set_value(2, CL_TEMP, 0x0000, &nullv).unwrap();
+        assert!(c.get_value(2, CL_TEMP, 0x0000).unwrap().is_null);
+        // 非対応の宛先/属性。
+        assert_eq!(
+            c.set_value(5, CL_ONOFF, 0, &v_bool(true)),
+            Err(RC_NO_CLUSTER)
+        );
+        assert_eq!(
+            c.set_value(1, CL_LEVEL, 0x0000, &v_u(sm_attr_type_t::SM_T_U8, 5)),
+            Err(RC_NO_ATTR)
+        );
+        assert_eq!(
+            c.get_value(1, CL_ONOFF, 0x1234).err(),
+            Some(RC_NO_ATTR),
+            "未対応属性は RC_NO_ATTR"
+        );
+    }
+
+    #[test]
+    fn set_value_does_not_fire_change_but_command_does() {
+        let mut c = installed();
+        // アプリ発の書き込みでは on_cluster_change を鳴らさない(HAL ループ防止)。
+        c.set_value(2, CL_TEMP, 0x0000, &v_i(sm_attr_type_t::SM_T_I16, 1000))
+            .unwrap();
+        let mut fired = 0;
+        c.poll_changes(|_, _, _, _| fired += 1);
+        assert_eq!(fired, 0);
+
+        // IM コマンド(OnOff On = 0x01)は発火する。
+        let mut scratch = [0u8; 64];
+        let mut sw = TlvWriter::new(&mut scratch);
+        let mut resp = CmdResponder::new(&mut sw);
+        let mut fields = TlvReader::new(&[]);
+        c.cluster_mut(1, CL_ONOFF)
+            .unwrap()
+            .invoke_command(
+                simple_matter::dm::meta::CommandId(0x01),
+                &mut fields,
+                &mut resp,
+                &acc(),
+            )
+            .unwrap();
+        let mut hits: heapless::Vec<(u16, u32, u32, bool), 4> = heapless::Vec::new();
+        c.poll_changes(|ep, cl, attr, v| {
+            let _ = hits.push((ep, cl, attr, unsafe { v.v.b }));
+        });
+        assert_eq!(hits.as_slice(), &[(1, CL_ONOFF, 0x0000, true)]);
+        // 2 度目は変化なし。
+        let mut again = 0;
+        c.poll_changes(|_, _, _, _| again += 1);
+        assert_eq!(again, 0);
+    }
+
+    #[test]
+    fn level_control_couples_on_off() {
+        let mut c = installed();
+        // MoveToLevelWithOnOff(0x04)で level=128 → OnOff が On になる(連動はシムが橋渡し)。
+        let mut buf = [0u8; 32];
+        let n = {
+            use simple_matter::tlv::{ContainerType, TlvTag};
+            let mut w = TlvWriter::new(&mut buf);
+            w.start_container(&TlvTag::Anonymous, ContainerType::Structure)
+                .unwrap();
+            w.write_u8(&TlvTag::ContextSpecific(0), 128).unwrap();
+            w.write_u16(&TlvTag::ContextSpecific(1), 0).unwrap();
+            w.end_container().unwrap();
+            w.len()
+        };
+        let mut scratch = [0u8; 64];
+        let mut sw = TlvWriter::new(&mut scratch);
+        let mut resp = CmdResponder::new(&mut sw);
+        let mut fields = TlvReader::new(&buf[..n]);
+        c.cluster_mut(1, CL_LEVEL)
+            .unwrap()
+            .invoke_command(
+                simple_matter::dm::meta::CommandId(0x04),
+                &mut fields,
+                &mut resp,
+                &acc(),
+            )
+            .unwrap();
+        c.couple_on_off();
+        assert_eq!(
+            unsafe { c.get_value(1, CL_LEVEL, 0x0000).unwrap().v.u },
+            128,
+            "CurrentLevel"
+        );
+        assert!(
+            unsafe { c.get_value(1, CL_ONOFF, 0x0000).unwrap().v.b },
+            "WithOnOff で On 連動"
+        );
+    }
+
+    #[test]
+    fn unsupported_cluster_and_capacity_rejected() {
+        // 未対応クラスタ ID(WindowCovering)は Decode。
+        let mut s = spec();
+        s.eps[0].clusters.clear();
+        let _ = s.eps[0].clusters.push(0x0102);
+        let mut c = Composed::new();
+        assert_eq!(c.install(&s, group_store()).err(), Some(ParseError::Decode));
+        // EP 重複は Decode。
+        let mut s2 = spec();
+        s2.eps[1].ep = 1;
+        let mut c2 = Composed::new();
+        assert_eq!(
+            c2.install(&s2, group_store()).err(),
+            Some(ParseError::Decode)
+        );
     }
 }
 

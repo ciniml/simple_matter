@@ -583,16 +583,23 @@ impl<const RESULT: usize> ImClient<RESULT> {
 
     /// 放置トランザクションと途絶した購読を掃除する(統合層が定期呼び出し、§4.1/§4.5.3)。
     ///
-    /// トランザクションが期限切れなら破棄し [`ImEvent::Failed`]`(Timeout)` を積んで `true` を
-    /// 返す。加えて `last_report + maxInterval + 猶予` を超えた購読を破棄し
+    /// トランザクションが期限切れなら破棄し [`ImEvent::Failed`]`(Timeout)` を積んで、その
+    /// トランザクションの exchange を返す。**統合層は返った exchange を必ず close して
+    /// 再送バッファを回収すること**(閉じないと、要求が standalone ACK で受領済み =
+    /// 再送スロットが空で MRP の諦めも走らない exchange が永久に残り、プール枯渇で
+    /// 以降の `start_*` が全て `NoSpace` になる — Tab5 実機 2026-08-25)。
+    /// 加えて `last_report + maxInterval + 猶予` を超えた購読を破棄し
     /// [`ImEvent::SubscriptionLost`] を積む(戻り値には影響しない)。
-    pub fn on_tick(&mut self, now_ms: u64) -> bool {
+    pub fn on_tick(&mut self, now_ms: u64) -> Option<ExchangeId> {
         let expired = match &self.txn {
-            Some(t) => now_ms.saturating_sub(t.started_ms) > CLIENT_TXN_TIMEOUT_MS,
-            None => false,
+            Some(t) if now_ms.saturating_sub(t.started_ms) > CLIENT_TXN_TIMEOUT_MS => {
+                Some(t.exchange)
+            }
+            _ => None,
         };
-        if expired {
+        if expired.is_some() {
             self.txn = None;
+            self.pending_invoke_len = None;
             self.event = Some(ImEvent::Failed {
                 status: ImStatus::Timeout,
             });
@@ -611,6 +618,19 @@ impl<const RESULT: usize> ImClient<RESULT> {
             });
         }
         expired
+    }
+
+    /// 進行中のトランザクションを外部都合で破棄する(統合層の待ちがタイムアウトした
+    /// とき等)。イベントは積まない(呼び出し元が同期的に諦めているため)。破棄した
+    /// トランザクションの exchange を返すので、統合層は close して再送バッファを回収する
+    /// こと。進行中でなければ `None`。
+    pub fn abort_txn(&mut self) -> Option<ExchangeId> {
+        let ex = self.txn.take().map(|t| t.exchange);
+        if ex.is_some() {
+            self.pending_invoke_len = None;
+            self.event = None;
+        }
+        ex
     }
 
     // ----------------------------------------------------------------------
