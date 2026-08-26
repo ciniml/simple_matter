@@ -706,6 +706,183 @@ fn add_noc_without_trusted_root_fails() {
     assert_eq!(im.data_model().opcreds.fabrics().len(), 0);
 }
 
+/// AddNOC の ICAC フィールドの送出形態。
+#[derive(Clone, Copy)]
+enum IcacField {
+    /// 空オクテット列 `cx(1)=[]` を含める(Apple Home が ICAC 不使用時に送る形)。
+    Empty,
+    /// ICAC フィールドを省略する。
+    Omitted,
+}
+
+/// ArmFailSafe → CSR → AddTrustedRoot → AddNOC を実行し、AddNOC の statusCode を返す。
+/// `icac` で ICAC フィールドの送出形態(空フィールド / 省略)を切り替える。NOC は RCAC 直下発行。
+fn commission_and_add_noc(
+    im: &mut Im,
+    mgr: &mut SessionManager<2>,
+    ex: ExchangeId,
+    crypto: &RustCrypto<DummyRng>,
+    icac: IcacField,
+) -> u64 {
+    let mut out = [0u8; 1024];
+    // ArmFailSafe。
+    let len = invoke(
+        im,
+        mgr,
+        ex,
+        0x0030,
+        0x00,
+        0,
+        |w, t| {
+            w.start_struct(t)?;
+            w.write_u16(&cx(0), 60)?;
+            w.write_u64(&cx(1), 1)?;
+            w.end_container()
+        },
+        &mut out,
+    );
+    assert_eq!(resp_command(&out[..len]).0, 0x01, "ArmFailSafeResponse");
+
+    // CSRRequest → 運用公開鍵。
+    let len = invoke(
+        im,
+        mgr,
+        ex,
+        0x003E,
+        0x04,
+        0,
+        |w, t| {
+            w.start_struct(t)?;
+            w.write_bytes(&cx(0), &[0x22u8; 32])?;
+            w.end_container()
+        },
+        &mut out,
+    );
+    let (_, f) = resp_command(&out[..len]);
+    let nocsr = field_bytes(f, 0).unwrap();
+    let csr = field_bytes(nocsr, 1).unwrap();
+    let op_pub = extract_pubkey(csr);
+
+    // RCAC(自己署名)と NOC(op_pub, RCAC 直下発行)。
+    let root_kp = crypto.p256_keypair_from_bytes(&[0x11; 32]).unwrap();
+    let root_pub = root_kp.public_key().to_bytes();
+    let mut rcac = [0u8; 400];
+    let rcac_len = write_cert(
+        &mut rcac,
+        &[0x01],
+        &[
+            (dn_attr::MATTER_RCAC_ID, RCAC_ID),
+            (dn_attr::MATTER_FABRIC_ID, FABRIC_ID),
+        ],
+        &[
+            (dn_attr::MATTER_RCAC_ID, RCAC_ID),
+            (dn_attr::MATTER_FABRIC_ID, FABRIC_ID),
+        ],
+        &root_pub,
+        true,
+        key_usage::KEY_CERT_SIGN | key_usage::CRL_SIGN,
+        &[],
+        &RCAC_SKID,
+        &RCAC_SKID,
+        &root_kp,
+    );
+    let mut noc = [0u8; 400];
+    let noc_len = write_cert(
+        &mut noc,
+        &[0x02],
+        &[
+            (dn_attr::MATTER_RCAC_ID, RCAC_ID),
+            (dn_attr::MATTER_FABRIC_ID, FABRIC_ID),
+        ],
+        &[
+            (dn_attr::MATTER_NODE_ID, NODE_ID),
+            (dn_attr::MATTER_FABRIC_ID, FABRIC_ID),
+        ],
+        &op_pub,
+        false,
+        key_usage::DIGITAL_SIGNATURE,
+        &[ext_key_usage::SERVER_AUTH, ext_key_usage::CLIENT_AUTH],
+        &NOC_SKID,
+        &RCAC_SKID,
+        &root_kp,
+    );
+
+    // AddTrustedRootCertificate。
+    let len = invoke(
+        im,
+        mgr,
+        ex,
+        0x003E,
+        0x0B,
+        0,
+        |w, t| {
+            w.start_struct(t)?;
+            w.write_bytes(&cx(0), &rcac[..rcac_len])?;
+            w.end_container()
+        },
+        &mut out,
+    );
+    assert_eq!(resp_status(&out[..len]), 0, "AddTrustedRoot success");
+
+    // AddNOC。ICAC フィールドは icac に従い空フィールド / 省略で送る。
+    let ipk = [0x44u8; 16];
+    let len = invoke(
+        im,
+        mgr,
+        ex,
+        0x003E,
+        0x06,
+        0,
+        |w, t| {
+            w.start_struct(t)?;
+            w.write_bytes(&cx(0), &noc[..noc_len])?;
+            if let IcacField::Empty = icac {
+                // ICAC 不使用でも空オクテット列でフィールドを送るコミッショナ(Apple Home)を模す。
+                w.write_bytes(&cx(1), &[])?;
+            }
+            w.write_bytes(&cx(2), &ipk)?;
+            w.write_u64(&cx(3), 0x0000_0000_0000_0001)?;
+            w.write_u16(&cx(4), 0xFFF1)?;
+            w.end_container()
+        },
+        &mut out,
+    );
+    let (rid, f) = resp_command(&out[..len]);
+    assert_eq!(rid, 0x08, "NOCResponse");
+    field_uint(f, 0).expect("statusCode present")
+}
+
+/// 実機回帰(Apple Home): AddNOC で ICAC 不使用時にコミッショナが ICACValue を空オクテット列で
+/// 送ってくる。修正前は空スライスを証明書としてパースして InvalidNOC で失敗していた。
+/// 空 ICAC フィールド版と、対照の ICAC 省略版の双方が statusCode OK(0)で fabric を 1 つ増やす。
+#[test]
+fn add_noc_with_empty_icac_field_succeeds() {
+    // 空 ICAC フィールド `cx(1)=[]` を含める版。
+    {
+        let (mut im, mut mgr, ex) = setup();
+        let crypto = RustCrypto::new(DummyRng);
+        let status = commission_and_add_noc(&mut im, &mut mgr, ex, &crypto, IcacField::Empty);
+        assert_eq!(status, 0, "AddNOC statusCode OK with empty ICAC field");
+        assert_eq!(
+            im.data_model().opcreds.fabrics().len(),
+            1,
+            "fabric added (empty ICAC field)"
+        );
+    }
+    // 対照: ICAC フィールドを省略した版。
+    {
+        let (mut im, mut mgr, ex) = setup();
+        let crypto = RustCrypto::new(DummyRng);
+        let status = commission_and_add_noc(&mut im, &mut mgr, ex, &crypto, IcacField::Omitted);
+        assert_eq!(status, 0, "AddNOC statusCode OK with ICAC omitted");
+        assert_eq!(
+            im.data_model().opcreds.fabrics().len(),
+            1,
+            "fabric added (ICAC omitted)"
+        );
+    }
+}
+
 #[test]
 fn network_commissioning_reads_ethernet_networks() {
     let dev = CommNode::build();
