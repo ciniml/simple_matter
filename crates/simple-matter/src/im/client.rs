@@ -73,7 +73,11 @@ pub const MAX_CLIENT_SUBSCRIPTIONS: usize = 4;
 ///
 /// デバイス側は `now >= last_report + max` でレポートを出すが、MRP 再送・処理遅延の
 /// ゆらぎがあるため即断しない。chip の liveness timeout(maxInterval + MRP 往復余裕)相当。
-pub const SUBSCRIPTION_GRACE_MS: u64 = 5_000;
+///
+/// 30 秒: MRP は最大 10 送信(累計 ~34 秒)まで再送するため、5 秒では「レポート 1 通の
+/// 再送が数秒続いた」だけで誤 LOST → 再購読 → デバイス側に幽霊購読を量産していた
+/// (設計 §16.6 P3、Tab5 実機 2026-08-26)。
+pub const SUBSCRIPTION_GRACE_MS: u64 = 30_000;
 
 // ==========================================================================
 // イベント
@@ -154,8 +158,7 @@ struct ClientTxn {
 struct ClientSub {
     /// デバイスが採番した購読 ID。
     id: u32,
-    /// 購読が乗るセッション(現状は情報のみ。将来の per-session 破棄用)。
-    #[allow(dead_code)]
+    /// 購読が乗るセッション([`ImClient::remove_subscriptions_on_session`] の照合キー)。
     session: SessionId,
     /// ネゴシエート済み最大レポート間隔(秒)。SubscribeResponse の値。
     max_interval_s: u16,
@@ -324,6 +327,46 @@ impl<const RESULT: usize> ImClient<RESULT> {
     /// 確立済み購読数。
     pub fn subscription_count(&self) -> usize {
         self.subs.len()
+    }
+
+    /// 購読テーブル容量(診断用)。
+    pub const fn subscription_capacity(&self) -> usize {
+        MAX_CLIENT_SUBSCRIPTIONS
+    }
+
+    /// 購読 `id` をローカルのテーブルから捨てる(設計 §16.6 P4)。戻り値 = 実際に消したか。
+    ///
+    /// デバイスへは何も送らない。以降その購読 ID のレポートには `InvalidSubscription` を
+    /// 返すため、デバイス側は(§16.6 P2 の修正により)その購読を捨てて双方が整合する。
+    /// [`ImEvent::SubscriptionLost`] は積まない(呼び出し元が意図して捨てているため)。
+    pub fn remove_subscription(&mut self, id: u32) -> bool {
+        let Some(i) = self.subs.iter().position(|s| s.id == id) else {
+            return false;
+        };
+        self.subs.swap_remove(i);
+        if matches!(&self.report_rx, Some(r) if r.subscription_id == id) {
+            self.report_rx = None;
+        }
+        true
+    }
+
+    /// セッション `session` に乗る購読を全て捨てる(戻り値 = 捨てた本数、設計 §16.6 P4)。
+    ///
+    /// CASE を張り直す(= 旧セッションを捨てる)ときに呼ぶと、旧セッションに残った購読が
+    /// keep-alive 途絶まで client 側テーブルを占有するのを防げる。
+    pub fn remove_subscriptions_on_session(&mut self, session: SessionId) -> usize {
+        let mut n = 0;
+        loop {
+            let Some(i) = self.subs.iter().position(|s| s.session == session) else {
+                break;
+            };
+            let id = self.subs.swap_remove(i).id;
+            if matches!(&self.report_rx, Some(r) if r.subscription_id == id) {
+                self.report_rx = None;
+            }
+            n += 1;
+        }
+        n
     }
 
     /// チャンク継続中のデバイス発レポートが使用中の exchange(統合層の回収判定用、§4.5.4)。

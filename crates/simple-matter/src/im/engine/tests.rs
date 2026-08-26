@@ -13,7 +13,7 @@ use crate::dm::clusters::{
 };
 use crate::dm::meta::EndpointId;
 use crate::exchange::{ExchangeId, HandlerAction, ProtocolHandler, Role, RxMessage};
-use crate::im::engine::{InteractionModel, SubDue};
+use crate::im::engine::{InteractionModel, SubDue, REPORT_INFLIGHT_TIMEOUT_MS};
 use crate::im::events::PRIORITY_CRITICAL;
 use crate::im::wire::{
     encode_invoke_request, encode_read_request, encode_read_request_events,
@@ -507,8 +507,21 @@ fn subscribe_prime_then_report_on_dirty() {
 
     // レポート後は dirty がクリアされ、max interval まで due でない。
     assert!(im.poll_subscriptions(2_000).is_none());
+    // 終端 StatusResponse 待ち(in-flight)の間は max interval ではなく強制回収の期限が出る
+    // (設計 §16.6 P1。in-flight ガードで due しない購読の締切を出しても意味がない)。
     assert_eq!(
         im.next_deadline(2_000),
+        Some(2_000 + REPORT_INFLIGHT_TIMEOUT_MS + 1),
+        "in-flight report: forced-reclaim deadline"
+    );
+    // 終端 StatusResponse(Success)で in-flight を解除 → 以降は max interval 期限。
+    let mut tx3 = [0u8; 64];
+    let a = im
+        .handle(&rxm(&stath, &stat[..stlen], ex2), &mut tx3, &mut mgr, 2_100)
+        .unwrap();
+    assert!(matches!(a, HandlerAction::CloseSilent));
+    assert_eq!(
+        im.next_deadline(2_100),
         Some(12_000),
         "last_report(2000) + max(10s)"
     );
@@ -2174,4 +2187,121 @@ mod events {
         assert_eq!(collect_events(&rtx[..rlen], &mut buf), 1, "イベントも載る");
         assert_eq!(buf[0].2, 3);
     }
+}
+
+// ==========================================================================
+// T8b §16.6: 購読レポートの in-flight タイムアウト / 失敗 StatusResponse
+// ==========================================================================
+
+/// 購読を 1 本確立し(OnOff クラスタ、min=1s / max=10s)、購読 ID を返す。
+fn establish_subscription(im: &mut Im, mgr: &mut SessionManager<2>, ex: ExchangeId) -> u32 {
+    let mut req = [0u8; 64];
+    let slen = encode_subscribe_request(&mut req, false, 1, 10, false, |p| {
+        p.push(&onoff_cluster_path())
+    })
+    .unwrap();
+    let mut tx = [0u8; 2048];
+    let a = im
+        .handle(
+            &rxm(&phdr(ImOpCode::SubscribeRequest.to_u8()), &req[..slen], ex),
+            &mut tx,
+            mgr,
+            0,
+        )
+        .unwrap();
+    assert_eq!(parts(a).0, ImOpCode::ReportData.to_u8());
+    let mut stat = [0u8; 16];
+    let stlen = StatusResponse::new(ImStatus::Success)
+        .encode(&mut stat)
+        .unwrap();
+    let mut tx2 = [0u8; 64];
+    let a = im
+        .handle(
+            &rxm(&phdr(ImOpCode::StatusResponse.to_u8()), &stat[..stlen], ex),
+            &mut tx2,
+            mgr,
+            0,
+        )
+        .unwrap();
+    let (op, len, _) = parts(a);
+    assert_eq!(op, ImOpCode::SubscribeResponse.to_u8());
+    SubscribeResponse::decode(&tx2[..len])
+        .unwrap()
+        .subscription_id
+}
+
+/// (1) 単一チャンクレポートの終端 StatusResponse が来ないまま
+/// [`REPORT_INFLIGHT_TIMEOUT_MS`] を超えたら、購読を破棄してその exchange を返す
+/// (設計 §16.6 P1。MRP ACK だけ届いた場合は `PollAction::Failed` が上がらないため、
+/// この掃引が無いと購読が永久に due せず initiator exchange も 1 本リークする)。
+#[test]
+fn inflight_report_timeout_drops_subscription_and_returns_exchange() {
+    let (mut im, mut mgr, ex) = setup();
+    let sid = ex.session();
+    let sub_id = establish_subscription(&mut im, &mut mgr, ex);
+
+    im.data_model_mut().on_off.set(true);
+    assert!(im.poll_subscriptions(2_000).is_some());
+    let ex2 = ExchangeId::from_parts(sid, 0x2222);
+    let mut rtx = [0u8; 256];
+    im.build_report(sub_id, ex2, &mut rtx, 2_000).unwrap();
+
+    // StatusResponse が来ない限り、dirty でも max interval 超過でも due しない(in-flight ガード)。
+    im.data_model_mut().on_off.set(false);
+    assert!(im.poll_subscriptions(20_000).is_none());
+    // 期限前は掃引しない。
+    assert!(im
+        .expire_stale_reports(2_000 + REPORT_INFLIGHT_TIMEOUT_MS)
+        .is_none());
+    // 期限超過で購読を破棄し、レポートを運んでいた exchange を返す(統合層が close する)。
+    assert_eq!(
+        im.expire_stale_reports(2_000 + REPORT_INFLIGHT_TIMEOUT_MS + 1),
+        Some(ex2)
+    );
+    assert_eq!(im.subscription_count(), 0);
+    assert_eq!(im.active_read_count(), 0);
+    assert!(im
+        .expire_stale_reports(2_000 + REPORT_INFLIGHT_TIMEOUT_MS + 1)
+        .is_none());
+    assert!(im.next_deadline(100_000).is_none());
+}
+
+/// (2) 単一チャンクレポートへの StatusResponse が **失敗ステータス**(InvalidSubscription =
+/// 相手がこの購読を知らない)なら、購読ごと破棄する(設計 §16.6 P2)。
+#[test]
+fn failed_status_response_to_report_drops_subscription() {
+    let (mut im, mut mgr, ex) = setup();
+    let sid = ex.session();
+    let sub_id = establish_subscription(&mut im, &mut mgr, ex);
+
+    im.data_model_mut().on_off.set(true);
+    assert!(im.poll_subscriptions(2_000).is_some());
+    let ex2 = ExchangeId::from_parts(sid, 0x2222);
+    let mut rtx = [0u8; 256];
+    im.build_report(sub_id, ex2, &mut rtx, 2_000).unwrap();
+    assert_eq!(im.subscription_count(), 1);
+
+    let mut stat = [0u8; 16];
+    let stlen = StatusResponse::new(ImStatus::InvalidSubscription)
+        .encode(&mut stat)
+        .unwrap();
+    let mut tx = [0u8; 64];
+    let a = im
+        .handle(
+            &rxm(&phdr(ImOpCode::StatusResponse.to_u8()), &stat[..stlen], ex2),
+            &mut tx,
+            &mut mgr,
+            2_100,
+        )
+        .unwrap();
+    assert!(
+        matches!(a, HandlerAction::CloseSilent),
+        "exchange は終端予約して回収する"
+    );
+    assert_eq!(
+        im.subscription_count(),
+        0,
+        "幽霊購読を残すと 60 秒ごとに無駄レポートを出し SUBS を食い潰す"
+    );
+    assert!(im.next_deadline(2_100).is_none());
 }

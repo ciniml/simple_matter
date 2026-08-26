@@ -44,7 +44,7 @@ use crate::im::wire::{
 use crate::sc::case::creds::{FabricStore, NocResolver, PeerIdentity};
 use crate::sc::initiator::{ScEvent, ScInitiator};
 use crate::sc::{OpCode, PROTO_ID_SECURE_CHANNEL};
-use crate::stack::{SendDirective, MAX_PACKET_SIZE};
+use crate::stack::{PoolUsage, SendDirective, MAX_PACKET_SIZE};
 use crate::tlv::{TlvTag, TlvWriter};
 use crate::transport::header::{PacketHeader, PayloadHeader};
 use crate::transport::net::PeerAddr;
@@ -270,6 +270,51 @@ impl<
     /// 確立済み購読数(client 側テーブル)。
     pub fn subscription_count(&self) -> usize {
         self.mgr.handler().im.subscription_count()
+    }
+
+    /// 購読テーブル容量(診断用)。
+    pub fn subscription_capacity(&self) -> usize {
+        self.mgr.handler().im.subscription_capacity()
+    }
+
+    /// client 側の購読 `id` をローカルで捨てる(設計 §16.6 P4)。戻り値 = 実際に消したか。
+    ///
+    /// シム(`sm_ctrl_unsubscribe` / 同一ノードの再購読)が自分のテーブルを捨てるときに
+    /// **必ず**併せて呼ぶ。呼ばないとコア側に旧購読が残り、デバイスの幽霊購読へ Success を
+    /// 返し続けて双方のテーブルが詰まる。
+    pub fn im_remove_subscription(&mut self, id: u32) -> bool {
+        self.mgr.handler_mut().im.remove_subscription(id)
+    }
+
+    /// セッションに乗る client 側購読を全て捨てる(戻り値 = 捨てた本数、設計 §16.6 P4)。
+    pub fn im_remove_subscriptions_on_session(&mut self, session: SessionId) -> usize {
+        self.mgr
+            .handler_mut()
+            .im
+            .remove_subscriptions_on_session(session)
+    }
+
+    /// 各プールの使用量(診断用。デバイス側 [`MatterStack::pool_usage`]
+    /// (crate::stack::MatterStack::pool_usage)のコントローラ版。設計 §16.6 診断)。
+    ///
+    /// コントローラの IM client は同時トランザクション 1 本固定なので、`reads` は
+    /// 進行中トランザクションの有無(0/1)を表す。
+    pub fn pool_usage(&self) -> PoolUsage {
+        let im = &self.mgr.handler().im;
+        PoolUsage {
+            exchanges: self.mgr.len(),
+            exchanges_cap: EXCHANGES,
+            sessions: self.sessions.len(),
+            sessions_cap: SESSIONS,
+            handshakes: 0,
+            handshakes_cap: 0,
+            tx_bufs: self.tx_pool.in_use(),
+            tx_bufs_cap: TX_BUFS,
+            subscriptions: im.subscription_count(),
+            subscriptions_cap: im.subscription_capacity(),
+            reads: usize::from(im.active_exchange().is_some()),
+            reads_cap: 1,
+        }
     }
 
     /// 次に [`poll`](Self::poll) すべき最も早い絶対時刻(MRP 再送/ACK + 購読ロスト検出)。

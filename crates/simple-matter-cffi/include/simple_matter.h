@@ -309,6 +309,12 @@ typedef struct {
   // 使用中の再送バッファ数 / 容量。
   uint16_t tx_bufs;
   uint16_t tx_bufs_cap;
+  // 購読数 / 容量(設計 §16.6 診断。幽霊購読で SUBS が詰まる兆候を見る)。
+  uint16_t subs;
+  uint16_t subs_cap;
+  // 進行中の Read / プライミング継続 slot 数 / 容量。
+  uint16_t reads;
+  uint16_t reads_cap;
 } sm_pool_stats_t;
 
 // アプリイベント(立った順にリングから取り出す)。
@@ -751,6 +757,14 @@ int32_t sm_ctrl_unsubscribe(uint64_t node_id);
 
 // ノードの購読が生きていれば true(UI 表示・poll 抑止の判定用。§16.2)。
 bool sm_ctrl_is_subscribed(uint64_t node_id);
+
+// コントローラ側の各プール使用量を `out` に書く(診断用。未初期化・NULL は 0 埋め)。
+//
+// デバイス側 [`sm_pool_stats`](crate::sm_pool_stats) と同じ構造体を使う。コントローラの
+// IM client は同時トランザクション 1 本固定なので `reads` は 0/1、ハンドシェイク欄は
+// 常に 0(SC initiator は slot プールを持たない)。`subs` はコア client の購読数で、
+// シムのテーブル([`sm_ctrl_is_subscribed`])と食い違っていないかの確認に使う(§16.6)。
+void sm_ctrl_pool_stats(sm_pool_stats_t *out);
 
 // operational(`_matter._tcp`)解決クエリを生成する(§11.1)。戻り値 = クエリ長(0 = 失敗)。
 //

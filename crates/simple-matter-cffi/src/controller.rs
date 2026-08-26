@@ -910,10 +910,18 @@ fn sub_index_by_id(s: &CtrlShim, id: u32) -> Option<usize> {
 }
 
 /// ノードの購読エントリを全て捨てる(戻り値 = 捨てた本数)。
+///
+/// シムのテーブルだけでなく **コア `ImClient` の購読テーブルからも消す**(設計 §16.6 P4)。
+/// 消さないと旧購読のレポートにコアが Success を返し続け、デバイス側の幽霊購読が生き残る
+/// (デバイスの SUBS が枯渇 → 以降の Subscribe が失敗)+ コア側テーブル(4)も詰まる。
 fn drop_subs_for_node(s: &mut CtrlShim, node_id: u64) -> usize {
-    let before = s.subs.len();
-    s.subs.retain(|e| e.node_id != node_id);
-    before - s.subs.len()
+    let mut n = 0;
+    while let Some(i) = s.subs.iter().position(|e| e.node_id == node_id) {
+        let id = s.subs.swap_remove(i).id;
+        s.stack.im_remove_subscription(id);
+        n += 1;
+    }
+    n
 }
 
 /// SUBSCRIBE_DONE で購読テーブルへ登録する(同一ノードの旧エントリは先に捨てる)。
@@ -921,7 +929,8 @@ fn register_subscription(s: &mut CtrlShim, node_id: u64, id: u32) {
     drop_subs_for_node(s, node_id);
     // 満杯なら最古を捨てる(API 側で事前検査するが、素の sm_ctrl_subscribe 経由の保険)。
     if s.subs.is_full() {
-        let _ = s.subs.swap_remove(0);
+        let old = s.subs.swap_remove(0);
+        s.stack.im_remove_subscription(old.id);
     }
     let paths = core::mem::take(&mut s.pending_sub_paths);
     let _ = s.subs.push(SubEntry { id, node_id, paths });
@@ -1726,6 +1735,41 @@ pub extern "C" fn sm_ctrl_is_subscribed(node_id: u64) -> bool {
     // SAFETY: 単線契約。
     let s = unsafe { ctrl_shim() };
     s.subs.iter().any(|e| e.node_id == node_id)
+}
+
+/// コントローラ側の各プール使用量を `out` に書く(診断用。未初期化・NULL は 0 埋め)。
+///
+/// デバイス側 [`sm_pool_stats`](crate::sm_pool_stats) と同じ構造体を使う。コントローラの
+/// IM client は同時トランザクション 1 本固定なので `reads` は 0/1、ハンドシェイク欄は
+/// 常に 0(SC initiator は slot プールを持たない)。`subs` はコア client の購読数で、
+/// シムのテーブル([`sm_ctrl_is_subscribed`])と食い違っていないかの確認に使う(§16.6)。
+#[no_mangle]
+pub extern "C" fn sm_ctrl_pool_stats(out: *mut crate::sm_pool_stats_t) {
+    if out.is_null() {
+        return;
+    }
+    let mut st = crate::sm_pool_stats_t::default();
+    if CTRL_INITED.load(Ordering::SeqCst) {
+        // SAFETY: 単線契約。
+        let s = unsafe { ctrl_shim() };
+        let u = s.stack.pool_usage();
+        st = crate::sm_pool_stats_t {
+            exchanges: u.exchanges as u16,
+            exchanges_cap: u.exchanges_cap as u16,
+            sessions: u.sessions as u16,
+            sessions_cap: u.sessions_cap as u16,
+            handshakes: u.handshakes as u16,
+            handshakes_cap: u.handshakes_cap as u16,
+            tx_bufs: u.tx_bufs as u16,
+            tx_bufs_cap: u.tx_bufs_cap as u16,
+            subs: u.subscriptions as u16,
+            subs_cap: u.subscriptions_cap as u16,
+            reads: u.reads as u16,
+            reads_cap: u.reads_cap as u16,
+        };
+    }
+    // SAFETY: caller が有効な out を渡す契約(NULL は上で除外)。
+    unsafe { out.write(st) };
 }
 
 /// operational(`_matter._tcp`)解決クエリを生成する(§11.1)。戻り値 = クエリ長(0 = 失敗)。

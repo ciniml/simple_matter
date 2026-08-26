@@ -1228,6 +1228,157 @@ fn keep_alive_report_refreshes_liveness() {
 }
 
 // ==========================================================================
+// (l) T8b §16.6 P4: remove_subscription 後のレポートは InvalidSubscription
+// ==========================================================================
+
+/// `remove_subscription` でローカルのテーブルから消した購読へレポートが届いたら
+/// `InvalidSubscription` を返す(デバイス側は §16.6 P2 の修正でその購読を捨てるので、
+/// シムが購読を張り直しても幽霊購読が残らない)。
+#[test]
+fn removed_subscription_report_is_rejected() {
+    use crate::im::wire::{encode_report_data, ReportDataHeader};
+    use crate::transport::header::{ExchFlags, PayloadHeader};
+
+    let crypto = crypto();
+    let (mut dev_mgr, mut dev_sessions, mut dev_pool) = device();
+    let (mut cli_mgr, mut cli_sessions, mut cli_pool) = client();
+    let cli_s = establish_case_pair(&mut cli_sessions, &mut dev_sessions);
+
+    let paths = [AttributePath::concrete(
+        EndpointId(1),
+        ClusterId(0x0006),
+        AttributeId(0x0000),
+    )];
+    let (sub_id, _max_s) = establish_subscription(
+        &crypto,
+        &mut cli_mgr,
+        &mut cli_sessions,
+        &mut cli_pool,
+        &mut dev_mgr,
+        &mut dev_sessions,
+        &mut dev_pool,
+        1600,
+        cli_s,
+        &paths,
+        0,
+        1,
+    );
+    assert_eq!(cli_mgr.handler().im.subscription_count(), 1);
+
+    // ローカル破棄(シムの sm_ctrl_unsubscribe / 再購読が呼ぶ経路)。冪等。
+    assert!(cli_mgr.handler_mut().im.remove_subscription(sub_id));
+    assert!(!cli_mgr.handler_mut().im.remove_subscription(sub_id));
+    assert_eq!(cli_mgr.handler().im.subscription_count(), 0);
+    assert_eq!(
+        cli_mgr.handler_mut().im.take_event(),
+        None,
+        "明示破棄では SubscriptionLost を積まない"
+    );
+
+    // 旧購読のレポートが届く → InvalidSubscription で終端(デバイスがこれで購読を捨てる)。
+    let mut payload = [0u8; 128];
+    let plen = encode_report_data(
+        &mut payload,
+        ReportDataHeader {
+            subscription_id: Some(sub_id),
+            more_chunks: false,
+            suppress_response: false,
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    let hdr = PayloadHeader {
+        exch_flags: ExchFlags::from_bits(ExchFlags::INITIATOR),
+        proto_opcode: ImOpCode::ReportData as u8,
+        exch_id: 0x78,
+        proto_id: PROTO_ID_INTERACTION_MODEL,
+        vendor_id: None,
+        ack_ctr: None,
+    };
+    let rx = RxMessage {
+        header: &hdr,
+        payload: &payload[..plen],
+        exchange: ExchangeId::from_parts(cli_s, 0x78),
+        role: crate::exchange::Role::Responder,
+    };
+    let mut tx = [0u8; 64];
+    let action = cli_mgr
+        .handler_mut()
+        .im
+        .handle(&rx, &mut tx, &mut cli_sessions, NOW)
+        .unwrap();
+    let HandlerAction::Close { opcode, len, .. } = action else {
+        panic!("expected Close, got {action:?}");
+    };
+    assert_eq!(opcode, ImOpCode::StatusResponse as u8);
+    assert_eq!(
+        StatusResponse::decode(&tx[..len]).unwrap().status,
+        ImStatus::InvalidSubscription
+    );
+
+    // セッション単位の破棄も同様(戻り値 = 本数)。
+    assert_eq!(
+        cli_mgr
+            .handler_mut()
+            .im
+            .remove_subscriptions_on_session(cli_s),
+        0,
+        "既に空"
+    );
+}
+
+// ==========================================================================
+// (m) T8b §16.6 P3: 猶予 30 秒(max+29 s は生存 / max+31 s でロスト)
+// ==========================================================================
+
+/// MRP は最大 10 送信(累計 ~34 秒)まで再送するため、レポート 1 通の再送が数十秒続いても
+/// 誤 LOST しない(旧値 5 秒では再購読 churn → デバイス側に幽霊購読を量産していた)。
+#[test]
+fn subscription_grace_tolerates_mrp_retransmission() {
+    assert_eq!(SUBSCRIPTION_GRACE_MS, 30_000, "設計 §16.6 P3");
+
+    let crypto = crypto();
+    let (mut dev_mgr, mut dev_sessions, mut dev_pool) = device();
+    let (mut cli_mgr, mut cli_sessions, mut cli_pool) = client();
+    let cli_s = establish_case_pair(&mut cli_sessions, &mut dev_sessions);
+
+    let paths = [AttributePath::concrete(
+        EndpointId(1),
+        ClusterId(0x0006),
+        AttributeId(0x0000),
+    )];
+    let (sub_id, max_s) = establish_subscription(
+        &crypto,
+        &mut cli_mgr,
+        &mut cli_sessions,
+        &mut cli_pool,
+        &mut dev_mgr,
+        &mut dev_sessions,
+        &mut dev_pool,
+        1600,
+        cli_s,
+        &paths,
+        0,
+        1,
+    );
+    let max_ms = NOW + (max_s as u64) * 1000;
+
+    // max + 29 秒(MRP 再送の途中)ではロストしない。
+    cli_mgr.handler_mut().im.on_tick(max_ms + 29_000);
+    assert_eq!(cli_mgr.handler_mut().im.take_event(), None);
+    assert_eq!(cli_mgr.handler().im.subscription_count(), 1);
+    // max + 31 秒(MRP が諦めた後)でロスト。
+    cli_mgr.handler_mut().im.on_tick(max_ms + 31_000);
+    assert_eq!(
+        cli_mgr.handler_mut().im.take_event(),
+        Some(ImEvent::SubscriptionLost {
+            subscription_id: sub_id
+        })
+    );
+    assert_eq!(cli_mgr.handler().im.subscription_count(), 0);
+}
+
+// ==========================================================================
 // (k) 未知の購読 ID → StatusResponse(InvalidSubscription) で終端
 // ==========================================================================
 

@@ -61,6 +61,15 @@ use crate::dm::expand::PathExpandCursor;
 /// 放置されたチャンク中 Read トランザクションを掃除するまでの時間(ミリ秒)。
 const READ_TXN_TIMEOUT_MS: u64 = 30_000;
 
+/// device 発レポートの in-flight タイムアウト(ミリ秒、設計 §16.6 P1)。
+///
+/// 単一チャンクレポートは終端 StatusResponse の受信でしか `report_exchange` を解除しない。
+/// MRP ACK だけ届いて StatusResponse が来ない(相手側で exchange が消えた後の重複、
+/// パケットロスの組合せ)と、その購読は in-flight ガードにより **永久に due しない**
+/// (dirty も max_interval も止まる)うえ initiator exchange が 1 本リークする。
+/// MRP の give-up 上限(累計 ~34 秒)に余裕を足した値で強制回収する。
+pub const REPORT_INFLIGHT_TIMEOUT_MS: u64 = 40_000;
+
 /// イベントログ(リングバッファ)の固定容量(設計 §12)。
 const EVENT_LOG_CAP: usize = 8;
 
@@ -313,6 +322,8 @@ struct Subscription<const P: usize> {
     /// 直近の device 発レポートを運んだ exchange(MRP 諦め時の購読破棄の逆引き用、
     /// 設計 §6.3。単一チャンクレポートは reads に継続 slot を持たないため購読側で覚える)。
     report_exchange: Option<ExchangeId>,
+    /// `report_exchange` を記録した時刻(in-flight タイムアウトの基準、設計 §16.6 P1)。
+    report_sent_ms: u64,
     /// 状態。
     state: SubState,
 }
@@ -342,6 +353,7 @@ impl<const P: usize> Subscription<P> {
             last_report_ms: now_ms,
             dirty: false,
             report_exchange: None,
+            report_sent_ms: 0,
             state: SubState::Priming,
         }
     }
@@ -886,13 +898,21 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
                 return Ok(HandlerAction::None);
             }
             // 配達確認: この exchange が購読レポートを運んでいたなら逆引きマップを消す
-            // (以降の無関係な exchange 失敗で購読を誤破棄しないため)。
+            // (以降の無関係な exchange 失敗で購読を誤破棄しないため)。失敗ステータス
+            // (InvalidSubscription 等 = 相手がこの購読を知らない)なら購読ごと破棄する
+            // (設計 §16.6 P2。残すと幽霊購読が max_interval ごとに無駄レポートを出し、
+            // SUBS を食い潰して新規 Subscribe が失敗する)。
             let acked = self
                 .subs
                 .iter()
                 .position(|s| s.report_exchange == Some(rx.exchange));
             if let Some(i) = acked {
-                self.subs[i].report_exchange = None;
+                if sr.status.is_success() {
+                    self.subs[i].report_exchange = None;
+                } else {
+                    let id = self.subs[i].id;
+                    self.on_report_failed(id);
+                }
             }
             return Ok(HandlerAction::CloseSilent);
         };
@@ -1258,6 +1278,20 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
             if s.state != SubState::Active {
                 continue;
             }
+            // in-flight(前回レポートの終端 StatusResponse 待ち)の購読は due にならない
+            // ([`Self::poll_subscriptions`] のガード)。代わりに強制回収の期限を出して、
+            // 凍った購読を寝たまま放置しない(設計 §16.6 P1)。
+            if s.report_exchange.is_some() {
+                let cand = s
+                    .report_sent_ms
+                    .saturating_add(REPORT_INFLIGHT_TIMEOUT_MS)
+                    .saturating_add(1);
+                earliest = Some(match earliest {
+                    Some(e) => e.min(cand),
+                    None => cand,
+                });
+                continue;
+            }
             let max_due = s
                 .last_report_ms
                 .saturating_add((s.max_interval_s as u64) * 1000);
@@ -1362,6 +1396,7 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         // in-flight ガードで購読が永久に due しなくなる)。送信失敗時は統合層が
         // [`Self::on_report_send_failed`] で解除する。
         self.subs[si].report_exchange = Some(exchange);
+        self.subs[si].report_sent_ms = now_ms;
 
         match outcome {
             ChunkOutcome::Done => {
@@ -1509,6 +1544,22 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
             };
             self.reads.swap_remove(i);
         }
+    }
+
+    /// 終端 StatusResponse が来ないまま [`REPORT_INFLIGHT_TIMEOUT_MS`] を超えた購読を
+    /// **1 件だけ**破棄し、そのレポートを運んでいた exchange を返す(設計 §16.6 P1)。
+    ///
+    /// 統合層は `while let Some(ex) = ...` で回し、返った exchange を close して再送
+    /// バッファを回収する。MRP ACK だけ届いて StatusResponse が来ない組合せでは
+    /// `PollAction::Failed` も上がらないため、この掃引が唯一の回収経路になる。
+    pub fn expire_stale_reports(&mut self, now_ms: u64) -> Option<ExchangeId> {
+        let (id, ex) = self.subs.iter().find_map(|s| {
+            let ex = s.report_exchange?;
+            (now_ms.saturating_sub(s.report_sent_ms) > REPORT_INFLIGHT_TIMEOUT_MS)
+                .then_some((s.id, ex))
+        })?;
+        self.on_report_failed(id);
+        Some(ex)
     }
 
     /// MRP が諦めた exchange を購読レポートへ逆引きし、該当購読を破棄する(設計 §6.3)。

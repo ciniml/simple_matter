@@ -92,6 +92,52 @@ uint8_t g_sub[SM_UI_MAX_NODES] = {};
 // 購読の再試行を控える時刻(失敗時 2 分。read のバックオフとは独立)。
 uint64_t g_sub_retry_until[SM_UI_MAX_NODES] = {};
 
+// ---- T8b/P5(§16.6): 購読喪失を受けたノードの「即再購読」キュー ----
+//
+// SM_CTRL_EV_SUBSCRIPTION_LOST を受けた時点で node_id を積み、定常ループの
+// 次の周回(UI op が無いとき)で 10 秒 tick を待たずに再購読する。行 index は
+// ノード表の増減で動くので **添字ではなく node_id** を持つ(0 = 空きスロット)。
+// 1 周につき 1 ノードだけ処理する(do_subscribe_node は CASE 込みで数秒かかる)。
+uint64_t g_resub_now[SM_UI_MAX_NODES] = {};
+
+void resub_now_push(uint64_t node_id) {
+  if (node_id == 0) {
+    return;
+  }
+  for (size_t i = 0; i < SM_UI_MAX_NODES; ++i) {
+    if (g_resub_now[i] == node_id) {
+      return; // 既に積んである
+    }
+  }
+  for (size_t i = 0; i < SM_UI_MAX_NODES; ++i) {
+    if (g_resub_now[i] == 0) {
+      g_resub_now[i] = node_id;
+      return;
+    }
+  }
+  // 満杯(= 全ノードが LOST)。従来の 10 秒 tick が拾うので落として構わない。
+}
+
+// 先頭の 1 件を取り出す(無ければ 0)。
+uint64_t resub_now_pop() {
+  for (size_t i = 0; i < SM_UI_MAX_NODES; ++i) {
+    if (g_resub_now[i] != 0) {
+      uint64_t id = g_resub_now[i];
+      g_resub_now[i] = 0;
+      return id;
+    }
+  }
+  return 0;
+}
+
+void resub_now_clear(uint64_t node_id) {
+  for (size_t i = 0; i < SM_UI_MAX_NODES; ++i) {
+    if (g_resub_now[i] == node_id) {
+      g_resub_now[i] = 0;
+    }
+  }
+}
+
 // 非同期イベント(REPORT / SUBSCRIPTION_LOST)をスナップショットへ反映する。
 // **イベントを捨てる全ての場所からこれを通す**(op 進行中に届いたレポートを落とさない)。
 // 実体は「スナップショット更新ヘルパ」節の後(set_node_* を使うため)。
@@ -528,6 +574,8 @@ bool consume_async_event(const sm_ctrl_event_t &ev) {
              (unsigned long long)ev.value_u64);
     mark_unsubscribed(ev.node_id, 0); // 次の poll tick で即再試行してよい
     set_node_note(ev.node_id, "subscription lost");
+    // T8b/P5(§16.6): tick を待たず、次の周回で再購読する。
+    resub_now_push(ev.node_id);
     return true;
   }
   if (ev.kind != SM_CTRL_EV_REPORT) {
@@ -2021,6 +2069,38 @@ void pump_task(void *) {
         }
       }
     }
+    // T8b/P5(§16.6): 購読喪失を受けたノードは 10 秒 tick を待たずここで再購読する
+    // (UI op はこの周回に無い = 上の op 処理を抜けてきている)。同一周回で複数
+    // ノードが LOST でも **1 周 1 ノード**だけ処理し、UDP のポンプを止めない。
+    if (uint64_t resub_id = resub_now_pop()) {
+      size_t slot = slot_of(resub_id);
+      uint8_t kind = node_kind(resub_id);
+      if (slot >= SM_UI_MAX_NODES || kind == SM_UI_KIND_UNKNOWN) {
+        // ノード表から消えた / 種別未確定。従来の 10 秒 tick に任せる。
+      } else if (g_sub[slot] == SUB_ACTIVE || now < g_sub_retry_until[slot]) {
+        // 既に張り直された / バックオフ中。
+      } else {
+        ESP_LOGI(TAG, "sub: resubscribe-now node=%016llx", (unsigned long long)resub_id);
+        set_node_busy(resub_id, true);
+        bool sub_ok = do_subscribe_node(resub_id, kind, 20000);
+        set_node_busy(resub_id, false);
+        // do_subscribe_node 中の LOST で積み直された分は捨てる(今の結果が最新)。
+        resub_now_clear(resub_id);
+        // 行 index は購読中に動きうるので取り直す。
+        slot = slot_of(resub_id);
+        if (slot < SM_UI_MAX_NODES) {
+          g_sub[slot] = sub_ok ? (uint8_t)SUB_ACTIVE : (uint8_t)SUB_NONE;
+          g_sub_retry_until[slot] = sub_ok ? 0 : now + 120000;
+          if (sub_ok) {
+            g_backoff_until[slot] = 0; // 通信は成立している
+          }
+        }
+        set_node_subscribed(resub_id, sub_ok);
+        set_node_note(resub_id, sub_ok ? "subscribed" : "subscribe failed");
+        continue; // 次の周回で UI op / 通常 tick に戻る
+      }
+    }
+
     // 10 秒周期でノードを 1 件ずつ read して on/off バッジを更新する。
     //
     // **落ちているノードには 2 分のバックオフ**を入れる(実機で発見した livelock:

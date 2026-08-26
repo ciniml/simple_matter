@@ -146,6 +146,14 @@ pub struct PoolUsage {
     pub tx_bufs: usize,
     /// 再送バッファ容量。
     pub tx_bufs_cap: usize,
+    /// 確立中/確立済みの購読数(設計 §16.6 診断)。
+    pub subscriptions: usize,
+    /// 購読テーブル容量。
+    pub subscriptions_cap: usize,
+    /// 進行中のチャンク中 Read / プライミング数。
+    pub reads: usize,
+    /// Read 継続 slot 容量。
+    pub reads_cap: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -336,6 +344,10 @@ impl<
             handshakes_cap: HANDSHAKES,
             tx_bufs: self.tx_pool.in_use(),
             tx_bufs_cap: TX_BUFS,
+            subscriptions: self.mgr.handler().im.subscription_count(),
+            subscriptions_cap: SUBS,
+            reads: self.mgr.handler().im.active_read_count(),
+            reads_cap: READS,
         }
     }
 
@@ -374,6 +386,14 @@ impl<
             .sc
             .expire_one(&mut self.sessions, now_ms)
         {
+            if let Some(freed) = self.mgr.close(ex) {
+                self.tx_pool.release(freed);
+            }
+        }
+        // 終端 StatusResponse が来ないまま固まった購読レポートを回収する(設計 §16.6 P1)。
+        // MRP ACK だけ届いて StatusResponse が来ない組合せでは `PollAction::Failed` が
+        // 上がらないため、放置すると購読が永久に due せず initiator exchange もリークする。
+        while let Some(ex) = self.mgr.handler_mut().im.expire_stale_reports(now_ms) {
             if let Some(freed) = self.mgr.close(ex) {
                 self.tx_pool.release(freed);
             }

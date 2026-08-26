@@ -1950,6 +1950,12 @@ pub struct sm_pool_stats_t {
     /// 使用中の再送バッファ数 / 容量。
     pub tx_bufs: u16,
     pub tx_bufs_cap: u16,
+    /// 購読数 / 容量(設計 §16.6 診断。幽霊購読で SUBS が詰まる兆候を見る)。
+    pub subs: u16,
+    pub subs_cap: u16,
+    /// 進行中の Read / プライミング継続 slot 数 / 容量。
+    pub reads: u16,
+    pub reads_cap: u16,
 }
 
 /// コアの各プール使用量を `out` に書く(診断用。未初期化・NULL は 0 埋め)。
@@ -1975,6 +1981,10 @@ pub extern "C" fn sm_pool_stats(out: *mut sm_pool_stats_t) {
             handshakes_cap: u.handshakes_cap as u16,
             tx_bufs: u.tx_bufs as u16,
             tx_bufs_cap: u.tx_bufs_cap as u16,
+            subs: u.subscriptions as u16,
+            subs_cap: u.subscriptions_cap as u16,
+            reads: u.reads as u16,
+            reads_cap: u.reads_cap as u16,
         };
     }
     // SAFETY: caller が有効な out を渡す契約(NULL は上で除外)。

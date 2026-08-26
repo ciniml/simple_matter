@@ -1008,9 +1008,10 @@ static void matter_task(void *) {
         s_last_pool_log = now;
         sm_pool_stats_t st = {};
         sm_pool_stats(&st);
-        ESP_LOGI(TAG, "pools: ex=%u/%u sess=%u/%u hs=%u/%u tx=%u/%u heap=%lu", st.exchanges,
-                 st.exchanges_cap, st.sessions, st.sessions_cap, st.handshakes, st.handshakes_cap,
-                 st.tx_bufs, st.tx_bufs_cap, (unsigned long)esp_get_free_heap_size());
+        ESP_LOGI(TAG, "pools: ex=%u/%u sess=%u/%u hs=%u/%u tx=%u/%u sub=%u/%u heap=%lu",
+                 st.exchanges, st.exchanges_cap, st.sessions, st.sessions_cap, st.handshakes,
+                 st.handshakes_cap, st.tx_bufs, st.tx_bufs_cap, st.subs, st.subs_cap,
+                 (unsigned long)esp_get_free_heap_size());
       }
     }
 #if CONFIG_SM_ENABLE_BLE

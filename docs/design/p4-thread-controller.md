@@ -1769,3 +1769,50 @@ SUBSCRIPTION_LOST + テーブル除去、(d) 購読中に別 op(read)を発行�
 3. 実機: NanoC6 ボタン押下 → Tab5 バッジ反転が **1 秒以内**。Tab5 の `nodes` に
    "subscribed"。NanoC6 `pools:` で ex/hs が安定、購読数が 1 で頭打ち(Tab5 再起動 3 回)。
    AirQ は購読確立と 60 秒以内の値更新を確認(dirty 対応済みなら即時)。
+
+### 16.6 T8b: 購読の堅牢化(NanoC6 の購読が長時間後に切れて見える件、2026-08-26)
+
+**症状**: 長時間稼働後、NanoC6 ボタン操作が Tab5 に 10 秒以上反映されない。Tab5 からの Toggle は効き、
+その後は購読レポートも再び届く。観測(8.5h 稼働中の 3 分間)では keep-alive レポートは 60 秒ちょうどで
+到達しており常時再現ではない = 間欠。デバイス側ログは未取得(シリアルが別プロセス占有)。
+
+**コードから特定した、購読が「凍る/幽霊化する」経路**(いずれも根本原因候補。全部塞ぐ):
+
+| # | 経路 | 影響 |
+|---|---|---|
+| P1 | デバイス: 単一チャンクレポート送出後 `report_exchange` を **StatusResponse 受信でしか解除しない**。MRP ACK だけ届いて StatusResponse が来ない(相手側で exchange 消滅後の重複、パケットロスの組合せ)と **購読が永久に due しない**(dirty も max_interval も止まる)+ initiator exchange が 1 本永久リーク(EXCHANGES=4) | 押しても届かない・keep-alive も止まる → Tab5 は 65 秒後 LOST → 再購読。凍った購読は SUBS(3)を食い続ける |
+| P2 | デバイス: 単一チャンクレポートへの **StatusResponse が失敗ステータス(InvalidSubscription 等)でも購読を破棄しない**(`on_status` の reads 不在分岐はステータス不問で `report_exchange` 解除のみ) | Tab5 が LOST/再購読した後の旧購読が幽霊化し、60 秒ごとに無駄レポート + SUBS 枯渇 → 4 本目以降の Subscribe が失敗 |
+| P3 | クライアント: `SUBSCRIPTION_GRACE_MS = 5 s`。MRP は最大 10 送信(累計 ~34 秒)まで再送するため、レポート 1 通の再送が数秒続くだけで **誤 LOST** → 再購読 → P2 の幽霊を量産 | 再購読の churn |
+| P4 | shim: `sm_ctrl_unsubscribe` / 同一ノード再購読時の旧エントリ破棄が **shim のテーブルだけ**で、コア `ImClient::subs` には残る → 旧購読のレポートに Success を返し続け、デバイスの旧購読が生き残る(P2 と合わせて幽霊化)。コア側テーブル(4)も詰まる | ⟳ や再購読のたびにリーク |
+| P5 | Tab5: LOST 後の再購読が次の 10 秒 tick 任せ | 復旧が最大 10 秒遅れる |
+
+**対処**:
+
+- **コア engine(デバイス側)**
+  - `Subscription` に `report_sent_ms: u64` を追加。`build_report` 成功時に記録。
+  - `InteractionModel::expire_stale_reports(now_ms) -> Option<ExchangeId>`(新設): `report_exchange` が
+    `REPORT_INFLIGHT_TIMEOUT_MS = 40_000`(MRP give-up 上限 ~34 s + 余裕)を超えて残っている購読を
+    **1 件ずつ破棄**(`on_report_failed` 相当)し、その exchange を返す。統合層 `MatterStack::drive_ticks`
+    が `while let Some(ex)` で回して `mgr.close(ex)` + `tx_pool.release` する(P1)。
+  - `on_status`: reads 不在分岐でも `!sr.status.is_success()` なら該当購読を `on_report_failed`(P2)。
+  - `next_deadline` に in-flight 期限も含める(凍った購読を寝たまま放置しない)。
+- **コア client(コントローラ側)**
+  - `SUBSCRIPTION_GRACE_MS` を 5 s → **30 s**(P3)。
+  - `ImClient::remove_subscription(id) -> bool` / `remove_subscriptions_on_session(session)` を追加。
+    `ControllerStack` に `im_remove_subscription` を経由(P4)。
+- **shim**: `sm_ctrl_unsubscribe` と `sm_ctrl_subscribe_paths` の旧エントリ破棄で、コア client 側も
+  `remove_subscription`(P4)。以降、旧購読のレポートには `InvalidSubscription` が返り、デバイスは P2 の
+  修正で購読を捨てる = 双方が自然に整合する。
+- **診断**: `sm_pool_stats_t` 末尾に `subs / subs_cap / reads / reads_cap`(u16×4)を追加(デバイス側
+  `MatterStack::pool_usage` に `subscriptions` を追加)。onoff_light_cpp の `pools:` ログに `sub=%u/%u`。
+  コントローラ側にも `sm_ctrl_pool_stats`(既存があれば `subs` 追加)。
+- **Tab5**: `SUBSCRIPTION_LOST` を受けたら **その場で再購読キューに積み、次ループで即再購読**(tick を
+  待たない。失敗時は従来の 2 分退避)(P5)。`nodes` 出力にコアの購読数も出す。
+
+**テスト**(コア): (1) 単一チャンクレポート送出後 StatusResponse を届けず 40 s 経過 → 購読破棄 + exchange
+回収(pool_usage で exchange 0)。(2) InvalidSubscription の StatusResponse → 購読破棄。(3) client:
+`remove_subscription` 後に届いたレポートへ InvalidSubscription を返す。(4) client: レポートが max+29 s
+遅れても LOST にならず、max+31 s で LOST。既存テストの期待値(5 s 前提)は更新。
+
+**ゲート**: cargo 全緑 → docker C6(onoff_light_cpp)/ P4(Tab5)→ 実機で NanoC6 `pools:` の `sub=` が
+1 で安定(Tab5 の ⟳ / 再起動を数回挟んでも増えない)、ボタン→Tab5 反映を長時間(数時間)観測。
