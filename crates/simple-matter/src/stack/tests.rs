@@ -108,6 +108,34 @@ static CFG: BasicInfoConfig = BasicInfoConfig {
     serial_number: "SN-0001",
 };
 
+/// Basic Information の ProductID を DAC の PID(0x8001)と一致させた設定
+/// (`VerifyNoPaa` 成功系。`docs/design/attestation.md` §8.5)。
+static CFG_PID_8001: BasicInfoConfig = BasicInfoConfig {
+    vendor_name: "TestVendor",
+    vendor_id: 0xFFF1,
+    product_name: "OnOffLight",
+    product_id: 0x8001,
+    hardware_version: 1,
+    hardware_version_string: "HW1",
+    software_version: 0x0001_0000,
+    software_version_string: "1.0.0",
+    serial_number: "SN-0001",
+};
+
+/// Basic Information の ProductID を DAC の PID(0x8001)と食い違わせた設定
+/// (実機 AirQ バグの再現: DAC=8001 だが Basic Info=8007。§8.1/§8.5)。
+static CFG_PID_8007: BasicInfoConfig = BasicInfoConfig {
+    vendor_name: "TestVendor",
+    vendor_id: 0xFFF1,
+    product_name: "OnOffLight",
+    product_id: 0x8007,
+    hardware_version: 1,
+    hardware_version_string: "HW1",
+    software_version: 0x0001_0000,
+    software_version_string: "1.0.0",
+    serial_number: "SN-0001",
+};
+
 static EP0_SERVERS: &[ClusterId] = &[
     ClusterId(0x0028),
     ClusterId(0x0030),
@@ -258,6 +286,28 @@ fn build_device_tampered_cd(fabrics: &RefCell<FabricTable<Crb, 5>>) -> Dev<'_> {
     let dac = TestDacProvider::new_with_tampered_cd(&dac_crypto).unwrap();
     Dev {
         basic: BasicInformationCluster::new(&CFG),
+        gc: GeneralCommissioning::default_config(),
+        net: NetworkCommissioning::new(b"eth0"),
+        admin: None,
+        opcreds: OpCredsCluster::new_shared(fabrics, RustCrypto::new(SeqRng(0x00C0_0001)), dac),
+        desc0: DescriptorCluster::new(EndpointId(0), EP0_DT, EP0_SERVERS, &[], EP0_PARTS),
+        onoff: OnOffCluster::new(),
+        desc1: DescriptorCluster::new(EndpointId(1), EP1_DT, EP1_SERVERS, &[], EP1_PARTS),
+        removed_fabric: None,
+        groups: None,
+    }
+}
+
+/// Basic Information の設定(特に ProductID)を差し替えたデバイス
+/// (`VerifyNoPaa` の報告 VID/PID 照合テスト用。§8.5)。
+fn build_device_cfg<'s>(
+    fabrics: &'s RefCell<FabricTable<Crb, 5>>,
+    cfg: &'static BasicInfoConfig,
+) -> Dev<'s> {
+    let dac_crypto = RustCrypto::new(SeqRng(0xDAC0_0001));
+    let dac = TestDacProvider::new(&dac_crypto).unwrap();
+    Dev {
+        basic: BasicInformationCluster::new(cfg),
         gc: GeneralCommissioning::default_config(),
         net: NetworkCommissioning::new(b"eth0"),
         admin: None,
@@ -2301,6 +2351,125 @@ mod controller_e2e {
             other => panic!("expected Attestation(CdSignature) failure, got {other:?}"),
         }
         assert_eq!(fabrics.borrow().len(), 0, "no fabric added on tampered CD");
+    }
+
+    /// PAA を辿らない最小検証(`AttestationPolicy::VerifyNoPaa`、§8)。デバイスは
+    /// DAC(VID=0xFFF1/PID=0x8001)を持ち Basic Information も PID=0x8001 を報告する。
+    /// PAA 信頼ストア無しで DAC←PAI + 署名 + nonce + CD + 報告 VID/PID 照合を通過し、
+    /// CASE まで完走する(§8.5 の (a))。
+    #[test]
+    fn controller_end_to_end_attestation_no_paa() {
+        let crypto = RustCrypto::new(SeqRng(0x0A0A_5701_1234_5678));
+        let fabrics: RefCell<FabricTable<Crb, 5>> = RefCell::new(FabricTable::new());
+
+        let config = PaseConfig::from_passcode(PASSCODE, &SALT, ITERATIONS).unwrap();
+        let dev_creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
+        let sc = SecureChannel::new(&crypto, SeqRng(0x5C00_0A0A), config, dev_creds);
+        let im = InteractionModel::new(build_device_cfg(&fabrics, &CFG_PID_8001));
+        let mut dev: TestStack = MatterStack::new(&crypto, sc, im);
+
+        let ca = Ca::<Crb>::generate(
+            &crypto,
+            &mut SeqRng(0xCA00_0A0A),
+            FABRIC_ID,
+            COMM_NODE,
+            0xFFF1,
+            0,
+        )
+        .expect("Ca::generate");
+        let ctrl_creds = ControllerCreds::new(&ca, &crypto, 0);
+        let sc_init = ScInitiator::new(&crypto, SeqRng(0x1C00_0A0A), ctrl_creds);
+        let mut ctrl: Ctrl = ControllerStack::new(&crypto, sc_init, ImClient::new());
+
+        let mut comm = Commissioner::new(&ca, &crypto, AttestationPolicy::VerifyNoPaa);
+        comm.commission(peer(), PASSCODE, DEVICE_NODE, NOW).unwrap();
+
+        let mut tx = [0u8; 1700];
+        let mut final_phase = comm.phase();
+        let mut saw_attestation = false;
+        for _ in 0..80 {
+            let out = comm.drive(&mut ctrl, NOW, &mut tx);
+            final_phase = out.phase;
+            if matches!(out.phase, Phase::Attestation) {
+                saw_attestation = true;
+            }
+            if let Some(d) = out.send {
+                deliver_and_settle(&mut ctrl, &mut dev, NOW, &tx, d.len);
+            }
+            match out.phase {
+                Phase::Done { .. } | Phase::Failed { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(saw_attestation, "attestation phase was exercised");
+        match final_phase {
+            Phase::Done { .. } => {}
+            other => panic!("no-PAA attestation commissioning did not complete: {other:?}"),
+        }
+        assert_eq!(
+            fabrics.borrow().len(),
+            1,
+            "device fabric added after VerifyNoPaa"
+        );
+    }
+
+    /// `VerifyNoPaa` の主眼(§8.1 実機 AirQ バグの再現): デバイスの DAC は
+    /// PID=0x8001 なのに Basic Information が PID=0x8007 を報告すると、DAC チェーン/
+    /// attestation 署名/CD は正しくても報告 VID/PID 照合で
+    /// `Attestation(ReportedVidPidMismatch)` としてコミッショニングが中断する
+    /// (§8.5 の (b))。
+    #[test]
+    fn controller_end_to_end_attestation_no_paa_reported_pid_mismatch() {
+        let crypto = RustCrypto::new(SeqRng(0x0B0B_5701_1234_5678));
+        let fabrics: RefCell<FabricTable<Crb, 5>> = RefCell::new(FabricTable::new());
+
+        let config = PaseConfig::from_passcode(PASSCODE, &SALT, ITERATIONS).unwrap();
+        let dev_creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
+        let sc = SecureChannel::new(&crypto, SeqRng(0x5C00_0B0B), config, dev_creds);
+        let im = InteractionModel::new(build_device_cfg(&fabrics, &CFG_PID_8007));
+        let mut dev: TestStack = MatterStack::new(&crypto, sc, im);
+
+        let ca = Ca::<Crb>::generate(
+            &crypto,
+            &mut SeqRng(0xCA00_0B0B),
+            FABRIC_ID,
+            COMM_NODE,
+            0xFFF1,
+            0,
+        )
+        .expect("Ca::generate");
+        let ctrl_creds = ControllerCreds::new(&ca, &crypto, 0);
+        let sc_init = ScInitiator::new(&crypto, SeqRng(0x1C00_0B0B), ctrl_creds);
+        let mut ctrl: Ctrl = ControllerStack::new(&crypto, sc_init, ImClient::new());
+
+        let mut comm = Commissioner::new(&ca, &crypto, AttestationPolicy::VerifyNoPaa);
+        comm.commission(peer(), PASSCODE, DEVICE_NODE, NOW).unwrap();
+
+        let mut tx = [0u8; 1700];
+        let mut final_phase = comm.phase();
+        for _ in 0..80 {
+            let out = comm.drive(&mut ctrl, NOW, &mut tx);
+            final_phase = out.phase;
+            if let Some(d) = out.send {
+                deliver_and_settle(&mut ctrl, &mut dev, NOW, &tx, d.len);
+            }
+            match out.phase {
+                Phase::Done { .. } | Phase::Failed { .. } => break,
+                _ => {}
+            }
+        }
+        match final_phase {
+            Phase::Failed {
+                reason: CommissionError::Attestation(AttestationError::ReportedVidPidMismatch),
+                ..
+            } => {}
+            other => panic!("expected Attestation(ReportedVidPidMismatch), got {other:?}"),
+        }
+        assert_eq!(
+            fabrics.borrow().len(),
+            0,
+            "no fabric added on reported VID/PID mismatch"
+        );
     }
 
     /// Wi-Fi コミッショニング(`pairing ble-wifi` のコアフロー): `set_wifi_credentials`

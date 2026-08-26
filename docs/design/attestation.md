@@ -163,3 +163,94 @@ chip `DefaultDeviceAttestationVerifier.cpp` の `gCdSigningKeys`(6 本)の
 - 実機 E2E: chip-tool `--paa-trust-store-path`(--bypass 無し)完走 + toggle、
   smctl `--paa-trust-store-path` 完走(CD 検証込み)、`SM_TAMPER_CD=1` の
   onoff-light 相手に smctl が `Attestation(CdSignature)` で中断。
+
+## 8. PAA を辿らない最小検証(`VerifyNoPaa`、2026-08-27)
+
+### 8.1 背景
+
+実機で AirQ が **DAC(VID=0xFFF1 / PID=0x8001)を持つのに Basic Information の
+ProductID を 0x8007 と報告**していた(DAC と焼き込み Basic Info の不整合)。厳格
+検証する Alexa はこれをアテステーションで拒否したが、本コントローラは
+`AttestationPolicy::Skip` で不整合を素通しし、smctl の既定も Skip だった。
+
+`Verify`(PAA まで辿る完全検証)は本来の対策だが、開発フローでは PAA 信頼ストアを
+用意しない運用が多い。そこで **PAA 信頼アンカーは要求しないが、DAC/PAI の 1 段
+チェーン・attestation 署名・nonce・CD・そして「DAC の VID/PID がデバイスの報告値と
+一致するか」までは検証する** 中間モード `VerifyNoPaa` を追加し、smctl の**既定**とする。
+
+### 8.2 `AttestationPolicy::VerifyNoPaa`
+
+```rust
+pub enum AttestationPolicy<'a> {
+    Skip,
+    Verify { paa_store: &'a [&'a [u8]] },
+    VerifyNoPaa,
+}
+```
+
+検証内容(`Verify` から PAA 段だけを外し、報告 VID/PID 照合を足したもの):
+
+1. DAC / PAI を X.509 DER としてパース。
+2. **DAC が PAI 公開鍵で署名されている**こと(チェーン 1 段)。**PAI←PAA は
+   検証しない**(PAA ストア不要)。
+3. attestation 署名(`elements ‖ challenge`)を DAC 公開鍵で ECDSA-P256 検証、
+   nonce エコー一致。
+4. **CD の CMS 署名検証 + VID/PID クロスチェックは `Verify` と同一ロジックを流用**
+   (§7。既に `KNOWN_CD_SIGNERS` と CMS リーダが実装済みなので最小スコープでも
+   実施する。CD の CMS 署名検証は「やる」が本設計の選択)。
+5. **本モードの主眼**: DAC 証明書 subject の Matter VID/PID DN 属性
+   (`cert::x509::matter_vid_pid`)が、コミッショニング対象デバイスが報告する
+   Basic Information の **VendorID / ProductID** と一致すること。不一致は新エラー
+   `AttestationError::ReportedVidPidMismatch`。
+
+上記のため、`VerifyNoPaa` では attestation 検証(1〜4)の成功後に **Basic Information
+の VendorID / ProductID を Read** し、DAC の VID/PID と照合する(§8.3)。
+
+**注意: 属性 ID はコアの Basic Information 実装(`basic_information.rs`)= Matter
+仕様に従い VendorID=`0x0002` / ProductID=`0x0004`**(タスク記載の 0x0001/0x0002 は
+それぞれ VendorName / VendorID を指すため不採用)。
+
+### 8.3 Commissioner のサブステップ拡張
+
+`Phase::Attestation` の `att_step` を拡張(`Verify` は 0〜2 のまま):
+
+- 0: CertificateChainRequest(DAC)
+- 1: CertificateChainRequest(PAI)
+- 2: AttestationRequest → 捕捉 + 検証(チェーン/署名/nonce/CD)。成功時、
+  - `Verify` は `Phase::Csr` へ遷移(従来どおり)。
+  - **`VerifyNoPaa` は `att_step = 3` に進み同フェーズに留まる**。
+- 3(`VerifyNoPaa` のみ): **Basic Information の VendorID(`0x0002`)+
+  ProductID(`0x0004`)を 1 本の ReadRequest で Read**。`ImEvent::ReadDone` を
+  受けて報告 VID/PID を取り出し、DAC の VID/PID と照合。一致で `Phase::Csr`、
+  不一致(または読めない)で `Attestation(ReportedVidPidMismatch)`。
+
+Read は `ControllerStack::start_read`(既存)で PASE セッション上に発行する。
+`consume_event` は `Phase::Attestation && att_step == 3` を専用分岐で処理し、
+`ReadDone` を待つ(他ステップは従来どおり `InvokeDone`)。
+
+**割り切り**: 報告 VID/PID 照合は `VerifyNoPaa` 専用とする。`Verify`(PAA)は
+既存テストのデバイス(Basic Info PID=0x8000 だが DAC PID=0x8001)を壊さないため
+報告照合を足さない(§8.5)。将来 `Verify` にも報告照合を入れる場合は、テスト
+デバイスの焼き込み PID を DAC と一致させる必要がある。
+
+### 8.4 smctl 既定の変更
+
+- `--paa-trust-store-path <dir>` 指定 → 従来の完全 `Verify`(PAA まで)。
+- **無指定(既定)→ `VerifyNoPaa`**(従来は Skip 相当)。ログは
+  `attestation: verifying DAC (no PAA trust anchor)`。成功ログは
+  コミッショニング完走で観測。
+- `--bypass-attestation` → 明示 `Skip`(DAC/PAI/CD を取得も検証もしない)。
+
+### 8.5 検証ゲート(2026-08-27)
+
+- ループバック(`stack/tests.rs`):
+  - `controller_end_to_end_attestation_no_paa`(デバイス報告 PID=0x8001、
+    PAA ストア無しで完走)。
+  - `controller_end_to_end_attestation_no_paa_reported_pid_mismatch`(デバイス
+    報告 PID=0x8007 に偽装 → `Attestation(ReportedVidPidMismatch)` で中断、
+    fabric 残留なし。実機 AirQ バグの再現)。
+  - `controller_end_to_end_attestation_no_paa_rejects_tampered_dac`(DAC 署名
+    改竄デバイス → `Attestation(DacChain)` で中断)。
+  - `controller_end_to_end_attestation_no_paa_rejects_bad_nonce`(コミッショナが
+    エコー照合する nonce を検証時に差し替え → `Attestation(Nonce)`)。
+  - 既存 `Verify`(PAA)テストは不変。

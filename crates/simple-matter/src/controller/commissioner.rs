@@ -20,10 +20,11 @@
 use crate::cert::parse_csr;
 use crate::cert::x509::{parse_x509, verify_signed_by};
 use crate::crypto::{Crypto, P256PublicKey, Rng};
+use crate::dm::meta::AttributeId;
 use crate::dm::meta::{ClusterId, EndpointId};
 use crate::error::{Error, Result};
 use crate::im::client::ImEvent;
-use crate::im::wire::{CommandId, CommandPath, ImStatus};
+use crate::im::wire::{AttributePath, AttributeReportRef, CommandId, CommandPath, ImStatus};
 use crate::sc::case::creds::{FabricStore, NocResolver};
 use crate::sc::initiator::{ScEvent, ScFailReason};
 use crate::stack::SendDirective;
@@ -51,6 +52,14 @@ const CERT_TYPE_DAC: u8 = 1;
 /// CertificateChainRequest の certificateType(PAI)。
 const CERT_TYPE_PAI: u8 = 2;
 const CMD_ADD_NOC: u32 = 0x06;
+
+/// Basic Information クラスタ(0x0028)と VendorID / ProductID 属性 ID。
+///
+/// 属性 ID は Matter 仕様(= コアの `basic_information.rs`)に従う:
+/// VendorID=0x0002、ProductID=0x0004(0x0001/0x0002 は VendorName/VendorID)。
+const CLUSTER_BASIC_INFORMATION: u32 = 0x0028;
+const ATTR_BASIC_VENDOR_ID: u32 = 0x0002;
+const ATTR_BASIC_PRODUCT_ID: u32 = 0x0004;
 const CMD_ADD_TRUSTED_ROOT: u32 = 0x0B;
 const CMD_ADD_OR_UPDATE_WIFI_NETWORK: u32 = 0x02;
 const CMD_ADD_OR_UPDATE_THREAD_NETWORK: u32 = 0x03;
@@ -87,6 +96,14 @@ pub enum AttestationPolicy<'a> {
         /// 信頼する PAA の X.509 DER 群。
         paa_store: &'a [&'a [u8]],
     },
+    /// PAA 信頼アンカーは要求しない最小検証(`docs/design/attestation.md` §8)。
+    ///
+    /// DAC←PAI の 1 段チェーン + attestation 署名 + nonce + CD(CMS 署名 +
+    /// VID/PID クロスチェック)を検証し、さらに **DAC の VID/PID がデバイスの
+    /// 報告する Basic Information の VendorID/ProductID と一致すること**を検証する
+    /// (不一致は [`AttestationError::ReportedVidPidMismatch`])。PAI←PAA は
+    /// 検証しないため PAA ストアは不要。smctl の既定(§8.4)。
+    VerifyNoPaa,
 }
 
 /// device attestation 検証の失敗理由(`docs/design/attestation.md` §1)。
@@ -114,6 +131,9 @@ pub enum AttestationError {
     CdSignature,
     /// CD の vendor_id / product_id_array が DAC の VID/PID と一致しない。
     CdVidPidMismatch,
+    /// DAC の VID/PID がデバイスの報告する Basic Information の VendorID/ProductID と
+    /// 一致しない(または報告値を Read できない)。`VerifyNoPaa`(§8)の主眼。
+    ReportedVidPidMismatch,
     /// PASE セッションから attestation challenge を取得できない。
     Challenge,
     /// 暗号バックエンドが検証中にエラーを返した。
@@ -252,8 +272,9 @@ pub struct Commissioner<'a, C: Crypto> {
     /// `Some` なら AddNOC 後に AddOrUpdateThreadNetwork → ConnectNetwork を挿入する
     /// (`wifi` とは排他。両方設定時は `wifi` 優先)。
     thread: Option<ThreadDataset>,
-    /// `Phase::Attestation`(`Verify`)のサブステップ: 0=DAC 要求, 1=PAI 要求,
-    /// 2=AttestationRequest, 3=検証完了(§3)。`Skip` では未使用。
+    /// `Phase::Attestation`(`Verify`/`VerifyNoPaa`)のサブステップ: 0=DAC 要求,
+    /// 1=PAI 要求, 2=AttestationRequest。`VerifyNoPaa` は続けて 3=Basic Info の
+    /// VID/PID Read, 4=完了(§3 / §8.3)。`Skip` では未使用。
     att_step: u8,
     /// CertificateChainRequest(DAC)で捕捉した X.509 DER。
     dac_der: [u8; ATT_CERT_BUF],
@@ -572,7 +593,7 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
                             )
                             .map_err(CommissionError::Stack)
                     }
-                    _ => {
+                    2 => {
                         // AttestationRequest: 32B nonce を Rng から払い出して送る。
                         stack
                             .fill_random(&mut self.att_nonce)
@@ -590,6 +611,25 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
                                 now_ms,
                                 tx_out,
                             )
+                            .map_err(CommissionError::Stack)
+                    }
+                    // att_step 3(`VerifyNoPaa` のみ): Basic Information の VendorID +
+                    // ProductID を Read し、DAC の VID/PID と照合する(§8.3)。
+                    _ => {
+                        let paths = [
+                            AttributePath::concrete(
+                                EndpointId(0),
+                                ClusterId(CLUSTER_BASIC_INFORMATION),
+                                AttributeId(ATTR_BASIC_VENDOR_ID),
+                            ),
+                            AttributePath::concrete(
+                                EndpointId(0),
+                                ClusterId(CLUSTER_BASIC_INFORMATION),
+                                AttributeId(ATTR_BASIC_PRODUCT_ID),
+                            ),
+                        ];
+                        stack
+                            .start_read(session, &paths, now_ms, tx_out)
                             .map_err(CommissionError::Stack)
                     }
                 }
@@ -768,6 +808,17 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
         R: Rng,
         F: FabricStore + NocResolver,
     {
+        // `VerifyNoPaa` の att_step 3 は Basic Information の Read(ReadDone を待つ、§8.3)。
+        // 他フェーズ・他ステップは Invoke / SC イベントなので通常経路へ落とす。
+        if matches!(self.phase, Phase::Attestation) && self.att_step == 3 {
+            match stack.im_take_event() {
+                Some(ImEvent::ReadDone) => self.on_reported_vid_pid(stack),
+                Some(ImEvent::Failed { status }) => self.enter_failed(CommissionError::Im(status)),
+                Some(_) => self.enter_failed(CommissionError::Protocol),
+                None => {}
+            }
+            return;
+        }
         match self.phase {
             Phase::Pase => match stack.sc_take_event() {
                 Some(ScEvent::PaseEstablished { session }) => {
@@ -952,8 +1003,14 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
                 };
                 match self.verify_attestation(&challenge) {
                     Ok(()) => {
-                        self.att_step = 3;
-                        self.advance(Phase::Csr);
+                        if matches!(self.policy, AttestationPolicy::VerifyNoPaa) {
+                            // 同フェーズに留まり Basic Information の VID/PID Read を発行する(§8.3)。
+                            self.att_step = 3;
+                            self.awaiting = false;
+                        } else {
+                            self.att_step = 3;
+                            self.advance(Phase::Csr);
+                        }
                     }
                     Err(e) => self.enter_failed(CommissionError::Attestation(e)),
                 }
@@ -966,8 +1023,11 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
         &self,
         challenge: &[u8; 16],
     ) -> core::result::Result<(), AttestationError> {
-        let paa_store = match self.policy {
-            AttestationPolicy::Verify { paa_store } => paa_store,
+        // `Verify` は PAA 信頼ストアで PAI←PAA まで検証する。`VerifyNoPaa` は
+        // PAA を辿らない(ストア不要、§8)。`Skip` はここへ来ない。
+        let paa_store: Option<&[&[u8]]> = match self.policy {
+            AttestationPolicy::Verify { paa_store } => Some(paa_store),
+            AttestationPolicy::VerifyNoPaa => None,
             AttestationPolicy::Skip => return Err(AttestationError::PaaNotFound),
         };
 
@@ -976,32 +1036,34 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
         let pai =
             parse_x509(&self.pai_der[..self.pai_len]).map_err(|_| AttestationError::PaiParse)?;
 
-        // 1. DAC が PAI で署名されていること。
+        // 1. DAC が PAI で署名されていること(チェーン 1 段)。
         if !verify_signed_by(self.crypto, &dac, &pai.spki_pubkey)
             .map_err(|_| AttestationError::Crypto)?
         {
             return Err(AttestationError::DacChain);
         }
 
-        // 2. PAI の issuer と DER 一致する subject を持つ PAA を信頼ストアから探し、
-        //    その公開鍵で PAI 署名を検証する。
-        let mut chain_ok = false;
-        for paa_der in paa_store {
-            let Ok(paa) = parse_x509(paa_der) else {
-                continue;
-            };
-            if paa.subject != pai.issuer {
-                continue;
+        // 2. `Verify` のみ: PAI の issuer と DER 一致する subject を持つ PAA を信頼
+        //    ストアから探し、その公開鍵で PAI 署名を検証する(`VerifyNoPaa` は省略)。
+        if let Some(paa_store) = paa_store {
+            let mut chain_ok = false;
+            for paa_der in paa_store {
+                let Ok(paa) = parse_x509(paa_der) else {
+                    continue;
+                };
+                if paa.subject != pai.issuer {
+                    continue;
+                }
+                if verify_signed_by(self.crypto, &pai, &paa.spki_pubkey)
+                    .map_err(|_| AttestationError::Crypto)?
+                {
+                    chain_ok = true;
+                    break;
+                }
             }
-            if verify_signed_by(self.crypto, &pai, &paa.spki_pubkey)
-                .map_err(|_| AttestationError::Crypto)?
-            {
-                chain_ok = true;
-                break;
+            if !chain_ok {
+                return Err(AttestationError::PaaNotFound);
             }
-        }
-        if !chain_ok {
-            return Err(AttestationError::PaaNotFound);
         }
 
         // 3. attestation 署名: elements ‖ challenge を DAC 公開鍵で検証(§1)。
@@ -1056,6 +1118,81 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
             .map_err(|_| AttestationError::CdParse)?
         {
             return Err(AttestationError::CdVidPidMismatch);
+        }
+        Ok(())
+    }
+
+    /// `VerifyNoPaa` の att_step 3: Read した Basic Information の VendorID/ProductID を
+    /// 取り出し、DAC の VID/PID と照合する(§8.3)。一致で `Phase::Csr` へ、
+    /// 不一致(または読めない)で [`AttestationError::ReportedVidPidMismatch`]。
+    fn on_reported_vid_pid<
+        R,
+        F,
+        const SS: usize,
+        const EX: usize,
+        const TX: usize,
+        const RS: usize,
+    >(
+        &mut self,
+        stack: &ControllerStack<'_, C, R, F, SS, EX, TX, RS>,
+    ) where
+        R: Rng,
+        F: FabricStore + NocResolver,
+    {
+        let mut reported_vid: Option<u16> = None;
+        let mut reported_pid: Option<u16> = None;
+        for rep in stack.read_reports() {
+            let Ok(AttributeReportRef::Data(data)) = rep else {
+                continue;
+            };
+            let Some(path) = data.path.to_concrete() else {
+                continue;
+            };
+            if path.cluster.0 != CLUSTER_BASIC_INFORMATION {
+                continue;
+            }
+            let mut vr = data.value();
+            let value = match vr.read_next() {
+                Ok(Some(e)) => match e.value.as_unsigned() {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                },
+                _ => continue,
+            };
+            match path.attribute.0 {
+                ATTR_BASIC_VENDOR_ID => reported_vid = Some(value as u16),
+                ATTR_BASIC_PRODUCT_ID => reported_pid = Some(value as u16),
+                _ => {}
+            }
+        }
+        match (reported_vid, reported_pid) {
+            (Some(vid), Some(pid)) => match self.verify_reported_vid_pid(vid, pid) {
+                Ok(()) => {
+                    self.att_step = 4;
+                    self.advance(Phase::Csr);
+                }
+                Err(e) => self.enter_failed(CommissionError::Attestation(e)),
+            },
+            _ => self.enter_failed(CommissionError::Attestation(
+                AttestationError::ReportedVidPidMismatch,
+            )),
+        }
+    }
+
+    /// DAC subject の VID/PID とデバイス報告の VendorID/ProductID を照合する(§8.2 手順 5)。
+    fn verify_reported_vid_pid(
+        &self,
+        reported_vid: u16,
+        reported_pid: u16,
+    ) -> core::result::Result<(), AttestationError> {
+        let dac =
+            parse_x509(&self.dac_der[..self.dac_len]).map_err(|_| AttestationError::DacParse)?;
+        let (dac_vid, dac_pid) = crate::cert::x509::matter_vid_pid(dac.subject);
+        let (Some(vid), Some(pid)) = (dac_vid, dac_pid) else {
+            return Err(AttestationError::ReportedVidPidMismatch);
+        };
+        if vid != reported_vid || pid != reported_pid {
+            return Err(AttestationError::ReportedVidPidMismatch);
         }
         Ok(())
     }
@@ -1170,4 +1307,152 @@ fn extract_csr_pubkey<C: Crypto>(crypto: &C, result: &[u8]) -> Result<[u8; 65]> 
     }
     let csr = find_ctx(&mut nr, 1)?.value.as_bytes()?;
     parse_csr(crypto, csr)
+}
+
+// ==========================================================================
+// attestation 検証のユニットテスト(`VerifyNoPaa`、attestation.md §8.5 (c)/(d))
+// ==========================================================================
+//
+// (a) 成功 /(b) 報告 VID/PID 不一致は正直なデバイスで縦通しできるため
+// `stack/tests.rs` の E2E で検証する。ここでは正直なデバイスでは注入しにくい
+// (c) DAC 署名改竄 と (d) nonce 不一致 を、キャプチャ済みバッファを直接組み立てて
+// `verify_attestation` に食わせる形で検証する(同一モジュールなので私有フィールドに
+// アクセスできる)。
+#[cfg(test)]
+mod verify_tests {
+    use super::*;
+    use crate::crypto::rustcrypto::RustCrypto;
+    use crate::crypto::P256Keypair;
+    use crate::dm::clusters::operational_credentials::dev_creds::{
+        DEV_CD_FOR_ALL_EXAMPLES, DEV_DAC_CERT_FFF1_8001, DEV_DAC_PRIVKEY_FFF1_8001,
+        DEV_PAI_CERT_FFF1,
+    };
+    use crate::tlv::TlvWriter;
+
+    struct SeqRng(u64);
+    impl Rng for SeqRng {
+        fn fill_bytes(&mut self, dest: &mut [u8]) -> Result<()> {
+            for b in dest.iter_mut() {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *b = (self.0 >> 33) as u8;
+            }
+            Ok(())
+        }
+    }
+    type Crb = RustCrypto<SeqRng>;
+
+    const CHALLENGE: [u8; 16] = [0x11; 16];
+
+    fn ca() -> Ca<Crb> {
+        let crypto = RustCrypto::new(SeqRng(0xCA0F_0001));
+        Ca::<Crb>::generate(&crypto, &mut SeqRng(0x9999), 0xFAB1, 0x1122, 0xFFF1, 0).unwrap()
+    }
+
+    /// dev DAC/PAI/CD で有効な attestation elements + signature を組み立て、
+    /// `Commissioner` のキャプチャバッファへ詰める。`dac_der` は DAC 証明書(改竄可)、
+    /// `embedded_nonce` は elements 内の nonce、`att_nonce` は送出済みとみなす nonce。
+    fn commissioner_with<'a>(
+        ca: &'a Ca<Crb>,
+        crypto: &'a Crb,
+        dac_der: &[u8],
+        embedded_nonce: &[u8; 32],
+        att_nonce: [u8; 32],
+    ) -> Commissioner<'a, Crb> {
+        let mut comm = Commissioner::new(ca, crypto, AttestationPolicy::VerifyNoPaa);
+        comm.dac_der[..dac_der.len()].copy_from_slice(dac_der);
+        comm.dac_len = dac_der.len();
+        comm.pai_der[..DEV_PAI_CERT_FFF1.len()].copy_from_slice(&DEV_PAI_CERT_FFF1);
+        comm.pai_len = DEV_PAI_CERT_FFF1.len();
+
+        // AttestationElements TLV: struct { 1: CD, 2: nonce, 3: timestamp }。
+        let mut elems = [0u8; ATT_ELEMENTS_BUF];
+        let elems_len = {
+            let mut w = TlvWriter::new(&mut elems);
+            w.start_struct(&TlvTag::Anonymous).unwrap();
+            w.write_bytes(&cx(1), &DEV_CD_FOR_ALL_EXAMPLES).unwrap();
+            w.write_bytes(&cx(2), embedded_nonce).unwrap();
+            w.write_u32(&cx(3), 0).unwrap();
+            w.end_container().unwrap();
+            w.len()
+        };
+        comm.att_elements[..elems_len].copy_from_slice(&elems[..elems_len]);
+        comm.att_elements_len = elems_len;
+
+        // signature = ECDSA_sign(elements || challenge) を DAC 秘密鍵で。
+        let keypair = crypto
+            .p256_keypair_from_bytes(&DEV_DAC_PRIVKEY_FFF1_8001)
+            .unwrap();
+        let mut tbs = [0u8; ATT_ELEMENTS_BUF + 16];
+        tbs[..elems_len].copy_from_slice(&elems[..elems_len]);
+        tbs[elems_len..elems_len + 16].copy_from_slice(&CHALLENGE);
+        let mut sig = [0u8; 64];
+        keypair.sign(&tbs[..elems_len + 16], &mut sig).unwrap();
+        comm.att_sig = sig;
+        comm.att_nonce = att_nonce;
+        comm
+    }
+
+    /// 正: 正しい DAC/PAI/CD + 一致 nonce なら `verify_attestation` は成功する
+    /// (PAA ストア無し)。報告 VID/PID の照合は別段(Read 後)なのでここでは対象外。
+    #[test]
+    fn verify_no_paa_accepts_valid() {
+        let crypto = RustCrypto::new(SeqRng(0x0001));
+        let ca = ca();
+        let nonce = [0x22u8; 32];
+        let comm = commissioner_with(&ca, &crypto, &DEV_DAC_CERT_FFF1_8001, &nonce, nonce);
+        assert!(comm.verify_attestation(&CHALLENGE).is_ok());
+    }
+
+    /// (c) DAC 署名改竄: DAC の signatureValue を 1 バイト反転すると DAC←PAI の
+    /// チェーン検証に失敗し `DacChain` を返す。
+    #[test]
+    fn verify_no_paa_rejects_tampered_dac() {
+        let crypto = RustCrypto::new(SeqRng(0x0002));
+        let ca = ca();
+        let nonce = [0x22u8; 32];
+        let mut dac = DEV_DAC_CERT_FFF1_8001;
+        let last = dac.len() - 1;
+        dac[last] ^= 0x01; // signatureValue の末尾バイトを反転
+        let comm = commissioner_with(&ca, &crypto, &dac, &nonce, nonce);
+        assert_eq!(
+            comm.verify_attestation(&CHALLENGE),
+            Err(AttestationError::DacChain)
+        );
+    }
+
+    /// (d) nonce 不一致: elements 内の nonce と Commissioner が送った nonce が食い違うと
+    /// `Nonce` を返す(署名・CD は正しい)。
+    #[test]
+    fn verify_no_paa_rejects_nonce_mismatch() {
+        let crypto = RustCrypto::new(SeqRng(0x0003));
+        let ca = ca();
+        let embedded = [0x22u8; 32];
+        let sent = [0x33u8; 32]; // 送出 nonce ≠ elements の nonce
+        let comm = commissioner_with(&ca, &crypto, &DEV_DAC_CERT_FFF1_8001, &embedded, sent);
+        assert_eq!(
+            comm.verify_attestation(&CHALLENGE),
+            Err(AttestationError::Nonce)
+        );
+    }
+
+    /// 報告 VID/PID 照合: DAC(FFF1/8001)に対し報告値の正/負を直接検証する。
+    #[test]
+    fn reported_vid_pid_matches_dac() {
+        let crypto = RustCrypto::new(SeqRng(0x0004));
+        let ca = ca();
+        let nonce = [0x22u8; 32];
+        let comm = commissioner_with(&ca, &crypto, &DEV_DAC_CERT_FFF1_8001, &nonce, nonce);
+        assert!(comm.verify_reported_vid_pid(0xFFF1, 0x8001).is_ok());
+        assert_eq!(
+            comm.verify_reported_vid_pid(0xFFF1, 0x8007),
+            Err(AttestationError::ReportedVidPidMismatch)
+        );
+        assert_eq!(
+            comm.verify_reported_vid_pid(0xFFF2, 0x8001),
+            Err(AttestationError::ReportedVidPidMismatch)
+        );
+    }
 }

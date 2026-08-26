@@ -299,8 +299,9 @@ pub struct Exec<'a> {
     subs: Vec<SubStat>,
     /// バッチモードか(`subscribe` の非ブロッキング化)。
     batch: bool,
-    /// `--paa-trust-store-path` 由来の PAA 信頼ストア(X.509 DER)。空なら attestation は
-    /// スキップ、非空なら `AttestationPolicy::Verify` で pairing する。
+    /// `--paa-trust-store-path` 由来の PAA 信頼ストア(X.509 DER)。非空なら
+    /// `AttestationPolicy::Verify`(PAA まで完全検証)、空なら既定の
+    /// `AttestationPolicy::VerifyNoPaa`(§8.4)。`--bypass-attestation` 時は `Skip`。
     paa_store: Vec<Vec<u8>>,
 }
 
@@ -674,17 +675,28 @@ impl<'a> Exec<'a> {
             self.ca.controller_node_id()
         );
 
-        // PAA 信頼ストアが空なら Skip、非空なら Verify(§3/§4)。ローカルへ複製してから
-        // slice 群を作る(`comm` が `self` を借用したまま `self.quiesce` へ入るのを避ける)。
+        // attestation ポリシ(§8.4):
+        //   --bypass-attestation      → Skip(取得も検証もしない)
+        //   --paa-trust-store-path 有 → Verify(PAA まで完全検証)
+        //   いずれも無し(既定)       → VerifyNoPaa(PAA を辿らない最小検証)
+        // ローカルへ複製してから slice 群を作る(`comm` が `self` を借用したまま
+        // `self.quiesce` へ入るのを避ける)。
         let paa_owned: Vec<Vec<u8>> = self.paa_store.clone();
         let paa_slices: Vec<&[u8]> = paa_owned.iter().map(Vec::as_slice).collect();
-        let policy = if paa_slices.is_empty() {
+        let policy = if self.g.bypass_attestation {
             logf!(
                 Level::Info,
                 "ctl",
-                "attestation skipped (no --paa-trust-store-path)"
+                "attestation skipped (--bypass-attestation)"
             );
             AttestationPolicy::Skip
+        } else if paa_slices.is_empty() {
+            logf!(
+                Level::Info,
+                "ctl",
+                "attestation: verifying DAC (no PAA trust anchor; DAC<-PAI + signature + nonce + CD + reported VID/PID)"
+            );
+            AttestationPolicy::VerifyNoPaa
         } else {
             logf!(
                 Level::Info,
@@ -1724,7 +1736,7 @@ const TIMED_INVOKE_TIMEOUT_MS: u16 = 10_000;
 ///
 /// 各ファイルの生バイト列(X.509 DER)を返す。ディレクトリが読めない・`.der` が 1 つも
 /// 無い場合はエラー(誤設定を検証スキップに退化させないため)。
-fn load_paa_store(dir: &std::path::Path) -> Result<Vec<Vec<u8>>, String> {
+pub(crate) fn load_paa_store(dir: &std::path::Path) -> Result<Vec<Vec<u8>>, String> {
     let entries = std::fs::read_dir(dir)
         .map_err(|e| format!("--paa-trust-store-path {}: {e}", dir.display()))?;
     let mut store = Vec::new();

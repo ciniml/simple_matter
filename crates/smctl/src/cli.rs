@@ -42,6 +42,11 @@ pub struct Globals {
     /// `--paa-trust-store-path <dir>`: 指定時、pairing で device attestation を検証する
     /// (ディレクトリ内の `*.der` を PAA 信頼ストアとして読む)。未指定は検証スキップ。
     pub paa_trust_store_path: Option<PathBuf>,
+    /// `--bypass-attestation`: device attestation を完全にスキップする(DAC/PAI/CD を
+    /// 取得も検証もしない = `AttestationPolicy::Skip`)。未指定かつ
+    /// `--paa-trust-store-path` も無しなら PAA を辿らない最小検証(`VerifyNoPaa`、
+    /// 既定)。`--paa-trust-store-path` 指定時は完全 `Verify`(§8.4)。
+    pub bypass_attestation: bool,
     /// `--at <ip>[,<ip>...]`: VPN 越しのユニキャスト mDNS 直叩き(matter-over-vpn.md V1/C1)。
     /// 指定時、mDNS 発見はマルチキャスト browse の代わりに各ホストの `:5353` へ QU クエリを
     /// ユニキャスト送信し、応答の A/AAAA でなく**クエリ宛先 IP** を接続先に採用する。
@@ -69,6 +74,7 @@ impl Globals {
             passcode: None,
             timed_ms: None,
             paa_trust_store_path: None,
+            bypass_attestation: false,
             at: None,
             log_level: None,
             color: crate::log::ColorMode::Auto,
@@ -89,6 +95,7 @@ impl Clone for Globals {
             passcode: self.passcode,
             timed_ms: self.timed_ms,
             paa_trust_store_path: self.paa_trust_store_path.clone(),
+            bypass_attestation: self.bypass_attestation,
             at: self.at.clone(),
             log_level: self.log_level,
             color: self.color,
@@ -274,6 +281,9 @@ fn parse_globals(args: &[String], base: &Globals) -> Result<(Globals, Vec<String
                     .next()
                     .ok_or("--paa-trust-store-path requires a directory")?;
                 g.paa_trust_store_path = Some(PathBuf::from(v));
+            }
+            "--bypass-attestation" => {
+                g.bypass_attestation = true;
             }
             "--at" => {
                 let v = it.next().ok_or("--at requires <ip>[,<ip>...]")?;
@@ -1150,7 +1160,9 @@ pub(crate) fn print_help() {
     println!(
         "\
 smctl — CLI Matter controller built on simple-matter (development tool;
-device attestation is verified only with --paa-trust-store-path, otherwise skipped)
+device attestation defaults to minimal verification without a PAA trust anchor
+[DAC chain + signature + nonce + CD + reported VID/PID], --paa-trust-store-path
+adds full PAA-anchored verification, --bypass-attestation skips it entirely)
 
 USAGE:
   smctl pairing onnetwork       <node-id> <passcode>
@@ -1219,8 +1231,13 @@ OPTIONS:
   --timed <ms>          send cluster command invokes as timed interactions
                         (TimedRequest -> Invoke); required by some commands
   --paa-trust-store-path <dir>
-                        verify device attestation during pairing using the PAA
-                        certificates (*.der) in <dir>; omit to skip verification
+                        fully verify device attestation during pairing using the
+                        PAA certificates (*.der) in <dir> (DAC<-PAI<-PAA chain)
+  --bypass-attestation  skip device attestation entirely (no DAC/PAI/CD fetch or
+                        verification). Default (neither flag) is minimal
+                        verification without a PAA trust anchor: DAC<-PAI chain,
+                        attestation signature, nonce, CD, and that the DAC's
+                        VID/PID match the device's reported Basic Information
   --json                machine-readable output: one JSON object per line on
                         stdout (read/write/invoke/subscribe reports/discover);
                         human-readable progress moves to stderr. Works in

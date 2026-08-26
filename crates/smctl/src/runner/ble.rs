@@ -81,6 +81,12 @@ pub fn pair_ble(
         ca.controller_node_id()
     );
 
+    // attestation ポリシ用の PAA 信頼ストア(--paa-trust-store-path、§8.4)。
+    let paa_store: Vec<Vec<u8>> = match &g.paa_trust_store_path {
+        Some(dir) => crate::ops::load_paa_store(dir)?,
+        None => Vec::new(),
+    };
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -95,6 +101,8 @@ pub fn pair_ble(
         wifi.as_ref().map(|(s, p)| (s.as_bytes(), p.as_bytes())),
         thread.as_deref(),
         g.at.as_deref(),
+        g.bypass_attestation,
+        &paa_store,
     ))?;
 
     // 発行済み serial を CA 状態に反映し、アドレス帳へ記帳する。
@@ -137,6 +145,8 @@ async fn run_ble(
     wifi: Option<(&[u8], &[u8])>,
     thread: Option<&[u8]>,
     at: Option<&[IpAddr]>,
+    bypass_attestation: bool,
+    paa_store: &[Vec<u8>],
 ) -> Result<SocketAddr, String> {
     // ble-wifi / ble-thread はデバイスがネットワーク join 後に IP 到達可能になるため、
     // CASE 以降は必ず運用 UDP で行う(handoff と同じ保留遷移)。
@@ -230,8 +240,36 @@ async fn run_ble(
     );
 
     // --- コミッショニング(BLE 上)---
+    // attestation ポリシ(§8.4): --bypass-attestation → Skip、--paa-trust-store-path
+    // 有 → Verify(PAA)、いずれも無し(既定)→ VerifyNoPaa。
+    let paa_slices: Vec<&[u8]> = paa_store.iter().map(Vec::as_slice).collect();
+    let policy = if bypass_attestation {
+        crate::log::logf!(
+            crate::log::Level::Info,
+            "ctl",
+            "attestation skipped (--bypass-attestation)"
+        );
+        AttestationPolicy::Skip
+    } else if paa_slices.is_empty() {
+        crate::log::logf!(
+            crate::log::Level::Info,
+            "ctl",
+            "attestation: verifying DAC (no PAA trust anchor; DAC<-PAI + signature + nonce + CD + reported VID/PID)"
+        );
+        AttestationPolicy::VerifyNoPaa
+    } else {
+        crate::log::logf!(
+            crate::log::Level::Info,
+            "ctl",
+            "attestation: verifying DAC chain against {} PAA cert(s)",
+            paa_slices.len()
+        );
+        AttestationPolicy::Verify {
+            paa_store: &paa_slices,
+        }
+    };
     let mut txc = [0u8; MAX_RX_PACKET_SIZE];
-    let mut comm = Commissioner::new(ca, crypto, AttestationPolicy::Skip);
+    let mut comm = Commissioner::new(ca, crypto, policy);
     if udp_case {
         comm.suspend_before_case();
     }
