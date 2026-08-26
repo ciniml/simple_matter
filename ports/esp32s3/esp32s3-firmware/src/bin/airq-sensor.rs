@@ -141,7 +141,7 @@ static CFG: BasicInfoConfig = BasicInfoConfig {
     vendor_name: "SimpleMatter",
     vendor_id: 0xFFF1,
     product_name: "AirQualitySensor",
-    product_id: 0x8007,
+    product_id: 0x8001,
     hardware_version: 1,
     hardware_version_string: "AirQ-StampS3",
     software_version: 0x0001_0000,
