@@ -13,7 +13,14 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 use simple_matter::controller::ca::Ca;
-use simple_matter::controller::{AttestationPolicy, Commissioner, Phase, CONTROLLER_FABRIC_INDEX};
+use simple_matter::controller::{
+    AttestationPolicy, Commissioner, OpenWindowParams, Phase, CONTROLLER_FABRIC_INDEX,
+    DEFAULT_WINDOW_ITERATIONS,
+};
+use simple_matter::discovery::onboarding::{
+    manual_pairing_code, passcode_is_valid, qr_payload, random_passcode, OnboardingPayload,
+    DISCOVERY_CAP_ON_NETWORK, QR_PAYLOAD_MAX_LEN,
+};
 use simple_matter::dm::meta::{AttributeId, ClusterId, CommandId, EndpointId, EventId};
 use simple_matter::error::Result as MResult;
 use simple_matter::im::client::ImClient;
@@ -22,6 +29,7 @@ use simple_matter::im::wire::{
 };
 use simple_matter::im::ImEvent;
 use simple_matter::sc::initiator::ScEvent;
+use simple_matter::stack::SendDirective;
 use simple_matter::tlv::{ContainerType, TlvElement, TlvReader, TlvTag, TlvValue, TlvWriter};
 use simple_matter::transport::net::{PeerAddr, MAX_RX_PACKET_SIZE};
 use simple_matter::transport::session::SessionId;
@@ -1179,6 +1187,21 @@ impl<'a> Exec<'a> {
                 .start_invoke(session, path, write_fields, now, &mut self.tx)
                 .map_err(|e| format!("start_invoke: {e:?}"))?,
         };
+        self.finish_invoke(node_id, ep, cluster, command, dir)
+    }
+
+    /// 送信済み InvokeRequest の応答を待ち、結果を表示する([`Self::invoke`] の後半)。
+    ///
+    /// [`Self::invoke`] のほか、コアのコマンド専用ヘルパ
+    /// (`start_open_commissioning_window` 等)で送った invoke の完了待ちにも使う。
+    fn finish_invoke(
+        &mut self,
+        node_id: u64,
+        ep: u16,
+        cluster: ClusterId,
+        command: CommandId,
+        dir: SendDirective,
+    ) -> Result<(), String> {
         send_dir(&self.socket, &self.tx, &dir);
         match self.wait_txn_event(Instant::now() + self.g.timeout)? {
             Some(ImEvent::InvokeDone { status }) => {
@@ -1219,11 +1242,13 @@ impl<'a> Exec<'a> {
         Ok(())
     }
 
-    /// `admincommissioning open-window`: ECM 窓オープン(設計 §6)。
+    /// `admincommissioning open-window`: ECM 窓オープン(設計 §6 / §17.2)。
     ///
     /// passcode(省略時は乱数)から SPAKE2+ verifier (w0 ‖ L) を導出し、
-    /// OpenCommissioningWindow(0x003C/0x00)を timed invoke で送る。成功したら
-    /// 2 人目のコントローラ向けに passcode / discriminator / manual pairing code を表示する。
+    /// OpenCommissioningWindow(0x003C/0x00)を timed invoke で送る(コアの
+    /// [`ControllerStack::start_open_commissioning_window`] を使う)。成功したら
+    /// 2 人目のコントローラ向けに passcode / discriminator / manual pairing code /
+    /// QR payload を表示する。
     fn admin_open_window(
         &mut self,
         node_id: u64,
@@ -1231,7 +1256,6 @@ impl<'a> Exec<'a> {
         discriminator: u16,
         passcode: Option<u32>,
     ) -> Result<(), String> {
-        use simple_matter::crypto::spake2p::compute_verifier;
         use simple_matter::crypto::Rng as _;
 
         let passcode = match passcode {
@@ -1241,37 +1265,55 @@ impl<'a> Exec<'a> {
                 }
                 p
             }
-            None => random_passcode()?,
+            None => random_passcode(&mut OsRng).map_err(|e| format!("rng: {e:?}"))?,
         };
         let mut salt = [0u8; 16];
         OsRng
             .fill_bytes(&mut salt)
             .map_err(|e| format!("rng: {e:?}"))?;
-        const ITERATIONS: u32 = 1000;
-        let v = compute_verifier(passcode, &salt, ITERATIONS)
-            .map_err(|e| format!("compute_verifier: {e:?}"))?;
-        let mut verifier = Vec::with_capacity(97);
-        verifier.extend_from_slice(&v.w0);
-        verifier.extend_from_slice(&v.l);
 
-        let fields = vec![
-            (0u8, ValueKind::U16, Parsed::Unsigned(timeout_s as u64)),
-            (1u8, ValueKind::Bytes, Parsed::Bytes(verifier)),
-            (2u8, ValueKind::U16, Parsed::Unsigned(discriminator as u64)),
-            (3u8, ValueKind::U32, Parsed::Unsigned(ITERATIONS as u64)),
-            (4u8, ValueKind::Bytes, Parsed::Bytes(salt.to_vec())),
-        ];
-        self.invoke(
-            node_id,
-            0,
-            ClusterId(0x003C),
-            CommandId(0x00),
-            fields,
-            None,
-            Some(TIMED_INVOKE_TIMEOUT_MS),
-        )?;
+        // QR は VID/PID を要求する。best-effort で BasicInformation から読む(取れなければ 0)。
+        let session = self.case_session(node_id)?;
+        let vendor_id = self.read_basic_u16(session, 0x0002).unwrap_or(0);
+        let product_id = self.read_basic_u16(session, 0x0004).unwrap_or(0);
 
-        let manual_code = manual_pairing_code(discriminator, passcode);
+        let params = OpenWindowParams {
+            timeout_s,
+            discriminator,
+            passcode,
+            salt,
+            iterations: DEFAULT_WINDOW_ITERATIONS,
+        };
+        logf!(
+            Level::Debug,
+            "im",
+            "InvokeRequest node={node_id} path: {} (with command fields) [timed, {}ms window]",
+            annotate_path(0, ClusterId(0x003C), None, Some(CommandId(0x00))),
+            TIMED_INVOKE_TIMEOUT_MS
+        );
+        let now = self.now_ms();
+        let dir = self
+            .stack
+            .start_open_commissioning_window(session, &params, now, &mut self.tx)
+            .map_err(|e| format!("start_open_commissioning_window: {e:?}"))?;
+        self.finish_invoke(node_id, 0, ClusterId(0x003C), CommandId(0x00), dir)?;
+
+        let manual = manual_pairing_code(discriminator, passcode);
+        let manual_code = String::from_utf8_lossy(&manual).into_owned();
+        let mut qr_buf = [0u8; QR_PAYLOAD_MAX_LEN];
+        let qr = qr_payload(
+            &OnboardingPayload {
+                vendor_id,
+                product_id,
+                discriminator,
+                passcode,
+                // 窓を開けたデバイスは既にネットワーク上にいる(on-network)。
+                discovery_caps: DISCOVERY_CAP_ON_NETWORK,
+            },
+            &mut qr_buf,
+        )
+        .map(|n| String::from_utf8_lossy(&qr_buf[..n]).into_owned())
+        .unwrap_or_default();
         if json::enabled() {
             Obj::new("openCommissioningWindow")
                 .num("node", node_id)
@@ -1279,12 +1321,14 @@ impl<'a> Exec<'a> {
                 .num("discriminator", discriminator as u64)
                 .num("passcode", passcode as u64)
                 .str("manualPairingCode", &manual_code)
+                .str("qrPayload", &qr)
                 .emit();
         } else {
             println!("[admincommissioning] commissioning window open for {timeout_s}s");
             println!("  passcode:            {passcode:08}");
             println!("  discriminator:       {discriminator}");
             println!("  manual pairing code: {manual_code}");
+            println!("  qr payload:          {qr}");
             println!(
                 "  second controller: smctl --state-dir <dir2> pairing onnetwork-long \
                  <node-id> {passcode} {discriminator}"
@@ -1293,17 +1337,52 @@ impl<'a> Exec<'a> {
         Ok(())
     }
 
+    /// BasicInformation(0x0028)の u16 属性を read する(QR 用の VID/PID。best-effort)。
+    fn read_basic_u16(&mut self, session: SessionId, attr: u32) -> Option<u16> {
+        const BASIC: ClusterId = ClusterId(0x0028);
+        let path = AttributePath::concrete(EndpointId(0), BASIC, AttributeId(attr));
+        let now = self.now_ms();
+        let dir = self
+            .stack
+            .start_read(session, &[path], now, &mut self.tx)
+            .ok()?;
+        send_dir(&self.socket, &self.tx, &dir);
+        match self.wait_txn_event(Instant::now() + self.g.timeout) {
+            Ok(Some(ImEvent::ReadDone)) => {}
+            _ => return None,
+        }
+        let mut value: Option<u16> = None;
+        for report in self.stack.read_reports() {
+            if let Ok(AttributeReportRef::Data(d)) = report {
+                if d.path.attribute == Some(AttributeId(attr)) {
+                    let mut r = d.value();
+                    if let Ok(Some(e)) = r.read_next() {
+                        if let TlvValue::UnsignedInteger(v) = e.value {
+                            value = u16::try_from(v).ok();
+                        }
+                    }
+                }
+            }
+        }
+        value
+    }
+
     /// `admincommissioning revoke`: RevokeCommissioning(timed invoke)。
     fn admin_revoke(&mut self, node_id: u64) -> Result<(), String> {
-        self.invoke(
-            node_id,
-            0,
-            ClusterId(0x003C),
-            CommandId(0x02),
-            Vec::new(),
-            None,
-            Some(TIMED_INVOKE_TIMEOUT_MS),
-        )
+        let session = self.case_session(node_id)?;
+        logf!(
+            Level::Debug,
+            "im",
+            "InvokeRequest node={node_id} path: {} [timed, {}ms window]",
+            annotate_path(0, ClusterId(0x003C), None, Some(CommandId(0x02))),
+            TIMED_INVOKE_TIMEOUT_MS
+        );
+        let now = self.now_ms();
+        let dir = self
+            .stack
+            .start_revoke_commissioning(session, now, &mut self.tx)
+            .map_err(|e| format!("start_revoke_commissioning: {e:?}"))?;
+        self.finish_invoke(node_id, 0, ClusterId(0x003C), CommandId(0x02), dir)
     }
 
     /// `pairing unpair <node-id>`: 自 fabric をデバイスから削除し、成功後にローカル状態を消す。
@@ -1641,7 +1720,6 @@ impl<'a> Exec<'a> {
 /// timed invoke の TimedRequest タイムアウト(ミリ秒。chip-tool の既定 10 秒相当)。
 const TIMED_INVOKE_TIMEOUT_MS: u16 = 10_000;
 
-/// setup passcode の有効性(§5.1.7: 全 0 / 全同一数字 / 連番等の 12 値と範囲を除外)。
 /// `--paa-trust-store-path <dir>` のディレクトリから PAA 証明書(`*.der`)を全部読む(§4)。
 ///
 /// 各ファイルの生バイト列(X.509 DER)を返す。ディレクトリが読めない・`.der` が 1 つも
@@ -1667,30 +1745,6 @@ fn load_paa_store(dir: &std::path::Path) -> Result<Vec<Vec<u8>>, String> {
         ));
     }
     Ok(store)
-}
-
-fn passcode_is_valid(p: u32) -> bool {
-    const INVALID: [u32; 12] = [
-        0, 11111111, 22222222, 33333333, 44444444, 55555555, 66666666, 77777777, 88888888,
-        99999999, 12345678, 87654321,
-    ];
-    (1..=99_999_998).contains(&p) && !INVALID.contains(&p)
-}
-
-/// 有効な setup passcode を乱数生成する。
-fn random_passcode() -> Result<u32, String> {
-    use simple_matter::crypto::Rng as _;
-    let mut b = [0u8; 4];
-    for _ in 0..16 {
-        OsRng
-            .fill_bytes(&mut b)
-            .map_err(|e| format!("rng: {e:?}"))?;
-        let p = u32::from_le_bytes(b) % 99_999_998 + 1;
-        if passcode_is_valid(p) {
-            return Ok(p);
-        }
-    }
-    Err("could not generate a valid passcode".into())
 }
 
 /// バイト列を小文字 hex 文字列にする。
@@ -1749,54 +1803,6 @@ pub fn pase_verifier(passcode: u32, salt: Option<Vec<u8>>, iterations: u32) -> R
         println!("SM_PASE_VERIFIER={combined}");
     }
     Ok(())
-}
-
-/// 11 桁 manual pairing code(§5.1.4.1、VID/PID なし・カスタムフローなし)。
-///
-/// - digit 1: `(VID_PID_present(0) << 2) | (discriminator >> 10)`
-/// - digits 2-6: `((discriminator & 0x300) << 6) | (passcode & 0x3FFF)`
-/// - digits 7-10: `passcode >> 14`
-/// - digit 11: Verhoeff 検査数字
-pub(crate) fn manual_pairing_code(discriminator: u16, passcode: u32) -> String {
-    let d1 = (discriminator >> 10) as u32; // 上位 2 ビット(VID_PID_present = 0)
-    let d2_6 = (((discriminator as u32) & 0x300) << 6) | (passcode & 0x3FFF);
-    let d7_10 = passcode >> 14;
-    let body = format!("{d1:01}{d2_6:05}{d7_10:04}");
-    let check = verhoeff_check_digit(&body);
-    format!("{body}{check}")
-}
-
-/// Verhoeff 検査数字(manual pairing code の末尾桁)。
-fn verhoeff_check_digit(digits: &str) -> u8 {
-    const D: [[u8; 10]; 10] = [
-        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
-        [1, 2, 3, 4, 0, 6, 7, 8, 9, 5],
-        [2, 3, 4, 0, 1, 7, 8, 9, 5, 6],
-        [3, 4, 0, 1, 2, 8, 9, 5, 6, 7],
-        [4, 0, 1, 2, 3, 9, 5, 6, 7, 8],
-        [5, 9, 8, 7, 6, 0, 4, 3, 2, 1],
-        [6, 5, 9, 8, 7, 1, 0, 4, 3, 2],
-        [7, 6, 5, 9, 8, 2, 1, 0, 4, 3],
-        [8, 7, 6, 5, 9, 3, 2, 1, 0, 4],
-        [9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
-    ];
-    const P: [[u8; 10]; 8] = [
-        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
-        [1, 5, 7, 6, 2, 8, 3, 0, 9, 4],
-        [5, 8, 0, 3, 7, 9, 6, 1, 4, 2],
-        [8, 9, 1, 6, 0, 4, 3, 5, 2, 7],
-        [9, 4, 5, 3, 1, 2, 6, 8, 7, 0],
-        [4, 2, 8, 6, 5, 7, 3, 9, 0, 1],
-        [2, 7, 9, 3, 8, 0, 6, 4, 1, 5],
-        [7, 0, 4, 6, 9, 1, 3, 2, 5, 8],
-    ];
-    const INV: [u8; 10] = [0, 4, 3, 2, 1, 5, 6, 7, 8, 9];
-    let mut c: u8 = 0;
-    for (i, ch) in digits.bytes().rev().enumerate() {
-        let digit = ch - b'0';
-        c = D[c as usize][P[(i + 1) % 8][digit as usize] as usize];
-    }
-    INV[c as usize]
 }
 
 pub(crate) fn report_phase(phase: Phase) {
@@ -2661,19 +2667,36 @@ fn fmt_device_type_struct(r: &mut TlvReader) -> String {
 mod admin_tests {
     use super::*;
 
+    /// コアへ移設した onboarding 生成器が、smctl の表示経路から見て
+    /// chip-tool 既知値と一致すること(ベクタ本体は
+    /// `simple_matter::discovery::onboarding` のテストが担保する)。
     #[test]
     fn manual_pairing_code_matches_chip_tool() {
-        // chip-tool の既定テスト値(disc 3840 / passcode 20202021)の manual code。
-        assert_eq!(manual_pairing_code(3840, 20202021), "34970112332");
+        let code = manual_pairing_code(3840, 20202021);
+        assert_eq!(String::from_utf8_lossy(&code), "34970112332");
+    }
+
+    #[test]
+    fn qr_payload_matches_chip_tool() {
+        let mut buf = [0u8; QR_PAYLOAD_MAX_LEN];
+        let n = qr_payload(
+            &OnboardingPayload {
+                vendor_id: 0xFFF1,
+                product_id: 0x8001,
+                discriminator: 3840,
+                passcode: 20202021,
+                discovery_caps: DISCOVERY_CAP_ON_NETWORK,
+            },
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8_lossy(&buf[..n]), "MT:-24J0AFN00KA0648G00");
     }
 
     #[test]
     fn passcode_validity() {
         assert!(passcode_is_valid(20202021));
-        assert!(passcode_is_valid(1));
-        assert!(passcode_is_valid(99_999_998));
         assert!(!passcode_is_valid(0));
-        assert!(!passcode_is_valid(11111111));
         assert!(!passcode_is_valid(12345678));
         assert!(!passcode_is_valid(99_999_999));
     }
@@ -2681,232 +2704,7 @@ mod admin_tests {
     #[test]
     fn random_passcode_is_valid() {
         for _ in 0..32 {
-            assert!(passcode_is_valid(random_passcode().unwrap()));
+            assert!(passcode_is_valid(random_passcode(&mut OsRng).unwrap()));
         }
-    }
-}
-
-#[cfg(test)]
-mod annotate_tests {
-    use super::*;
-
-    #[test]
-    fn annotate_path_uses_registry_then_names_table() {
-        // レジストリ収載: kebab-case 名(従来どおり)。
-        assert_eq!(
-            annotate_path(1, ClusterId(0x0006), Some(AttributeId(0x0000)), None),
-            "endpoint=1 cluster=onoff(0x0006) attribute=on-off(0x0000)"
-        );
-        // レジストリ未収載の標準クラスタ: 名前注釈テーブルで 0xID(Name) 表記(§9.5)。
-        // (0x0033 GeneralDiagnostics と 0x001F AccessControl はフル定義済みになったので、
-        //  未収載例には 0x0035 ThreadNetworkDiagnostics を使う。)
-        assert_eq!(
-            annotate_path(0, ClusterId(0x0035), None, None),
-            "endpoint=0 cluster=0x0035(ThreadNetworkDiagnostics)"
-        );
-        // global 属性はレジストリ収載/未収載どちらでも名前が付く。
-        assert_eq!(
-            annotate_path(0, ClusterId(0x0035), Some(AttributeId(0xFFFB)), None),
-            "endpoint=0 cluster=0x0035(ThreadNetworkDiagnostics) attribute=0xfffb(AttributeList)"
-        );
-        assert_eq!(
-            annotate_path(1, ClusterId(0x0006), Some(AttributeId(0xFFFD)), None),
-            "endpoint=1 cluster=onoff(0x0006) attribute=0xfffd(ClusterRevision)"
-        );
-        // 完全未知(vendor 域)は hex のみ。
-        assert_eq!(
-            annotate_path(2, ClusterId(0xFC01), Some(AttributeId(0x1234)), None),
-            "endpoint=2 cluster=0xfc01 attribute=0x1234"
-        );
-    }
-
-    #[test]
-    fn format_concrete_uses_names_table() {
-        assert_eq!(
-            format_concrete(ClusterId(0x0035), Some(AttributeId(0xFFFB)), 0),
-            "ep0 0x0035(ThreadNetworkDiagnostics)/0xfffb(AttributeList)"
-        );
-        assert_eq!(
-            format_concrete(ClusterId(0x0006), Some(AttributeId(0x0000)), 1),
-            "ep1 onoff/on-off"
-        );
-        assert_eq!(format_concrete(ClusterId(0xFC01), None, 2), "ep2 0xfc01");
-    }
-}
-
-#[cfg(test)]
-mod names_tests {
-    use super::*;
-
-    /// TLV を組んで `fmt_next_value_named` に通すヘルパ。
-    fn fmt_with(sem: Semantic, build: impl FnOnce(&mut TlvWriter)) -> String {
-        let mut buf = [0u8; 256];
-        let n = {
-            let mut w = TlvWriter::new(&mut buf);
-            build(&mut w);
-            w.len()
-        };
-        let mut r = TlvReader::new(&buf[..n]);
-        fmt_next_value_named(&mut r, sem).expect("value")
-    }
-
-    fn build_server_list(w: &mut TlvWriter) {
-        w.start_array(&TlvTag::Anonymous).unwrap();
-        w.write_u16(&TlvTag::Anonymous, 0x0006).unwrap(); // レジストリ収載(onoff)
-        w.write_u16(&TlvTag::Anonymous, 0x001D).unwrap(); // レジストリ収載(descriptor)
-        w.write_u16(&TlvTag::Anonymous, 0x0035).unwrap(); // 名前注釈のみ
-        w.write_u16(&TlvTag::Anonymous, 0xFC01).unwrap(); // 未知(vendor 域)
-        w.end_container().unwrap();
-    }
-
-    #[test]
-    fn cluster_id_list_decodes_names() {
-        assert_eq!(
-            fmt_with(Semantic::ClusterIdList, build_server_list),
-            "[6(onoff), 29(descriptor), 53(ThreadNetworkDiagnostics), 64513]"
-        );
-    }
-
-    #[test]
-    fn semantic_none_keeps_legacy_output() {
-        // --names 無し(注釈 None)は従来の汎用ダンプのまま。
-        assert_eq!(
-            fmt_with(Semantic::None, build_server_list),
-            "[6, 29, 53, 64513]"
-        );
-    }
-
-    #[test]
-    fn cluster_id_single_element_decodes() {
-        // chunked レポート(list_index 付き)で要素単体が来ても名前が付く。
-        let s = fmt_with(Semantic::ClusterIdList, |w| {
-            w.write_u16(&TlvTag::Anonymous, 0x0006).unwrap();
-        });
-        assert_eq!(s, "6(onoff)");
-    }
-
-    #[test]
-    fn device_type_struct_list_decodes_names() {
-        let s = fmt_with(Semantic::DeviceTypeStructList, |w| {
-            w.start_array(&TlvTag::Anonymous).unwrap();
-            for (dt, rev) in [(0x0101u32, 3u16), (0x0016, 1), (0xFC00, 2)] {
-                w.start_struct(&TlvTag::Anonymous).unwrap();
-                w.write_u32(&TlvTag::ContextSpecific(0), dt).unwrap();
-                w.write_u16(&TlvTag::ContextSpecific(1), rev).unwrap();
-                w.end_container().unwrap();
-            }
-            w.end_container().unwrap();
-        });
-        assert_eq!(
-            s,
-            "[{device-type: 0x0101(DimmableLight), revision: 3}, \
-             {device-type: 0x0016(RootNode), revision: 1}, \
-             {device-type: 0xfc00, revision: 2}]"
-        );
-    }
-
-    #[test]
-    fn unexpected_shape_falls_back_to_generic_dump() {
-        // 注釈と実データの形が合わないときは汎用ダンプで常に成立させる。
-        let s = fmt_with(Semantic::DeviceTypeStructList, |w| {
-            w.start_array(&TlvTag::Anonymous).unwrap();
-            w.write_utf8(&TlvTag::Anonymous, "bogus").unwrap();
-            w.end_container().unwrap();
-        });
-        assert_eq!(s, "[\"bogus\"]");
-    }
-
-    #[test]
-    fn path_semantic_resolves_from_registry() {
-        let sem = |cid: u32, aid: u32| {
-            path_semantic(&AttributePath::concrete(
-                EndpointId(1),
-                ClusterId(cid),
-                AttributeId(aid),
-            ))
-        };
-        assert_eq!(sem(0x001D, 0x0000), Semantic::DeviceTypeStructList);
-        assert_eq!(sem(0x001D, 0x0001), Semantic::ClusterIdList);
-        assert_eq!(sem(0x001D, 0x0002), Semantic::ClusterIdList);
-        assert_eq!(sem(0x001D, 0x0003), Semantic::None); // parts-list は注釈なし
-        assert_eq!(sem(0x0006, 0x0000), Semantic::None); // 他クラスタ
-        assert_eq!(sem(0xFC01, 0x0000), Semantic::None); // レジストリ未収載
-                                                         // ワイルドカード(attribute 無し)のパスも None。
-        let wild = AttributePath {
-            endpoint: Some(EndpointId(1)),
-            cluster: Some(ClusterId(0x001D)),
-            attribute: None,
-            list_index: None,
-            list_append: false,
-            enable_tag_compression: false,
-        };
-        assert_eq!(path_semantic(&wild), Semantic::None);
-    }
-}
-
-#[cfg(test)]
-mod noc_tests {
-    use super::*;
-
-    /// RemoveFabric の NOCResponse を 1 個含む InvokeResponseIB を組む
-    /// (unpair の応答判定が実際のワイヤ形状で成立することを固定する)。
-    fn build_removefabric_response(status_code: u8, fabric_index: u8) -> Vec<u8> {
-        let mut buf = vec![0u8; 128];
-        let len = {
-            let mut w = TlvWriter::new(&mut buf);
-            // InvokeResponseIB
-            w.start_struct(&TlvTag::Anonymous).unwrap();
-            // command(0) = CommandDataIB
-            w.start_struct(&TlvTag::ContextSpecific(0)).unwrap();
-            // path(0) = CommandPath(list)。unpair の抽出では skip される。
-            w.start_container(&TlvTag::ContextSpecific(0), ContainerType::List)
-                .unwrap();
-            w.write_u16(&TlvTag::ContextSpecific(0), 0).unwrap(); // endpoint
-            w.write_u32(&TlvTag::ContextSpecific(1), 0x003E).unwrap(); // cluster
-            w.write_u32(&TlvTag::ContextSpecific(2), 0x08).unwrap(); // NOCResponse cmd id
-            w.end_container().unwrap();
-            // fields(1) = NOCResponse struct { 0: statusCode, 1: fabricIndex }
-            w.start_struct(&TlvTag::ContextSpecific(1)).unwrap();
-            w.write_u8(&TlvTag::ContextSpecific(0), status_code)
-                .unwrap();
-            w.write_u8(&TlvTag::ContextSpecific(1), fabric_index)
-                .unwrap();
-            w.end_container().unwrap();
-            w.end_container().unwrap(); // CommandDataIB
-            w.end_container().unwrap(); // InvokeResponseIB
-            w.len()
-        };
-        buf.truncate(len);
-        buf
-    }
-
-    #[test]
-    fn decode_noc_status_code_extracts_status() {
-        assert_eq!(
-            decode_noc_status_code(&build_removefabric_response(0, 1)),
-            Some(0)
-        );
-        // 11 = InvalidFabricIndex(RemoveFabric の失敗コード例)。
-        assert_eq!(
-            decode_noc_status_code(&build_removefabric_response(11, 1)),
-            Some(11)
-        );
-    }
-
-    #[test]
-    fn decode_noc_status_code_none_when_absent() {
-        // 空/NOCResponse を含まない応答は None(IM status 判定へフォールバック)。
-        assert_eq!(decode_noc_status_code(&[]), None);
-        // Status(1) だけの InvokeResponseIB(コマンド応答無し)も None。
-        let mut buf = vec![0u8; 64];
-        let len = {
-            let mut w = TlvWriter::new(&mut buf);
-            w.start_struct(&TlvTag::Anonymous).unwrap();
-            w.start_struct(&TlvTag::ContextSpecific(1)).unwrap(); // CommandStatusIB
-            w.end_container().unwrap();
-            w.end_container().unwrap();
-            w.len()
-        };
-        assert_eq!(decode_noc_status_code(&buf[..len]), None);
     }
 }

@@ -19,6 +19,9 @@ esp_console REPL(main/console_dbg.cpp)へコマンドを投げ、応答を終端
     scripts/tab5ctl.py swipe 900 400 300 400 400
     scripts/tab5ctl.py screenshot -o shot.png
     scripts/tab5ctl.py screenshot --div 2 -o shot_half.png
+    scripts/tab5ctl.py openwindow aabbccdd 300
+    scripts/tab5ctl.py window
+    scripts/tab5ctl.py revoke aabbccdd
     scripts/tab5ctl.py send "pair 192.168.1.23 11 wifi"
 
 依存: pyserial(必須)、Pillow(screenshot の PNG 出力にのみ必要)。
@@ -214,6 +217,17 @@ def main() -> int:
     p.add_argument("y2", type=int)
     p.add_argument("ms", type=int, nargs="?", default=300)
 
+    # T9(§17.4): コミッショニングウィンドウ。
+    p = sub.add_parser("openwindow", help="コミッショニングウィンドウを開く")
+    p.add_argument("node", help="NodeId(hex)")
+    p.add_argument("timeout_s", type=int, nargs="?", default=300, help="180..900(既定 300)")
+    p.add_argument("disc", type=int, nargs="?", default=None, help="discriminator(既定: 乱数)")
+
+    p = sub.add_parser("revoke", help="コミッショニングウィンドウを閉じる")
+    p.add_argument("node", help="NodeId(hex)")
+
+    sub.add_parser("window", help="直近の窓(manual code / QR / 残り秒)")
+
     sub.add_parser("ui-dump", help="ウィジェットツリーをダンプ")
     sub.add_parser("nodes", help="ノード一覧")
     sub.add_parser("status", help="コントローラ状態")
@@ -237,8 +251,14 @@ def main() -> int:
             line = f"swipe {args.x1} {args.y1} {args.x2} {args.y2} {args.ms}"
         elif args.cmd == "send":
             line = args.line
+        elif args.cmd == "openwindow":
+            line = f"openwindow {args.node} {args.timeout_s}"
+            if args.disc is not None:
+                line += f" {args.disc}"
+        elif args.cmd == "revoke":
+            line = f"revoke {args.node}"
         else:
-            line = args.cmd  # ui-dump / nodes / status
+            line = args.cmd  # ui-dump / nodes / status / window
 
         status, lines = dev.run(line, timeout=args.timeout)
         for out_line in lines:

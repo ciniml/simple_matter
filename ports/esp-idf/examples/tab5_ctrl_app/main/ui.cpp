@@ -187,6 +187,16 @@ struct Ui {
   lv_obj_t *kb = nullptr;
   bool pair_open = false;
   bool pair_started = false; // Start を押してから結果表示を始める
+  // --- T9(§17.4): Share ダイアログ ---
+  lv_obj_t *share_modal = nullptr;
+  lv_obj_t *lbl_share_head = nullptr;
+  lv_obj_t *lbl_share_code = nullptr; // manual pairing code(montserrat 48)
+  lv_obj_t *lbl_share_sub = nullptr;  // passcode / discriminator
+  lv_obj_t *lbl_share_state = nullptr; // "closes in N s" / "window closed"
+  lv_obj_t *share_qr = nullptr;
+  uint64_t share_node = 0;
+  char share_qr_data[40] = {};
+
   bool pair_ble = false;     // 1 番目の欄が discriminator になっているか
   char saved_ipv6[46] = {};  // BLE へ切り替えたときに退避する IPv6
   char saved_disc[8] = {};   // on-network へ戻したときに退避する discriminator
@@ -514,6 +524,135 @@ void open_pair_dialog(lv_event_t *) {
 
 // --- Devices タブ ---
 
+// --- T9(§17.4): Share ダイアログ(コミッショニングウィンドウ)---
+//
+// pair ダイアログと同じ作法(全画面の半透明モーダル + カード)。表示内容は
+// スナップショットの `window` 欄だけを見る(pump が埋める)。
+
+// 11 桁の manual pairing code を "XXXX-XXX-XXXX" に整形する。
+void format_manual_code(const char *src, char *out, size_t cap) {
+  const size_t n = (src != nullptr) ? strlen(src) : 0;
+  if (n != 11) {
+    snprintf(out, cap, "%s", (n != 0) ? src : "-");
+    return;
+  }
+  snprintf(out, cap, "%.4s-%.3s-%.4s", src, src + 4, src + 7);
+}
+
+void close_share_dialog() {
+  if (g_ui.share_modal != nullptr) {
+    lv_obj_delete(g_ui.share_modal);
+    g_ui.share_modal = nullptr;
+    g_ui.lbl_share_head = g_ui.lbl_share_code = g_ui.lbl_share_sub = nullptr;
+    g_ui.lbl_share_state = g_ui.share_qr = nullptr;
+    g_ui.share_qr_data[0] = '\0';
+  }
+  g_ui.share_node = 0;
+}
+
+void on_share_close(lv_event_t *) { close_share_dialog(); }
+
+void on_share_revoke(lv_event_t *) {
+  if (g_ui.share_node != 0) {
+    post(SM_UI_OP_REVOKE_WINDOW, g_ui.share_node);
+    if (g_ui.lbl_share_state != nullptr) {
+      lv_label_set_text(g_ui.lbl_share_state, "revoking ...");
+    }
+  }
+}
+
+void open_share_dialog(uint64_t node_id) {
+  close_share_dialog();
+  g_ui.share_node = node_id;
+
+  lv_obj_t *scr = lv_screen_active();
+  lv_obj_t *modal = lv_obj_create(scr);
+  g_ui.share_modal = modal;
+  lv_obj_remove_style_all(modal);
+  lv_obj_set_size(modal, LV_PCT(100), LV_PCT(100));
+  lv_obj_set_style_bg_color(modal, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(modal, LV_OPA_70, 0);
+  lv_obj_remove_flag(modal, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *card = lv_obj_create(modal);
+  style_panel(card, COL_PANEL);
+  lv_obj_set_size(card, g_scr_w - 160, 560);
+  lv_obj_set_pos(card, 80, 60);
+  lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(card, 10, 0);
+
+  char head[80];
+  snprintf(head, sizeof(head), "Share 0x%016llx with another controller",
+           (unsigned long long)node_id);
+  g_ui.lbl_share_head = make_label(card, &lv_font_montserrat_24, COL_TEXT, head);
+  make_label(card, &lv_font_montserrat_14, COL_DIM,
+             "Enter the code below on the second controller (chip-tool / smctl \"pairing code\",\n"
+             "or scan the QR with a phone app). The window closes automatically when it expires.");
+
+  lv_obj_t *body = lv_obj_create(card);
+  lv_obj_remove_style_all(body);
+  lv_obj_set_size(body, LV_PCT(100), 300);
+  lv_obj_set_flex_flow(body, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(body, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(body, 24, 0);
+
+  lv_obj_t *left = lv_obj_create(body);
+  lv_obj_remove_style_all(left);
+  lv_obj_set_size(left, g_scr_w - 160 - 20 - 220 - 24, 300);
+  lv_obj_set_flex_flow(left, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(left, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+  lv_obj_set_style_pad_row(left, 14, 0);
+  make_label(left, &lv_font_montserrat_16, COL_ACCENT, "Manual pairing code");
+  g_ui.lbl_share_code = make_label(left, &lv_font_montserrat_48, COL_TEXT, "----------- ");
+  g_ui.lbl_share_sub = make_label(left, &lv_font_montserrat_20, COL_DIM, "");
+  g_ui.lbl_share_state = make_label(left, &lv_font_montserrat_24, COL_WARN, "opening window ...");
+
+  lv_obj_t *right = lv_obj_create(body);
+  lv_obj_remove_style_all(right);
+  lv_obj_set_size(right, 240, 300);
+  lv_obj_set_flex_flow(right, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(right, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_row(right, 8, 0);
+#if LV_USE_QRCODE
+  g_ui.share_qr = lv_qrcode_create(right);
+  lv_qrcode_set_size(g_ui.share_qr, 220);
+  lv_qrcode_set_dark_color(g_ui.share_qr, lv_color_hex(0x000000));
+  lv_qrcode_set_light_color(g_ui.share_qr, lv_color_hex(0xffffff));
+  lv_obj_set_style_border_width(g_ui.share_qr, 8, 0);
+  lv_obj_set_style_border_color(g_ui.share_qr, lv_color_hex(0xffffff), 0);
+#else
+  make_label(right, &lv_font_montserrat_14, COL_DIM, "(LV_USE_QRCODE is disabled)");
+#endif
+
+  lv_obj_t *btns = lv_obj_create(card);
+  lv_obj_remove_style_all(btns);
+  lv_obj_set_size(btns, LV_PCT(100), BTN_H);
+  lv_obj_set_flex_flow(btns, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(btns, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(btns, 16, 0);
+  make_button(btns, "Revoke", 220, COL_WARN, on_share_revoke, nullptr);
+  make_button(btns, "Close", 180, COL_OFF, on_share_close, nullptr);
+}
+
+void on_share(lv_event_t *e) {
+  const uint64_t node_id = row_node_id(e);
+  if (node_id == 0) {
+    return;
+  }
+  sm_ui_op_t op = {};
+  op.kind = SM_UI_OP_OPEN_WINDOW;
+  op.node_id = node_id;
+  op.timeout_s = 300;      // 既定 5 分(§17.4)
+  op.discriminator = 0xFFFF; // シムで乱数生成(12bit)
+  op.passcode = 0;           // 同上(仕様の禁止値を避けた乱数)
+  if (!sm_app_post_op(&op)) {
+    lv_label_set_text(g_ui.lbl_status, "busy: the pump queue is full, try again");
+    return;
+  }
+  open_share_dialog(node_id);
+}
+
 void on_toggle(lv_event_t *e) { post(SM_UI_OP_TOGGLE, row_node_id(e)); }
 void on_read(lv_event_t *e) { post(SM_UI_OP_READ_ONOFF, row_node_id(e)); }
 void on_refresh_addr(lv_event_t *e) { post(SM_UI_OP_REFRESH_ADDR, row_node_id(e)); }
@@ -532,9 +671,10 @@ void build_node_row(size_t idx) {
   // ROW_H は 96 のまま(20+14+16 の 3 行 = 約 60px < ROW_H-20)。
   lv_obj_t *col = lv_obj_create(w.root);
   lv_obj_remove_style_all(col);
-  // 幅は行の総和が画面に収まるように: 480 + 150(badge) + 40(sub) + 120(note) +
-  // 130 + 120 + 150(ボタン)+ 隙間 12×6 = 1262 < 1280。
-  lv_obj_set_size(col, 480, ROW_H - 20);
+  // 幅は行の総和が画面に収まるように: 370 + 150(badge) + 40(sub) + 120(note) +
+  // 130 + 120 + 150 + 110(ボタン)+ 隙間 12×7 = 1274 ≤ 1280
+  // (T9 §17.4 で Share ボタン 110 を足すぶん、名前列を 480 → 370 に詰めた)。
+  lv_obj_set_size(col, 370, ROW_H - 20);
   lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
   w.lbl_id = make_label(col, &lv_font_montserrat_20, COL_TEXT, "-");
@@ -562,6 +702,8 @@ void build_node_row(size_t idx) {
   w.btn_toggle = make_button(w.root, "Toggle", 130, COL_ACCENT, on_toggle, ud);
   make_button(w.root, "Read", 120, COL_OFF, on_read, ud);
   make_button(w.root, LV_SYMBOL_REFRESH " Addr", 150, COL_OFF, on_refresh_addr, ud);
+  // T9(§17.4): 別のコントローラへ渡すためのコミッショニングウィンドウを開く。
+  make_button(w.root, "Share", 110, COL_WARN, on_share, ud);
 }
 
 void on_reload(lv_event_t *) {
@@ -710,7 +852,16 @@ void refresh_devices() {
     lv_obj_set_flag(w.btn_toggle, LV_OBJ_FLAG_HIDDEN, sensor);
 
     lv_label_set_text(w.lbl_sub, n.subscribed ? "* sub" : "");
-    lv_label_set_text(w.lbl_note, n.busy ? "working ..." : n.note);
+    // T9(§17.4): 窓が開いているノードは note を残り秒つきの表示で上書きする。
+    if (!n.busy && g_snap.window.status == SM_UI_WINDOW_OPEN &&
+        g_snap.window.node_id == n.node_id) {
+      const long long left = (g_snap.window.expires_ms > g_snap.now_ms)
+                                 ? (long long)((g_snap.window.expires_ms - g_snap.now_ms) / 1000ull)
+                                 : 0;
+      lv_label_set_text_fmt(w.lbl_note, "window open (%lld s)", left);
+    } else {
+      lv_label_set_text(w.lbl_note, n.busy ? "working ..." : n.note);
+    }
   }
 }
 
@@ -990,6 +1141,57 @@ void refresh_pair_dialog() {
   }
 }
 
+// T9(§17.4): Share ダイアログの反映(500ms タイマ)。表示はスナップショットの
+// `window` 欄だけを見る。残り秒は snapshot の now_ms と expires_ms の差。
+void refresh_share_dialog() {
+  if (g_ui.share_modal == nullptr || g_ui.lbl_share_state == nullptr) {
+    return;
+  }
+  const sm_ui_window_t &w = g_snap.window;
+  // 別のノードの窓を開き直した(= 他行の Share を押した)場合は自分の表示を止める。
+  if (w.node_id != g_ui.share_node) {
+    lv_label_set_text(g_ui.lbl_share_state, "superseded by another node");
+    return;
+  }
+  char code[20];
+  format_manual_code(w.manual_code, code, sizeof(code));
+  lv_label_set_text(g_ui.lbl_share_code, code);
+  lv_label_set_text_fmt(g_ui.lbl_share_sub, "passcode %lu    discriminator %u",
+                        (unsigned long)w.passcode, (unsigned)w.discriminator);
+
+  switch (w.status) {
+  case SM_UI_WINDOW_OPENING:
+    lv_label_set_text(g_ui.lbl_share_state, "opening window ...");
+    lv_obj_set_style_text_color(g_ui.lbl_share_state, lv_color_hex(COL_WARN), 0);
+    break;
+  case SM_UI_WINDOW_OPEN: {
+    const long long left =
+        (w.expires_ms > g_snap.now_ms) ? (long long)((w.expires_ms - g_snap.now_ms) / 1000ull) : 0;
+    lv_label_set_text_fmt(g_ui.lbl_share_state, "closes in %lld s", left);
+    lv_obj_set_style_text_color(g_ui.lbl_share_state, lv_color_hex(COL_ON), 0);
+    break;
+  }
+  case SM_UI_WINDOW_CLOSED:
+    lv_label_set_text(g_ui.lbl_share_state, "window closed");
+    lv_obj_set_style_text_color(g_ui.lbl_share_state, lv_color_hex(COL_DIM), 0);
+    break;
+  case SM_UI_WINDOW_FAILED:
+    lv_label_set_text_fmt(g_ui.lbl_share_state, "failed (status %u, phase %u)",
+                          (unsigned)w.fail_status, (unsigned)w.fail_phase);
+    lv_obj_set_style_text_color(g_ui.lbl_share_state, lv_color_hex(COL_WARN), 0);
+    break;
+  default:
+    break;
+  }
+
+#if LV_USE_QRCODE
+  if (g_ui.share_qr != nullptr && w.qr[0] != 0 && strcmp(g_ui.share_qr_data, w.qr) != 0) {
+    snprintf(g_ui.share_qr_data, sizeof(g_ui.share_qr_data), "%s", w.qr);
+    lv_qrcode_update(g_ui.share_qr, g_ui.share_qr_data, (uint32_t)strlen(g_ui.share_qr_data));
+  }
+#endif
+}
+
 void tick_cb(lv_timer_t *) {
   sm_app_snapshot_get(&g_snap);
   refresh_status_bar();
@@ -997,6 +1199,7 @@ void tick_cb(lv_timer_t *) {
   refresh_devices();
   refresh_network_tab();
   refresh_pair_dialog();
+  refresh_share_dialog();
 }
 
 } // namespace

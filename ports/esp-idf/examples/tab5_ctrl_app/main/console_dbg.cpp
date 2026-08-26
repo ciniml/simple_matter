@@ -37,8 +37,32 @@ int cmd_nodes(int, char **) {
   for (size_t i = 0; i < snap.node_count && i < SM_UI_MAX_NODES; ++i) {
     const sm_ui_node_t &n = snap.nodes[i];
     // T8(§16.3): subscribed=1 なら周期 read は止まっており、値はレポート由来。
-    printf("NODE %016llx kind=%u onoff=%d aq=%u subscribed=%u addr=%s note=\"%s\"\n",
-           (unsigned long long)n.node_id, n.kind, (int)n.onoff, n.aq, n.subscribed, n.addr,
+    // T9(§17.4): window= は「この行のノードで開いている窓」の状態。
+    // "-"(無し)/ "opening" / "open:<残り秒>" / "closed" / "failed:<status>"。
+    char win[32] = "-";
+    if (snap.window.node_id == n.node_id) {
+      switch (snap.window.status) {
+      case SM_UI_WINDOW_OPENING:
+        snprintf(win, sizeof(win), "opening");
+        break;
+      case SM_UI_WINDOW_OPEN:
+        snprintf(win, sizeof(win), "open:%lld",
+                 snap.window.expires_ms > snap.now_ms
+                     ? (long long)((snap.window.expires_ms - snap.now_ms) / 1000ull)
+                     : 0LL);
+        break;
+      case SM_UI_WINDOW_CLOSED:
+        snprintf(win, sizeof(win), "closed");
+        break;
+      case SM_UI_WINDOW_FAILED:
+        snprintf(win, sizeof(win), "failed:%u", snap.window.fail_status);
+        break;
+      default:
+        break;
+      }
+    }
+    printf("NODE %016llx kind=%u onoff=%d aq=%u subscribed=%u window=%s addr=%s note=\"%s\"\n",
+           (unsigned long long)n.node_id, n.kind, (int)n.onoff, n.aq, n.subscribed, win, n.addr,
            n.note);
     if (n.kind == 2) {
       printf("SENSOR %016llx co2=%s%.1f pm25=%s%.1f temp_c100=%s%ld hum_p100=%s%ld\n",
@@ -160,6 +184,62 @@ int cmd_setaddr(int argc, char **argv) {
   snprintf(op.ipv6, sizeof(op.ipv6), "%s", argv[2]);
   op.via = (argc >= 4 && strcmp(argv[3], "thread") == 0) ? SM_UI_VIA_THREAD : SM_UI_VIA_WIFI;
   printf(sm_app_post_op(&op) ? "OK queued\n" : "ERR queue full\n");
+  return 0;
+}
+
+// ===== T9: コミッショニングウィンドウ(§17.4)==================================
+
+int cmd_openwindow(int argc, char **argv) {
+  // openwindow <node_hex> [timeout_s] [disc]
+  if (argc < 2) {
+    printf("ERR usage: openwindow <node_hex> [timeout_s] [disc]\n");
+    return 1;
+  }
+  sm_ui_op_t op = {};
+  op.kind = SM_UI_OP_OPEN_WINDOW;
+  op.node_id = parse_hex(argv[1]);
+  if (op.node_id == 0) {
+    printf("ERR node id must be non-zero\n");
+    return 1;
+  }
+  op.timeout_s = (argc >= 3) ? (uint16_t)strtoul(argv[2], nullptr, 10) : 300;
+  // disc 省略 = 0xFFFF(シムで 12bit 乱数)。passcode は常に乱数。
+  op.discriminator = (argc >= 4) ? (uint16_t)strtoul(argv[3], nullptr, 10) : 0xFFFF;
+  op.passcode = 0;
+  printf(sm_app_post_op(&op) ? "OK queued\n" : "ERR queue full\n");
+  return 0;
+}
+
+int cmd_revoke(int argc, char **argv) {
+  if (argc < 2) {
+    printf("ERR usage: revoke <node_hex>\n");
+    return 1;
+  }
+  sm_ui_op_t op = {};
+  op.kind = SM_UI_OP_REVOKE_WINDOW;
+  op.node_id = parse_hex(argv[1]);
+  if (op.node_id == 0) {
+    printf("ERR node id must be non-zero\n");
+    return 1;
+  }
+  printf(sm_app_post_op(&op) ? "OK queued\n" : "ERR queue full\n");
+  return 0;
+}
+
+int cmd_window(int, char **) {
+  static sm_ui_snapshot_t snap;
+  sm_app_snapshot_get(&snap);
+  static const char *ST[] = {"none", "opening", "open", "closed", "failed"};
+  const sm_ui_window_t &w = snap.window;
+  const char *st = (w.status < (sizeof(ST) / sizeof(ST[0]))) ? ST[w.status] : "?";
+  printf("WINDOW node=%016llx state=%s left=%lld passcode=%lu disc=%u manual=%s qr=%s "
+         "fail_status=%u fail_phase=%u\n",
+         (unsigned long long)w.node_id, st,
+         (w.expires_ms > snap.now_ms) ? (long long)((w.expires_ms - snap.now_ms) / 1000ull) : -1LL,
+         (unsigned long)w.passcode, (unsigned)w.discriminator,
+         w.manual_code[0] ? w.manual_code : "-", w.qr[0] ? w.qr : "-", w.fail_status,
+         w.fail_phase);
+  printf("OK\n");
   return 0;
 }
 
@@ -587,6 +667,11 @@ void sm_console_start() {
   reg("pair", "pair <ipv6> <node_hex> [thread|wifi] [passcode]", cmd_pair);
   reg("udptest", "udptest <port> <secs>", cmd_udptest);
   reg("setaddr", "setaddr <node_hex> <ip> [wifi|thread]", cmd_setaddr);
+  reg("openwindow", "openwindow <node_hex> [timeout_s] [disc] (T9: open a commissioning window)",
+      cmd_openwindow);
+  reg("revoke", "revoke <node_hex> (T9: close the commissioning window)", cmd_revoke);
+  reg("window", "show the last commissioning window (manual code / QR / seconds left)",
+      cmd_window);
   reg("refresh", "refresh <node_hex> (SRP/mDNS re-resolve + kind re-detect)", cmd_refresh);
   // T5b / T5c
   reg("tap", "tap <x> <y> (synthetic touch)", cmd_tap);

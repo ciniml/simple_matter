@@ -230,6 +230,12 @@ pub struct ImClient<const RESULT: usize = DEFAULT_RESULT_LEN> {
     /// 応答として送出する(opcode は進行中トランザクション種別で決まる。
     /// `docs/design/admin-commissioning.md` §3)。
     pending_invoke_len: Option<usize>,
+    /// 直近の InvokeResponse に載っていたクラスタ固有ステータス(§8.10 StatusIB)。
+    ///
+    /// [`ImEvent::InvokeDone`] の `status` は IM ステータスなので、AdministratorCommissioning の
+    /// Busy(2)/ PAKEParameterError(3)のようなクラスタ固有コードはここに退避する
+    /// (`docs/design/p4-thread-controller.md` §17.2)。次の InvokeResponse で上書きされる。
+    last_cluster_status: Option<u8>,
 }
 
 impl<const RESULT: usize> Default for ImClient<RESULT> {
@@ -256,7 +262,15 @@ impl<const RESULT: usize> ImClient<RESULT> {
             sub_truncated: false,
             sub_event: None,
             pending_invoke_len: None,
+            last_cluster_status: None,
         }
+    }
+
+    /// 直近の InvokeResponse のクラスタ固有ステータス(無ければ `None`)。
+    ///
+    /// [`ImEvent::InvokeDone`] を受け取った直後に読む。
+    pub const fn last_cluster_status(&self) -> Option<u8> {
+        self.last_cluster_status
     }
 
     /// 進行中トランザクションがあれば `true`。
@@ -774,6 +788,7 @@ impl<const RESULT: usize> ImClient<RESULT> {
         let _ = self.append_array_elements(rx.payload, 1);
 
         let mut status = ImStatus::Success;
+        self.last_cluster_status = None;
         match ir.invoke_responses() {
             Ok(iter) => {
                 for item in iter {
@@ -781,6 +796,7 @@ impl<const RESULT: usize> ImClient<RESULT> {
                         Ok(InvokeResponseRefItem::Status(s)) => {
                             if !s.status.status.is_success() {
                                 status = s.status.status;
+                                self.last_cluster_status = s.status.cluster_status;
                             }
                         }
                         Ok(InvokeResponseRefItem::Command(_)) => {}

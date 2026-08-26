@@ -1842,3 +1842,114 @@ InvalidSubscription)こと、shim でも node_id が正しく振り分くこと�
 `esp_wifi_remote`(SDIO)呼び出し、`sm_app_lock` を UI 側が長時間保持)。対処: 定常ループの各ステップ
 (take_op / pump_once / refresh_thread_status / refresh_wifi_status / rebuild_node_list / poll tick / resub)の所要時間を
 計測し、**1 秒超で `pump: slow step=<name> ms=<n>` を WARN ログ**。次の停止で犯人を特定する。
+
+## 17. T9: Tab5 からコミッショニングウィンドウを開く(マルチコントローラ化)
+
+Status: 設計(2026-08-26)。目的: Tab5 が管理するデバイス(NanoC6 / AirQ 等)に、**別のコントローラ**
+(chip-tool / smctl / スマホアプリ)を追加コミッションできるようにする。Matter の標準手順 =
+AdministratorCommissioning(EP0 / 0x003C)の **OpenCommissioningWindow(ECM、timed invoke)** を既存 fabric の
+管理者(Tab5)が発行し、生成した passcode / discriminator を **manual pairing code(11 桁)と QR(`MT:` payload)**
+で 2 人目に渡す。
+
+### 17.1 既存部品
+
+- コア: デバイス側 AdministratorCommissioning クラスタ(ECW/BC/Revoke、`dm/clusters/administrator_commissioning.rs`)、
+  `crypto::spake2p::compute_verifier(passcode, salt, iterations)`、`ControllerStack::start_invoke_timed`。
+- smctl: `admincommissioning open-window`(`ops.rs::admin_open_window`)= verifier 生成 → timed invoke →
+  `manual_pairing_code`(`ops.rs:1760`、chip-tool 一致テスト付き)。**QR payload は未実装**。
+- shim: `sm_ctrl_invoke_args`(引数 4 個まで、`sm_attr_bytes.len` は u8 なので 97 B verifier は載る)だが
+  **timed invoke が無い**。
+- Tab5: LVGL `lv_qrcode`(`CONFIG_LV_USE_QRCODE=y`、Network タブで使用中)、pair ダイアログの作法、
+  console_dbg(`toggle`/`read`…)、`tab5ctl.py`。
+- デバイス: AirQ は chip-tool で OCW→2 fabric 目を実証済み(airq-port.md §7.4.3)。NanoC6(cffi デバイス)は
+  fabric 容量 `NF` と AdministratorCommissioning の組み込みを **要確認**(§17.5)。
+
+### 17.2 コア(`crates/simple-matter`、no_std)
+
+新モジュール `discovery::onboarding`(smctl から移設・拡張):
+```rust
+pub fn manual_pairing_code(discriminator: u16, passcode: u32) -> [u8; 11];   // 11 桁 ASCII(chip-tool 一致)
+pub fn passcode_is_valid(p: u32) -> bool;                                    // 仕様の禁止値
+pub fn random_passcode<R: Rng>(rng: &mut R) -> Result<u32>;
+/// QR payload(仕様 §5.1.3、"MT:" + base38)。VID/PID/discriminator(12bit)/passcode/
+/// discovery caps(bit0 SoftAP, bit1 BLE, bit2 on-network)/ commissioning flow=0。
+pub fn qr_payload(p: &OnboardingPayload, out: &mut [u8]) -> Result<usize>;   // "MT:" 含めて ≤ 32 B
+pub struct OnboardingPayload { pub vendor_id: u16, pub product_id: u16, pub discriminator: u16,
+                               pub passcode: u32, pub discovery_caps: u8 }
+```
+テストベクタ: chip-tool `payload generate-qrcode` 既知値(例: VID 0xFFF1 PID 0x8000 disc 3840 passcode 20202021
+→ `MT:Y.K9042C00KA0648G00`)+ manual code の既存ベクタ移設。
+
+`ControllerStack` に OCW 専用ヘルパ(smctl / shim 共用):
+```rust
+pub struct OpenWindowParams { pub timeout_s: u16, pub discriminator: u16, pub passcode: u32,
+                              pub salt: [u8; 16], pub iterations: u32 /* 1000 */ }
+pub fn start_open_commissioning_window(&mut self, session, p: &OpenWindowParams, now_ms, tx) -> Result<SendDirective>;
+pub fn start_revoke_commissioning(&mut self, session, now_ms, tx) -> Result<SendDirective>;
+```
+中身 = `compute_verifier` → InvokeRequest(EP0/0x003C/0x00、fields 0..4)を `start_invoke_timed` で。Revoke は
+0x02 を timed invoke。完了は従来の `ImEvent::InvokeDone { status }`(クラスタ固有ステータス Busy=2 /
+PAKEParameterError=3 / WindowNotOpen=4 は `status` に載る)。smctl の `admin_open_window` はこれらを呼ぶ形に置換
+(出力は不変、QR 文字列を追加表示)。
+
+### 17.3 shim(`crates/simple-matter-cffi`)
+
+```c
+typedef struct {
+  uint64_t node_id; uint16_t timeout_s; uint16_t discriminator; uint32_t passcode;
+  uint16_t vendor_id; uint16_t product_id;      // QR 用(取得できなければ 0)
+  char manual_code[12];                          // 11 桁 + NUL
+  char qr_payload[32];                           // "MT:..." + NUL
+  uint64_t opened_at_ms;                         // 0 = 未オープン
+} sm_ctrl_window_t;
+
+// ECM 窓を開く。passcode=0 なら乱数生成、discriminator=0xFFFF なら乱数(12bit)。timeout 180..900。
+// 内部で (1) EP0 BasicInformation VendorID(0x0002)/ProductID(0x0004) を read(失敗しても続行、QR は VID/PID=0)、
+// (2) OpenCommissioningWindow を timed invoke。完了は SM_CTRL_EV_WINDOW_OPENED(value_u64=passcode、
+// endpoint=discriminator、attribute=timeout_s)/ SM_CTRL_EV_WINDOW_FAILED(status=クラスタステータス or IM ステータス、
+// phase=失敗段階 1=VID read 2=PID read 3=invoke)。戻り値は他の op と同じ(-10 busy 等)。
+int32_t sm_ctrl_open_commissioning_window(uint64_t node_id, uint16_t timeout_s, uint16_t discriminator,
+                                          uint32_t passcode, uint64_t now_ms);
+// 直近に開いた窓の情報(manual code / QR 文字列込み)。未オープンなら false。
+bool sm_ctrl_last_window(sm_ctrl_window_t *out);
+// RevokeCommissioning(timed invoke)。完了は INVOKE_DONE / INVOKE_FAILED(node_id で識別)。
+int32_t sm_ctrl_revoke_commissioning(uint64_t node_id, uint64_t now_ms);
+```
+- 実装: `PendingOp::OpenWindow { step, params }` の 3 段階(read VID → read PID → timed invoke)を `drive_awaitop`
+  で直列に進める(既存の単一トランザクション直列の枠内。各段階で `issue_op` を再発行)。RNG は shim の `CRng`。
+- `SM_CTRL_EV_WINDOW_OPENED = 18` / `SM_CTRL_EV_WINDOW_FAILED = 19`。
+- WindowStatus の確認は既存 `sm_ctrl_read_scalar(node, 0, 0x003C, 0x0000)` で(0=閉 1=ECM 2=BC)。
+
+### 17.4 Tab5(`tab5_ctrl_app`)
+
+- Devices タブ各行に **「Share」ボタン**(幅 110。名前列 480→370 で捻出。合計 ≤1280 を維持)。
+- `SM_UI_OP_OPEN_WINDOW`(timeout 既定 300 s、discriminator 乱数、passcode 乱数)/ `SM_UI_OP_REVOKE_WINDOW` を追加。
+  pump: `sm_ctrl_open_commissioning_window` → `run_until(term_window)`(30 s)→ 成功なら `sm_ctrl_last_window` を
+  スナップショット `window` 欄(`sm_ui_window_t`: node_id / passcode / discriminator / manual_code / qr / expires_ms /
+  status)へ、失敗は note "open window failed (status N)"。
+- **Share ダイアログ**(pair ダイアログと同作法): 見出し「Share <node> with another controller」、manual pairing
+  code(montserrat 48、`XXXX-XXX-XXXX` 区切り)、passcode / discriminator(小)、QR(`lv_qrcode`、220px)、残り時間
+  「closes in N s」(snapshot の now_ms から計算)、ボタン **Revoke**(→ `SM_UI_OP_REVOKE_WINDOW`)と **Close**。
+  ダイアログ表示中は pump が 10 秒ごとに WindowStatus を read(既存 poll tick 内、対象ノードのみ)し、閉じたら
+  `status=closed` にして「window closed」表示。Revoke 完了/期限切れで自動的に closed。
+- 行の note に "window open (N s)" を出す。`nodes` 出力に `window=` を追加。
+- console: `openwindow <node_hex> [timeout_s] [disc]` / `revoke <node_hex>` / `window`(直近の窓を表示)を追加
+  (tab5ctl で自走検証できるように)。
+
+### 17.5 デバイス側の確認・調整
+
+- cffi デバイス(onoff_light_cpp / NanoC6): `NF`(fabric 容量)≥ 2、AdministratorCommissioning が EP0 に組み込まれ、
+  ECW open → PASE(動的 verifier)→ AddNOC で 2 fabric 目が入ること。不足なら NF を 2 以上に(KVS 容量も確認)。
+- AirQ(Rust)は chip-tool で実証済み。
+
+### 17.6 テスト・ゲート
+
+- コア: onboarding のベクタテスト(manual code 既存 + QR 新規)、`start_open_commissioning_window` の
+  InvokeRequest エンコード(fields 0..4、timed)テスト。
+- **ctrl↔dev ループバック E2E**(`stack/tests.rs`): コントローラ A がコミッション → A が OCW(生成 passcode)→
+  デバイス WindowStatus=1 → **コントローラ B(2 つ目の `ControllerStack`)が PASE(その passcode)→ AddNOC で
+  2 fabric 目** → B から OnOff read 成功、A からも引き続き操作可 → A が Revoke → WindowStatus=0。
+- shim: `composed_e2e` に open window → `sm_ctrl_last_window` の manual/QR が妥当 → WindowStatus read=1 → revoke → 0。
+- 実機: Tab5 の Share → 表示された manual code で **PC の smctl(別 state-dir)`pairing code`/onnetwork-long** で
+  NanoC6・AirQ に 2 fabric 目 → smctl から toggle/read、Tab5 からも引き続き購読・操作できる。tab5ctl で
+  `openwindow` → `window` → screenshot(QR 表示)。

@@ -32,6 +32,7 @@ use core::num::NonZeroU8;
 
 use crate::buf::BufferPool;
 use crate::crypto::{Crypto, Rng};
+use crate::dm::meta::{ClusterId, CommandId, EndpointId};
 use crate::error::{Error, Result};
 use crate::exchange::{
     ExchangeId, ExchangeManager, HandlerAction, Outgoing, PollAction, ProtocolMux, SendTiming,
@@ -54,6 +55,41 @@ use crate::transport::util::WriteBuf;
 use ca::Ca;
 
 pub use ca::CONTROLLER_FABRIC_INDEX;
+
+// ==========================================================================
+// AdministratorCommissioning(コミッショニング窓を開く。設計 §17.2)
+// ==========================================================================
+
+/// AdministratorCommissioning クラスタ ID(§11.19)。
+const ADMIN_COMMISSIONING_CLUSTER: u32 = 0x003C;
+/// OpenCommissioningWindow(ECM)コマンド ID。
+const CMD_OPEN_COMMISSIONING_WINDOW: u32 = 0x00;
+/// RevokeCommissioning コマンド ID。
+const CMD_REVOKE_COMMISSIONING: u32 = 0x02;
+/// PAKEPasscodeVerifier の長さ(w0(32) ‖ L(65))。
+const PAKE_VERIFIER_LEN: usize =
+    crate::dm::clusters::administrator_commissioning::PAKE_VERIFIER_LEN;
+
+/// timed invoke の TimedRequest タイムアウト(ミリ秒。chip-tool 既定の 10 秒相当)。
+pub const TIMED_INVOKE_TIMEOUT_MS: u16 = 10_000;
+
+/// PBKDF2 iteration count の既定値(仕様の下限 = 1000。窓オープンの負荷を最小にする)。
+pub const DEFAULT_WINDOW_ITERATIONS: u32 = 1000;
+
+/// [`ControllerStack::start_open_commissioning_window`] の引数(設計 §17.2)。
+#[derive(Clone, Copy, Debug)]
+pub struct OpenWindowParams {
+    /// 窓を開けておく秒数(仕様の許容範囲 180..=900)。
+    pub timeout_s: u16,
+    /// 窓の 12 ビット discriminator(2 人目のコントローラが mDNS で探す鍵)。
+    pub discriminator: u16,
+    /// 払い出す setup passcode(デバイスへは verifier しか渡らない)。
+    pub passcode: u32,
+    /// PBKDF2 salt(16 バイト。窓ごとに乱数)。
+    pub salt: [u8; 16],
+    /// PBKDF2 iteration count([`DEFAULT_WINDOW_ITERATIONS`])。
+    pub iterations: u32,
+}
 
 // ==========================================================================
 // CASE 用の creds(コントローラの自 fabric ビュー)
@@ -228,6 +264,14 @@ impl<
     /// IM client の完了/失敗イベントを 1 件取り出す(§4.4)。
     pub fn im_take_event(&mut self) -> Option<ImEvent> {
         self.mgr.handler_mut().im.take_event()
+    }
+
+    /// 直近の InvokeResponse のクラスタ固有ステータス(無ければ `None`)。
+    ///
+    /// [`ImEvent::InvokeDone`] の `status` が `Failure` のとき、クラスタ固有コード
+    /// (AdministratorCommissioning の Busy=2 / PAKEParameterError=3 等)をここで取る。
+    pub fn im_last_cluster_status(&self) -> Option<u8> {
+        self.mgr.handler().im.last_cluster_status()
     }
 
     /// 直近 IM 応答の結果 payload(生 TLV)。
@@ -740,6 +784,80 @@ impl<
             PROTO_ID_INTERACTION_MODEL,
             ImOpCode::TimedRequest.to_u8(),
             len,
+            now_ms,
+            tx_out,
+        )
+    }
+
+    /// 既存 fabric の管理者として **ECM コミッショニング窓**を開く
+    /// (AdministratorCommissioning 0x003C / OpenCommissioningWindow 0x00、timed invoke)。
+    ///
+    /// `p.passcode` から SPAKE2+ verifier(w0 ‖ L、97 B)を導出して EP0 へ送る。デバイスは
+    /// passcode を受け取らない(仕様要件)。完了は通常の invoke と同じ
+    /// [`ImEvent::InvokeDone`] で、クラスタ固有ステータス(Busy=2 / PAKEParameterError=3)は
+    /// `status` に載る。
+    ///
+    /// 払い出した passcode / discriminator は
+    /// [`onboarding`](crate::discovery::onboarding) で manual pairing code / QR にして
+    /// 2 人目のコントローラへ渡す(`docs/design/p4-thread-controller.md` §17.2)。
+    #[cfg(feature = "rustcrypto")]
+    pub fn start_open_commissioning_window(
+        &mut self,
+        session: SessionId,
+        p: &OpenWindowParams,
+        now_ms: u64,
+        tx_out: &mut [u8],
+    ) -> Result<SendDirective> {
+        let v = crate::crypto::spake2p::compute_verifier(p.passcode, &p.salt, p.iterations)?;
+        let mut verifier = [0u8; PAKE_VERIFIER_LEN];
+        verifier[..v.w0.len()].copy_from_slice(&v.w0);
+        verifier[v.w0.len()..].copy_from_slice(&v.l);
+        let (timeout_s, discriminator, iterations, salt) =
+            (p.timeout_s, p.discriminator, p.iterations, p.salt);
+        self.start_invoke_timed(
+            session,
+            TIMED_INVOKE_TIMEOUT_MS,
+            CommandPath::new(
+                EndpointId(0),
+                ClusterId(ADMIN_COMMISSIONING_CLUSTER),
+                CommandId(CMD_OPEN_COMMISSIONING_WINDOW),
+            ),
+            move |w, t| {
+                w.start_struct(t)?;
+                w.write_u16(&TlvTag::ContextSpecific(0), timeout_s)?;
+                w.write_bytes(&TlvTag::ContextSpecific(1), &verifier)?;
+                w.write_u16(&TlvTag::ContextSpecific(2), discriminator)?;
+                w.write_u32(&TlvTag::ContextSpecific(3), iterations)?;
+                w.write_bytes(&TlvTag::ContextSpecific(4), &salt)?;
+                w.end_container()
+            },
+            now_ms,
+            tx_out,
+        )
+    }
+
+    /// 開いているコミッショニング窓を閉じる(0x003C / RevokeCommissioning 0x02、timed invoke)。
+    ///
+    /// 完了は [`ImEvent::InvokeDone`](窓が開いていなければ `status` に
+    /// クラスタ固有 WindowNotOpen=4)。
+    pub fn start_revoke_commissioning(
+        &mut self,
+        session: SessionId,
+        now_ms: u64,
+        tx_out: &mut [u8],
+    ) -> Result<SendDirective> {
+        self.start_invoke_timed(
+            session,
+            TIMED_INVOKE_TIMEOUT_MS,
+            CommandPath::new(
+                EndpointId(0),
+                ClusterId(ADMIN_COMMISSIONING_CLUSTER),
+                CommandId(CMD_REVOKE_COMMISSIONING),
+            ),
+            |w, t| {
+                w.start_struct(t)?;
+                w.end_container()
+            },
             now_ms,
             tx_out,
         )

@@ -29,8 +29,9 @@ use crate::crypto::rustcrypto::RustCrypto;
 use crate::crypto::spake2p::Spake2pProver;
 use crate::crypto::{Crypto, P256Keypair, P256PublicKey, Rng, Sha256};
 use crate::dm::clusters::{
-    BasicInfoConfig, BasicInformationCluster, DescriptorCluster, GeneralCommissioning,
-    NetworkCommissioning, OnOffCluster, OpCredsCluster, TestDacProvider,
+    AdminCommissioningCluster, BasicInfoConfig, BasicInformationCluster, CommissioningWindow,
+    DescriptorCluster, GeneralCommissioning, NetworkCommissioning, OnOffCluster, OpCredsCluster,
+    TestDacProvider,
 };
 use crate::dm::meta::{ClusterId, DeviceType, EndpointId, EndpointMeta};
 use crate::dm::{DataModel, ServerCluster};
@@ -114,6 +115,15 @@ static EP0_SERVERS: &[ClusterId] = &[
     ClusterId(0x003E),
     ClusterId(0x001D),
 ];
+/// AdministratorCommissioning(0x003C)入りの EP0(OCW の E2E 用。`build_device_admin`)。
+static EP0_SERVERS_ADMIN: &[ClusterId] = &[
+    ClusterId(0x0028),
+    ClusterId(0x0030),
+    ClusterId(0x0031),
+    ClusterId(0x003C),
+    ClusterId(0x003E),
+    ClusterId(0x001D),
+];
 static EP1_SERVERS: &[ClusterId] = &[ClusterId(0x0006), ClusterId(0x001D)];
 static EP0_DT: &[DeviceType] = &[DeviceType::new(0x0016, 1)];
 static EP1_DT: &[DeviceType] = &[DeviceType::new(0x0100, 3)];
@@ -127,6 +137,9 @@ struct Dev<'s, N: ServerCluster = NetworkCommissioning> {
     basic: BasicInformationCluster,
     gc: GeneralCommissioning,
     net: N,
+    /// AdministratorCommissioning(0x003C)。窓状態は呼び出し側所有の RefCell を共有する。
+    /// `None` = このデバイスは窓を持たない(EP0 の ServerList にも出さない)。
+    admin: Option<AdminCommissioningCluster<'s>>,
     opcreds: Op<'s>,
     desc0: DescriptorCluster,
     onoff: OnOffCluster,
@@ -144,11 +157,20 @@ impl<N: ServerCluster> DataModel for Dev<'_, N> {
             EndpointMeta::new(EndpointId(0), EP0_DT, EP0_SERVERS),
             EndpointMeta::new(EndpointId(1), EP1_DT, EP1_SERVERS),
         ];
-        EPS
+        static EPS_ADMIN: &[EndpointMeta] = &[
+            EndpointMeta::new(EndpointId(0), EP0_DT, EP0_SERVERS_ADMIN),
+            EndpointMeta::new(EndpointId(1), EP1_DT, EP1_SERVERS),
+        ];
+        if self.admin.is_some() {
+            EPS_ADMIN
+        } else {
+            EPS
+        }
     }
 
     fn clusters_on(&self, ep: EndpointId) -> &[ClusterId] {
         match ep.0 {
+            0 if self.admin.is_some() => EP0_SERVERS_ADMIN,
             0 => EP0_SERVERS,
             1 => EP1_SERVERS,
             _ => &[],
@@ -160,6 +182,7 @@ impl<N: ServerCluster> DataModel for Dev<'_, N> {
             (0, 0x0028) => Some(&self.basic),
             (0, 0x0030) => Some(&self.gc),
             (0, 0x0031) => Some(&self.net),
+            (0, 0x003C) => self.admin.as_ref().map(|c| c as &dyn ServerCluster),
             (0, 0x003E) => Some(&self.opcreds),
             (0, 0x001D) => Some(&self.desc0),
             (1, 0x0006) => Some(&self.onoff),
@@ -173,6 +196,7 @@ impl<N: ServerCluster> DataModel for Dev<'_, N> {
             (0, 0x0028) => Some(&mut self.basic),
             (0, 0x0030) => Some(&mut self.gc),
             (0, 0x0031) => Some(&mut self.net),
+            (0, 0x003C) => self.admin.as_mut().map(|c| c as &mut dyn ServerCluster),
             (0, 0x003E) => Some(&mut self.opcreds),
             (0, 0x001D) => Some(&mut self.desc0),
             (1, 0x0006) => Some(&mut self.onoff),
@@ -182,6 +206,10 @@ impl<N: ServerCluster> DataModel for Dev<'_, N> {
     }
 
     fn on_tick(&mut self, now_ms: u64) -> Option<u64> {
+        // 窓の期限切れ(WindowEvent::Closed を積む)。
+        if let Some(admin) = self.admin.as_mut() {
+            let _ = admin.on_tick(now_ms);
+        }
         if self.gc.on_tick(now_ms) {
             if let Some(idx) = self.opcreds.on_failsafe_expired() {
                 self.removed_fabric = Some(idx);
@@ -211,6 +239,19 @@ fn build_device(fabrics: &RefCell<FabricTable<Crb, 5>>) -> Dev<'_> {
     build_device_with(fabrics, NetworkCommissioning::new(b"eth0"))
 }
 
+/// コミッショニング窓の状態を呼び出し側と共有するデバイス(OCW の E2E 用)。
+///
+/// EP0 に AdministratorCommissioning(0x003C)が生え、Descriptor の ServerList にも載る。
+fn build_device_admin<'s>(
+    fabrics: &'s RefCell<FabricTable<Crb, 5>>,
+    window: &'s RefCell<CommissioningWindow>,
+) -> Dev<'s> {
+    let mut dev = build_device_with(fabrics, NetworkCommissioning::new(b"eth0"));
+    dev.admin = Some(AdminCommissioningCluster::new(window));
+    dev.desc0 = DescriptorCluster::new(EndpointId(0), EP0_DT, EP0_SERVERS_ADMIN, &[], EP0_PARTS);
+    dev
+}
+
 /// CD を 1 バイト改竄した DAC provider を持つデバイス(CD CMS 検証の失敗系 E2E 用)。
 fn build_device_tampered_cd(fabrics: &RefCell<FabricTable<Crb, 5>>) -> Dev<'_> {
     let dac_crypto = RustCrypto::new(SeqRng(0xDAC0_0001));
@@ -219,6 +260,7 @@ fn build_device_tampered_cd(fabrics: &RefCell<FabricTable<Crb, 5>>) -> Dev<'_> {
         basic: BasicInformationCluster::new(&CFG),
         gc: GeneralCommissioning::default_config(),
         net: NetworkCommissioning::new(b"eth0"),
+        admin: None,
         opcreds: OpCredsCluster::new_shared(fabrics, RustCrypto::new(SeqRng(0x00C0_0001)), dac),
         desc0: DescriptorCluster::new(EndpointId(0), EP0_DT, EP0_SERVERS, &[], EP0_PARTS),
         onoff: OnOffCluster::new(),
@@ -239,6 +281,7 @@ fn build_device_with<N: ServerCluster>(
         basic: BasicInformationCluster::new(&CFG),
         gc: GeneralCommissioning::default_config(),
         net,
+        admin: None,
         opcreds: OpCredsCluster::new_shared(fabrics, RustCrypto::new(SeqRng(0x00C0_0001)), dac),
         desc0: DescriptorCluster::new(EndpointId(0), EP0_DT, EP0_SERVERS, &[], EP0_PARTS),
         onoff: OnOffCluster::new(),
@@ -3367,6 +3410,583 @@ mod controller_e2e {
             onoff,
             "final read"
         ));
+    }
+    // ======================================================================
+    // T9: コミッショニング窓を開いて 2 人目のコントローラを迎える(設計 §17.6)
+    // ======================================================================
+
+    use crate::dm::clusters::WindowEvent;
+
+    /// 窓オープンの E2E で使うデバイススタック(セッション/exchange をやや大きめに取る:
+    /// 2 コントローラ分の PASE + CASE が同居する)。
+    type WinDev<'s> = MatterStack<'s, Crb, SeqRng, Dev<'s>, 5, 8, 8, 4, 2, 2, 3, 8>;
+
+    /// コントローラ B のアドレス(A と別 IP。デバイスから見た送信元を分ける)。
+    fn ctrl_b_addr() -> PeerAddr {
+        PeerAddr::Udp(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 11)),
+            5540,
+        ))
+    }
+
+    /// 3 者ネットワークのノード識別。
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Who {
+        Dev,
+        A,
+        B,
+    }
+
+    fn who_addr(w: Who) -> PeerAddr {
+        match w {
+            Who::Dev => peer(),
+            Who::A => ctrl_addr(),
+            Who::B => ctrl_b_addr(),
+        }
+    }
+
+    fn who_of(addr: PeerAddr) -> Who {
+        if addr == ctrl_addr() {
+            Who::A
+        } else if addr == ctrl_b_addr() {
+            Who::B
+        } else {
+            Who::Dev
+        }
+    }
+
+    /// 窓状態の変化をデバイスの app ループ相当で反映する(設計 §4/§5)。
+    fn apply_window(dev: &mut WinDev<'_>, window: &RefCell<CommissioningWindow>) {
+        let ev = window.borrow_mut().take_event();
+        match ev {
+            Some(WindowEvent::OpenedEnhanced { .. }) | Some(WindowEvent::OpenedBasic) => {
+                let cfg = window.borrow().pase_config();
+                if let Some(cfg) = cfg {
+                    dev.set_pase_config(cfg);
+                    dev.set_pase_enabled(true);
+                }
+            }
+            Some(WindowEvent::Closed) => dev.set_pase_enabled(false),
+            None => {}
+        }
+    }
+
+    /// 1 パケットを `dst` へ渡し、応答が続く限り 3 者間で連鎖配送する。
+    #[allow(clippy::too_many_arguments)]
+    fn relay<'s>(
+        a: &mut Ctrl<'s>,
+        b: &mut Ctrl<'s>,
+        dev: &mut WinDev<'_>,
+        window: &RefCell<CommissioningWindow>,
+        now: u64,
+        first: &[u8],
+        mut src: Who,
+        mut dst: Who,
+    ) {
+        let mut buf = [0u8; 1700];
+        let mut len = first.len();
+        buf[..len].copy_from_slice(first);
+        let mut tx = [0u8; 1700];
+        for _ in 0..32 {
+            let dir = match dst {
+                Who::Dev => {
+                    let d = dev.handle_rx(&mut buf[..len], who_addr(src), now, &mut tx);
+                    apply_window(dev, window);
+                    d
+                }
+                Who::A => a.handle_rx(&mut buf[..len], who_addr(src), now, &mut tx),
+                Who::B => b.handle_rx(&mut buf[..len], who_addr(src), now, &mut tx),
+            };
+            match dir {
+                Some(d) => {
+                    buf[..d.len].copy_from_slice(&tx[..d.len]);
+                    len = d.len;
+                    src = dst;
+                    dst = who_of(d.addr);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// 時間を進めながら 3 者を poll し、ACK / 再送を流し切って静穏化する。
+    fn settle<'s>(
+        a: &mut Ctrl<'s>,
+        b: &mut Ctrl<'s>,
+        dev: &mut WinDev<'_>,
+        window: &RefCell<CommissioningWindow>,
+        base_now: u64,
+    ) {
+        let mut now = base_now;
+        for _ in 0..16 {
+            now += 400;
+            let mut progressed = false;
+            let mut tx = [0u8; 1700];
+            let mut buf = [0u8; 1700];
+            while let Some(d) = a.poll(now, &mut tx) {
+                buf[..d.len].copy_from_slice(&tx[..d.len]);
+                relay(
+                    a,
+                    b,
+                    dev,
+                    window,
+                    now,
+                    &buf[..d.len],
+                    Who::A,
+                    who_of(d.addr),
+                );
+                progressed = true;
+            }
+            while let Some(d) = b.poll(now, &mut tx) {
+                buf[..d.len].copy_from_slice(&tx[..d.len]);
+                relay(
+                    a,
+                    b,
+                    dev,
+                    window,
+                    now,
+                    &buf[..d.len],
+                    Who::B,
+                    who_of(d.addr),
+                );
+                progressed = true;
+            }
+            while let Some(d) = dev.poll(now, &mut tx) {
+                buf[..d.len].copy_from_slice(&tx[..d.len]);
+                relay(
+                    a,
+                    b,
+                    dev,
+                    window,
+                    now,
+                    &buf[..d.len],
+                    Who::Dev,
+                    who_of(d.addr),
+                );
+                progressed = true;
+            }
+            apply_window(dev, window);
+            let quiescent = a.next_deadline(now).is_none()
+                && b.next_deadline(now).is_none()
+                && dev.next_deadline(now).is_none();
+            if !progressed && quiescent {
+                break;
+            }
+        }
+    }
+
+    /// `from` が送った 1 パケットをデバイスへ届け、応答往復と ACK を流し切る。
+    #[allow(clippy::too_many_arguments)]
+    fn deliver<'s>(
+        a: &mut Ctrl<'s>,
+        b: &mut Ctrl<'s>,
+        dev: &mut WinDev<'_>,
+        window: &RefCell<CommissioningWindow>,
+        now: u64,
+        tx: &[u8],
+        len: usize,
+        from: Who,
+    ) {
+        relay(a, b, dev, window, now, &tx[..len], from, Who::Dev);
+        settle(a, b, dev, window, now);
+    }
+
+    /// コントローラ 1 台のスカラ属性 read(値は最初の報告を返す)。
+    #[allow(clippy::too_many_arguments)]
+    fn read_scalar<'s>(
+        ctrl_is_a: bool,
+        a: &mut Ctrl<'s>,
+        b: &mut Ctrl<'s>,
+        dev: &mut WinDev<'_>,
+        window: &RefCell<CommissioningWindow>,
+        session: crate::transport::session::SessionId,
+        path: AttributePath,
+        now: u64,
+    ) -> Option<TlvValue<'static>> {
+        let mut tx = [0u8; 1700];
+        let dir = {
+            let ctrl: &mut Ctrl<'s> = if ctrl_is_a { a } else { b };
+            ctrl.start_read(session, &[path], now, &mut tx).ok()?
+        };
+        deliver(
+            a,
+            b,
+            dev,
+            window,
+            now,
+            &tx,
+            dir.len,
+            if ctrl_is_a { Who::A } else { Who::B },
+        );
+        let ctrl: &mut Ctrl<'s> = if ctrl_is_a { a } else { b };
+        if ctrl.im_take_event() != Some(ImEvent::ReadDone) {
+            return None;
+        }
+        let mut out = None;
+        for report in ctrl.read_reports() {
+            if let Ok(AttributeReportRef::Data(d)) = report {
+                if d.path.attribute == path.attribute {
+                    let mut v = d.value();
+                    if let Ok(Some(e)) = v.read_next() {
+                        out = match e.value {
+                            TlvValue::UnsignedInteger(u) => Some(TlvValue::UnsignedInteger(u)),
+                            TlvValue::Boolean(x) => Some(TlvValue::Boolean(x)),
+                            _ => None,
+                        };
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// T9 E2E(設計 §17.6): A がコミッション → OCW で窓を開く → **B(2 つ目の
+    /// `ControllerStack`)が払い出し passcode で PASE + AddNOC** → デバイスに 2 fabric 目 →
+    /// B から read できる / A も引き続き操作できる → A が Revoke → WindowStatus = 0。
+    #[test]
+    fn open_commissioning_window_admits_second_controller() {
+        use crate::controller::OpenWindowParams;
+        use crate::dm::clusters::administrator_commissioning::window_status;
+
+        /// 2 人目へ払い出す setup passcode(仕様の禁止値でない任意値)。
+        const NEW_PASSCODE: u32 = 17_654_321;
+        /// 窓の discriminator(12 ビット)。
+        const NEW_DISCRIMINATOR: u16 = 0x0ABC;
+        /// コントローラ B の fabric / ノード。
+        const FABRIC_ID_B: u64 = 0xFAB2;
+        const COMM_NODE_B: u64 = 0x3344;
+        const DEVICE_NODE_B: u64 = 0xCCDD;
+
+        let crypto = RustCrypto::new(SeqRng(0x0C90_0001_1234_5678));
+        let fabrics: RefCell<FabricTable<Crb, 5>> = RefCell::new(FabricTable::new());
+        let window = RefCell::new(CommissioningWindow::new());
+
+        // --- デバイス: AdministratorCommissioning 付き ---
+        let config = PaseConfig::from_passcode(PASSCODE, &SALT, ITERATIONS).unwrap();
+        let dev_creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
+        let sc = SecureChannel::new(&crypto, SeqRng(0x5C00_0900), config, dev_creds);
+        let im = InteractionModel::new(build_device_admin(&fabrics, &window));
+        let mut dev: WinDev = MatterStack::new(&crypto, sc, im);
+
+        // --- コントローラ A(1 人目 = 管理者)---
+        let ca_a = Ca::<Crb>::generate(
+            &crypto,
+            &mut SeqRng(0xCA00_0900),
+            FABRIC_ID,
+            COMM_NODE,
+            0xFFF1,
+            0,
+        )
+        .expect("Ca::generate(A)");
+        let sc_a = ScInitiator::new(
+            &crypto,
+            SeqRng(0x1C00_0900),
+            ControllerCreds::new(&ca_a, &crypto, 0),
+        );
+        let mut ctrl_a: Ctrl = ControllerStack::new(&crypto, sc_a, ImClient::new());
+
+        // --- コントローラ B(2 人目。まだデバイスを知らない)---
+        let ca_b = Ca::<Crb>::generate(
+            &crypto,
+            &mut SeqRng(0xCB00_0900),
+            FABRIC_ID_B,
+            COMM_NODE_B,
+            0xFFF1,
+            0,
+        )
+        .expect("Ca::generate(B)");
+        let sc_b = ScInitiator::new(
+            &crypto,
+            SeqRng(0x1C00_0901),
+            ControllerCreds::new(&ca_b, &crypto, 0),
+        );
+        let mut ctrl_b: Ctrl = ControllerStack::new(&crypto, sc_b, ImClient::new());
+
+        // --- (1) A が焼き込み passcode でコミッショニング ---
+        let mut comm_a = Commissioner::new(&ca_a, &crypto, AttestationPolicy::Skip);
+        comm_a
+            .commission(peer(), PASSCODE, DEVICE_NODE, NOW)
+            .unwrap();
+        let mut tx = [0u8; 1700];
+        let mut phase_a = comm_a.phase();
+        for _ in 0..60 {
+            let out = comm_a.drive(&mut ctrl_a, NOW, &mut tx);
+            phase_a = out.phase;
+            if let Some(d) = out.send {
+                deliver(
+                    &mut ctrl_a,
+                    &mut ctrl_b,
+                    &mut dev,
+                    &window,
+                    NOW,
+                    &tx,
+                    d.len,
+                    Who::A,
+                );
+            }
+            match out.phase {
+                Phase::Done { .. } | Phase::Failed { .. } => break,
+                _ => {}
+            }
+        }
+        let session_a = match phase_a {
+            Phase::Done { session } => session,
+            other => panic!("controller A commissioning did not complete: {other:?}"),
+        };
+        assert_eq!(fabrics.borrow().len(), 1, "1 fabric after A");
+
+        // 窓はまだ閉じている。
+        let ws = AttributePath::concrete(EndpointId(0), ClusterId(0x003C), AttributeId(0x0000));
+        assert_eq!(
+            read_scalar(
+                true,
+                &mut ctrl_a,
+                &mut ctrl_b,
+                &mut dev,
+                &window,
+                session_a,
+                ws,
+                NOW
+            ),
+            Some(TlvValue::UnsignedInteger(
+                window_status::WINDOW_NOT_OPEN as u64
+            )),
+            "WindowStatus = 0 (closed)"
+        );
+
+        // --- (2) A が OpenCommissioningWindow(ECM、timed invoke)---
+        let params = OpenWindowParams {
+            timeout_s: 300,
+            discriminator: NEW_DISCRIMINATOR,
+            passcode: NEW_PASSCODE,
+            salt: *b"T9 window salt !",
+            iterations: 1000,
+        };
+        let dir = ctrl_a
+            .start_open_commissioning_window(session_a, &params, NOW, &mut tx)
+            .expect("start_open_commissioning_window");
+        deliver(
+            &mut ctrl_a,
+            &mut ctrl_b,
+            &mut dev,
+            &window,
+            NOW,
+            &tx,
+            dir.len,
+            Who::A,
+        );
+        match ctrl_a.im_take_event() {
+            Some(ImEvent::InvokeDone { status }) => {
+                assert_eq!(status, ImStatus::Success, "OpenCommissioningWindow");
+            }
+            other => panic!("expected InvokeDone(OCW), got {other:?}"),
+        }
+        assert_eq!(
+            window.borrow().status(),
+            window_status::ENHANCED_WINDOW_OPEN,
+            "device window is ECM-open"
+        );
+        // InvokeRequest の fields 0..4 がデバイスに正しく届いていること
+        // (field 2 = discriminator、field 3/4 = iterations/salt、field 1 = verifier は
+        // 下の B の PASE 成立が担保する。timed 必須なのはクラスタ meta が @timed のため)。
+        assert_eq!(window.borrow().discriminator(), NEW_DISCRIMINATOR);
+        {
+            let g = window.borrow();
+            let (_verifier, salt, iterations) = g.pase_params().expect("ECM pase params");
+            assert_eq!(salt, b"T9 window salt !");
+            assert_eq!(iterations, 1000);
+        }
+        assert_eq!(
+            read_scalar(
+                true,
+                &mut ctrl_a,
+                &mut ctrl_b,
+                &mut dev,
+                &window,
+                session_a,
+                ws,
+                NOW
+            ),
+            Some(TlvValue::UnsignedInteger(
+                window_status::ENHANCED_WINDOW_OPEN as u64
+            )),
+            "WindowStatus = 1 (ECM)"
+        );
+
+        // 払い出し文字列(2 人目へ渡すもの)が生成できること。
+        let manual =
+            crate::discovery::onboarding::manual_pairing_code(NEW_DISCRIMINATOR, NEW_PASSCODE);
+        assert!(manual.iter().all(|b| b.is_ascii_digit()));
+
+        // --- (3) B が払い出し passcode で PASE → AddNOC(2 fabric 目)---
+        let mut comm_b = Commissioner::new(&ca_b, &crypto, AttestationPolicy::Skip);
+        comm_b
+            .commission(peer(), NEW_PASSCODE, DEVICE_NODE_B, NOW)
+            .unwrap();
+        let mut phase_b = comm_b.phase();
+        for _ in 0..60 {
+            let out = comm_b.drive(&mut ctrl_b, NOW, &mut tx);
+            phase_b = out.phase;
+            if let Some(d) = out.send {
+                deliver(
+                    &mut ctrl_a,
+                    &mut ctrl_b,
+                    &mut dev,
+                    &window,
+                    NOW,
+                    &tx,
+                    d.len,
+                    Who::B,
+                );
+            }
+            match out.phase {
+                Phase::Done { .. } | Phase::Failed { .. } => break,
+                _ => {}
+            }
+        }
+        let session_b = match phase_b {
+            Phase::Done { session } => session,
+            other => panic!("controller B commissioning did not complete: {other:?}"),
+        };
+        assert_eq!(fabrics.borrow().len(), 2, "2 fabrics after B");
+        {
+            let g = fabrics.borrow();
+            let fe = g.get(NonZeroU8::new(2).unwrap()).unwrap();
+            assert_eq!(fe.node_id(), DEVICE_NODE_B);
+            assert_eq!(fe.fabric_id(), FABRIC_ID_B);
+        }
+
+        // --- (4) B から read できる ---
+        let onoff = AttributePath::concrete(EndpointId(1), ClusterId(0x0006), AttributeId(0x0000));
+        assert_eq!(
+            read_scalar(
+                false,
+                &mut ctrl_a,
+                &mut ctrl_b,
+                &mut dev,
+                &window,
+                session_b,
+                onoff,
+                NOW
+            ),
+            Some(TlvValue::Boolean(false)),
+            "controller B reads OnOff over its own CASE"
+        );
+
+        // --- (5) A も引き続き操作できる(既存 fabric が壊れていない)---
+        let dir = ctrl_a
+            .start_invoke(
+                session_a,
+                CommandPath::new(EndpointId(1), ClusterId(0x0006), CommandId(0x01)),
+                |w, t| {
+                    w.start_struct(t)?;
+                    w.end_container()
+                },
+                NOW,
+                &mut tx,
+            )
+            .expect("A: OnOff On");
+        deliver(
+            &mut ctrl_a,
+            &mut ctrl_b,
+            &mut dev,
+            &window,
+            NOW,
+            &tx,
+            dir.len,
+            Who::A,
+        );
+        assert_eq!(
+            ctrl_a.im_take_event(),
+            Some(ImEvent::InvokeDone {
+                status: ImStatus::Success
+            })
+        );
+        assert!(dev.device().onoff.is_on(), "A still controls the device");
+        // B から見ても反映されている。
+        assert_eq!(
+            read_scalar(
+                false,
+                &mut ctrl_a,
+                &mut ctrl_b,
+                &mut dev,
+                &window,
+                session_b,
+                onoff,
+                NOW
+            ),
+            Some(TlvValue::Boolean(true)),
+            "controller B sees the change made by A"
+        );
+
+        // --- (6) A が Revoke → 窓が閉じる ---
+        let dir = ctrl_a
+            .start_revoke_commissioning(session_a, NOW, &mut tx)
+            .expect("start_revoke_commissioning");
+        deliver(
+            &mut ctrl_a,
+            &mut ctrl_b,
+            &mut dev,
+            &window,
+            NOW,
+            &tx,
+            dir.len,
+            Who::A,
+        );
+        match ctrl_a.im_take_event() {
+            Some(ImEvent::InvokeDone { status }) => {
+                assert_eq!(status, ImStatus::Success, "RevokeCommissioning");
+            }
+            other => panic!("expected InvokeDone(Revoke), got {other:?}"),
+        }
+        assert_eq!(
+            read_scalar(
+                true,
+                &mut ctrl_a,
+                &mut ctrl_b,
+                &mut dev,
+                &window,
+                session_a,
+                ws,
+                NOW
+            ),
+            Some(TlvValue::UnsignedInteger(
+                window_status::WINDOW_NOT_OPEN as u64
+            )),
+            "WindowStatus = 0 after revoke"
+        );
+
+        // --- (7) timed でない invoke は拒否される(= 上の成功は timed 経路)---
+        let dir = ctrl_a
+            .start_invoke(
+                session_a,
+                CommandPath::new(EndpointId(0), ClusterId(0x003C), CommandId(0x02)),
+                |w, t| {
+                    w.start_struct(t)?;
+                    w.end_container()
+                },
+                NOW,
+                &mut tx,
+            )
+            .expect("A: untimed revoke");
+        deliver(
+            &mut ctrl_a,
+            &mut ctrl_b,
+            &mut dev,
+            &window,
+            NOW,
+            &tx,
+            dir.len,
+            Who::A,
+        );
+        match ctrl_a.im_take_event() {
+            Some(ImEvent::InvokeDone { status }) => assert_ne!(
+                status,
+                ImStatus::Success,
+                "untimed RevokeCommissioning must be rejected"
+            ),
+            other => panic!("expected InvokeDone(untimed revoke), got {other:?}"),
+        }
     }
 }
 

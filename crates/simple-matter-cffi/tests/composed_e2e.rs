@@ -730,7 +730,147 @@ fn composed_device_commission_read_write_invoke_subscribe() {
         "未知ノード"
     );
 
+    // ======================================================================
+    // T9 §17.3: コミッショニング窓を開く(ECW → WindowStatus → Revoke)
+    // ======================================================================
+
+    // 一度も開いていなければ false。
+    let mut win = sm_ctrl_window_t {
+        node_id: 0,
+        timeout_s: 0,
+        discriminator: 0,
+        passcode: 0,
+        vendor_id: 0,
+        product_id: 0,
+        manual_code: [0; 12],
+        qr_payload: [0; 32],
+        opened_at_ms: 0,
+    };
+    assert!(!sm_ctrl_last_window(&mut win), "未オープンなら false");
+
+    // 窓は閉じている(WindowStatus = 0)。
+    assert_eq!(
+        read_scalar(&mut lb, node_id, 0, 0x003C, 0x0000),
+        (0, false),
+        "WindowStatus = 0 (closed)"
+    );
+
+    // passcode / discriminator は乱数生成(0 / 0xFFFF)。
+    assert_eq!(
+        sm_ctrl_open_commissioning_window(node_id, 300, 0xFFFF, 0, now_ms()),
+        0,
+        "open window start"
+    );
+    let ev = lb
+        .drive_until(
+            sm_ctrl_event_kind_t::SM_CTRL_EV_WINDOW_OPENED,
+            sm_ctrl_event_kind_t::SM_CTRL_EV_WINDOW_FAILED,
+        )
+        .expect("WINDOW_OPENED");
+    assert_eq!(ev.node_id, node_id);
+    assert_eq!(ev.attribute, 300, "attribute = timeout 秒");
+    assert!(ev.value_u64 > 0, "value_u64 = 払い出した passcode");
+    assert!(ev.endpoint <= 0x0FFF, "endpoint = 12bit discriminator");
+
+    // 払い出し情報(manual code / QR)が取れる。
+    assert!(sm_ctrl_last_window(&mut win), "窓を開いたので true");
+    assert_eq!(win.node_id, node_id);
+    assert_eq!(win.timeout_s, 300);
+    assert_eq!(win.passcode as u64, ev.value_u64);
+    assert_eq!(win.discriminator, ev.endpoint);
+    assert!(win.opened_at_ms > 0);
+    // VID/PID は BasicInformation の read 由来(sm_config_t の値)。
+    assert_eq!(win.vendor_id, 0xFFF1, "VendorID read");
+    assert_eq!(win.product_id, 0x8001, "ProductID read");
+    let manual = cstr(&win.manual_code);
+    assert_eq!(manual.len(), 11, "manual pairing code は 11 桁");
+    assert!(manual.chars().all(|c| c.is_ascii_digit()));
+    let qr = cstr(&win.qr_payload);
+    assert!(qr.starts_with("MT:"), "QR payload: {qr}");
+    assert_eq!(qr.len(), 22, "\"MT:\" + base38 19 文字: {qr}");
+    // ホスト側の生成器と一致すること(シムが正しい引数で組み立てている)。
+    {
+        use simple_matter::discovery::onboarding::{
+            manual_pairing_code, qr_payload, OnboardingPayload, DISCOVERY_CAP_ON_NETWORK,
+            QR_PAYLOAD_MAX_LEN,
+        };
+        assert_eq!(
+            manual,
+            String::from_utf8_lossy(&manual_pairing_code(win.discriminator, win.passcode))
+        );
+        let mut buf = [0u8; QR_PAYLOAD_MAX_LEN];
+        let n = qr_payload(
+            &OnboardingPayload {
+                vendor_id: win.vendor_id,
+                product_id: win.product_id,
+                discriminator: win.discriminator,
+                passcode: win.passcode,
+                discovery_caps: DISCOVERY_CAP_ON_NETWORK,
+            },
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(qr, String::from_utf8_lossy(&buf[..n]));
+    }
+
+    // デバイス側で ECM 窓が開いている(WindowStatus = 1)。
+    assert_eq!(
+        read_scalar(&mut lb, node_id, 0, 0x003C, 0x0000),
+        (1, false),
+        "WindowStatus = 1 (ECM)"
+    );
+
+    // 二重オープンはクラスタ固有ステータス Busy(2)で失敗する。
+    assert_eq!(
+        sm_ctrl_open_commissioning_window(node_id, 300, 0xFFFF, 0, now_ms()),
+        0
+    );
+    let ev = lb
+        .drive_until(
+            sm_ctrl_event_kind_t::SM_CTRL_EV_WINDOW_FAILED,
+            sm_ctrl_event_kind_t::SM_CTRL_EV_WINDOW_OPENED,
+        )
+        .expect("WINDOW_FAILED(busy)");
+    assert_eq!(ev.phase, 3, "失敗段階 = invoke");
+    assert_eq!(ev.status, 2, "クラスタ固有 Busy");
+
+    // 引数チェック: 仕様の禁止 passcode。
+    assert_eq!(
+        sm_ctrl_open_commissioning_window(node_id, 300, 3840, 12345678, now_ms()),
+        -5
+    );
+    assert_eq!(
+        sm_ctrl_open_commissioning_window(0xDEAD, 300, 3840, 0, now_ms()),
+        -3,
+        "未知ノード"
+    );
+
+    // Revoke で閉じる(完了は INVOKE_DONE)。
+    assert_eq!(sm_ctrl_revoke_commissioning(node_id, now_ms()), 0);
+    let ev = lb
+        .drive_until(
+            sm_ctrl_event_kind_t::SM_CTRL_EV_INVOKE_DONE,
+            sm_ctrl_event_kind_t::SM_CTRL_EV_INVOKE_FAILED,
+        )
+        .expect("INVOKE_DONE(revoke)");
+    assert_eq!((ev.node_id, ev.status), (node_id, 0));
+    assert_eq!(
+        read_scalar(&mut lb, node_id, 0, 0x003C, 0x0000),
+        (0, false),
+        "WindowStatus = 0 (revoked)"
+    );
+
     sm_ctrl_deinit();
     // SAFETY: alloc したレイアウトで解放する。
     unsafe { dealloc(mem, layout) };
+}
+
+/// NUL 終端の `char` 配列を Rust の String にする。
+fn cstr(buf: &[std::ffi::c_char]) -> String {
+    let bytes: Vec<u8> = buf
+        .iter()
+        .take_while(|c| **c != 0)
+        .map(|c| *c as u8)
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
 }

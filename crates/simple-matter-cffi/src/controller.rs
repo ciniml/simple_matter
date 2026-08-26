@@ -28,7 +28,7 @@
 //! v1 は **単一コントローラインスタンス・単線アクセス**(全 API は同一タスクから呼ぶ)。
 //! 供給メモリは [`sm_ctrl_init`] から [`sm_ctrl_deinit`] まで移動・解放しないこと。
 
-use core::ffi::c_void;
+use core::ffi::{c_char, c_void};
 use core::mem::{align_of, size_of};
 use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use core::ptr::{addr_of, addr_of_mut, null_mut};
@@ -37,11 +37,15 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use simple_matter::controller::ca::{Ca, CA_STATE_MAX_LEN};
 use simple_matter::controller::nodes as nodes_codec;
 use simple_matter::controller::{
-    AttestationPolicy, Commissioner, ControllerCreds, ControllerStack, Phase,
-    CONTROLLER_FABRIC_INDEX,
+    AttestationPolicy, Commissioner, ControllerCreds, ControllerStack, OpenWindowParams, Phase,
+    CONTROLLER_FABRIC_INDEX, DEFAULT_WINDOW_ITERATIONS,
 };
 use simple_matter::crypto::rustcrypto::RustCrypto;
 use simple_matter::discovery::client::MdnsClient;
+use simple_matter::discovery::onboarding::{
+    manual_pairing_code, passcode_is_valid, qr_payload, random_discriminator, random_passcode,
+    OnboardingPayload, DISCOVERY_CAP_ON_NETWORK, MANUAL_CODE_LEN, QR_PAYLOAD_MAX_LEN,
+};
 use simple_matter::discovery::{MATTER_PORT, MDNS_PORT};
 use simple_matter::dm::meta::{AttributeId, ClusterId, CommandId, EndpointId};
 use simple_matter::im::client::{AttrReports, ImClient, ImEvent, MAX_CLIENT_SUBSCRIPTIONS};
@@ -94,6 +98,21 @@ const EV_CAP: usize = 32;
 const SUB_MAX_PATHS: usize = 8;
 /// 1 回の invoke に渡せる引数(context tag 0..)の上限。
 pub const MAX_OP_ARGS: usize = 4;
+/// BasicInformation クラスタ ID(QR 用 VID/PID の取得元)。
+const BASIC_INFORMATION_CLUSTER: u32 = 0x0028;
+/// AdministratorCommissioning クラスタ ID。
+const ADMIN_COMMISSIONING_CLUSTER: u32 = 0x003C;
+/// RevokeCommissioning コマンド ID。
+const CMD_REVOKE_COMMISSIONING: u32 = 0x02;
+/// BasicInformation VendorID 属性 ID。
+const ATTR_VENDOR_ID: u32 = 0x0002;
+/// BasicInformation ProductID 属性 ID。
+const ATTR_PRODUCT_ID: u32 = 0x0004;
+/// timed invoke の TimedRequest タイムアウト(ミリ秒。smctl / chip-tool と同値)。
+const TIMED_INVOKE_TIMEOUT_MS: u16 = 10_000;
+/// コミッショニング窓タイムアウトの許容範囲(仕様 §11.19.8.1)。
+const WINDOW_TIMEOUT_MIN_S: u16 = 180;
+const WINDOW_TIMEOUT_MAX_S: u16 = 900;
 /// BTP central の window(コアの参照実装 `ble-commissioner.rs` / デバイス側シムと同じ 6)。
 #[cfg(feature = "ble")]
 const CTRL_BTP_WINDOW: usize = 6;
@@ -193,6 +212,42 @@ pub enum sm_ctrl_event_kind_t {
     /// 購読が失われた(keep-alive 途絶。§16.2)。`node_id`、`value_u64` = 購読 ID。
     /// シムの購読テーブルからは除去済みなので、C++ 側は poll フォールバック / 再購読へ。
     SM_CTRL_EV_SUBSCRIPTION_LOST = 17,
+    /// コミッショニング窓を開いた(§17.3)。`node_id` = 対象ノード、`value_u64` = 払い出した
+    /// passcode、`endpoint` = discriminator、`attribute` = timeout(秒)。manual pairing code /
+    /// QR 文字列込みの全情報は [`sm_ctrl_last_window`] で取る。
+    SM_CTRL_EV_WINDOW_OPENED = 18,
+    /// コミッショニング窓を開けなかった(§17.3)。`status` = クラスタ固有ステータス
+    /// (Busy=2 / PAKEParameterError=3)または IM ステータス、`phase` = 失敗段階
+    /// (1=VendorID read、2=ProductID read、3=OpenCommissioningWindow invoke。
+    /// 0xE0/0xD0/0xF0 台は診断コード)。
+    SM_CTRL_EV_WINDOW_FAILED = 19,
+}
+
+/// 直近に開いたコミッショニング窓の払い出し情報(§17.3)。
+///
+/// [`sm_ctrl_open_commissioning_window`] が成功したあと [`sm_ctrl_last_window`] で取る。
+/// `manual_code` / `qr_payload` はどちらも NUL 終端の ASCII。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct sm_ctrl_window_t {
+    /// 窓を開けた相手ノードの運用 NodeId。
+    pub node_id: u64,
+    /// 窓を開けておく秒数(OpenCommissioningWindow に渡した値)。
+    pub timeout_s: u16,
+    /// 窓の 12 ビット discriminator。
+    pub discriminator: u16,
+    /// 払い出した setup passcode。
+    pub passcode: u32,
+    /// QR 用 VendorID(read できなければ 0)。
+    pub vendor_id: u16,
+    /// QR 用 ProductID(read できなければ 0)。
+    pub product_id: u16,
+    /// 11 桁 manual pairing code + NUL。
+    pub manual_code: [c_char; 12],
+    /// `"MT:"` + base38 の QR payload + NUL。
+    pub qr_payload: [c_char; 32],
+    /// 窓を開いた時刻(呼び出し側の `now_ms`)。0 = 未オープン。
+    pub opened_at_ms: u64,
 }
 
 /// 購読する属性パス 1 本(`sm_ctrl_subscribe_paths` の引数。§16.2)。
@@ -246,6 +301,8 @@ enum PendingOp {
         ep: u16,
         cluster: u32,
         cmd: u32,
+        /// 非 0 なら timed invoke(TimedRequest のタイムアウト、ミリ秒)。
+        timed_ms: u16,
     },
     Read {
         ep: u16,
@@ -264,6 +321,15 @@ enum PendingOp {
         min_s: u16,
         max_s: u16,
     },
+    /// コミッショニング窓オープン(§17.3)。パラメータは `CtrlShim::win`。
+    ///
+    /// 単一トランザクション直列の枠内で 3 段階を直列に進める:
+    /// `step` 1 = BasicInformation VendorID read、2 = ProductID read、
+    /// 3 = OpenCommissioningWindow の timed invoke。read は QR 用の飾りなので、
+    /// 失敗しても VID/PID = 0 のまま次段へ進む。
+    OpenWindow {
+        step: u8,
+    },
 }
 
 /// 購読 1 本の属性パス(endpoint, cluster, attribute)。
@@ -281,6 +347,54 @@ struct SubEntry {
     node_id: u64,
     /// 購読したパス(レポートのフィルタに使う)。
     paths: heapless::Vec<SubPath, SUB_MAX_PATHS>,
+}
+
+/// 進行中のコミッショニング窓オープンのパラメータ(§17.3)。
+///
+/// `PendingOp::OpenWindow` は Copy な `step` しか持たないので、実引数はここに置く
+/// (`op_args` と同じ「単一トランザクション直列だから 1 組で足りる」前提)。
+#[derive(Clone, Copy)]
+struct WindowReq {
+    node_id: u64,
+    timeout_s: u16,
+    discriminator: u16,
+    passcode: u32,
+    vendor_id: u16,
+    product_id: u16,
+    salt: [u8; 16],
+    opened_at_ms: u64,
+}
+
+impl WindowReq {
+    const fn zero() -> Self {
+        Self {
+            node_id: 0,
+            timeout_s: 0,
+            discriminator: 0,
+            passcode: 0,
+            vendor_id: 0,
+            product_id: 0,
+            salt: [0u8; 16],
+            opened_at_ms: 0,
+        }
+    }
+}
+
+impl sm_ctrl_window_t {
+    /// 未オープンのゼロ値。
+    const fn zero() -> Self {
+        Self {
+            node_id: 0,
+            timeout_s: 0,
+            discriminator: 0,
+            passcode: 0,
+            vendor_id: 0,
+            product_id: 0,
+            manual_code: [0; 12],
+            qr_payload: [0; 32],
+            opened_at_ms: 0,
+        }
+    }
 }
 
 /// コントローラの活動状態(単一トランザクションを直列実行する)。
@@ -348,6 +462,12 @@ struct CtrlShim {
     subs: heapless::Vec<SubEntry, MAX_CLIENT_SUBSCRIPTIONS>,
     /// 進行中 Subscribe の引数パス(`op_args` と同格。SUBSCRIBE_DONE でテーブルへ移す)。
     pending_sub_paths: heapless::Vec<SubPath, SUB_MAX_PATHS>,
+    /// 乱数(passcode / discriminator / salt の生成。C コールバック RNG)。
+    rng: CRng,
+    /// 進行中のコミッショニング窓オープンのパラメータ(`op_args` と同格。§17.3)。
+    win: WindowReq,
+    /// 直近に開けた窓([`sm_ctrl_last_window`] が返す)。`opened_at_ms` = 0 は未オープン。
+    last_window: sm_ctrl_window_t,
     // --- BLE central(F7b、§11.4)。BTP central を C++ の NimBLE central から給餌する ---
     /// BTP central 状態機械(同時 1 接続。デバイス側シムの鏡像)。
     #[cfg(feature = "ble")]
@@ -594,7 +714,7 @@ fn pump(s: &mut CtrlShim, now: u64) {
         Activity::Idle => drain_sub_events(s),
         Activity::Pairing { node_id, addr } => drive_pairing(s, node_id, addr, now),
         Activity::Connecting { node_id, addr, op } => drive_connecting(s, node_id, addr, op, now),
-        Activity::AwaitOp { node_id, op } => drive_awaitop(s, node_id, op),
+        Activity::AwaitOp { node_id, op } => drive_awaitop(s, node_id, op, now),
         // BLE フェーズは BTP イベント駆動(`sm_ctrl_ble_event` 内の `ble_service`)。
         // UDP pump では進めない。handoff 後は Activity::Pairing に遷移し上の Pairing 腕が担う。
         #[cfg(feature = "ble")]
@@ -701,7 +821,7 @@ fn drive_connecting(s: &mut CtrlShim, node_id: u64, addr: SocketAddr, op: Pendin
 }
 
 /// 運用トランザクションの応答(IM イベント)を処理する。
-fn drive_awaitop(s: &mut CtrlShim, node_id: u64, op: PendingOp) {
+fn drive_awaitop(s: &mut CtrlShim, node_id: u64, op: PendingOp, now: u64) {
     let Some(ev) = s.stack.im_take_event() else {
         return;
     };
@@ -774,6 +894,66 @@ fn drive_awaitop(s: &mut CtrlShim, node_id: u64, op: PendingOp) {
             s.push_event(e);
             s.activity = Activity::Idle;
         }
+        // --- コミッショニング窓オープン(3 段階。§17.3)---
+        (PendingOp::OpenWindow { step }, ImEvent::ReadDone) if step == 1 || step == 2 => {
+            let attr = if step == 1 {
+                ATTR_VENDOR_ID
+            } else {
+                ATTR_PRODUCT_ID
+            };
+            let v = read_scalar_value(s, 0, BASIC_INFORMATION_CLUSTER, attr)
+                .filter(|(_, is_null)| !*is_null)
+                .map(|(v, _)| v as u16)
+                .unwrap_or(0);
+            if step == 1 {
+                s.win.vendor_id = v;
+            } else {
+                s.win.product_id = v;
+            }
+            next_window_step(s, node_id, step + 1, now);
+        }
+        (PendingOp::OpenWindow { step }, ImEvent::InvokeDone { status }) if step >= 3 => {
+            if status.is_success() {
+                s.win.opened_at_ms = now;
+                let w = build_window_record(&s.win);
+                s.last_window = w;
+                let mut e = CtrlShim::ev(sm_ctrl_event_kind_t::SM_CTRL_EV_WINDOW_OPENED);
+                e.node_id = node_id;
+                e.value_u64 = s.win.passcode as u64;
+                e.endpoint = s.win.discriminator;
+                e.attribute = s.win.timeout_s as u32;
+                s.push_event(e);
+            } else {
+                // クラスタ固有ステータス(Busy=2 / PAKEParameterError=3)があればそれを、
+                // 無ければ IM ステータスを載せる(§17.3)。
+                let mut e = CtrlShim::ev(sm_ctrl_event_kind_t::SM_CTRL_EV_WINDOW_FAILED);
+                e.node_id = node_id;
+                e.status = s
+                    .stack
+                    .im_last_cluster_status()
+                    .unwrap_or_else(|| status.to_u8());
+                e.phase = 3;
+                s.push_event(e);
+            }
+            s.activity = Activity::Idle;
+        }
+        (PendingOp::OpenWindow { step }, ImEvent::Failed { status }) => {
+            // VID/PID の read は QR の飾りなので、失敗しても 0 のまま次段へ進む。ただし
+            // タイムアウトはセッションが死んでいる兆候(§16.6 P6)なので窓オープン自体を諦める。
+            if step < 3 && !matches!(status, ImStatus::Timeout) {
+                next_window_step(s, node_id, step + 1, now);
+            } else {
+                let mut e = CtrlShim::ev(sm_ctrl_event_kind_t::SM_CTRL_EV_WINDOW_FAILED);
+                e.node_id = node_id;
+                e.status = status.to_u8();
+                e.phase = step;
+                s.push_event(e);
+                s.activity = Activity::Idle;
+                if matches!(status, ImStatus::Timeout) {
+                    s.invalidate_session(node_id);
+                }
+            }
+        }
         (op, ImEvent::Failed { status }) => {
             let mut e = CtrlShim::ev(op_failed_kind(op));
             e.node_id = node_id;
@@ -824,19 +1004,27 @@ fn issue_op(
     let args = s.op_args.clone();
     let sub_paths = s.pending_sub_paths.clone();
     match op {
-        PendingOp::Invoke { ep, cluster, cmd } => s.stack.start_invoke(
-            session,
-            CommandPath::new(EndpointId(ep), ClusterId(cluster), CommandId(cmd)),
-            |w, t| {
+        PendingOp::Invoke {
+            ep,
+            cluster,
+            cmd,
+            timed_ms,
+        } => {
+            let path = CommandPath::new(EndpointId(ep), ClusterId(cluster), CommandId(cmd));
+            let fields = move |w: &mut simple_matter::tlv::TlvWriter<'_>, t: &TlvTag| {
                 w.start_struct(t)?;
                 for (i, a) in args.iter().enumerate() {
                     write_value(w, &TlvTag::ContextSpecific(i as u8), a)?;
                 }
                 w.end_container()
-            },
-            now,
-            scratch,
-        ),
+            };
+            if timed_ms > 0 {
+                s.stack
+                    .start_invoke_timed(session, timed_ms, path, fields, now, scratch)
+            } else {
+                s.stack.start_invoke(session, path, fields, now, scratch)
+            }
+        }
         PendingOp::Read { ep, cluster, attr } => s.stack.start_read(
             session,
             &[AttributePath::concrete(
@@ -874,6 +1062,35 @@ fn issue_op(
             s.stack
                 .start_subscribe(session, &paths, min_s, max_s, now, scratch)
         }
+        PendingOp::OpenWindow { step } => match step {
+            // 1/2 段目: QR に載せる VendorID / ProductID を BasicInformation から読む。
+            1 | 2 => s.stack.start_read(
+                session,
+                &[AttributePath::concrete(
+                    EndpointId(0),
+                    ClusterId(BASIC_INFORMATION_CLUSTER),
+                    AttributeId(if step == 1 {
+                        ATTR_VENDOR_ID
+                    } else {
+                        ATTR_PRODUCT_ID
+                    }),
+                )],
+                now,
+                scratch,
+            ),
+            // 3 段目: OpenCommissioningWindow(timed invoke)。
+            _ => {
+                let p = OpenWindowParams {
+                    timeout_s: s.win.timeout_s,
+                    discriminator: s.win.discriminator,
+                    passcode: s.win.passcode,
+                    salt: s.win.salt,
+                    iterations: DEFAULT_WINDOW_ITERATIONS,
+                };
+                s.stack
+                    .start_open_commissioning_window(session, &p, now, scratch)
+            }
+        },
     }
 }
 
@@ -884,7 +1101,62 @@ fn op_failed_kind(op: PendingOp) -> sm_ctrl_event_kind_t {
         PendingOp::Read { .. } => sm_ctrl_event_kind_t::SM_CTRL_EV_READ_FAILED,
         PendingOp::Write { .. } => sm_ctrl_event_kind_t::SM_CTRL_EV_WRITE_FAILED,
         PendingOp::Subscribe { .. } => sm_ctrl_event_kind_t::SM_CTRL_EV_SUBSCRIBE_FAILED,
+        PendingOp::OpenWindow { .. } => sm_ctrl_event_kind_t::SM_CTRL_EV_WINDOW_FAILED,
     }
+}
+
+/// 窓オープンの次の段階を発行する(セッションが失われていれば WINDOW_FAILED で終端)。
+fn next_window_step(s: &mut CtrlShim, node_id: u64, step: u8, now: u64) {
+    let session = s.node_index(node_id).and_then(|i| s.nodes[i].session);
+    match session {
+        Some(session) => launch_op(s, node_id, session, PendingOp::OpenWindow { step }, now),
+        None => {
+            let mut e = CtrlShim::ev(sm_ctrl_event_kind_t::SM_CTRL_EV_WINDOW_FAILED);
+            e.node_id = node_id;
+            e.phase = step;
+            s.push_event(e);
+            s.activity = Activity::Idle;
+        }
+    }
+}
+
+/// 払い出し情報から [`sm_ctrl_window_t`](manual code / QR 文字列込み)を組む。
+fn build_window_record(w: &WindowReq) -> sm_ctrl_window_t {
+    let mut out = sm_ctrl_window_t {
+        node_id: w.node_id,
+        timeout_s: w.timeout_s,
+        discriminator: w.discriminator,
+        passcode: w.passcode,
+        vendor_id: w.vendor_id,
+        product_id: w.product_id,
+        manual_code: [0; 12],
+        qr_payload: [0; 32],
+        opened_at_ms: w.opened_at_ms,
+    };
+    let manual = manual_pairing_code(w.discriminator, w.passcode);
+    for (dst, src) in out.manual_code[..MANUAL_CODE_LEN]
+        .iter_mut()
+        .zip(manual.iter())
+    {
+        *dst = *src as c_char;
+    }
+    let mut qr = [0u8; QR_PAYLOAD_MAX_LEN];
+    if let Ok(n) = qr_payload(
+        &OnboardingPayload {
+            vendor_id: w.vendor_id,
+            product_id: w.product_id,
+            discriminator: w.discriminator,
+            passcode: w.passcode,
+            // 窓を開けたデバイスは既に運用ネットワーク上にいる。
+            discovery_caps: DISCOVERY_CAP_ON_NETWORK,
+        },
+        &mut qr,
+    ) {
+        for (dst, src) in out.qr_payload[..n].iter_mut().zip(qr[..n].iter()) {
+            *dst = *src as c_char;
+        }
+    }
+    out
 }
 
 /// 確立済みセッション上で `op` を発行し、応答待ちへ遷移する。
@@ -1277,6 +1549,9 @@ pub extern "C" fn sm_ctrl_init(
         addr_of_mut!((*sp).op_args).write(heapless::Vec::new());
         addr_of_mut!((*sp).subs).write(heapless::Vec::new());
         addr_of_mut!((*sp).pending_sub_paths).write(heapless::Vec::new());
+        addr_of_mut!((*sp).rng).write(rng);
+        addr_of_mut!((*sp).win).write(WindowReq::zero());
+        addr_of_mut!((*sp).last_window).write(sm_ctrl_window_t::zero());
         #[cfg(feature = "ble")]
         {
             addr_of_mut!((*sp).btp).write(Btp::new(BtpRole::Central));
@@ -1540,6 +1815,7 @@ pub extern "C" fn sm_ctrl_invoke(
             ep: endpoint,
             cluster,
             cmd: command,
+            timed_ms: 0,
         },
         now_ms,
     );
@@ -1621,6 +1897,7 @@ pub extern "C" fn sm_ctrl_invoke_args(
             ep: endpoint,
             cluster,
             cmd: command,
+            timed_ms: 0,
         },
         now_ms,
     );
@@ -1747,6 +2024,135 @@ pub extern "C" fn sm_ctrl_subscribe_paths(
         pump(s, now_ms);
     } else {
         s.pending_sub_paths.clear();
+    }
+    rc
+}
+
+/// 既存 fabric の管理者として **ECM コミッショニング窓**を開く(§17.3)。
+///
+/// `passcode` = 0 なら有効な setup passcode を乱数生成、`discriminator` = 0xFFFF なら
+/// 12 ビット discriminator を乱数生成する(それ以外は下位 12 ビットだけを使う)。
+/// `timeout_s` は仕様の許容範囲 180..=900 へクランプする。
+///
+/// 内部で 3 段階を直列に進める:
+/// (1) EP0 BasicInformation VendorID(0x0002)read、(2) ProductID(0x0004)read
+/// (どちらも QR 用の飾りで、失敗しても VID/PID = 0 で続行)、
+/// (3) OpenCommissioningWindow(0x003C/0x00)を timed invoke。
+///
+/// 完了は [`sm_ctrl_take_event`] の [`SM_CTRL_EV_WINDOW_OPENED`](`value_u64` = passcode、
+/// `endpoint` = discriminator、`attribute` = timeout 秒)/
+/// [`SM_CTRL_EV_WINDOW_FAILED`](`status` = ステータス、`phase` = 失敗段階)。
+/// manual pairing code / QR 文字列込みの情報は [`sm_ctrl_last_window`] で取る。
+///
+/// 戻り値: 0=OK、-1=未初期化、-3=未知ノード、-4=CASE 開始失敗、-5=引数不正
+/// (passcode が仕様の禁止値)、-6=RNG 失敗、-10=busy。
+///
+/// [`SM_CTRL_EV_WINDOW_OPENED`]: sm_ctrl_event_kind_t::SM_CTRL_EV_WINDOW_OPENED
+/// [`SM_CTRL_EV_WINDOW_FAILED`]: sm_ctrl_event_kind_t::SM_CTRL_EV_WINDOW_FAILED
+#[no_mangle]
+pub extern "C" fn sm_ctrl_open_commissioning_window(
+    node_id: u64,
+    timeout_s: u16,
+    discriminator: u16,
+    passcode: u32,
+    now_ms: u64,
+) -> i32 {
+    if !CTRL_INITED.load(Ordering::SeqCst) {
+        return -1;
+    }
+    // SAFETY: 単線契約。
+    let s = unsafe { ctrl_shim() };
+    if !matches!(s.activity, Activity::Idle) {
+        return -10; // busy(状態を触る前に弾く)。
+    }
+    if passcode != 0 && !passcode_is_valid(passcode) {
+        return -5;
+    }
+    use simple_matter::crypto::Rng as _;
+    let mut rng = s.rng;
+    let passcode = if passcode == 0 {
+        match random_passcode(&mut rng) {
+            Ok(p) => p,
+            Err(_) => return -6,
+        }
+    } else {
+        passcode
+    };
+    let discriminator = if discriminator == 0xFFFF {
+        match random_discriminator(&mut rng) {
+            Ok(d) => d,
+            Err(_) => return -6,
+        }
+    } else {
+        discriminator & 0x0FFF
+    };
+    let mut salt = [0u8; 16];
+    if rng.fill_bytes(&mut salt).is_err() {
+        return -6;
+    }
+    s.win = WindowReq {
+        node_id,
+        timeout_s: timeout_s.clamp(WINDOW_TIMEOUT_MIN_S, WINDOW_TIMEOUT_MAX_S),
+        discriminator,
+        passcode,
+        vendor_id: 0,
+        product_id: 0,
+        salt,
+        opened_at_ms: 0,
+    };
+    let rc = start_operation(s, node_id, PendingOp::OpenWindow { step: 1 }, now_ms);
+    if rc == 0 {
+        pump(s, now_ms);
+    }
+    rc
+}
+
+/// 直近に開いた窓の払い出し情報(manual code / QR 文字列込み)を `out` に書く(§17.3)。
+///
+/// 一度も窓を開いていなければ false(`out` は触らない)。窓が期限切れ / Revoke で
+/// 閉じたかどうかは追跡しない(WindowStatus は
+/// `sm_ctrl_read_scalar(node, 0, 0x003C, 0x0000)` で読む。0=閉 1=ECM 2=BC)。
+#[no_mangle]
+pub extern "C" fn sm_ctrl_last_window(out: *mut sm_ctrl_window_t) -> bool {
+    if !CTRL_INITED.load(Ordering::SeqCst) || out.is_null() {
+        return false;
+    }
+    // SAFETY: 単線契約。
+    let s = unsafe { ctrl_shim() };
+    if s.last_window.opened_at_ms == 0 {
+        return false;
+    }
+    // SAFETY: caller が有効な out を与える契約。
+    unsafe { *out = s.last_window };
+    true
+}
+
+/// 開いているコミッショニング窓を閉じる(0x003C/0x02 RevokeCommissioning、timed invoke)。
+///
+/// 完了は通常の invoke と同じ INVOKE_DONE / INVOKE_FAILED(`node_id` で識別。窓が開いて
+/// いなければ `status` にクラスタ固有 WindowNotOpen=4)。
+/// 戻り値: 0=OK、-1=未初期化、-3=未知ノード、-4=CASE 開始失敗、-10=busy。
+#[no_mangle]
+pub extern "C" fn sm_ctrl_revoke_commissioning(node_id: u64, now_ms: u64) -> i32 {
+    if !CTRL_INITED.load(Ordering::SeqCst) {
+        return -1;
+    }
+    // SAFETY: 単線契約。
+    let s = unsafe { ctrl_shim() };
+    s.op_args.clear();
+    let rc = start_operation(
+        s,
+        node_id,
+        PendingOp::Invoke {
+            ep: 0,
+            cluster: ADMIN_COMMISSIONING_CLUSTER,
+            cmd: CMD_REVOKE_COMMISSIONING,
+            timed_ms: TIMED_INVOKE_TIMEOUT_MS,
+        },
+        now_ms,
+    );
+    if rc == 0 {
+        pump(s, now_ms);
     }
     rc
 }

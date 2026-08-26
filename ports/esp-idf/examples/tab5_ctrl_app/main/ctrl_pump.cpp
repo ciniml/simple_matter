@@ -137,6 +137,10 @@ const char *op_step_name(uint8_t kind) {
     return "op:pair_ble";
   case SM_UI_OP_SET_ADDR:
     return "op:set_addr";
+  case SM_UI_OP_OPEN_WINDOW:
+    return "op:open_window";
+  case SM_UI_OP_REVOKE_WINDOW:
+    return "op:revoke_window";
   default:
     return "op:?";
   }
@@ -151,6 +155,12 @@ constexpr uint16_t EP_ONOFF = 1;
 constexpr uint32_t CL_ONOFF = 0x0006;
 constexpr uint32_t CMD_TOGGLE = 0x02;
 constexpr uint32_t ATTR_ONOFF = 0x0000;
+
+// AdministratorCommissioning(EP0 / 0x003C。T9、§17.3)。WindowStatus は
+// 0=閉 1=ECM 2=BC。窓を開く / 閉じるのはシムの専用 API 経由(timed invoke が要る)。
+constexpr uint16_t EP_ROOT = 0;
+constexpr uint32_t CL_ADMIN_COMM = 0x003C;
+constexpr uint32_t ATTR_WINDOW_STATUS = 0x0000;
 
 // 空気質センサ(airq-sensor、docs/design/airq-port.md §A1)の読み出しパス。
 // **f32 の 2 本(CO2 / PM2.5)は value_u64 の下位 32bit にビットパターンが載る**
@@ -493,6 +503,10 @@ bool term_invoke(const sm_ctrl_event_t &e) {
 }
 bool term_read(const sm_ctrl_event_t &e) {
   return e.kind == SM_CTRL_EV_READ_DONE || e.kind == SM_CTRL_EV_READ_FAILED;
+}
+// T9(§17.4): コミッショニングウィンドウを開く op の終端。
+bool term_window(const sm_ctrl_event_t &e) {
+  return e.kind == SM_CTRL_EV_WINDOW_OPENED || e.kind == SM_CTRL_EV_WINDOW_FAILED;
 }
 // T8: 購読確立の終端(プライミングの REPORT 群はこの前に流れてくる)。
 bool term_subscribe(const sm_ctrl_event_t &e) {
@@ -1122,6 +1136,176 @@ void do_toggle(uint64_t node_id) {
   } else {
     set_node_note(node_id, "toggle FAILED");
     sm_app_set_status("toggle %016llx failed", (unsigned long long)node_id);
+  }
+}
+
+// ---- T9(§17.4): コミッショニングウィンドウ ----
+//
+// UI(Share ボタン / console `openwindow`)→ シムの
+// `sm_ctrl_open_commissioning_window` を叩き、WINDOW_OPENED / WINDOW_FAILED を
+// 終端として run_until で駆動する。成功したら `sm_ctrl_last_window` の
+// manual code / QR をスナップショットの `window` 欄へ写す(Share ダイアログの素材)。
+
+// 開いた窓の WindowStatus を確認する周期(§17.4「10 秒ごと」)。
+constexpr uint64_t WINDOW_POLL_MS = 10000;
+
+void do_open_window(const sm_ui_op_t &op) {
+  uint16_t timeout_s = op.timeout_s != 0 ? op.timeout_s : 300;
+  if (timeout_s < 180) {
+    timeout_s = 180;
+  }
+  if (timeout_s > 900) {
+    timeout_s = 900;
+  }
+  // discriminator 0xFFFF / passcode 0 は「シム側で乱数生成」(§17.3)。
+  const uint16_t disc = op.discriminator;
+  const uint32_t passcode = op.passcode;
+
+  {
+    sm_ui_snapshot_t *s = sm_app_lock();
+    memset(&s->window, 0, sizeof(s->window));
+    s->window.node_id = op.node_id;
+    s->window.status = SM_UI_WINDOW_OPENING;
+    sm_app_unlock();
+  }
+  sm_app_set_status("open commissioning window on %016llx (%u s) ...",
+                    (unsigned long long)op.node_id, (unsigned)timeout_s);
+  set_node_busy(op.node_id, true);
+
+  int32_t rc = start_op_clean([&] {
+    return sm_ctrl_open_commissioning_window(op.node_id, timeout_s, disc, passcode, now_ms());
+  });
+  if (rc != 0) {
+    set_node_busy(op.node_id, false);
+    set_node_note(op.node_id, "open window rejected");
+    sm_ui_snapshot_t *s = sm_app_lock();
+    s->window.status = SM_UI_WINDOW_FAILED;
+    s->window.fail_status = 0;
+    s->window.fail_phase = 0;
+    sm_app_unlock();
+    sm_app_set_status("open window %016llx: rejected (rc=%ld)", (unsigned long long)op.node_id,
+                      (long)rc);
+    return;
+  }
+
+  sm_ctrl_event_t ev;
+  // VID read → PID read → timed invoke の 3 段をシムが直列に進めるので、
+  // 通常の invoke より長めに待つ(§17.3)。
+  const bool ok = run_until(g_udp, 30000, ev, term_window) && ev.kind == SM_CTRL_EV_WINDOW_OPENED;
+  set_node_busy(op.node_id, false);
+  if (!ok) {
+    char note[40];
+    snprintf(note, sizeof(note), "open window failed (status %u)", (unsigned)ev.status);
+    set_node_note(op.node_id, note);
+    sm_ui_snapshot_t *s = sm_app_lock();
+    s->window.status = SM_UI_WINDOW_FAILED;
+    s->window.fail_status = ev.status;
+    s->window.fail_phase = ev.phase;
+    sm_app_unlock();
+    sm_app_set_status("open window %016llx failed (status=%u phase=%u)",
+                      (unsigned long long)op.node_id, (unsigned)ev.status, (unsigned)ev.phase);
+    return;
+  }
+
+  sm_ctrl_window_t w;
+  memset(&w, 0, sizeof(w));
+  const bool have = sm_ctrl_last_window(&w);
+  // timeout は WINDOW_OPENED の attribute に載る(§17.3)。取れなければ要求値。
+  const uint32_t granted = ev.attribute != 0 ? ev.attribute : (uint32_t)timeout_s;
+  {
+    sm_ui_snapshot_t *s = sm_app_lock();
+    s->window.node_id = op.node_id;
+    s->window.passcode = have ? w.passcode : (uint32_t)ev.value_u64;
+    s->window.discriminator = have ? w.discriminator : (uint16_t)ev.endpoint;
+    // シムのバッファが NUL 終端でなくても読み過ぎないよう精度を切る。
+    snprintf(s->window.manual_code, sizeof(s->window.manual_code), "%.11s",
+             have ? w.manual_code : "");
+    snprintf(s->window.qr, sizeof(s->window.qr), "%.31s", have ? w.qr_payload : "");
+    s->window.expires_ms = now_ms() + (uint64_t)granted * 1000ull;
+    s->window.status = SM_UI_WINDOW_OPEN;
+    s->window.fail_status = 0;
+    s->window.fail_phase = 0;
+    sm_app_unlock();
+  }
+  set_node_note(op.node_id, "window open");
+  sm_app_set_status("window open on %016llx: code %.11s (disc %u, %u s)",
+                    (unsigned long long)op.node_id, have ? w.manual_code : "?",
+                    (unsigned)(have ? w.discriminator : 0), (unsigned)granted);
+}
+
+void do_revoke_window(uint64_t node_id) {
+  sm_app_set_status("revoke commissioning window on %016llx ...", (unsigned long long)node_id);
+  set_node_busy(node_id, true);
+  int32_t rc = start_op_clean([&] { return sm_ctrl_revoke_commissioning(node_id, now_ms()); });
+  if (rc != 0) {
+    set_node_busy(node_id, false);
+    set_node_note(node_id, "revoke rejected");
+    sm_app_set_status("revoke %016llx: rejected (rc=%ld)", (unsigned long long)node_id, (long)rc);
+    return;
+  }
+  sm_ctrl_event_t ev;
+  const bool ok = run_until(g_udp, 30000, ev, term_invoke) && ev.kind == SM_CTRL_EV_INVOKE_DONE;
+  set_node_busy(node_id, false);
+  if (ok) {
+    set_node_note(node_id, "window revoked");
+    sm_ui_snapshot_t *s = sm_app_lock();
+    if (s->window.node_id == node_id) {
+      s->window.status = SM_UI_WINDOW_CLOSED;
+      s->window.expires_ms = 0;
+    }
+    sm_app_unlock();
+    sm_app_set_status("window revoked on %016llx", (unsigned long long)node_id);
+  } else {
+    char note[40];
+    snprintf(note, sizeof(note), "revoke failed (status %u)", (unsigned)ev.status);
+    set_node_note(node_id, note);
+    // WindowNotOpen(=4)は「既に閉じている」なので閉扱いにする。
+    if (ev.status == 4) {
+      sm_ui_snapshot_t *s = sm_app_lock();
+      if (s->window.node_id == node_id) {
+        s->window.status = SM_UI_WINDOW_CLOSED;
+        s->window.expires_ms = 0;
+      }
+      sm_app_unlock();
+    }
+    sm_app_set_status("revoke %016llx failed (status=%u)", (unsigned long long)node_id,
+                      (unsigned)ev.status);
+  }
+}
+
+// 開いている窓の WindowStatus(EP0/0x003C/0x0000)を read して、閉じていたら
+// スナップショットへ反映する(§17.4。10 秒 tick から呼ぶ)。
+void poll_window_status() {
+  uint64_t node_id = 0;
+  {
+    sm_ui_snapshot_t *s = sm_app_lock();
+    if (s->window.status == SM_UI_WINDOW_OPEN) {
+      node_id = s->window.node_id;
+    }
+    sm_app_unlock();
+  }
+  if (node_id == 0) {
+    return;
+  }
+  static constexpr SensorAttrPath WINDOW_STATUS_PATH = {EP_ROOT, CL_ADMIN_COMM,
+                                                        ATTR_WINDOW_STATUS, "WindowStatus"};
+  uint64_t raw = 0;
+  bool is_null = false;
+  set_node_busy(node_id, true);
+  const bool ok = do_read_scalar(node_id, WINDOW_STATUS_PATH, 10000, &raw, &is_null);
+  set_node_busy(node_id, false);
+  if (!ok) {
+    return; // 到達不能。期限切れ側の判定に任せる(窓を勝手に閉じたことにしない)。
+  }
+  if (!is_null && raw == 0) {
+    sm_ui_snapshot_t *s = sm_app_lock();
+    if (s->window.node_id == node_id && s->window.status == SM_UI_WINDOW_OPEN) {
+      s->window.status = SM_UI_WINDOW_CLOSED;
+      s->window.expires_ms = 0;
+    }
+    sm_app_unlock();
+    set_node_note(node_id, "window closed");
+    sm_app_set_status("window on %016llx is closed", (unsigned long long)node_id);
   }
 }
 
@@ -2094,6 +2278,7 @@ void pump_task(void *) {
   // --- 4. 定常ループ: UI の操作を 1 件ずつ + 周期タスク ---
   uint64_t next_status = 0;
   uint64_t next_clock = 0;
+  uint64_t next_window = 0;                // T9: 開いた窓の WindowStatus 確認(10 秒)
   uint64_t next_poll = now_ms() + 30000; // 起動直後は WiFi/Thread 収束待ち(5 秒だと初回が必ず落ちて 2 分退避)
   size_t poll_index = 0;
   for (;;) {
@@ -2142,6 +2327,12 @@ void pump_task(void *) {
           break;
         case SM_UI_OP_SET_ADDR:
           do_set_addr(op);
+          break;
+        case SM_UI_OP_OPEN_WINDOW: // T9(§17.4)
+          do_open_window(op);
+          break;
+        case SM_UI_OP_REVOKE_WINDOW:
+          do_revoke_window(op.node_id);
           break;
         }
       }
@@ -2195,6 +2386,34 @@ void pump_task(void *) {
         }
       }
     }
+    // T9(§17.4): 開いた窓の寿命管理。期限を過ぎたら閉じた扱いにし、開いている
+    // 間は 10 秒ごとに WindowStatus を read して実際に閉じたかを確かめる
+    // (ダイアログの「closes in N s」/「window closed」表示の素)。
+    {
+      bool open_now = false;
+      sm_ui_snapshot_t *s = sm_app_lock();
+      if (s->window.status == SM_UI_WINDOW_OPEN) {
+        if (s->window.expires_ms != 0 && now >= s->window.expires_ms) {
+          s->window.status = SM_UI_WINDOW_CLOSED;
+          s->window.expires_ms = 0;
+        } else {
+          open_now = true;
+        }
+      }
+      sm_app_unlock();
+      if (open_now && now >= next_window) {
+        next_window = now + WINDOW_POLL_MS;
+        StepTimer st("window_poll", STEP_WARN_MS);
+        poll_window_status();
+        continue; // read で 1 秒級かかるので、次の周回で通常 tick に戻る
+      }
+      if (!open_now) {
+        // 窓が無い間は「開いた直後の 10 秒」を先に確保しておく(開いてすぐ
+        // read しに行かない)。
+        next_window = now + WINDOW_POLL_MS;
+      }
+    }
+
     // T8b/P5(§16.6): 購読喪失を受けたノードは 10 秒 tick を待たずここで再購読する
     // (UI op はこの周回に無い = 上の op 処理を抜けてきている)。同一周回で複数
     // ノードが LOST でも **1 周 1 ノード**だけ処理し、UDP のポンプを止めない。

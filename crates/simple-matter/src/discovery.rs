@@ -46,6 +46,12 @@ use crate::transport::session::fixed::FixedVec;
 
 pub mod dns;
 
+/// オンボーディング払い出し情報(manual pairing code / QR payload / setup passcode)。
+///
+/// コミッショニング窓を開いたときの払い出し文字列生成(`docs/design/p4-thread-controller.md` §17)。
+/// 暗号にも `controller` feature にも依存しない(デバイス側 example の表示にも使える)。
+pub mod onboarding;
+
 /// discovery クライアント(commissionable browse / operational 解決)。
 ///
 /// `controller` feature 有効時のみコンパイルされる(`docs/design/controller.md` §5)。

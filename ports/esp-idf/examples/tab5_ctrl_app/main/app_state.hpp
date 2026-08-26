@@ -25,7 +25,9 @@ enum sm_ui_op_kind_t : uint8_t {
   SM_UI_OP_PAIR = 2,         // on-network PASE コミッショニング
   SM_UI_OP_REFRESH_ADDR = 3, // SRP 列挙(→ WiFi なら mDNS)→ アドレス更新 + 種別再検出
   SM_UI_OP_PAIR_BLE = 4,     // BLE コミッショニング(T3、§11)
-  SM_UI_OP_SET_ADDR = 5      // 運用アドレスを直接指定(ipv6 欄に v4/v6 リテラル。T5a)
+  SM_UI_OP_SET_ADDR = 5,     // 運用アドレスを直接指定(ipv6 欄に v4/v6 リテラル。T5a)
+  SM_UI_OP_OPEN_WINDOW = 6,  // ECM コミッショニングウィンドウを開く(T9、§17.4)
+  SM_UI_OP_REVOKE_WINDOW = 7 // 開いたウィンドウを閉じる(RevokeCommissioning。T9)
 };
 
 // PAIR の経路。0/1 は on-network(リンクローカル宛の sin6_scope_id をどちらの
@@ -44,7 +46,8 @@ struct sm_ui_op_t {
   uint32_t passcode;      // PAIR / PAIR_BLE のみ
   char ipv6[46];          // PAIR のみ(NUL 終端の IPv6 リテラル)
   uint8_t via;            // PAIR / PAIR_BLE のみ(sm_ui_via_t)
-  uint16_t discriminator; // PAIR_BLE のみ(広告照合。既定 3840)
+  uint16_t discriminator; // PAIR_BLE(広告照合。既定 3840)/ OPEN_WINDOW(0xFFFF = 乱数)
+  uint16_t timeout_s;     // OPEN_WINDOW のみ(180..900。0 なら既定 300)
 };
 
 // BLE コミッショニングの進捗(スナップショットの ble_stage)。UI はこれを文字列にする。
@@ -112,6 +115,31 @@ struct sm_ui_node_t {
   uint64_t last_update_ms;
 };
 
+// --- T9(§17.4): コミッショニングウィンドウ ---
+//
+// 直近に開いた(あるいは開こうとした)窓 1 件。pump が
+// `sm_ctrl_open_commissioning_window` → `sm_ctrl_last_window` の結果を書き、
+// UI(Share ダイアログ)と console の `window` が読む。
+enum sm_ui_window_status_t : uint8_t {
+  SM_UI_WINDOW_NONE = 0,    // 一度も開いていない
+  SM_UI_WINDOW_OPENING = 1, // 要求済み(WINDOW_OPENED 待ち)
+  SM_UI_WINDOW_OPEN = 2,    // 開いている(expires_ms まで)
+  SM_UI_WINDOW_CLOSED = 3,  // 閉じた(Revoke / 期限切れ / WindowStatus=0 を観測)
+  SM_UI_WINDOW_FAILED = 4   // 開けなかった(status に理由)
+};
+
+struct sm_ui_window_t {
+  uint64_t node_id;
+  uint32_t passcode;
+  uint16_t discriminator;
+  char manual_code[12]; // 11 桁 + NUL(区切りは UI 側で入れる)
+  char qr[32];          // "MT:..." + NUL
+  uint64_t expires_ms;  // pump の now_ms 基準(0 = 未オープン)
+  uint8_t status;       // sm_ui_window_status_t
+  uint8_t fail_status;  // FAILED のときのクラスタ / IM ステータス
+  uint8_t fail_phase;   // FAILED のときの失敗段階(1=VID 2=PID 3=invoke)
+};
+
 // pump → UI のスナップショット(丸ごとコピーして使う)。
 struct sm_ui_snapshot_t {
   uint32_t seq; // 更新のたびに増える(UI は変化検知に使ってよい)
@@ -144,6 +172,9 @@ struct sm_ui_snapshot_t {
   // --- BLE(T3、§11。pump が sm_ble_central_state() をコピーする)---
   uint8_t ble_host;  // sm_ble_host_state_t: 0=off 1=starting 2=ready 3=failed
   uint8_t ble_stage; // sm_ui_ble_stage_t(BLE コミッショニングの進捗)
+
+  // --- T9: コミッショニングウィンドウ(§17.4)---
+  sm_ui_window_t window;
 
   // --- pairing ---
   uint8_t pair_state; // 0=idle 1=進行中 2=成功 3=失敗

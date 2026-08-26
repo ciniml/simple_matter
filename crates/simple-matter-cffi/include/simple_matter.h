@@ -114,6 +114,15 @@ typedef enum {
   // 購読が失われた(keep-alive 途絶。§16.2)。`node_id`、`value_u64` = 購読 ID。
   // シムの購読テーブルからは除去済みなので、C++ 側は poll フォールバック / 再購読へ。
   SM_CTRL_EV_SUBSCRIPTION_LOST = 17,
+  // コミッショニング窓を開いた(§17.3)。`node_id` = 対象ノード、`value_u64` = 払い出した
+  // passcode、`endpoint` = discriminator、`attribute` = timeout(秒)。manual pairing code /
+  // QR 文字列込みの全情報は [`sm_ctrl_last_window`] で取る。
+  SM_CTRL_EV_WINDOW_OPENED = 18,
+  // コミッショニング窓を開けなかった(§17.3)。`status` = クラスタ固有ステータス
+  // (Busy=2 / PAKEParameterError=3)または IM ステータス、`phase` = 失敗段階
+  // (1=VendorID read、2=ProductID read、3=OpenCommissioningWindow invoke。
+  // 0xE0/0xD0/0xF0 台は診断コード)。
+  SM_CTRL_EV_WINDOW_FAILED = 19,
 } sm_ctrl_event_kind_t;
 
 // アプリイベント種別(`docs/design/c-ffi-shim.md` §1)。
@@ -438,6 +447,31 @@ typedef struct {
   uint32_t attribute;
 } sm_attr_path_t;
 
+// 直近に開いたコミッショニング窓の払い出し情報(§17.3)。
+//
+// [`sm_ctrl_open_commissioning_window`] が成功したあと [`sm_ctrl_last_window`] で取る。
+// `manual_code` / `qr_payload` はどちらも NUL 終端の ASCII。
+typedef struct {
+  // 窓を開けた相手ノードの運用 NodeId。
+  uint64_t node_id;
+  // 窓を開けておく秒数(OpenCommissioningWindow に渡した値)。
+  uint16_t timeout_s;
+  // 窓の 12 ビット discriminator。
+  uint16_t discriminator;
+  // 払い出した setup passcode。
+  uint32_t passcode;
+  // QR 用 VendorID(read できなければ 0)。
+  uint16_t vendor_id;
+  // QR 用 ProductID(read できなければ 0)。
+  uint16_t product_id;
+  // 11 桁 manual pairing code + NUL。
+  char manual_code[12];
+  // `"MT:"` + base38 の QR payload + NUL。
+  char qr_payload[32];
+  // 窓を開いた時刻(呼び出し側の `now_ms`)。0 = 未オープン。
+  uint64_t opened_at_ms;
+} sm_ctrl_window_t;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -748,6 +782,48 @@ int32_t sm_ctrl_subscribe_paths(uint64_t node_id,
                                 uint16_t min_interval_s,
                                 uint16_t max_interval_s,
                                 uint64_t now_ms);
+
+// 既存 fabric の管理者として **ECM コミッショニング窓**を開く(§17.3)。
+//
+// `passcode` = 0 なら有効な setup passcode を乱数生成、`discriminator` = 0xFFFF なら
+// 12 ビット discriminator を乱数生成する(それ以外は下位 12 ビットだけを使う)。
+// `timeout_s` は仕様の許容範囲 180..=900 へクランプする。
+//
+// 内部で 3 段階を直列に進める:
+// (1) EP0 BasicInformation VendorID(0x0002)read、(2) ProductID(0x0004)read
+// (どちらも QR 用の飾りで、失敗しても VID/PID = 0 で続行)、
+// (3) OpenCommissioningWindow(0x003C/0x00)を timed invoke。
+//
+// 完了は [`sm_ctrl_take_event`] の [`SM_CTRL_EV_WINDOW_OPENED`](`value_u64` = passcode、
+// `endpoint` = discriminator、`attribute` = timeout 秒)/
+// [`SM_CTRL_EV_WINDOW_FAILED`](`status` = ステータス、`phase` = 失敗段階)。
+// manual pairing code / QR 文字列込みの情報は [`sm_ctrl_last_window`] で取る。
+//
+// 戻り値: 0=OK、-1=未初期化、-3=未知ノード、-4=CASE 開始失敗、-5=引数不正
+// (passcode が仕様の禁止値)、-6=RNG 失敗、-10=busy。
+//
+// [`SM_CTRL_EV_WINDOW_OPENED`]: sm_ctrl_event_kind_t::SM_CTRL_EV_WINDOW_OPENED
+// [`SM_CTRL_EV_WINDOW_FAILED`]: sm_ctrl_event_kind_t::SM_CTRL_EV_WINDOW_FAILED
+int32_t sm_ctrl_open_commissioning_window(uint64_t node_id,
+                                          uint16_t timeout_s,
+                                          uint16_t discriminator,
+                                          uint32_t passcode,
+                                          uint64_t now_ms);
+
+// 直近に開いた窓の払い出し情報(manual code / QR 文字列込み)を `out` に書く(§17.3)。
+//
+// 一度も窓を開いていなければ false(`out` は触らない)。窓が期限切れ / Revoke で
+// 閉じたかどうかは追跡しない(WindowStatus は
+// `sm_ctrl_read_scalar(node, 0, 0x003C, 0x0000)` で読む。0=閉 1=ECM 2=BC)。
+bool sm_ctrl_last_window(sm_ctrl_window_t *out);
+
+// 開いているコミッショニング窓を閉じる(0x003C/0x02 RevokeCommissioning、timed invoke)。
+//
+// 完了は通常の invoke と同じ INVOKE_DONE / INVOKE_FAILED(`node_id` で識別。窓が開いて
+// いなければ `status` にクラスタ固有 WindowNotOpen=4)。
+// 戻り値: 0=OK、-1=未初期化、-3=未知ノード、-4=CASE 開始失敗、-10=busy。
+int32_t sm_ctrl_revoke_commissioning(uint64_t node_id,
+                                     uint64_t now_ms);
 
 // ノードの購読をローカルで破棄する(§16.2)。戻り値 = 破棄した本数。
 //
