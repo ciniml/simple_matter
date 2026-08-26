@@ -496,7 +496,9 @@ impl<'a> Exec<'a> {
     /// 購読系イベントを処理する(レポート表示 + 要約カウント)。
     fn on_sub_event(&mut self, ev: ImEvent) {
         match ev {
-            ImEvent::SubscriptionReport { subscription_id } => {
+            ImEvent::SubscriptionReport {
+                subscription_id, ..
+            } => {
                 let ts = self.start.elapsed().as_secs();
                 let is_event = self
                     .subs
@@ -524,7 +526,9 @@ impl<'a> Exec<'a> {
                     s.reports += 1;
                 }
             }
-            ImEvent::SubscriptionLost { subscription_id } => {
+            ImEvent::SubscriptionLost {
+                subscription_id, ..
+            } => {
                 if json::enabled() {
                     Obj::new("subscription-lost")
                         .num("subscriptionId", subscription_id)
@@ -1471,6 +1475,7 @@ impl<'a> Exec<'a> {
             Some(ImEvent::SubscribeDone {
                 subscription_id,
                 max_interval_s,
+                ..
             }) => {
                 logf!(
                     Level::Debug,
@@ -1574,6 +1579,7 @@ impl<'a> Exec<'a> {
             Some(ImEvent::SubscribeDone {
                 subscription_id,
                 max_interval_s,
+                ..
             }) => (subscription_id, max_interval_s),
             Some(ev) => return Err(format!("subscribe-event failed: {ev:?}")),
             None => return self.op_timeout(node_id, "subscribe-event"),

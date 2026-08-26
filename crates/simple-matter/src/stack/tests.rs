@@ -1499,6 +1499,7 @@ mod controller_e2e {
             Some(ImEvent::SubscribeDone {
                 subscription_id,
                 max_interval_s,
+                ..
             }) => {
                 assert_eq!(max_interval_s, 60, "negotiated max interval");
                 subscription_id
@@ -1537,7 +1538,9 @@ mod controller_e2e {
                     assert_eq!(status, ImStatus::Success);
                     invoke_done = true;
                 }
-                ImEvent::SubscriptionReport { subscription_id } => {
+                ImEvent::SubscriptionReport {
+                    subscription_id, ..
+                } => {
                     report_sub = Some(subscription_id);
                 }
                 other => panic!("unexpected event {other:?}"),
@@ -1701,7 +1704,10 @@ mod controller_e2e {
         flush(&mut ctrl, &mut dev, t2);
         let mut report_sub = None;
         while let Some(ev) = ctrl.im_take_event() {
-            if let ImEvent::SubscriptionReport { subscription_id } = ev {
+            if let ImEvent::SubscriptionReport {
+                subscription_id, ..
+            } = ev
+            {
                 report_sub = Some(subscription_id);
             }
         }
@@ -1787,6 +1793,178 @@ mod controller_e2e {
     /// (`on_report_failed`、設計 §6.3)、exchange/tx バッファが解放されることを検証する。
     /// 実機回帰の 2 次要因(前回実行の残骸購読が 30 秒ごとに死んだピアへレポートを送り、
     /// スロットを浪費し続ける)の再発防止。
+    /// 設計 §6.1 の統合回帰(ctrl↔dev ループバック)。
+    ///
+    /// デバイス発の購読レポートに対するコントローラの `StatusResponse` を **1 通落とす**と、
+    /// デバイスは同一 msg_ctr の `ReportData` を再送する。その再送がネットワーク上で遅れ、
+    /// コントローラ側の会話が(再送された `StatusResponse` が届いて)終端・回収された後に
+    /// 到着すると、**修正前のコントローラは ACK を一切返さない**(会話が無いので `rearm_ack`
+    /// できない)。送信側はこれを 10 回再送して購読を失う(T8b 実機で観測した経路)。
+    /// 修正後は会話の有無に依らず standalone ACK(orphan ACK)が出る。
+    #[test]
+    fn duplicate_report_after_closed_exchange_gets_standalone_ack() {
+        use crate::dm::meta::EventId;
+        use crate::im::events::PRIORITY_INFO;
+        use crate::im::wire::EventPath;
+
+        let crypto = RustCrypto::new(SeqRng(0xDEAD_0002_1234_5678));
+        let fabrics: RefCell<FabricTable<Crb, 5>> = RefCell::new(FabricTable::new());
+
+        let config = PaseConfig::from_passcode(PASSCODE, &SALT, ITERATIONS).unwrap();
+        let dev_creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
+        let sc = SecureChannel::new(&crypto, SeqRng(0x5C00_0DE1), config, dev_creds);
+        let im = InteractionModel::new(build_device(&fabrics));
+        let mut dev: TestStack = MatterStack::new(&crypto, sc, im);
+
+        let ca = Ca::<Crb>::generate(
+            &crypto,
+            &mut SeqRng(0xCA00_0DE1),
+            FABRIC_ID,
+            COMM_NODE,
+            0xFFF1,
+            0,
+        )
+        .expect("Ca::generate");
+        let ctrl_creds = ControllerCreds::new(&ca, &crypto, 0);
+        let sc_init = ScInitiator::new(&crypto, SeqRng(0x1C00_0DE1), ctrl_creds);
+        let mut ctrl: Ctrl = ControllerStack::new(&crypto, sc_init, ImClient::new());
+
+        let mut comm = Commissioner::new(&ca, &crypto, AttestationPolicy::Skip);
+        comm.commission(peer(), PASSCODE, DEVICE_NODE, NOW).unwrap();
+        let mut tx = [0u8; 1700];
+        let mut final_phase = comm.phase();
+        for _ in 0..60 {
+            let out = comm.drive(&mut ctrl, NOW, &mut tx);
+            final_phase = out.phase;
+            if let Some(d) = out.send {
+                deliver_and_settle(&mut ctrl, &mut dev, NOW, &tx, d.len);
+            }
+            match out.phase {
+                Phase::Done { .. } | Phase::Failed { .. } => break,
+                _ => {}
+            }
+        }
+        let case_session = match final_phase {
+            Phase::Done { session } => session,
+            other => panic!("commissioning did not complete: {other:?}"),
+        };
+
+        // イベント購読を確立する(デバイス発レポートを作るため)。
+        let dir = ctrl
+            .start_subscribe_events(
+                case_session,
+                &[],
+                &[EventPath::concrete(
+                    EndpointId(1),
+                    ClusterId(0x0006),
+                    EventId(0),
+                )],
+                None,
+                0,
+                30,
+                NOW,
+                &mut tx,
+            )
+            .expect("start subscribe-event");
+        deliver_and_settle(&mut ctrl, &mut dev, NOW, &tx, dir.len);
+        assert!(matches!(
+            ctrl.im_take_event(),
+            Some(ImEvent::SubscribeDone { .. })
+        ));
+        while ctrl.im_take_event().is_some() {}
+        assert_eq!(dev.im().subscription_count(), 1);
+
+        // --- (a) デバイス発の購読レポートを 1 通作り、コントローラへ届ける ---
+        let _ = dev.post_event(
+            EndpointId(1),
+            ClusterId(0x0006),
+            EventId(0),
+            PRIORITY_INFO,
+            NOW + 100,
+            |w, tag| {
+                w.start_struct(tag)?;
+                w.write_bool(&TlvTag::ContextSpecific(0), true)?;
+                w.end_container()
+            },
+        );
+        let mut txd = [0u8; 1700];
+        let mut txc = [0u8; 1700];
+        let mut now = NOW + 200;
+        let report_len = dev.poll(now, &mut txd).expect("report staged").len;
+        let mut report = [0u8; 1700];
+        report[..report_len].copy_from_slice(&txd[..report_len]);
+
+        let mut rx = report;
+        let status = ctrl
+            .handle_rx(&mut rx[..report_len], peer(), now, &mut txc)
+            .expect("controller answers the report with StatusResponse");
+        // --- (b) その StatusResponse を 1 通だけ落とす(デバイスへ渡さない)---
+        let _ = status;
+
+        // --- (c) ACK が来ないのでデバイスが同じ msg_ctr の ReportData を再送する。
+        //         その再送はネットワーク上で遅れているものとして手元に保持する ---
+        let mut dup = [0u8; 1700];
+        let mut dup_len = 0usize;
+        for _ in 0..40 {
+            now += 100;
+            if let Some(d) = dev.poll(now, &mut txd) {
+                dup_len = d.len;
+                dup[..dup_len].copy_from_slice(&txd[..dup_len]);
+                break;
+            }
+        }
+        assert_eq!(
+            dup_len, report_len,
+            "device retransmits the same unacked ReportData"
+        );
+
+        // --- (d) コントローラの StatusResponse 再送は届く → デバイスの再送が止まり、
+        //         デバイスの ACK でコントローラ側の会話が終端・回収される ---
+        for _ in 0..40 {
+            now += 100;
+            if let Some(d) = ctrl.poll(now, &mut txc) {
+                let mut b = [0u8; 1700];
+                b[..d.len].copy_from_slice(&txc[..d.len]);
+                ping_pong(&mut ctrl, &mut dev, now, &b[..d.len], true);
+                break;
+            }
+        }
+        flush(&mut ctrl, &mut dev, now);
+        assert_eq!(
+            ctrl.transport_deadline(),
+            None,
+            "controller's report exchange is settled and reclaimed"
+        );
+        assert!(
+            dev.poll(now, &mut txd).is_none(),
+            "device stopped retransmitting the report"
+        );
+
+        // --- (e) 遅れて届いた重複 ReportData。会話はもう無い ---
+        now += 1000;
+        assert!(
+            ctrl.handle_rx(&mut dup[..dup_len], peer(), now, &mut txc)
+                .is_none(),
+            "duplicate is not dispatched"
+        );
+        // 修正前はここで ACK が出ず、送信側は再送を続けて購読を失う(設計 §6.1)。
+        let ack = ctrl
+            .poll(now, &mut txc)
+            .expect("controller emits a standalone ACK for the orphaned duplicate");
+        assert!(ack.len > 0);
+        assert_eq!(ack.addr, peer(), "ACK goes back to the device");
+        assert_eq!(ctrl.poll(now, &mut txc), None, "exactly one orphan ACK");
+
+        // --- (f) その ACK はデバイスで問題なく受理され、購読は生き続ける ---
+        let mut b = [0u8; 1700];
+        b[..ack.len].copy_from_slice(&txc[..ack.len]);
+        assert!(dev
+            .handle_rx(&mut b[..ack.len], ctrl_addr(), now, &mut txd)
+            .is_none());
+        assert_eq!(dev.im().subscription_count(), 1, "subscription survives");
+        assert_eq!(ctrl.subscription_count(), 1);
+    }
+
     #[test]
     fn subscription_dropped_when_report_unacked() {
         use crate::dm::meta::EventId;

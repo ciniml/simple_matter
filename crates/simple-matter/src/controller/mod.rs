@@ -277,13 +277,15 @@ impl<
         self.mgr.handler().im.subscription_capacity()
     }
 
-    /// client 側の購読 `id` をローカルで捨てる(設計 §16.6 P4)。戻り値 = 実際に消したか。
+    /// client 側の購読 `(session, id)` をローカルで捨てる(設計 §16.6 P4/P7)。
+    /// 戻り値 = 実際に消したか。
     ///
     /// シム(`sm_ctrl_unsubscribe` / 同一ノードの再購読)が自分のテーブルを捨てるときに
     /// **必ず**併せて呼ぶ。呼ばないとコア側に旧購読が残り、デバイスの幽霊購読へ Success を
-    /// 返し続けて双方のテーブルが詰まる。
-    pub fn im_remove_subscription(&mut self, id: u32) -> bool {
-        self.mgr.handler_mut().im.remove_subscription(id)
+    /// 返し続けて双方のテーブルが詰まる。購読 ID はデバイスごとの採番で別ノード間で衝突する
+    /// ため、セッションと組で指定する(§16.6 P7)。
+    pub fn im_remove_subscription(&mut self, session: SessionId, id: u32) -> bool {
+        self.mgr.handler_mut().im.remove_subscription(session, id)
     }
 
     /// セッションに乗る client 側購読を全て捨てる(戻り値 = 捨てた本数、設計 §16.6 P4)。
@@ -471,6 +473,24 @@ impl<
                     if let Some(d) = self.stage_standalone_ack(exchange, ack_ctr, now_ms, tx_out) {
                         return Some(d);
                     }
+                }
+                PollAction::SendOrphanAck {
+                    session,
+                    exch_id,
+                    peer_is_initiator,
+                    ack_ctr,
+                } => {
+                    if let Some(d) = self.stage_orphan_ack(
+                        session,
+                        exch_id,
+                        !peer_is_initiator,
+                        ack_ctr,
+                        now_ms,
+                        tx_out,
+                    ) {
+                        return Some(d);
+                    }
+                    // 構築に失敗したら握り潰して次の poll 対象へ進む(会話は既に無い)。
                 }
                 PollAction::Failed { freed_tx, .. } => {
                     self.tx_pool.release(freed_tx);
@@ -1122,6 +1142,41 @@ impl<
                     &mut self.sessions,
                     self.crypto,
                     ex,
+                    ack_ctr,
+                    &mut wb,
+                    now_ms,
+                )
+                .ok()?;
+            (addr, wb.start(), wb.end())
+        };
+        tx_out.copy_within(start..end, 0);
+        Some(SendDirective {
+            addr,
+            len: end - start,
+        })
+    }
+
+    /// 会話を持たない重複への standalone ACK を組み立てて `tx_out` に置く(設計 §6.1)。
+    fn stage_orphan_ack(
+        &mut self,
+        session: SessionId,
+        exch_id: u16,
+        i_flag: bool,
+        ack_ctr: u32,
+        now_ms: u64,
+        tx_out: &mut [u8],
+    ) -> Option<SendDirective> {
+        let headroom = PacketHeader::MAX_LEN + PayloadHeader::MAX_LEN;
+        let (addr, start, end) = {
+            let mut wb = WriteBuf::new(tx_out, headroom).ok()?;
+            let addr = self
+                .mgr
+                .build_standalone_ack_raw(
+                    &mut self.sessions,
+                    self.crypto,
+                    session,
+                    exch_id,
+                    i_flag,
                     ack_ctr,
                     &mut wb,
                     now_ms,

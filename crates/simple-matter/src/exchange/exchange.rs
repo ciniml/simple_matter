@@ -216,6 +216,20 @@ pub enum PollAction {
         /// ACK 対象の受信メッセージカウンタ。
         ack_ctr: u32,
     },
+    /// 会話を持たない重複メッセージへの standalone ACK(設計 §6.1)。
+    ///
+    /// 終端・回収済みの会話宛に届いた重複 reliable メッセージに対し、会話を復元せずに
+    /// ACK だけを返す。[`ExchangeManager::build_standalone_ack_raw`] で生成する。
+    SendOrphanAck {
+        /// ACK を返すセッション。
+        session: SessionId,
+        /// 相手が使っていた Exchange ID(そのまま echo する)。
+        exch_id: u16,
+        /// 重複メッセージの送信元が initiator だったか(自分の I フラグはこの否定)。
+        peer_is_initiator: bool,
+        /// ACK 対象の受信メッセージカウンタ。
+        ack_ctr: u32,
+    },
     /// 再送上限到達で失敗した会話(プールから除去済み)。
     Failed {
         /// 失敗した会話のハンドル。
@@ -225,6 +239,18 @@ pub enum PollAction {
     },
 }
 
+/// 会話を持たない重複メッセージに返すべき standalone ACK の保留エントリ(設計 §6.1)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OrphanAck {
+    session: SessionId,
+    exch_id: u16,
+    peer_is_initiator: bool,
+    ack_ctr: u32,
+}
+
+/// 保留できる orphan ACK の数(設計 §6.1)。溢れたら最古を捨てる。
+const ORPHAN_ACKS: usize = 2;
+
 /// 会話プール + プロトコルディスパッチ配線。
 ///
 /// `H` はディスパッチャ(通常は [`ProtocolMux`](super::dispatch::ProtocolMux))で、
@@ -232,6 +258,8 @@ pub enum PollAction {
 #[derive(Debug)]
 pub struct ExchangeManager<H, const EXCHANGES: usize> {
     exchanges: FixedVec<ExchangeState, EXCHANGES>,
+    /// 会話を持たない重複への未送 standalone ACK(設計 §6.1)。
+    orphan_acks: FixedVec<OrphanAck, ORPHAN_ACKS>,
     next_exch_id: u16,
     handler: H,
 }
@@ -241,6 +269,7 @@ impl<H, const EXCHANGES: usize> ExchangeManager<H, EXCHANGES> {
     pub fn new(handler: H) -> Self {
         Self {
             exchanges: FixedVec::new(),
+            orphan_acks: FixedVec::new(),
             next_exch_id: 1,
             handler,
         }
@@ -319,6 +348,11 @@ impl<H, const EXCHANGES: usize> ExchangeManager<H, EXCHANGES> {
 
     /// すべての会話にまたがる、次に poll すべき最も早い deadline を返す。
     pub fn next_deadline(&self) -> Option<u64> {
+        // 会話を持たない重複への standalone ACK は遅延させる意味がないので即時扱い
+        // (過去時刻 = 常に due、設計 §6.1)。
+        if !self.orphan_acks.is_empty() {
+            return Some(0);
+        }
         let mut next: Option<u64> = None;
         for e in self.exchanges.iter() {
             if let Some(d) = e.mrp.next_deadline() {
@@ -420,6 +454,19 @@ impl<H, const EXCHANGES: usize> ExchangeManager<H, EXCHANGES> {
         }
     }
 
+    /// 会話を持たない重複への ACK を保留キューへ積む(同一エントリは重複登録しない)。
+    ///
+    /// 満杯なら最古(先頭)を捨てて新しいものを入れる(設計 §6.1)。
+    fn push_orphan_ack(&mut self, entry: OrphanAck) {
+        if self.orphan_acks.iter().any(|o| *o == entry) {
+            return;
+        }
+        if self.orphan_acks.is_full() {
+            let _ = self.orphan_acks.swap_remove(0);
+        }
+        let _ = self.orphan_acks.push(entry);
+    }
+
     /// 再送・standalone ACK の期限到達を 1 件処理して返す(単一の poll 駆動点)。
     ///
     /// [`PollAction::Idle`] が返るまで繰り返し呼ぶことで、その時刻に処理すべき送出を
@@ -428,6 +475,7 @@ impl<H, const EXCHANGES: usize> ExchangeManager<H, EXCHANGES> {
     /// - 再送 deadline 到達 → [`PollAction::Retransmit`](状態は次回へ進む)。
     /// - 再送上限到達 → 会話を除去し [`PollAction::Failed`]。
     /// - standalone ACK 期限到達 → ACK 済みに印を付け [`PollAction::SendAck`]。
+    /// - 会話を持たない重複への保留 ACK → [`PollAction::SendOrphanAck`](設計 §6.1)。
     pub fn poll(&mut self, now_ms: u64, jitter_rand: u8) -> PollAction {
         // 終端済み(closing)かつ MRP 静穏の会話を回収する(プール枯渇防止)。
         let mut i = 0;
@@ -437,6 +485,16 @@ impl<H, const EXCHANGES: usize> ExchangeManager<H, EXCHANGES> {
             } else {
                 i += 1;
             }
+        }
+        // 会話を持たない重複への standalone ACK を 1 件排出する(遅延なし、設計 §6.1)。
+        if !self.orphan_acks.is_empty() {
+            let o = self.orphan_acks.swap_remove(0);
+            return PollAction::SendOrphanAck {
+                session: o.session,
+                exch_id: o.exch_id,
+                peer_is_initiator: o.peer_is_initiator,
+                ack_ctr: o.ack_ctr,
+            };
         }
         for i in 0..self.exchanges.len() {
             match self.exchanges[i].mrp.take_due_retrans(now_ms, jitter_rand) {
@@ -522,8 +580,16 @@ impl<H, const EXCHANGES: usize> ExchangeManager<H, EXCHANGES> {
         // (MRP 有効セッションのみ)。
         if decoded.duplicate {
             if allows_mrp && phdr.is_reliable() {
-                if let Some(i) = self.match_index(session, phdr.exch_id, phdr.is_initiator()) {
-                    self.exchanges[i].mrp.rearm_ack(decoded.msg_ctr, now_ms);
+                match self.match_index(session, phdr.exch_id, phdr.is_initiator()) {
+                    Some(i) => self.exchanges[i].mrp.rearm_ack(decoded.msg_ctr, now_ms),
+                    // 会話が終端・回収済みでも MRP 仕様上 ACK は返さねばならない
+                    // (返さないと送信側が 10 回再送して会話を失敗扱いにする、設計 §6.1)。
+                    None => self.push_orphan_ack(OrphanAck {
+                        session,
+                        exch_id: phdr.exch_id,
+                        peer_is_initiator: phdr.is_initiator(),
+                        ack_ctr: decoded.msg_ctr,
+                    }),
                 }
             }
             return Ok(RecvReport {
@@ -732,13 +798,47 @@ impl<H, const EXCHANGES: usize> ExchangeManager<H, EXCHANGES> {
         now_ms: u64,
     ) -> Result<PeerAddr> {
         let idx = self.index_of_id(exchange).ok_or(Error::NotFound)?;
-        let role = self.exchanges[idx].role;
-        let (_ctr, addr) = build_packet(
+        let i_flag = self.exchanges[idx].role == Role::Initiator;
+        self.build_standalone_ack_raw(
             sessions,
             crypto,
             exchange.session,
-            role,
             exchange.exch_id,
+            i_flag,
+            ack_ctr,
+            out,
+            now_ms,
+        )
+    }
+
+    /// 会話プールを参照せずに standalone ACK を組み立てる(設計 §6.1)。
+    ///
+    /// [`PollAction::SendOrphanAck`] のように「会話がもう存在しない」相手へ ACK を返す
+    /// ために使う。`i_flag` は**自分**が initiator かどうか(= 相手が initiator なら
+    /// `false`)。
+    #[allow(clippy::too_many_arguments)] // ヘッダ構築に必要な素の値群(build_packet と同じ理由)。
+    pub fn build_standalone_ack_raw<C: Crypto, const SESSIONS: usize>(
+        &self,
+        sessions: &mut SessionManager<SESSIONS>,
+        crypto: &C,
+        session: SessionId,
+        exch_id: u16,
+        i_flag: bool,
+        ack_ctr: u32,
+        out: &mut WriteBuf<'_>,
+        now_ms: u64,
+    ) -> Result<PeerAddr> {
+        let role = if i_flag {
+            Role::Initiator
+        } else {
+            Role::Responder
+        };
+        let (_ctr, addr) = build_packet(
+            sessions,
+            crypto,
+            session,
+            role,
+            exch_id,
             SECURE_CHANNEL_PROTOCOL_ID,
             MRP_STANDALONE_ACK_OPCODE,
             false,
@@ -1288,6 +1388,105 @@ mod tests {
             }
             other => panic!("expected immediate re-ACK, got {other:?}"),
         }
+    }
+
+    /// 設計 §6.1: 会話が既に終端・回収済みでも、重複 reliable メッセージには
+    /// standalone ACK(orphan ACK)を返す。返さないと送信側が 10 回再送して失敗する。
+    #[test]
+    fn recv_duplicate_after_exchange_closed_emits_orphan_ack() {
+        let mut sessions: SessionManager<2> = SessionManager::new();
+        let peer = addr(5540);
+        let key = [0x33u8; 16];
+        let sid_val = encrypted_session(&mut sessions, peer, key);
+        let wire_sid = sessions.get(sid_val).unwrap().local_session_id();
+        let peer_node = 0x5555_6666_7777_8888u64;
+        let mut mgr: ExchangeManager<RecordingDispatcher, 4> = null_mgr();
+
+        let m = Incoming {
+            key: Some((key, peer_node)),
+            wire_session_id: wire_sid,
+            ctr: 5,
+            exch_id: 0x70,
+            proto_id: 0x0001,
+            reliable: true,
+            ack_ctr: None,
+            initiator: true,
+        };
+        let mut wire = [0u8; 256];
+        let n = build_incoming(&crypto(), &m, &mut wire);
+        let r1 = mgr
+            .recv(
+                &mut sessions,
+                &crypto(),
+                peer,
+                1000,
+                &mut wire[..n],
+                &mut [0u8; 512],
+            )
+            .unwrap();
+        let ex = r1.exchange.unwrap();
+        // 会話を終端・回収する(応答を返して close 済みの状態を模す)。
+        assert!(mgr.close(ex).is_none());
+        assert_eq!(mgr.len(), 0);
+
+        // 同一 ctr の再送が届く。会話は無いので重複としてドロップされる。
+        let n2 = build_incoming(&crypto(), &m, &mut wire);
+        let r2 = mgr
+            .recv(
+                &mut sessions,
+                &crypto(),
+                peer,
+                1500,
+                &mut wire[..n2],
+                &mut [0u8; 512],
+            )
+            .unwrap();
+        assert!(r2.duplicate);
+        assert!(!r2.dispatched);
+        assert!(r2.exchange.is_none());
+
+        // 会話が無くても即時に orphan ACK が出る。
+        assert_eq!(mgr.next_deadline(), Some(0), "orphan ACK は即時扱い");
+        match mgr.poll(1500, 0) {
+            PollAction::SendOrphanAck {
+                session,
+                exch_id,
+                peer_is_initiator,
+                ack_ctr,
+            } => {
+                assert_eq!(session, sid_val);
+                assert_eq!(exch_id, 0x70);
+                assert!(peer_is_initiator, "相手が initiator なので自分は responder");
+                assert_eq!(ack_ctr, 5);
+            }
+            other => panic!("expected SendOrphanAck, got {other:?}"),
+        }
+        // 1 件だけ排出したら静穏に戻る。
+        assert_eq!(
+            mgr.poll(1500, 0),
+            PollAction::Idle {
+                next_deadline: None
+            }
+        );
+
+        // raw 版で実際にワイヤパケットを組み立てられる(I フラグ = !peer_is_initiator)。
+        let headroom = PacketHeader::MAX_LEN + PayloadHeader::MAX_LEN;
+        let mut store = [0u8; 128];
+        let mut w = WriteBuf::new(&mut store, headroom).unwrap();
+        let dst = mgr
+            .build_standalone_ack_raw(
+                &mut sessions,
+                &crypto(),
+                sid_val,
+                0x70,
+                false,
+                5,
+                &mut w,
+                1500,
+            )
+            .unwrap();
+        assert_eq!(dst, peer);
+        assert!(!w.as_slice().is_empty());
     }
 
     #[test]

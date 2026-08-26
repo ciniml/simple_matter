@@ -40,6 +40,107 @@
 namespace {
 
 constexpr const char *TAG = "pump";
+
+// --- pump 停滞の計測(docs/design/p4-thread-controller.md §16.6 の追記) ---
+// 定常ループの各ステップ所要時間を測り、閾値超過で WARN する。実機で観測された
+// 「191 秒間 pump が無反応」の犯人をログから特定するための足場。
+// オーバーヘッドは 1 ステップあたり esp_timer_get_time() 2 回 + 数命令。
+struct LoopProfile {
+  uint64_t start_us = 0;
+  uint64_t worst_us = 0;
+  const char *worst_step = "-";
+  char detail[112] = {0}; // 1ms 以上のステップの内訳 "name=ms,..."
+  size_t detail_len = 0;
+
+  void begin() {
+    worst_us = 0;
+    worst_step = "-";
+    detail[0] = '\0';
+    detail_len = 0;
+    start_us = (uint64_t)esp_timer_get_time();
+  }
+  void add(const char *name, uint64_t us) {
+    if (us > worst_us) {
+      worst_us = us;
+      worst_step = name;
+    }
+    if (us < 1000 || detail_len + 1 >= sizeof(detail)) {
+      return;
+    }
+    int n = snprintf(detail + detail_len, sizeof(detail) - detail_len, "%s%s=%llu",
+                     detail_len != 0 ? "," : "", name, (unsigned long long)(us / 1000));
+    if (n < 0) {
+      return;
+    }
+    detail_len += (size_t)n;
+    if (detail_len >= sizeof(detail)) {
+      detail_len = sizeof(detail) - 1; // 切り詰められた
+    }
+  }
+};
+
+LoopProfile g_loop_prof;
+
+// 個々のステップ。スコープを抜けた時点(continue / break 経由でも)で計測される。
+class StepTimer {
+public:
+  StepTimer(const char *name, uint32_t warn_ms)
+      : name_(name), warn_us_((uint64_t)warn_ms * 1000ULL),
+        t0_((uint64_t)esp_timer_get_time()) {}
+  ~StepTimer() {
+    uint64_t us = (uint64_t)esp_timer_get_time() - t0_;
+    g_loop_prof.add(name_, us);
+    if (us > warn_us_) {
+      ESP_LOGW(TAG, "pump: slow step=%s ms=%llu", name_, (unsigned long long)(us / 1000));
+    }
+  }
+  StepTimer(const StepTimer &) = delete;
+  StepTimer &operator=(const StepTimer &) = delete;
+
+private:
+  const char *name_;
+  uint64_t warn_us_;
+  uint64_t t0_;
+};
+
+// 1 周回全体。5 秒超なら内訳付きでまとめて WARN。
+class LoopTimer {
+public:
+  LoopTimer() { g_loop_prof.begin(); }
+  ~LoopTimer() {
+    uint64_t us = (uint64_t)esp_timer_get_time() - g_loop_prof.start_us;
+    if (us > 5000000ULL) {
+      ESP_LOGW(TAG, "pump: slow loop ms=%llu worst=%s ms=%llu steps=[%s]",
+               (unsigned long long)(us / 1000), g_loop_prof.worst_step,
+               (unsigned long long)(g_loop_prof.worst_us / 1000), g_loop_prof.detail);
+    }
+  }
+  LoopTimer(const LoopTimer &) = delete;
+  LoopTimer &operator=(const LoopTimer &) = delete;
+};
+
+// ステップの警告閾値。UI op は run_until で秒単位かかるのが正常なので緩める。
+constexpr uint32_t STEP_WARN_MS = 1000;
+constexpr uint32_t OP_WARN_MS = 20000;
+
+const char *op_step_name(uint8_t kind) {
+  switch (kind) {
+  case SM_UI_OP_TOGGLE:
+    return "op:toggle";
+  case SM_UI_OP_READ_ONOFF:
+    return "op:read";
+  case SM_UI_OP_REFRESH_ADDR:
+    return "op:refresh_addr";
+  case SM_UI_OP_PAIR:
+    return "op:pair";
+  case SM_UI_OP_PAIR_BLE:
+    return "op:pair_ble";
+  case SM_UI_OP_SET_ADDR:
+    return "op:set_addr";
+  default:
+    return "op:?";
+  }
+}
 constexpr const char *SM_NVS_NAMESPACE = "smctl";
 // ノード種別のキャッシュ(T4、§12.3 の 1)。key = NodeId の hex(下位 60bit、15 桁 =
 // NVS のキー長上限)、値 = sm_ui_node_kind_t。
@@ -1996,52 +2097,69 @@ void pump_task(void *) {
   uint64_t next_poll = now_ms() + 30000; // 起動直後は WiFi/Thread 収束待ち(5 秒だと初回が必ず落ちて 2 分退避)
   size_t poll_index = 0;
   for (;;) {
+    LoopTimer loop_timer;
     sm_ui_op_t op;
-    if (sm_app_take_op(&op, 100)) {
-      switch (op.kind) {
-      case SM_UI_OP_TOGGLE:
-        set_node_busy(op.node_id, true);
-        do_toggle(op.node_id);
-        set_node_busy(op.node_id, false);
-        break;
-      case SM_UI_OP_READ_ONOFF:
-        set_node_busy(op.node_id, true);
-        // 種別で分岐。センサ行の Read は「全属性の再読込」(§12.3 の 3)。
-        if (node_kind(op.node_id) == SM_UI_KIND_SENSOR) {
-          do_read_sensor_all(op.node_id, false, 20000);
-        } else {
-          do_read_onoff(op.node_id, false, 20000);
+    bool have_op;
+    {
+      StepTimer st("take_op", STEP_WARN_MS);
+      have_op = sm_app_take_op(&op, 100);
+    }
+    if (have_op) {
+      {
+        // UI op は run_until で秒単位かかるのが正常なので閾値を大きく取る。
+        StepTimer st(op_step_name(op.kind), OP_WARN_MS);
+        switch (op.kind) {
+        case SM_UI_OP_TOGGLE:
+          set_node_busy(op.node_id, true);
+          do_toggle(op.node_id);
+          set_node_busy(op.node_id, false);
+          break;
+        case SM_UI_OP_READ_ONOFF:
+          set_node_busy(op.node_id, true);
+          // 種別で分岐。センサ行の Read は「全属性の再読込」(§12.3 の 3)。
+          if (node_kind(op.node_id) == SM_UI_KIND_SENSOR) {
+            do_read_sensor_all(op.node_id, false, 20000);
+          } else {
+            do_read_onoff(op.node_id, false, 20000);
+          }
+          set_node_busy(op.node_id, false);
+          break;
+        case SM_UI_OP_REFRESH_ADDR:
+          set_node_busy(op.node_id, true);
+          do_refresh_addr(op.node_id);
+          // ⟳ は種別の再検出も兼ねる(誤判別からの復帰導線。§12.3 の 1)。
+          kind_cache_set(op.node_id, SM_UI_KIND_UNKNOWN);
+          set_node_kind(op.node_id, SM_UI_KIND_UNKNOWN);
+          clear_node_sensors(op.node_id);
+          resolve_node_kind(op.node_id, 15000);
+          set_node_busy(op.node_id, false);
+          break;
+        case SM_UI_OP_PAIR:
+          do_pair(op);
+          break;
+        case SM_UI_OP_PAIR_BLE:
+          do_pair_ble(op);
+          break;
+        case SM_UI_OP_SET_ADDR:
+          do_set_addr(op);
+          break;
         }
-        set_node_busy(op.node_id, false);
-        break;
-      case SM_UI_OP_REFRESH_ADDR:
-        set_node_busy(op.node_id, true);
-        do_refresh_addr(op.node_id);
-        // ⟳ は種別の再検出も兼ねる(誤判別からの復帰導線。§12.3 の 1)。
-        kind_cache_set(op.node_id, SM_UI_KIND_UNKNOWN);
-        set_node_kind(op.node_id, SM_UI_KIND_UNKNOWN);
-        clear_node_sensors(op.node_id);
-        resolve_node_kind(op.node_id, 15000);
-        set_node_busy(op.node_id, false);
-        break;
-      case SM_UI_OP_PAIR:
-        do_pair(op);
-        break;
-      case SM_UI_OP_PAIR_BLE:
-        do_pair_ble(op);
-        break;
-      case SM_UI_OP_SET_ADDR:
-        do_set_addr(op);
-        break;
       }
-      refresh_thread_status();
+      {
+        StepTimer st("refresh_thread", STEP_WARN_MS);
+        refresh_thread_status();
+      }
       continue;
     }
 
     // 操作が無い間も UDP は回す(MRP の ACK / 再送で無音にならないように)。
-    pump_once(g_udp, 50);
+    {
+      StepTimer st("pump_once", STEP_WARN_MS);
+      pump_once(g_udp, 50);
+    }
     // T8(§16.3): デバイス発の購読レポート / 購読喪失をここで拾う。
     {
+      StepTimer st("events", STEP_WARN_MS);
       sm_ctrl_event_t aev;
       while (sm_ctrl_take_event(&aev)) {
         consume_async_event(aev);
@@ -2052,19 +2170,27 @@ void pump_task(void *) {
     // T6: 鮮度表示の基準時刻だけは細かく進める(500ms。lock は取るが中身は 1 語)。
     if (now >= next_clock) {
       next_clock = now + 500;
+      StepTimer st("clock", STEP_WARN_MS); // lock 待ちが伸びていないかも見る
       sm_ui_snapshot_t *s = sm_app_lock();
       s->now_ms = now;
       sm_app_unlock();
     }
     if (now >= next_status) {
       next_status = now + 2000;
-      refresh_thread_status();
-      refresh_wifi_status();
+      {
+        StepTimer st("refresh_thread", STEP_WARN_MS);
+        refresh_thread_status();
+      }
+      {
+        StepTimer st("refresh_wifi", STEP_WARN_MS);
+        refresh_wifi_status();
+      }
       if (sm_ctrl_node_count() != 0) {
         sm_ui_snapshot_t *s = sm_app_lock();
         size_t shown = s->node_count;
         sm_app_unlock();
         if (shown == 0) {
+          StepTimer st("rebuild_nodes", STEP_WARN_MS);
           rebuild_node_list();
         }
       }
@@ -2081,6 +2207,7 @@ void pump_task(void *) {
         // 既に張り直された / バックオフ中。
       } else {
         ESP_LOGI(TAG, "sub: resubscribe-now node=%016llx", (unsigned long long)resub_id);
+        StepTimer st("resub_now", STEP_WARN_MS);
         set_node_busy(resub_id, true);
         bool sub_ok = do_subscribe_node(resub_id, kind, 20000);
         set_node_busy(resub_id, false);
@@ -2109,6 +2236,7 @@ void pump_task(void *) {
     // (特に sm_ctrl_ble_pair_start)が rc=-2 で弾かれ続ける)。
     if (now >= next_poll) {
       next_poll = now + 10000;
+      StepTimer st("poll_tick", STEP_WARN_MS);
       sm_ui_snapshot_t *s = sm_app_lock();
       size_t count = s->node_count;
       sm_app_unlock();

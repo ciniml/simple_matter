@@ -1823,3 +1823,22 @@ SUBSCRIPTION_LOST + テーブル除去、(d) 購読中に別 op(read)を発行�
 タイムアウトし続ける(今朝の「AirQ unreachable」の正体)。修正: 3 経路で `invalidate_session(node)`(次の op は
 CASE(resumption 可)を張り直す)。回帰テスト `tests/session_invalidation.rs`(仮想時計ハーネス、3 シナリオ)。
 実機: AirQ リセット → Tab5 が LOST → 2 分後の再試行で Tab5 無再起動のまま再購読成功(購読 ID=1 = 幽霊なし)。
+
+**追記(P7: 購読 ID の衝突、2026-08-26 夜、8 時間ログで確定)**: 購読 ID はデバイスごとの採番なので、別デバイス間で
+同じ値になる(NanoC6 の幽霊購読 ID=2 と AirQ の再購読 ID=2)。ところが `ImClient::on_device_report` /
+`ClientSub` 照合、shim の `sub_index_by_id` は **ID だけ**で照合しており、NanoC6 の幽霊レポートが AirQ の購読として
+受理(Success 応答 + AirQ の `last_report_ms` 更新)されていた。結果: (1) デバイスの幽霊購読が P2 で破棄されず
+残り続ける(`sub=2/3` が 5 時間)、(2) 死んだノードの keep-alive が別ノードのレポートで偽装され LOST 検出が
+効かない、(3) パスが重なれば値の誤配。
+修正: `ClientSub` の `session` を照合に使う(`(session, id)` で一意。`RxMessage` の exchange から session を取る)。
+`ImEvent::SubscriptionReport / SubscriptionLost / SubscribeDone` に `session: SessionId` を載せ、shim の `SubEntry`
+にも `session` を持たせて `(session, id)` で引く。`remove_subscription(session, id)` に変更。
+回帰テスト: 2 セッション上で同じ購読 ID を確立し、片方のレポートがもう片方に混ざらない(未知扱いで
+InvalidSubscription)こと、shim でも node_id が正しく振り分くこと。
+
+**追記(Tab5 pump の停止、要計測)**: 8 時間ログで 15:25:28→15:28:39 の **191 秒間 pump が無反応**(AirQ の 10 秒
+レポートが途絶、UI op なし)。これが両ノード LOST(→ 再購読、幽霊化)の直接の引き金で、ユーザー症状
+(ボタンが 10 秒以上反映されない → Toggle で戻る)に一致。原因未特定(候補: `sm_ot_hub_get_status` の OT ロック、
+`esp_wifi_remote`(SDIO)呼び出し、`sm_app_lock` を UI 側が長時間保持)。対処: 定常ループの各ステップ
+(take_op / pump_once / refresh_thread_status / refresh_wifi_status / rebuild_node_list / poll tick / resub)の所要時間を
+計測し、**1 秒超で `pump: slow step=<name> ms=<n>` を WARN ログ**。次の停止で犯人を特定する。

@@ -516,6 +516,24 @@ impl<
                     }
                     // ACK 構築に失敗した場合は次の poll 対象へ進む。
                 }
+                PollAction::SendOrphanAck {
+                    session,
+                    exch_id,
+                    peer_is_initiator,
+                    ack_ctr,
+                } => {
+                    if let Some(d) = self.stage_orphan_ack(
+                        session,
+                        exch_id,
+                        !peer_is_initiator,
+                        ack_ctr,
+                        now_ms,
+                        tx_out,
+                    ) {
+                        return Some(d);
+                    }
+                    // 構築に失敗したら握り潰して次の poll 対象へ進む(会話は既に無い)。
+                }
                 PollAction::Failed {
                     exchange, freed_tx, ..
                 } => {
@@ -774,6 +792,41 @@ impl<
                     &mut self.sessions,
                     self.crypto,
                     ex,
+                    ack_ctr,
+                    &mut wb,
+                    now_ms,
+                )
+                .ok()?;
+            (addr, wb.start(), wb.end())
+        };
+        tx_out.copy_within(start..end, 0);
+        Some(SendDirective {
+            addr,
+            len: end - start,
+        })
+    }
+
+    /// 会話を持たない重複への standalone ACK を組み立てて `tx_out` に置く(設計 §6.1)。
+    fn stage_orphan_ack(
+        &mut self,
+        session: SessionId,
+        exch_id: u16,
+        i_flag: bool,
+        ack_ctr: u32,
+        now_ms: u64,
+        tx_out: &mut [u8],
+    ) -> Option<SendDirective> {
+        let headroom = PacketHeader::MAX_LEN + PayloadHeader::MAX_LEN;
+        let (addr, start, end) = {
+            let mut wb = WriteBuf::new(tx_out, headroom).ok()?;
+            let addr = self
+                .mgr
+                .build_standalone_ack_raw(
+                    &mut self.sessions,
+                    self.crypto,
+                    session,
+                    exch_id,
+                    i_flag,
                     ack_ctr,
                     &mut wb,
                     now_ms,

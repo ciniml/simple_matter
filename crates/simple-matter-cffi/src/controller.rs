@@ -274,6 +274,9 @@ type SubPath = (u16, u32, u32);
 struct SubEntry {
     /// コアが払い出した購読 ID。
     id: u32,
+    /// 購読が乗るセッション。購読 ID はデバイスごとの採番で別ノード間で衝突するため、
+    /// `(session, id)` で初めて一意(設計 §16.6 P7)。
+    session: SessionId,
     /// 対象ノードの運用 NodeId(レポートの振り分けに使う)。
     node_id: u64,
     /// 購読したパス(レポートのフィルタに使う)。
@@ -753,13 +756,15 @@ fn drive_awaitop(s: &mut CtrlShim, node_id: u64, op: PendingOp) {
         (
             PendingOp::Subscribe { .. },
             ImEvent::SubscribeDone {
-                subscription_id, ..
+                session,
+                subscription_id,
+                ..
             },
         ) => {
-            register_subscription(s, node_id, subscription_id);
+            register_subscription(s, node_id, session, subscription_id);
             // プライミングレポートの各属性を **SUBSCRIBE_DONE の前に** REPORT として積む
             // (初期値が READ と同じ経路で表示に入る。§16.2)。
-            if let Some(idx) = sub_index_by_id(s, subscription_id) {
+            if let Some(idx) = sub_index(s, session, subscription_id) {
                 let items = collect_priming_values(s);
                 emit_sub_reports(s, idx, &items);
             }
@@ -919,9 +924,14 @@ fn error_code(e: simple_matter::error::Error) -> u8 {
 // 購読テーブル(§16.2): ノード複数 × パス複数
 // ==========================================================================
 
-/// 購読 ID からテーブル添字を引く。
-fn sub_index_by_id(s: &CtrlShim, id: u32) -> Option<usize> {
-    s.subs.iter().position(|e| e.id == id)
+/// 購読 `(session, id)` からテーブル添字を引く。
+///
+/// 購読 ID だけでは一意にならない(デバイスごとの採番なので別ノード間で衝突する)。
+/// ID だけで引くと別ノードの幽霊レポートが他ノードの購読として振り分けられる(§16.6 P7)。
+fn sub_index(s: &CtrlShim, session: SessionId, id: u32) -> Option<usize> {
+    s.subs
+        .iter()
+        .position(|e| e.id == id && e.session == session)
 }
 
 /// ノードの購読エントリを全て捨てる(戻り値 = 捨てた本数)。
@@ -932,23 +942,28 @@ fn sub_index_by_id(s: &CtrlShim, id: u32) -> Option<usize> {
 fn drop_subs_for_node(s: &mut CtrlShim, node_id: u64) -> usize {
     let mut n = 0;
     while let Some(i) = s.subs.iter().position(|e| e.node_id == node_id) {
-        let id = s.subs.swap_remove(i).id;
-        s.stack.im_remove_subscription(id);
+        let e = s.subs.swap_remove(i);
+        s.stack.im_remove_subscription(e.session, e.id);
         n += 1;
     }
     n
 }
 
 /// SUBSCRIBE_DONE で購読テーブルへ登録する(同一ノードの旧エントリは先に捨てる)。
-fn register_subscription(s: &mut CtrlShim, node_id: u64, id: u32) {
+fn register_subscription(s: &mut CtrlShim, node_id: u64, session: SessionId, id: u32) {
     drop_subs_for_node(s, node_id);
     // 満杯なら最古を捨てる(API 側で事前検査するが、素の sm_ctrl_subscribe 経由の保険)。
     if s.subs.is_full() {
         let old = s.subs.swap_remove(0);
-        s.stack.im_remove_subscription(old.id);
+        s.stack.im_remove_subscription(old.session, old.id);
     }
     let paths = core::mem::take(&mut s.pending_sub_paths);
-    let _ = s.subs.push(SubEntry { id, node_id, paths });
+    let _ = s.subs.push(SubEntry {
+        id,
+        session,
+        node_id,
+        paths,
+    });
 }
 
 /// 直近の購読レポート本文から (パス, 値, null) を取り出す(借用を切ってから push する)。
@@ -1019,15 +1034,21 @@ fn emit_sub_reports(s: &mut CtrlShim, idx: usize, items: &[(SubPath, u64, bool)]
 /// Idle / op 進行中 / CASE 確立中のいずれの `im_take_event` 経路からも呼ぶ。
 fn handle_sub_event(s: &mut CtrlShim, ev: &ImEvent) -> bool {
     match *ev {
-        ImEvent::SubscriptionReport { subscription_id } => {
-            if let Some(idx) = sub_index_by_id(s, subscription_id) {
+        ImEvent::SubscriptionReport {
+            session,
+            subscription_id,
+        } => {
+            if let Some(idx) = sub_index(s, session, subscription_id) {
                 let items = collect_sub_values(s);
                 emit_sub_reports(s, idx, &items);
             }
             true
         }
-        ImEvent::SubscriptionLost { subscription_id } => {
-            if let Some(idx) = sub_index_by_id(s, subscription_id) {
+        ImEvent::SubscriptionLost {
+            session,
+            subscription_id,
+        } => {
+            if let Some(idx) = sub_index(s, session, subscription_id) {
                 let entry = s.subs.swap_remove(idx);
                 // keep-alive 途絶 = セッション/デバイスが死んだ可能性が高い。再購読は新しい
                 // CASE(resumption 可)で行わせる(§16.6 P6)。
@@ -2891,9 +2912,12 @@ mod tests {
             let mut pb: heapless::Vec<SubPath, SUB_MAX_PATHS> = heapless::Vec::new();
             pb.push((1, 0x040D, 0x0000)).unwrap();
             pb.push((2, 0x0405, 0x0000)).unwrap();
+            let sess_a = SessionId::from_raw(11);
+            let sess_b = SessionId::from_raw(22);
             s.subs
                 .push(SubEntry {
                     id: 0x1001,
+                    session: sess_a,
                     node_id: node_a,
                     paths: pa,
                 })
@@ -2901,6 +2925,7 @@ mod tests {
             s.subs
                 .push(SubEntry {
                     id: 0x2002,
+                    session: sess_b,
                     node_id: node_b,
                     paths: pb,
                 })
@@ -2910,7 +2935,7 @@ mod tests {
             assert!(!sm_ctrl_is_subscribed(0x3333));
 
             // ノード B の購読 ID で 3 属性ぶんの値が届いた(1 本はパス外 = 捨てる)。
-            let idx_b = sub_index_by_id(s, 0x2002).unwrap();
+            let idx_b = sub_index(s, sess_b, 0x2002).unwrap();
             let items = [
                 ((1u16, 0x040Du32, 0x0000u32), 812, false),
                 ((2u16, 0x0405u32, 0x0000u32), 0, true),
@@ -2935,7 +2960,7 @@ mod tests {
             assert!(got[1].value_is_null, "null 値もそのまま載る");
 
             // ノード A の購読 ID なら node_a に振り分かれる。
-            let idx_a = sub_index_by_id(s, 0x1001).unwrap();
+            let idx_a = sub_index(s, sess_a, 0x1001).unwrap();
             emit_sub_reports(s, idx_a, &[((1, 0x0006, 0x0000), 1, false)]);
             assert!(sm_ctrl_take_event(&mut ev));
             assert_eq!(ev.node_id, node_a);
@@ -2943,9 +2968,37 @@ mod tests {
             assert!(!sm_ctrl_take_event(&mut ev));
 
             // (c) keep-alive 途絶 → SUBSCRIPTION_LOST + テーブルから除去。
+            // (P7) 同じ購読 ID でも session が違えば別ノードの購読には振り分けない。
+            assert!(sub_index(s, sess_a, 0x2002).is_none());
+            assert!(sub_index(s, sess_b, 0x1001).is_none());
+            assert!(handle_sub_event(
+                s,
+                &ImEvent::SubscriptionReport {
+                    session: sess_a,
+                    subscription_id: 0x2002,
+                }
+            ));
+            assert!(
+                !sm_ctrl_take_event(&mut ev),
+                "session が違うレポートは未知扱い(§16.6 P7)"
+            );
             assert!(handle_sub_event(
                 s,
                 &ImEvent::SubscriptionLost {
+                    session: sess_b,
+                    subscription_id: 0x1001,
+                }
+            ));
+            assert!(
+                !sm_ctrl_take_event(&mut ev),
+                "session が違うロストは無視(§16.6 P7)"
+            );
+            assert!(sm_ctrl_is_subscribed(node_a), "誤って消していないこと");
+
+            assert!(handle_sub_event(
+                s,
+                &ImEvent::SubscriptionLost {
+                    session: sess_a,
                     subscription_id: 0x1001
                 }
             ));
@@ -2959,6 +3012,7 @@ mod tests {
             assert!(handle_sub_event(
                 s,
                 &ImEvent::SubscriptionLost {
+                    session: sess_a,
                     subscription_id: 0xDEAD
                 }
             ));
@@ -2967,6 +3021,7 @@ mod tests {
             assert!(handle_sub_event(
                 s,
                 &ImEvent::SubscriptionReport {
+                    session: sess_a,
                     subscription_id: 0xDEAD
                 }
             ));
@@ -2984,6 +3039,7 @@ mod tests {
                 s.subs
                     .push(SubEntry {
                         id: 0x100 + i as u32,
+                        session: SessionId::from_raw(100 + i as u32),
                         node_id: 0xF000 + i as u64,
                         paths: heapless::Vec::new(),
                     })

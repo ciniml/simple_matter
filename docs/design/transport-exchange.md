@@ -721,3 +721,36 @@ Packet/Payload ヘッダ分離、セッション enum 判別、MRP を Exchange 
    `select4`)か、別タスクか。`UdpSend`/`UdpReceive` を分離した(§2.1)のは後者を可能にするためだが、
    共有状態の Mutex 競合を考えると初期は単一ループが無難か。executor 非依存のまま両対応にできる形が理想。
 ```
+
+### 6.1 重複メッセージへの standalone ACK(2026-08-26 追記)
+
+**問題**: `ExchangeManager::recv` はリプレイ窓で弾いた重複(`decoded.duplicate`)に対し、**会話がまだ存在する
+ときだけ** `rearm_ack` する。会話が終端・回収済み(例: コントローラがデバイス発 ReportData に StatusResponse を
+返して close 済み)の重複には **ACK を一切返さない**。送信側は ACK が来ないので再送を続け(最大 10 回・~34 秒)、
+最終的に give-up → 送信側の会話が失敗扱いになる(デバイスの購読レポートなら `on_report_exchange_failed` で購読破棄)。
+MRP 仕様(Matter Core §4.12)は「重複を受け取った受信者は改めて ACK を返さなければならない」であり、これは
+仕様違反。P4 コントローラ実機で「ACK 済みなのに再送が 8 回続く」を観測(T8b 調査)。
+
+**方針**: 会話の有無に関わらず、`R` フラグ付き重複には即時 standalone ACK を返す。
+
+- `ExchangeManager` に `orphan_acks: FixedVec<OrphanAck, ORPHAN_ACKS>`(`ORPHAN_ACKS = 2`、溢れたら最古を捨てる)を
+  追加。`OrphanAck { session: SessionId, exch_id: u16, peer_is_initiator: bool, ack_ctr: u32 }`。
+- `recv` の重複分岐: `allows_mrp && phdr.is_reliable()` のとき、会話があれば従来どおり `rearm_ack`、無ければ
+  `orphan_acks` に積む(同一 (session, exch_id, ack_ctr) は重複登録しない)。
+- `poll` は closing 回収の後・再送処理の前に `orphan_acks` を 1 件取り出し、新設の
+  `PollAction::SendOrphanAck { session, exch_id, peer_is_initiator, ack_ctr }` を返す(遅延なし。会話を持たないので
+  200 ms の piggyback 待ちは意味がない)。
+- `build_standalone_ack` の中身を `build_standalone_ack_raw(sessions, crypto, session, exch_id, i_flag, ack_ctr, out, now)`
+  に切り出し、既存 API はそれを呼ぶ。I フラグ = `!peer_is_initiator`(自分の役割)。
+- `MatterStack::poll` / `ControllerStack::poll` の `match` に `SendOrphanAck` を追加(`stage_standalone_ack` の raw 版)。
+- `next_deadline`: `orphan_acks` が空でなければ `Some(now)` 相当(即時)。
+
+**回帰テスト**: (1) exchange 層: 会話 close 後に同じ msg_ctr の reliable メッセージを再投入 → `recv` は
+`duplicate=true`、直後の `poll` が `SendOrphanAck`(正しい session/exch_id/I フラグ/ack_ctr)、その後 Idle。
+(2) 会話が生きている重複は従来どおり `rearm_ack` → `SendAck`(既存 `recv_duplicate_reliable_rearms_ack` 維持)。
+(3) 統合(stack loopback ctrl↔dev): 実装時の実測で、コントローラの StatusResponse は `Close { reliable: true }`
+で送られるため、それが落ちても自分の再送スロットを抱えて会話が生き続け、重複 ReportData は従来の `rearm_ack`
+で ACK される(= T8b で見た「8 回」は実は ACK されていた)。問題が出るのは **会話が終端・回収済み**の後に遅延した
+重複が届く経路なので、テストは「StatusResponse を 1 通落とす → デバイスの再送 datagram を保留 → StatusResponse の
+再送でデバイス側が止まり ctrl 側会話が回収される → 保留していた重複を投入 → 修正前は沈黙、修正後は standalone ACK
+1 通、両側の購読は生存」とした(`duplicate_report_after_closed_exchange_gets_standalone_ack`)。

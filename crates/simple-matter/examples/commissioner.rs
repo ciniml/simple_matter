@@ -494,6 +494,7 @@ fn run_subscribe_demo(
         Some(ImEvent::SubscribeDone {
             subscription_id,
             max_interval_s,
+            ..
         }) => (subscription_id, max_interval_s),
         Some(ev) => return Err(format!("subscribe failed: {ev:?}")),
         None => return Err("subscribe timed out (no SubscribeResponse)".into()),
@@ -525,7 +526,9 @@ fn run_subscribe_demo(
                 println!("[subscribe] Toggle acknowledged (status = Success)");
                 got_invoke = true;
             }
-            Some(ImEvent::SubscriptionReport { subscription_id }) => {
+            Some(ImEvent::SubscriptionReport {
+                subscription_id, ..
+            }) => {
                 if subscription_id != sub_id {
                     return Err(format!(
                         "report for unexpected subscription {subscription_id}"
@@ -538,7 +541,9 @@ fn run_subscribe_demo(
                 );
                 got_report = true;
             }
-            Some(ImEvent::SubscriptionLost { subscription_id }) => {
+            Some(ImEvent::SubscriptionLost {
+                subscription_id, ..
+            }) => {
                 return Err(format!("subscription {subscription_id} lost"));
             }
             Some(ev) => return Err(format!("unexpected IM event: {ev:?}")),
@@ -551,13 +556,17 @@ fn run_subscribe_demo(
     println!("[subscribe] waiting for a keep-alive report (~{max_s}s)...");
     let until = Instant::now() + Duration::from_millis((max_s as u64) * 1000 + 8_000);
     match wait_im_event(stack, socket, start, rx, tx, until) {
-        Some(ImEvent::SubscriptionReport { subscription_id }) => {
+        Some(ImEvent::SubscriptionReport {
+            subscription_id, ..
+        }) => {
             let v = sub_report_onoff_value(stack);
             println!(
                 "[subscribe] KEEP-ALIVE REPORT received: OnOff = {v:?} (subscription_id={subscription_id})"
             );
         }
-        Some(ImEvent::SubscriptionLost { subscription_id }) => {
+        Some(ImEvent::SubscriptionLost {
+            subscription_id, ..
+        }) => {
             return Err(format!(
                 "subscription {subscription_id} lost while waiting for keep-alive"
             ));

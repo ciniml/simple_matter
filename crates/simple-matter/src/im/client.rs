@@ -100,6 +100,9 @@ pub enum ImEvent {
     },
     /// Subscribe のプライミングが完了し購読が確立した。
     SubscribeDone {
+        /// 購読が乗るセッション(購読 ID はデバイスごとの採番で衝突するため、
+        /// `(session, subscription_id)` で初めて一意、設計 §16.6 P7)。
+        session: SessionId,
         /// デバイスが採番した購読 ID。
         subscription_id: u32,
         /// ネゴシエート済み最大レポート間隔(秒)。keep-alive 途絶検出の基準。
@@ -110,11 +113,15 @@ pub enum ImEvent {
     /// 本文(AttributeReportIB 連結の生 TLV)は [`ImClient::sub_report`] /
     /// [`ImClient::sub_reports`] で取り出す(次のレポート到着まで保持)。
     SubscriptionReport {
+        /// 対象購読が乗るセッション(§16.6 P7)。
+        session: SessionId,
         /// 対象購読 ID。
         subscription_id: u32,
     },
     /// 購読がロストした(maxInterval + 猶予を超えてレポートが途絶、§4.5.3)。
     SubscriptionLost {
+        /// 対象購読が乗っていたセッション(§16.6 P7)。
+        session: SessionId,
         /// 対象購読 ID(client 側の購読 slot は破棄済み)。
         subscription_id: u32,
     },
@@ -158,7 +165,8 @@ struct ClientTxn {
 struct ClientSub {
     /// デバイスが採番した購読 ID。
     id: u32,
-    /// 購読が乗るセッション([`ImClient::remove_subscriptions_on_session`] の照合キー)。
+    /// 購読が乗るセッション。購読 ID はデバイスごとの採番なので別デバイス間で衝突する。
+    /// `(session, id)` で初めて一意で、レポート照合もこの組で行う(設計 §16.6 P7)。
     session: SessionId,
     /// ネゴシエート済み最大レポート間隔(秒)。SubscribeResponse の値。
     max_interval_s: u16,
@@ -334,20 +342,32 @@ impl<const RESULT: usize> ImClient<RESULT> {
         MAX_CLIENT_SUBSCRIPTIONS
     }
 
-    /// 購読 `id` をローカルのテーブルから捨てる(設計 §16.6 P4)。戻り値 = 実際に消したか。
+    /// 購読 `(session, id)` をローカルのテーブルから捨てる(設計 §16.6 P4/P7)。
+    /// 戻り値 = 実際に消したか。
     ///
     /// デバイスへは何も送らない。以降その購読 ID のレポートには `InvalidSubscription` を
     /// 返すため、デバイス側は(§16.6 P2 の修正により)その購読を捨てて双方が整合する。
     /// [`ImEvent::SubscriptionLost`] は積まない(呼び出し元が意図して捨てているため)。
-    pub fn remove_subscription(&mut self, id: u32) -> bool {
-        let Some(i) = self.subs.iter().position(|s| s.id == id) else {
+    pub fn remove_subscription(&mut self, session: SessionId, id: u32) -> bool {
+        let Some(i) = self
+            .subs
+            .iter()
+            .position(|s| s.id == id && s.session == session)
+        else {
             return false;
         };
         self.subs.swap_remove(i);
-        if matches!(&self.report_rx, Some(r) if r.subscription_id == id) {
+        self.drop_report_rx_of(session, id);
+        true
+    }
+
+    /// チャンク継続中のレポートが購読 `(session, id)` のものなら捨てる(§16.6 P7)。
+    fn drop_report_rx_of(&mut self, session: SessionId, id: u32) {
+        if matches!(&self.report_rx, Some(r)
+            if r.subscription_id == id && r.exchange.session() == session)
+        {
             self.report_rx = None;
         }
-        true
     }
 
     /// セッション `session` に乗る購読を全て捨てる(戻り値 = 捨てた本数、設計 §16.6 P4)。
@@ -361,9 +381,7 @@ impl<const RESULT: usize> ImClient<RESULT> {
                 break;
             };
             let id = self.subs.swap_remove(i).id;
-            if matches!(&self.report_rx, Some(r) if r.subscription_id == id) {
-                self.report_rx = None;
-            }
+            self.drop_report_rx_of(session, id);
             n += 1;
         }
         n
@@ -652,12 +670,11 @@ impl<const RESULT: usize> ImClient<RESULT> {
             let Some(i) = self.subs.iter().position(|s| now_ms > s.lost_deadline_ms()) else {
                 break;
             };
-            let id = self.subs.swap_remove(i).id;
-            if matches!(&self.report_rx, Some(r) if r.subscription_id == id) {
-                self.report_rx = None;
-            }
+            let sub = self.subs.swap_remove(i);
+            self.drop_report_rx_of(sub.session, sub.id);
             self.sub_event = Some(ImEvent::SubscriptionLost {
-                subscription_id: id,
+                session: sub.session,
+                subscription_id: sub.id,
             });
         }
         expired
@@ -828,6 +845,7 @@ impl<const RESULT: usize> ImClient<RESULT> {
                     return self.fail(ImStatus::ResourceExhausted);
                 }
                 self.event = Some(ImEvent::SubscribeDone {
+                    session: rx.exchange.session(),
                     subscription_id: sr.subscription_id,
                     max_interval_s: sr.max_interval_s,
                 });
@@ -867,7 +885,14 @@ impl<const RESULT: usize> ImClient<RESULT> {
             let len = StatusResponse::new(ImStatus::InvalidSubscription).encode(tx)?;
             return Ok(close(ImOpCode::StatusResponse, len));
         };
-        let Some(si) = self.subs.iter().position(|s| s.id == sub_id) else {
+        // 購読 ID はデバイスごとの採番で別デバイス間で衝突するため、session と組で照合する
+        // (§16.6 P7。ID だけで照合すると別ノードの幽霊レポートを受理してしまう)。
+        let session = rx.exchange.session();
+        let Some(si) = self
+            .subs
+            .iter()
+            .position(|s| s.id == sub_id && s.session == session)
+        else {
             if continuing {
                 self.report_rx = None;
             }
@@ -916,6 +941,7 @@ impl<const RESULT: usize> ImClient<RESULT> {
         } else {
             self.report_rx = None;
             self.sub_event = Some(ImEvent::SubscriptionReport {
+                session,
                 subscription_id: sub_id,
             });
             Ok(close(ImOpCode::StatusResponse, len))

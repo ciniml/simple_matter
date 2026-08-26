@@ -818,6 +818,7 @@ fn establish_subscription(
         Some(ImEvent::SubscribeDone {
             subscription_id,
             max_interval_s,
+            ..
         }) => (subscription_id, max_interval_s),
         other => panic!("expected SubscribeDone, got {other:?}"),
     }
@@ -882,6 +883,7 @@ fn subscribe_priming_and_device_report() {
     assert_eq!(
         cli_mgr.handler_mut().im.take_event(),
         Some(ImEvent::SubscriptionReport {
+            session: cli_s,
             subscription_id: sub_id
         })
     );
@@ -1008,6 +1010,7 @@ fn subscribe_events_priming_and_device_report() {
     assert_eq!(
         cli_mgr.handler_mut().im.take_event(),
         Some(ImEvent::SubscriptionReport {
+            session: cli_s,
             subscription_id: sub_id
         })
     );
@@ -1090,6 +1093,7 @@ fn chunked_device_report() {
     assert_eq!(
         cli_mgr.handler_mut().im.take_event(),
         Some(ImEvent::SubscriptionReport {
+            session: cli_s,
             subscription_id: sub_id
         })
     );
@@ -1150,6 +1154,7 @@ fn subscription_lost_on_max_interval_timeout() {
     assert_eq!(
         cli_mgr.handler_mut().im.take_event(),
         Some(ImEvent::SubscriptionLost {
+            session: cli_s,
             subscription_id: sub_id
         })
     );
@@ -1214,6 +1219,7 @@ fn keep_alive_report_refreshes_liveness() {
     assert_eq!(
         cli_mgr.handler_mut().im.take_event(),
         Some(ImEvent::SubscriptionReport {
+            session: cli_s,
             subscription_id: sub_id
         })
     );
@@ -1266,8 +1272,8 @@ fn removed_subscription_report_is_rejected() {
     assert_eq!(cli_mgr.handler().im.subscription_count(), 1);
 
     // ローカル破棄(シムの sm_ctrl_unsubscribe / 再購読が呼ぶ経路)。冪等。
-    assert!(cli_mgr.handler_mut().im.remove_subscription(sub_id));
-    assert!(!cli_mgr.handler_mut().im.remove_subscription(sub_id));
+    assert!(cli_mgr.handler_mut().im.remove_subscription(cli_s, sub_id));
+    assert!(!cli_mgr.handler_mut().im.remove_subscription(cli_s, sub_id));
     assert_eq!(cli_mgr.handler().im.subscription_count(), 0);
     assert_eq!(
         cli_mgr.handler_mut().im.take_event(),
@@ -1372,6 +1378,7 @@ fn subscription_grace_tolerates_mrp_retransmission() {
     assert_eq!(
         cli_mgr.handler_mut().im.take_event(),
         Some(ImEvent::SubscriptionLost {
+            session: cli_s,
             subscription_id: sub_id
         })
     );
@@ -1527,5 +1534,190 @@ fn timed_write_node_label() {
         dev_mgr.handler().im.data_model().basic.node_label(),
         "kitchen",
         "device NodeLabel written via timed write"
+    );
+}
+
+// ==========================================================================
+// (n) T8c §16.6 P7: 購読 ID は `(session, id)` で初めて一意
+// ==========================================================================
+
+/// 購読 `(session, id)` を `im` に確立する(プライミング省略、SubscribeResponse 直投入)。
+fn establish_sub_on_session(
+    im: &mut ImC,
+    sessions: &mut SessionManager<4>,
+    session: SessionId,
+    exch_id: u16,
+    sub_id: u32,
+    max_interval_s: u16,
+    now: u64,
+) {
+    use crate::transport::header::{ExchFlags, PayloadHeader};
+
+    let ex = ExchangeId::from_parts(session, exch_id);
+    let paths = [AttributePath::concrete(
+        EndpointId(1),
+        ClusterId(0x0006),
+        AttributeId(0x0000),
+    )];
+    let mut out = [0u8; 256];
+    im.start_subscribe(ex, &paths, 0, max_interval_s, &mut out, now)
+        .unwrap();
+
+    let mut payload = [0u8; 64];
+    let plen = SubscribeResponse::new(sub_id, max_interval_s)
+        .encode(&mut payload)
+        .unwrap();
+    let hdr = PayloadHeader {
+        exch_flags: ExchFlags::from_bits(0),
+        proto_opcode: ImOpCode::SubscribeResponse as u8,
+        exch_id,
+        proto_id: PROTO_ID_INTERACTION_MODEL,
+        vendor_id: None,
+        ack_ctr: None,
+    };
+    let rx = RxMessage {
+        header: &hdr,
+        payload: &payload[..plen],
+        exchange: ex,
+        role: crate::exchange::Role::Initiator,
+    };
+    let mut tx = [0u8; 64];
+    im.handle(&rx, &mut tx, sessions, now).unwrap();
+    assert_eq!(
+        im.take_event(),
+        Some(ImEvent::SubscribeDone {
+            session,
+            subscription_id: sub_id,
+            max_interval_s,
+        })
+    );
+}
+
+/// デバイス発レポート(空 payload)を `session` 上の新規 responder exchange で投げ、
+/// 返った `StatusResponse` のステータスを返す。
+fn feed_device_report(
+    im: &mut ImC,
+    sessions: &mut SessionManager<4>,
+    session: SessionId,
+    exch_id: u16,
+    sub_id: u32,
+    now: u64,
+) -> ImStatus {
+    use crate::im::wire::{encode_report_data, ReportDataHeader};
+    use crate::transport::header::{ExchFlags, PayloadHeader};
+
+    let mut payload = [0u8; 128];
+    let plen = encode_report_data(
+        &mut payload,
+        ReportDataHeader {
+            subscription_id: Some(sub_id),
+            more_chunks: false,
+            suppress_response: false,
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    let hdr = PayloadHeader {
+        exch_flags: ExchFlags::from_bits(ExchFlags::INITIATOR),
+        proto_opcode: ImOpCode::ReportData as u8,
+        exch_id,
+        proto_id: PROTO_ID_INTERACTION_MODEL,
+        vendor_id: None,
+        ack_ctr: None,
+    };
+    let rx = RxMessage {
+        header: &hdr,
+        payload: &payload[..plen],
+        exchange: ExchangeId::from_parts(session, exch_id),
+        role: crate::exchange::Role::Responder,
+    };
+    let mut tx = [0u8; 64];
+    let action = im.handle(&rx, &mut tx, sessions, now).unwrap();
+    let HandlerAction::Close { opcode, len, .. } = action else {
+        panic!("expected Close, got {action:?}");
+    };
+    assert_eq!(opcode, ImOpCode::StatusResponse as u8);
+    StatusResponse::decode(&tx[..len]).unwrap().status
+}
+
+/// 購読 ID はデバイスごとの採番なので別デバイス(= 別セッション)間で衝突する。
+/// ID だけで照合していた頃は、死んだノードの幽霊レポートが別ノードの購読として受理され、
+/// (1) 幽霊購読が掃除されない (2) 偽の keep-alive で LOST 検出が効かない、が起きていた。
+#[test]
+fn same_subscription_id_on_two_sessions_is_not_confused() {
+    const SUB: u32 = 2; // 実機(NanoC6 の幽霊 / AirQ の再購読)で衝突した ID。
+    const MAX_S: u16 = 10;
+    /// 確立時刻から数えたロスト期限(maxInterval + 猶予)。
+    const LOST_AFTER_MS: u64 = (MAX_S as u64) * 1000 + SUBSCRIPTION_GRACE_MS;
+
+    let mut im = ImC::new();
+    let mut sessions: SessionManager<4> = SessionManager::new();
+    let sa = SessionId::from_raw(1);
+    let sb = SessionId::from_raw(2);
+
+    establish_sub_on_session(&mut im, &mut sessions, sa, 0x11, SUB, MAX_S, NOW);
+    establish_sub_on_session(&mut im, &mut sessions, sb, 0x22, SUB, MAX_S, NOW);
+    assert_eq!(
+        im.subscription_count(),
+        2,
+        "同じ ID でも別セッションなら別購読"
+    );
+
+    // セッション B のレポートは B の購読として受理される(A には混ざらない)。
+    assert_eq!(
+        feed_device_report(&mut im, &mut sessions, sb, 0x31, SUB, NOW + 5_000),
+        ImStatus::Success
+    );
+    assert_eq!(
+        im.take_event(),
+        Some(ImEvent::SubscriptionReport {
+            session: sb,
+            subscription_id: SUB,
+        })
+    );
+
+    // A の last_report は更新されていないので、A だけが自分の期限でロストする。
+    im.on_tick(NOW + LOST_AFTER_MS + 1);
+    assert_eq!(
+        im.take_event(),
+        Some(ImEvent::SubscriptionLost {
+            session: sa,
+            subscription_id: SUB,
+        }),
+        "B のレポートで A の keep-alive が偽装されてはならない"
+    );
+    assert_eq!(im.take_event(), None);
+    assert_eq!(im.subscription_count(), 1, "B の購読は生き残る");
+
+    // 死んだ A 側からの幽霊レポートは未知扱い(InvalidSubscription)で、B は refresh しない。
+    assert_eq!(
+        feed_device_report(&mut im, &mut sessions, sa, 0x32, SUB, NOW + 41_000),
+        ImStatus::InvalidSubscription
+    );
+    assert_eq!(im.take_event(), None, "幽霊レポートで REPORT を積まない");
+    im.on_tick(NOW + 5_000 + LOST_AFTER_MS + 1);
+    assert_eq!(
+        im.take_event(),
+        Some(ImEvent::SubscriptionLost {
+            session: sb,
+            subscription_id: SUB,
+        }),
+        "幽霊レポートが B の last_report を更新していないこと"
+    );
+    assert_eq!(im.subscription_count(), 0);
+
+    // 明示破棄も (session, id) 単位。
+    establish_sub_on_session(&mut im, &mut sessions, sa, 0x13, SUB, MAX_S, NOW);
+    establish_sub_on_session(&mut im, &mut sessions, sb, 0x24, SUB, MAX_S, NOW);
+    assert!(
+        !im.remove_subscription(SessionId::from_raw(9), SUB),
+        "別セッション"
+    );
+    assert!(im.remove_subscription(sa, SUB));
+    assert_eq!(im.subscription_count(), 1);
+    assert_eq!(
+        feed_device_report(&mut im, &mut sessions, sb, 0x33, SUB, NOW + 1_000),
+        ImStatus::Success,
+        "残った B の購読は引き続き受理する"
     );
 }
