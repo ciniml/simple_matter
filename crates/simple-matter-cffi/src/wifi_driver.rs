@@ -13,7 +13,7 @@
 //! - join 結果は [`crate::sm_wifi_status`] が [`ShimWifiDriver::set_status`] を呼んで反映し、
 //!   コアの `poll_deferred` が遅延 ConnectNetworkResponse を確定させる。
 
-use simple_matter::wifi::{WifiDriver, WifiStatus};
+use simple_matter::wifi::{wifi_security, WifiDriver, WifiNetworkInfo, WifiStatus};
 
 /// take 方式の WiFi ドライバ(単線契約下でのみ使用)。
 #[derive(Debug)]
@@ -26,6 +26,12 @@ pub struct ShimWifiDriver {
     pending: bool,
     /// 現在の join 状態(`sm_wifi_status` で更新)。
     status: WifiStatus,
+    /// C++ が報告したリンク情報(BSSID / channel / RSSI。`sm_wifi_set_link_info`)。
+    ///
+    /// `Some` のとき [`WifiDriver::current_network`] が実測値を返し、コアの
+    /// `ScanNetworks` がそれを 1 件のスキャン結果として載せる
+    /// (`docs/design/airq-port.md` §9)。
+    link: Option<([u8; 6], u16, i8)>,
 }
 
 impl ShimWifiDriver {
@@ -38,7 +44,31 @@ impl ShimWifiDriver {
             creds_len: 0,
             pending: false,
             status: WifiStatus::Idle,
+            link: None,
         }
+    }
+
+    /// クラスタを経由せず join 済みの資格情報をドライバへ登録する(§9、`sm_wifi_seed_network`)。
+    ///
+    /// [`WifiDriver::connect`] と違い **join 要求は立てない**(C++ は既に join 済み)。
+    /// SSID を保持することで [`current_network`](WifiDriver::current_network) が
+    /// 実測リンク情報つきのエントリを返せるようになる。
+    pub fn seed(&mut self, ssid: &[u8], creds: &[u8]) {
+        let n = ssid.len().min(self.ssid.len());
+        self.ssid[..n].copy_from_slice(&ssid[..n]);
+        self.ssid_len = n;
+        let m = creds.len().min(self.creds.len());
+        self.creds[..m].copy_from_slice(&creds[..m]);
+        self.creds_len = m;
+    }
+
+    /// C++ が観測したリンク情報(esp_wifi の `esp_wifi_sta_get_ap_info`)を記録する。
+    ///
+    /// リンク情報を持つ = station は associate 済みなので、状態も
+    /// [`WifiStatus::Connected`] にする(`sm_wifi_status(true, ..)` と同じ効果)。
+    pub fn set_link_info(&mut self, bssid: [u8; 6], channel: u16, rssi: i8) {
+        self.link = Some((bssid, channel, rssi));
+        self.status = WifiStatus::Connected;
     }
 
     /// C++ に渡していない join 要求があるか。
@@ -88,5 +118,19 @@ impl WifiDriver for ShimWifiDriver {
 
     fn status(&self) -> WifiStatus {
         self.status
+    }
+
+    fn current_network(&self) -> Option<WifiNetworkInfo> {
+        if self.ssid_len == 0 || self.status != WifiStatus::Connected {
+            return None;
+        }
+        let (bssid, channel, rssi) = self.link?;
+        Some(WifiNetworkInfo::new(
+            &self.ssid[..self.ssid_len],
+            bssid,
+            channel,
+            rssi,
+            wifi_security::WPA2_PERSONAL,
+        ))
     }
 }

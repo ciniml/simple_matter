@@ -125,6 +125,19 @@ impl ShimNetComm {
         }
     }
 
+    /// 既に join 済みの WiFi 資格情報をクラスタ + ドライバへ登録する(§9)。
+    ///
+    /// Kconfig プリセット SSID などで **クラスタを経由せず** join する構成では
+    /// `Networks` が空のままになり、Alexa 等のコミッショナが「未設定」と判断して
+    /// 中断する(`docs/design/airq-port.md` §9)。WiFi 構成でなければ no-op。
+    #[cfg(feature = "ble")]
+    fn seed_wifi_network(&mut self, ssid: &[u8], creds: &[u8]) {
+        if let ShimNetComm::Wifi(n) = self {
+            n.driver_mut().seed(ssid, creds);
+            n.seed_network(ssid, creds);
+        }
+    }
+
     /// Thread ドライバへの可変参照(Thread 構成でなければ `None`)。
     #[cfg(feature = "ble")]
     fn thread_driver_mut(&mut self) -> Option<&mut ShimThreadDriver> {
@@ -2547,6 +2560,81 @@ pub extern "C" fn sm_wifi_status(connected: bool, now_ms: u64) {
             driver.set_status(connected);
         }
         s.housekeep(now_ms);
+    }
+}
+
+/// 既に join 済みの WiFi ネットワークを NetworkCommissioning へ登録する(§9)。
+///
+/// Kconfig プリセット SSID などで **クラスタを経由せず** esp_wifi が join する構成では
+/// `NetworkCommissioning.Networks` が空のままになる。Alexa/Apple/Google のコミッショナは
+/// これを「ネットワーク未設定」と判断して WiFi 設定フローへ入り、`ScanNetworks` が空を
+/// 返すため「ネットワークが見つからない」で中断する(`docs/design/airq-port.md` §9)。
+/// join 直後に本 API を呼ぶと `Networks[0] = { networkID: ssid, connected }` が現れ、
+/// `ScanNetworks` も当該 AP を 1 件返すようになる。
+///
+/// 実測のリンク情報(BSSID/channel/RSSI)を載せたい場合は、本 API の **前に**
+/// [`sm_wifi_set_link_info`] を呼ぶ(呼ばなければ推定値のエントリになる)。
+/// WiFi 構成でない(Ethernet/Thread)/ ble 無効ビルドは no-op。
+#[no_mangle]
+pub extern "C" fn sm_wifi_seed_network(
+    ssid: *const u8,
+    ssid_len: usize,
+    pass: *const u8,
+    pass_len: usize,
+) {
+    #[cfg(not(feature = "ble"))]
+    {
+        let _ = (ssid, ssid_len, pass, pass_len);
+    }
+    #[cfg(feature = "ble")]
+    {
+        if !INITED.load(Ordering::SeqCst) || ssid.is_null() || ssid_len == 0 {
+            return;
+        }
+        // SAFETY: caller が ssid_len バイトの ssid を与える契約。
+        let ssid = unsafe { core::slice::from_raw_parts(ssid, ssid_len) };
+        let creds: &[u8] = if pass.is_null() || pass_len == 0 {
+            &[]
+        } else {
+            // SAFETY: 同上(pass / pass_len)。
+            unsafe { core::slice::from_raw_parts(pass, pass_len) }
+        };
+        // SAFETY: 単線契約。
+        let s = unsafe { shim() };
+        s.stack.device_mut().net.seed_wifi_network(ssid, creds);
+    }
+}
+
+/// 現在の WiFi リンク情報(BSSID / channel / RSSI)を報告する(§9)。
+///
+/// C++ 側が `esp_wifi_sta_get_ap_info()` で得た値をそのまま渡す。`ScanNetworks` が返す
+/// `WiFiInterfaceScanResultStruct` の bssid/channel/rssi に載る。リンク情報を持つことは
+/// station が associate 済みであることを意味するため、WiFi ドライバの状態も
+/// Connected になる([`sm_wifi_status`]`(true, ..)` 相当。housekeep は呼ばない)。
+///
+/// `bssid` は 6 バイト。NULL なら BSSID は全 0 として記録する。
+/// WiFi 構成でない / ble 無効ビルドは no-op。
+#[no_mangle]
+pub extern "C" fn sm_wifi_set_link_info(bssid: *const u8, channel: u16, rssi: i8) {
+    #[cfg(not(feature = "ble"))]
+    {
+        let _ = (bssid, channel, rssi);
+    }
+    #[cfg(feature = "ble")]
+    {
+        if !INITED.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut mac = [0u8; 6];
+        if !bssid.is_null() {
+            // SAFETY: caller が 6 バイトの bssid を与える契約。
+            unsafe { core::ptr::copy_nonoverlapping(bssid, mac.as_mut_ptr(), 6) };
+        }
+        // SAFETY: 単線契約。
+        let s = unsafe { shim() };
+        if let Some(driver) = s.stack.device_mut().net.wifi_driver_mut() {
+            driver.set_link_info(mac, channel, rssi);
+        }
     }
 }
 

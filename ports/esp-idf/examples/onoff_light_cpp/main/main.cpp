@@ -537,6 +537,32 @@ static void wifi_join(const uint8_t *ssid, size_t ssid_len, const uint8_t *pass,
 }
 #endif
 
+#if !CONFIG_SM_NETWORK_THREAD
+// 既接続 WiFi を NetworkCommissioning へ反映する(docs/design/airq-port.md §9)。
+//
+// Kconfig プリセット SSID / NVS 復元 join は **クラスタを経由しない**ため
+// `Networks` が空のままになり、Alexa 等のコミッショナが「ネットワーク未設定」と
+// 判断して WiFi 設定フローに入り、ScanNetworks が空 → 中断する。got_ip のたびに
+// 現在の station 設定と実測リンク情報(esp_wifi_sta_get_ap_info)を渡す(冪等)。
+// WiFi 構成でない / BLE 無効ビルドではシム側が no-op。
+static void report_wifi_link_and_seed() {
+  wifi_ap_record_t ap{};
+  if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+    ESP_LOGI(TAG, "wifi link: ch=%u rssi=%d bssid=%02x:%02x:%02x:%02x:%02x:%02x", ap.primary,
+             ap.rssi, ap.bssid[0], ap.bssid[1], ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5]);
+    sm_wifi_set_link_info(ap.bssid, ap.primary, ap.rssi);
+  }
+  wifi_config_t wc{};
+  if (esp_wifi_get_config(WIFI_IF_STA, &wc) == ESP_OK) {
+    size_t sl = strnlen((const char *)wc.sta.ssid, sizeof(wc.sta.ssid));
+    size_t pl = strnlen((const char *)wc.sta.password, sizeof(wc.sta.password));
+    if (sl > 0) {
+      sm_wifi_seed_network(wc.sta.ssid, sl, wc.sta.password, pl);
+    }
+  }
+}
+#endif
+
 // ---- LED -------------------------------------------------------------------
 
 static void led_init() {
@@ -902,6 +928,10 @@ static void matter_task(void *) {
       switch (c.kind) {
       case CmdKind::IpV4:
         stack.set_addrs(c.v4, nullptr);
+#if !CONFIG_SM_NETWORK_THREAD
+        // 実測リンク情報 →(BLE 有効なら)Connected 確定 → 保持ネットワーク登録(§9)。
+        report_wifi_link_and_seed();
+#endif
 #if CONFIG_SM_ENABLE_BLE
         sm_wifi_status(true, now); // 遅延 ConnectNetworkResponse を Success で確定。
 #endif

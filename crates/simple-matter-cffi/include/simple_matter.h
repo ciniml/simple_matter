@@ -623,6 +623,36 @@ size_t sm_take_wifi_request(uint8_t *ssid_out,
 void sm_wifi_status(bool connected,
                     uint64_t now_ms);
 
+// 既に join 済みの WiFi ネットワークを NetworkCommissioning へ登録する(§9)。
+//
+// Kconfig プリセット SSID などで **クラスタを経由せず** esp_wifi が join する構成では
+// `NetworkCommissioning.Networks` が空のままになる。Alexa/Apple/Google のコミッショナは
+// これを「ネットワーク未設定」と判断して WiFi 設定フローへ入り、`ScanNetworks` が空を
+// 返すため「ネットワークが見つからない」で中断する(`docs/design/airq-port.md` §9)。
+// join 直後に本 API を呼ぶと `Networks[0] = { networkID: ssid, connected }` が現れ、
+// `ScanNetworks` も当該 AP を 1 件返すようになる。
+//
+// 実測のリンク情報(BSSID/channel/RSSI)を載せたい場合は、本 API の **前に**
+// [`sm_wifi_set_link_info`] を呼ぶ(呼ばなければ推定値のエントリになる)。
+// WiFi 構成でない(Ethernet/Thread)/ ble 無効ビルドは no-op。
+void sm_wifi_seed_network(const uint8_t *ssid,
+                          size_t ssid_len,
+                          const uint8_t *pass,
+                          size_t pass_len);
+
+// 現在の WiFi リンク情報(BSSID / channel / RSSI)を報告する(§9)。
+//
+// C++ 側が `esp_wifi_sta_get_ap_info()` で得た値をそのまま渡す。`ScanNetworks` が返す
+// `WiFiInterfaceScanResultStruct` の bssid/channel/rssi に載る。リンク情報を持つことは
+// station が associate 済みであることを意味するため、WiFi ドライバの状態も
+// Connected になる([`sm_wifi_status`]`(true, ..)` 相当。housekeep は呼ばない)。
+//
+// `bssid` は 6 バイト。NULL なら BSSID は全 0 として記録する。
+// WiFi 構成でない / ble 無効ビルドは no-op。
+void sm_wifi_set_link_info(const uint8_t *bssid,
+                           uint16_t channel,
+                           int8_t rssi);
+
 // ConnectNetwork で受理した Thread attach 要求の dataset TLV を取り出す(§10.1)。
 //
 // 戻り値 = dataset TLV バイト長(0 = 保留要求なし / Thread 構成でない / ble 無効)。

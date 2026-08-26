@@ -17,7 +17,7 @@ use crate::dm::{AttrWrite, DeferredPoll, ServerCluster};
 use crate::im::wire::ImStatus;
 use crate::thread::{NullThreadDriver, ThreadDriver, ThreadStatus};
 use crate::tlv::{TlvReader, TlvTag};
-use crate::wifi::{NullWifiDriver, WifiDriver, WifiStatus};
+use crate::wifi::{NullWifiDriver, WifiDriver, WifiNetworkInfo, WifiStatus};
 
 /// FeatureMap の Ethernet ビット(EN、bit 2)。
 pub const FEATURE_ETHERNET: u32 = 0x04;
@@ -225,6 +225,49 @@ fn write_scan_response(resp: &mut CmdResponder<'_, '_>, status: u8) -> Result<()
     close_response(w)
 }
 
+/// ScanNetworksResponse(0x01)の Wi-Fi 版:
+/// `{ 0: networkingStatus, 2: wiFiScanResults[] }`(`docs/design/airq-port.md` §9)。
+///
+/// `entry` が `None` なら [`write_scan_response`] と同じ空応答(tag 2 を省く)。
+/// `Some` なら `WiFiInterfaceScanResultStruct`(§11.8.7.2)を 1 件だけ載せる:
+/// `{ 0: security(map8), 1: ssid(octstr), 2: bssid(octstr 6B), 3: channel(u16),
+/// 4: wiFiBand(enum8), 5: rssi(int8) }`。
+///
+/// Thread 版は [`write_scan_response`] を使い続ける(挙動不変)。
+fn write_wifi_scan_response(
+    resp: &mut CmdResponder<'_, '_>,
+    status: u8,
+    entry: Option<&WifiNetworkInfo>,
+) -> Result<(), ImStatus> {
+    let w = open_response(resp, 0x01)?;
+    w.write_u8(&TlvTag::ContextSpecific(0), status)
+        .map_err(map_tlv)?;
+    if let Some(e) = entry {
+        w.start_array(&TlvTag::ContextSpecific(2))
+            .map_err(map_tlv)?;
+        w.start_struct(&TlvTag::Anonymous).map_err(map_tlv)?;
+        w.write_u8(&TlvTag::ContextSpecific(0), e.security)
+            .map_err(map_tlv)?;
+        w.write_bytes(&TlvTag::ContextSpecific(1), e.ssid())
+            .map_err(map_tlv)?;
+        w.write_bytes(&TlvTag::ContextSpecific(2), &e.bssid)
+            .map_err(map_tlv)?;
+        w.write_u16(&TlvTag::ContextSpecific(3), e.channel)
+            .map_err(map_tlv)?;
+        // wiFiBand: 2.4GHz(WiFiBandEnum::2G4 = 0)。SupportedWiFiBands と揃える。
+        w.write_u8(&TlvTag::ContextSpecific(4), WIFI_BAND_2G4)
+            .map_err(map_tlv)?;
+        w.write_i8(&TlvTag::ContextSpecific(5), e.rssi)
+            .map_err(map_tlv)?;
+        w.end_container().map_err(map_tlv)?;
+        w.end_container().map_err(map_tlv)?;
+    }
+    close_response(w)
+}
+
+/// WiFiBandEnum の 2.4GHz(0)。`SupportedWiFiBands`(0x0008)と同じ値。
+const WIFI_BAND_2G4: u8 = 0;
+
 impl Default for NetworkCommissioningWifi {
     fn default() -> Self {
         Self::new()
@@ -282,6 +325,45 @@ impl<W: WifiDriver> NetworkCommissioningWifi<W> {
                 self.last_connect_error = Some(reason);
             }
             WifiStatus::Idle | WifiStatus::Connecting => {}
+        }
+    }
+
+    /// クラスタを経由せず join 済みの資格情報を「保持ネットワーク」として登録する
+    /// (`docs/design/airq-port.md` §9)。
+    ///
+    /// ビルド時プリセット / KVS 復元で **クラスタを通らずに** Wi-Fi へ join する構成では
+    /// `Networks` が空のままになる。Alexa/Apple/Google のコミッショナはこれを「未設定」と
+    /// 判断して Wi-Fi 設定フローに入り、`ScanNetworks` が空を返すため中断する。
+    /// 起動時にこのメソッドで `Networks[0] = { networkID: ssid, connected: <driver 状態> }`、
+    /// `LastNetworkingStatus = Success` を作っておくと、そのフローに入らない。
+    ///
+    /// `connected` は以後も [`update_from_driver`](Self::update_from_driver) が追従する。
+    /// `ssid` が空なら何もしない。
+    pub fn seed_network(&mut self, ssid: &[u8], creds: &[u8]) {
+        if ssid.is_empty() {
+            return;
+        }
+        self.set_ssid(ssid);
+        self.set_creds(creds);
+        self.last_status = Some(net_status::SUCCESS);
+        self.last_connect_error = None;
+        self.connected = matches!(self.driver.status(), WifiStatus::Connected);
+    }
+
+    /// `ScanNetworks` が返す 1 件のエントリ(なければ `None`)。
+    ///
+    /// 優先順に、ドライバの [`WifiDriver::current_network`](実測 BSSID/channel/RSSI)、
+    /// 保持 SSID からの推定エントリ([`WifiNetworkInfo::estimated`])。どちらも無ければ
+    /// 空結果。`filter`(ScanNetworks の tag 0 ssid)が与えられた場合は SSID 一致時のみ返す。
+    fn scan_entry(&self, filter: Option<&[u8]>) -> Option<WifiNetworkInfo> {
+        let entry = match self.driver.current_network() {
+            Some(info) if info.ssid_len > 0 => info,
+            _ if self.ssid_len > 0 => WifiNetworkInfo::estimated(self.network_id()),
+            _ => return None,
+        };
+        match filter {
+            Some(f) if f != entry.ssid() => None,
+            _ => Some(entry),
         }
     }
 
@@ -386,19 +468,32 @@ impl<W: WifiDriver> NetworkCommissioningWifi<W> {
         _acc: &AccessContext,
     ) -> Result<(), ImStatus> {
         match cmd.0 {
-            // ScanNetworks(0x00): シム。空結果で Success を返す(chip-tool は既定でスキップ)。
-            0x00 => write_scan_response(resp, net_status::SUCCESS),
+            // ScanNetworks(0x00、fields: 0 ssid?(octstr、nullable)、1 breadcrumb?):
+            // 実スキャンは行わず、接続中/保持ネットワークを 1 件返す(doc §9)。
+            // Alexa 等のコミッショナは目的 SSID がスキャン結果に無いと先へ進まない。
+            0x00 => {
+                let filter = Self::first_octstr(fields);
+                let entry = self.scan_entry(filter);
+                write_wifi_scan_response(resp, net_status::SUCCESS, entry.as_ref())
+            }
             // AddOrUpdateWiFiNetwork(0x02): SSID + credentials を保存し
             // NetworkConfigResponse(Success, idx 0)。join はまだ開始しない。
             0x02 => {
                 let (ssid, creds) = Self::octstr_fields(fields);
+                // 保持中と同じ SSID への再設定なら connected を落とさない(doc §9)。
+                // seed_network / auto-join 済みの AP へ同じ資格情報が来るケースで、
+                // Networks[].connected が一瞬 false になるのを避ける。
+                let same_network =
+                    self.ssid_len > 0 && ssid.map(|s| s == self.network_id()).unwrap_or(false);
                 if let Some(ssid) = ssid {
                     self.set_ssid(ssid);
                 }
                 if let Some(creds) = creds {
                     self.set_creds(creds);
                 }
-                self.connected = false;
+                if !same_network {
+                    self.connected = false;
+                }
                 self.last_status = Some(net_status::SUCCESS);
                 write_network_config_response(resp, net_status::SUCCESS, Some(0))
             }
@@ -1102,6 +1197,7 @@ mod wifi_tests {
     use crate::dm::meta::{AttributeId, Privilege, SessionKind};
     use crate::dm::{DeferredPoll, ServerCluster};
     use crate::tlv::{ContainerType, TlvReader, TlvTag, TlvValue, TlvWriter};
+    use crate::wifi::wifi_security;
 
     fn acc() -> AccessContext {
         AccessContext::new(SessionKind::Case, None, 0, Privilege::Administer)
@@ -1278,6 +1374,8 @@ mod wifi_tests {
         creds_len: usize,
         calls: usize,
         status: WifiStatus,
+        /// `current_network` が返すリンク情報(既定 `None` = 未対応ドライバ相当)。
+        info: Option<WifiNetworkInfo>,
     }
 
     impl RecordingDriver {
@@ -1289,6 +1387,7 @@ mod wifi_tests {
                 creds_len: 0,
                 calls: 0,
                 status: WifiStatus::Idle,
+                info: None,
             }
         }
         fn ssid(&self) -> &[u8] {
@@ -1310,6 +1409,9 @@ mod wifi_tests {
         }
         fn status(&self) -> WifiStatus {
             self.status
+        }
+        fn current_network(&self) -> Option<WifiNetworkInfo> {
+            self.info
         }
     }
 
@@ -1482,6 +1584,272 @@ mod wifi_tests {
         assert!(!net.connected);
         assert_eq!(net.last_status, Some(net_status::OTHER_CONNECTION_FAILURE));
         assert_eq!(net.last_connect_error, Some(-7));
+    }
+
+    // ------------------------------------------------------------------
+    // doc §9: 既接続 Wi-Fi の NetworkCommissioning 反映(Alexa 互換)
+    // ------------------------------------------------------------------
+
+    /// `Networks`(0x0001)を読み、`(件数, 先頭 SSID, 先頭 connected)` を返す。
+    fn read_networks_attr<W: WifiDriver>(
+        net: &NetworkCommissioningWifi<W>,
+    ) -> (usize, [u8; 32], usize, bool) {
+        let mut buf = [0u8; 96];
+        let mut w = TlvWriter::new(&mut buf);
+        {
+            let mut e = AttrEncoder::new(&mut w, TlvTag::Anonymous);
+            net.read_attribute(AttributeId(0x0001), &mut e, &acc())
+                .unwrap();
+        }
+        let len = w.len();
+        let mut r = TlvReader::new(&buf[..len]);
+        assert!(matches!(
+            r.read_next().unwrap().unwrap().value,
+            TlvValue::ContainerStart(ContainerType::Array)
+        ));
+        let mut count = 0usize;
+        let mut ssid = [0u8; 32];
+        let mut ssid_len = 0usize;
+        let mut connected = false;
+        loop {
+            let e = r.read_next().unwrap().unwrap();
+            match e.value {
+                TlvValue::ContainerEnd => break,
+                TlvValue::ContainerStart(ContainerType::Structure) => {
+                    count += 1;
+                    loop {
+                        let f = r.read_next().unwrap().unwrap();
+                        match (f.tag, f.value) {
+                            (_, TlvValue::ContainerEnd) => break,
+                            (TlvTag::ContextSpecific(0), TlvValue::ByteString(b)) if count == 1 => {
+                                ssid_len = b.len();
+                                ssid[..ssid_len].copy_from_slice(b);
+                            }
+                            (TlvTag::ContextSpecific(1), TlvValue::Boolean(v)) if count == 1 => {
+                                connected = v;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                other => panic!("unexpected Networks element: {:?}", other),
+            }
+        }
+        (count, ssid, ssid_len, connected)
+    }
+
+    /// ScanNetworks(0x00)を発行し、応答バイト列を返す。`filter` が `Some` なら tag 0 に載せる。
+    fn scan<W: WifiDriver>(
+        net: &mut NetworkCommissioningWifi<W>,
+        filter: Option<&[u8]>,
+    ) -> (u32, [u8; 128], usize) {
+        let mut fbuf = [0u8; 96];
+        let flen = {
+            let mut w = TlvWriter::new(&mut fbuf);
+            w.start_struct(&TlvTag::ContextSpecific(1)).unwrap();
+            if let Some(f) = filter {
+                w.write_bytes(&TlvTag::ContextSpecific(0), f).unwrap();
+            }
+            w.write_u64(&TlvTag::ContextSpecific(1), 0).unwrap();
+            w.end_container().unwrap();
+            w.len()
+        };
+        let mut fr = TlvReader::new(&fbuf[..flen]);
+        let mut out = [0u8; 128];
+        let mut w = TlvWriter::new(&mut out);
+        let mut resp = CmdResponder::new(&mut w);
+        net.invoke_command(CommandId(0x00), &mut fr, &mut resp, &acc())
+            .unwrap();
+        let rid = resp.response_command().unwrap().0;
+        let wlen = w.len();
+        (rid, out, wlen)
+    }
+
+    /// ScanNetworksResponse の `wiFiScanResults`(tag 2)を 1 件だけ読み出す。
+    /// 返り値は `(security, ssid, bssid, channel, band, rssi)`。tag 2 が無ければ `None`。
+    #[allow(clippy::type_complexity)]
+    fn scan_results(bytes: &[u8]) -> Option<(u64, [u8; 32], usize, [u8; 6], u64, u64, i64)> {
+        let mut r = TlvReader::new(bytes);
+        assert!(matches!(
+            r.read_next().unwrap().unwrap().value,
+            TlvValue::ContainerStart(ContainerType::Structure)
+        ));
+        // tag 2(配列)まで読み飛ばす。
+        loop {
+            let e = r.read_next().unwrap()?;
+            match e.value {
+                TlvValue::ContainerEnd => return None,
+                TlvValue::ContainerStart(ContainerType::Array)
+                    if e.tag == TlvTag::ContextSpecific(2) =>
+                {
+                    break
+                }
+                _ => {}
+            }
+        }
+        assert!(matches!(
+            r.read_next().unwrap().unwrap().value,
+            TlvValue::ContainerStart(ContainerType::Structure)
+        ));
+        let (mut security, mut channel, mut band) = (0u64, 0u64, 0u64);
+        let mut rssi = 0i64;
+        let mut ssid = [0u8; 32];
+        let mut ssid_len = 0usize;
+        let mut bssid = [0u8; 6];
+        loop {
+            let f = r.read_next().unwrap().unwrap();
+            if matches!(f.value, TlvValue::ContainerEnd) {
+                break;
+            }
+            match f.tag {
+                TlvTag::ContextSpecific(0) => security = f.value.as_unsigned().unwrap(),
+                TlvTag::ContextSpecific(1) => {
+                    let b = f.value.as_bytes().unwrap();
+                    ssid_len = b.len();
+                    ssid[..ssid_len].copy_from_slice(b);
+                }
+                TlvTag::ContextSpecific(2) => {
+                    bssid.copy_from_slice(f.value.as_bytes().unwrap());
+                }
+                TlvTag::ContextSpecific(3) => channel = f.value.as_unsigned().unwrap(),
+                TlvTag::ContextSpecific(4) => band = f.value.as_unsigned().unwrap(),
+                TlvTag::ContextSpecific(5) => rssi = f.value.as_signed().unwrap(),
+                _ => {}
+            }
+        }
+        // 配列は 1 件のみ。
+        assert!(matches!(
+            r.read_next().unwrap().unwrap().value,
+            TlvValue::ContainerEnd
+        ));
+        Some((security, ssid, ssid_len, bssid, channel, band, rssi))
+    }
+
+    /// seed_network で Networks が 1 件になり、connected は driver 状態に追従する。
+    #[test]
+    fn seed_network_publishes_single_network() {
+        let mut net = NetworkCommissioningWifi::with_driver(RecordingDriver::new());
+        // 未 seed は空配列。
+        assert_eq!(read_networks_attr(&net).0, 0);
+
+        net.seed_network(b"iotap", b"hogeFugapiyo");
+        let (count, ssid, ssid_len, connected) = read_networks_attr(&net);
+        assert_eq!(count, 1);
+        assert_eq!(&ssid[..ssid_len], b"iotap");
+        // driver は Idle なので connected=false。
+        assert!(!connected);
+        assert_eq!(net.last_status, Some(net_status::SUCCESS));
+
+        // driver が Connected を報告したら update_from_driver が追従する。
+        net.driver_mut().status = WifiStatus::Connected;
+        net.update_from_driver();
+        assert!(read_networks_attr(&net).3);
+
+        // 既に Connected なら seed 時点で connected=true。
+        let mut net2 = NetworkCommissioningWifi::with_driver(RecordingDriver::new());
+        net2.driver_mut().status = WifiStatus::Connected;
+        net2.seed_network(b"iotap", b"pass");
+        assert!(read_networks_attr(&net2).3);
+
+        // 空 SSID は no-op。
+        let mut net3 = NetworkCommissioningWifi::new();
+        net3.seed_network(b"", b"pass");
+        assert_eq!(read_networks_attr(&net3).0, 0);
+    }
+
+    /// ネットワーク未設定・driver 情報なしなら従来どおり空の ScanNetworksResponse。
+    #[test]
+    fn scan_networks_without_network_is_empty() {
+        let mut net = NetworkCommissioningWifi::with_driver(RecordingDriver::new());
+        let (rid, out, len) = scan(&mut net, None);
+        assert_eq!(rid, 0x01);
+        assert_eq!(
+            resp_field(&out[..len], 0).unwrap().as_unsigned().unwrap(),
+            net_status::SUCCESS as u64
+        );
+        assert!(scan_results(&out[..len]).is_none(), "wiFiScanResults 無し");
+    }
+
+    /// driver 情報が無くても保持 SSID があれば推定エントリを返す。
+    #[test]
+    fn scan_networks_falls_back_to_estimated_entry() {
+        let mut net = NetworkCommissioningWifi::with_driver(RecordingDriver::new());
+        net.seed_network(b"iotap", b"hogeFugapiyo");
+        let (rid, out, len) = scan(&mut net, None);
+        assert_eq!(rid, 0x01);
+        let (security, ssid, ssid_len, bssid, channel, band, rssi) =
+            scan_results(&out[..len]).expect("推定エントリ 1 件");
+        assert_eq!(&ssid[..ssid_len], b"iotap");
+        assert_eq!(security, wifi_security::WPA2_PERSONAL as u64);
+        assert_eq!(bssid, [0u8; 6]);
+        assert_eq!(channel, 0);
+        assert_eq!(band, WIFI_BAND_2G4 as u64);
+        assert_eq!(rssi, crate::wifi::ESTIMATED_RSSI_DBM as i64);
+    }
+
+    /// driver が current_network を返すなら実測値(BSSID/channel/RSSI)を載せる。
+    #[test]
+    fn scan_networks_uses_driver_link_info() {
+        let mut net = NetworkCommissioningWifi::with_driver(RecordingDriver::new());
+        net.driver_mut().info = Some(WifiNetworkInfo::new(
+            b"iotap",
+            [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
+            6,
+            -47,
+            wifi_security::WPA3_PERSONAL,
+        ));
+        net.seed_network(b"iotap", b"hogeFugapiyo");
+        let (_, out, len) = scan(&mut net, None);
+        let (security, ssid, ssid_len, bssid, channel, band, rssi) =
+            scan_results(&out[..len]).expect("実測エントリ 1 件");
+        assert_eq!(&ssid[..ssid_len], b"iotap");
+        assert_eq!(security, wifi_security::WPA3_PERSONAL as u64);
+        assert_eq!(bssid, [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01]);
+        assert_eq!(channel, 6);
+        assert_eq!(band, WIFI_BAND_2G4 as u64);
+        assert_eq!(rssi, -47);
+    }
+
+    /// SSID フィルタ: 一致すれば 1 件、不一致なら空(いずれも Success)。
+    #[test]
+    fn scan_networks_applies_ssid_filter() {
+        let mut net = NetworkCommissioningWifi::with_driver(RecordingDriver::new());
+        net.seed_network(b"iotap", b"hogeFugapiyo");
+
+        let (_, out, len) = scan(&mut net, Some(b"iotap"));
+        assert_eq!(
+            resp_field(&out[..len], 0).unwrap().as_unsigned().unwrap(),
+            net_status::SUCCESS as u64
+        );
+        let (_, ssid, ssid_len, ..) = scan_results(&out[..len]).expect("一致 → 1 件");
+        assert_eq!(&ssid[..ssid_len], b"iotap");
+
+        let (_, out, len) = scan(&mut net, Some(b"other"));
+        assert_eq!(
+            resp_field(&out[..len], 0).unwrap().as_unsigned().unwrap(),
+            net_status::SUCCESS as u64
+        );
+        assert!(scan_results(&out[..len]).is_none(), "不一致 → 空");
+    }
+
+    /// 同一 SSID の AddOrUpdateWiFiNetwork では connected を落とさない。別 SSID なら落とす。
+    #[test]
+    fn add_or_update_same_ssid_keeps_connected() {
+        let mut net = NetworkCommissioningWifi::with_driver(RecordingDriver::new());
+        net.driver_mut().status = WifiStatus::Connected;
+        net.seed_network(b"iotap", b"hogeFugapiyo");
+        assert!(net.connected);
+
+        // 同一 SSID: connected 維持。
+        let (rid, ..) = invoke(&mut net, 0x02, b"iotap");
+        assert_eq!(rid, 0x05);
+        assert!(net.connected, "同一 AP への再設定で connected を落とさない");
+        assert!(read_networks_attr(&net).3);
+
+        // 別 SSID: connected は false に戻る。
+        let (rid, ..) = invoke(&mut net, 0x02, b"another");
+        assert_eq!(rid, 0x05);
+        assert!(!net.connected);
     }
 }
 

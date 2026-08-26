@@ -1254,6 +1254,10 @@ async fn main(_spawner: Spawner) {
                 Some(req) => {
                     println!("[kvs] restored wifi credentials; auto-joining");
                     EspWifiDriver.connect(req.ssid(), req.pass());
+                    // クラスタを経由しない join なので Networks が空のままになる。
+                    // Alexa 等のコミッショナ対策に保持ネットワークとして登録する
+                    // (docs/design/airq-port.md §9)。
+                    stack.device_mut().net.seed_network(req.ssid(), req.pass());
                 }
                 None => println!("[kvs] wifi credentials record invalid; ignoring"),
             },
@@ -1265,6 +1269,11 @@ async fn main(_spawner: Spawner) {
                 {
                     println!("[wifi] using build-time preset credentials (ssid={})", ssid);
                     EspWifiDriver.connect(ssid.as_bytes(), pass.as_bytes());
+                    // 同上(doc §9): プリセット join もクラスタを通らないため seed する。
+                    stack
+                        .device_mut()
+                        .net
+                        .seed_network(ssid.as_bytes(), pass.as_bytes());
                 }
             }
             Err(e) => println!("[kvs] wifi credentials read failed: {:?}", e),

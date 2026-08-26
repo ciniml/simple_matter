@@ -28,7 +28,7 @@ use esp_println::println;
 use esp_radio::wifi::sta::StationConfig;
 use esp_radio::wifi::{Config, WifiController, WifiError};
 
-use simple_matter::wifi::{WifiDriver, WifiStatus};
+use simple_matter::wifi::{wifi_security, WifiDriver, WifiNetworkInfo, WifiStatus};
 
 extern crate alloc;
 
@@ -100,6 +100,35 @@ static WIFI_STATE: AtomicU8 = AtomicU8::new(STATE_IDLE);
 /// 直近の失敗理由(esp-radio の DisconnectReason 由来のコード)。
 static WIFI_FAIL_REASON: AtomicI32 = AtomicI32::new(0);
 
+/// associate 済みリンクの実測情報(BSSID / channel / RSSI)。
+///
+/// `NetworkCommissioning.ScanNetworks` が「接続中の AP」を 1 件のスキャン結果として
+/// 返すために使う(`docs/design/airq-port.md` §9)。[`wifi_task`] が join 成功直後に
+/// `WifiController::ap_info()` / `rssi()` から埋める。取得できなかった項目は
+/// [`LinkInfo::UNKNOWN`] の値のまま残る。
+#[derive(Clone, Copy)]
+pub struct LinkInfo {
+    /// 接続先 AP の BSSID(不明なら全 0)。
+    pub bssid: [u8; 6],
+    /// 動作チャネル(不明なら 0)。
+    pub channel: u16,
+    /// RSSI(dBm。取得できなければコアの推定値)。
+    pub rssi: i8,
+}
+
+impl LinkInfo {
+    /// 実測値が取れていないときの初期値(コアの推定エントリと同じ RSSI)。
+    const UNKNOWN: Self = Self {
+        bssid: [0u8; 6],
+        channel: 0,
+        rssi: simple_matter::wifi::ESTIMATED_RSSI_DBM,
+    };
+}
+
+/// 現在のリンク情報([`wifi_task`] が join 成功時に更新)。
+static WIFI_LINK: Mutex<CriticalSectionRawMutex, RefCell<LinkInfo>> =
+    Mutex::new(RefCell::new(LinkInfo::UNKNOWN));
+
 /// コアの [`WifiDriver`] を実装するハンドル(状態は上記 static と共有)。
 ///
 /// ファームウェア全体で Wi-Fi station は 1 つなので、複数インスタンスを作っても
@@ -125,6 +154,24 @@ impl WifiDriver for EspWifiDriver {
         WIFI_ACTIVE.lock(|cell| *cell.borrow_mut() = Some(req.clone()));
         WIFI_STATE.store(STATE_CONNECTING, Ordering::Release);
         WIFI_REQUEST.signal(req);
+    }
+
+    /// 接続中ネットワークの情報(doc §9)。SSID は [`WIFI_ACTIVE`] の join 要求、
+    /// BSSID / channel / RSSI は [`wifi_task`] が esp-radio から取った実測値。
+    /// security は WPA2-Personal 固定(esp-radio の authmode を写像していない)。
+    fn current_network(&self) -> Option<WifiNetworkInfo> {
+        if WIFI_STATE.load(Ordering::Acquire) != STATE_CONNECTED {
+            return None;
+        }
+        let req = WIFI_ACTIVE.lock(|cell| cell.borrow().clone())?;
+        let link = WIFI_LINK.lock(|cell| *cell.borrow());
+        Some(WifiNetworkInfo::new(
+            req.ssid(),
+            link.bssid,
+            link.channel,
+            link.rssi,
+            wifi_security::WPA2_PERSONAL,
+        ))
     }
 
     fn status(&self) -> WifiStatus {
@@ -179,6 +226,30 @@ pub async fn wifi_task(mut controller: WifiController<'_>) -> ! {
                     "[wifi] associated: ssid={:?} channel={}",
                     info.ssid, info.channel
                 );
+                // ScanNetworks 用のリンク情報(doc §9)。channel は associate 情報、
+                // BSSID / RSSI は esp-radio の ap_info() / rssi() から取る。
+                // 取れなければ既定値(全 0 / コアの推定 RSSI)のままにする。
+                let mut link = LinkInfo {
+                    bssid: [0u8; 6],
+                    channel: info.channel as u16,
+                    rssi: simple_matter::wifi::ESTIMATED_RSSI_DBM,
+                };
+                match controller.ap_info() {
+                    Ok(ap) => {
+                        link.bssid = ap.bssid;
+                        link.channel = ap.channel as u16;
+                        link.rssi = ap.signal_strength;
+                    }
+                    Err(e) => println!("[wifi] ap_info unavailable: {:?}", e),
+                }
+                if let Ok(rssi) = controller.rssi() {
+                    link.rssi = rssi.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
+                }
+                println!(
+                    "[wifi] link: bssid={:02x?} channel={} rssi={}",
+                    link.bssid, link.channel, link.rssi
+                );
+                WIFI_LINK.lock(|cell| *cell.borrow_mut() = link);
                 WIFI_STATE.store(STATE_CONNECTED, Ordering::Release);
                 // 切断イベント or 新しい join 要求を待つ。
                 match select(WIFI_REQUEST.wait(), controller.wait_for_disconnect_async()).await {

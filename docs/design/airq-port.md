@@ -687,3 +687,45 @@ AdminCommissioning + 窓配線 + mDNS commissionable)。
 - Rust crate: [sen5x-rs](https://crates.io/crates/sen5x-rs)、
   [scd4x](https://crates.io/crates/scd4x)、[libscd](https://crates.io/crates/libscd)、
   [espup](https://github.com/esp-rs/espup)(Xtensa ツールチェーン)。
+
+## 9. Alexa 互換: 既接続 Wi-Fi の NetworkCommissioning 反映(2026-08-27)
+
+**事象**: Tab5(または smctl)で OCW を開き Alexa から AirQ を追加すると、Alexa は発見・PASE・非認証警告まで進み、
+「デバイスのネットワーク登録」段階でエラー。AirQ 側では fabric 世代も Wi-Fi 資格情報も変化なし(= AddNOC 未到達)、
+`[pase]`/`[net]` の異常ログなし。Alexa の到達性(IPv6 mDNS 応答・ND)は PC から確認済み。
+
+**原因(推定、コードで裏付け)**: AirQ はビルド時プリセット/KVS 復元の資格情報で **クラスタを経由せず** join するため、
+`NetworkCommissioning.Networks = []`。さらにコアの `ScanNetworks` は **常に空結果で Success**(chip-tool は既定で
+スキャンを省くので問題化しなかった)。Alexa/Apple/Google のコミッショナは「Networks が空 → 未設定」と判断して
+Wi-Fi 設定に入り、目的 SSID を `ScanNetworks` で確認する → 空 → 「ネットワークが見つからない」で中断。
+
+**対処(デバイス側、コア + AirQ FW)**:
+
+1. コア `wifi::WifiDriver` に **接続中ネットワーク情報**の取得を追加(既定実装は `None`):
+   ```rust
+   pub struct WifiNetworkInfo { pub ssid: [u8; 32], pub ssid_len: usize, pub bssid: [u8; 6],
+                                pub channel: u16, pub rssi: i8, pub security: u8 /* WiFiSecurityBitmap */ }
+   fn current_network(&self) -> Option<WifiNetworkInfo> { None }
+   ```
+2. コア `NetworkCommissioningWifi`:
+   - `seed_network(ssid, creds)`: プリセット/KVS 復元の資格情報をクラスタの保持ネットワークとして登録
+     (`Networks[0] = { networkID: ssid, connected: <driver status> }`、`LastNetworkingStatus = Success`)。
+     `connected` は従来どおり `update_from_driver` で追従。
+   - `ScanNetworks(0x00)`(fields: 0 ssid?: octstr、1 breadcrumb): `driver.current_network()` が `Some` なら、
+     SSID フィルタ無し or 一致のときそのエントリ 1 件を `wiFiScanResults`(tag 2)に載せて Success。
+     `WiFiInterfaceScanResultStruct` = { 0 security(map8), 1 ssid(octstr), 2 bssid(octstr 6B), 3 channel(u16),
+     4 wiFiBand(enum8、2G4=0), 5 rssi(int8) }。`None` でも保持 SSID があれば security=WPA2-Personal(0x08)、
+     bssid=00..、channel=0、rssi=-60 の**推定エントリ**を返す(空よりコミッショナが先へ進める)。保持も無ければ従来どおり空。
+   - `AddOrUpdateWiFiNetwork` が **保持中と同じ SSID** なら `connected` を落とさない(同一 AP への再設定で
+     Networks[].connected が一瞬 false になるのを避ける)。
+3. AirQ FW(`ports/esp32s3`): 起動時の preset/KVS join 直後に `net.seed_network(ssid, pass)`。`EspWifiDriver::current_network`
+   は `WIFI_ACTIVE` の SSID + associate 時の `info.channel`(static に保持)+ rssi(esp-radio から取れれば実値、無理なら
+   -60 固定)+ bssid(取れれば。無理なら 0)。security は WPA2-Personal 固定。
+4. cffi(`wifi_driver.rs`、onoff_light_cpp の Wi-Fi 構成)にも同型の `sm_wifi_seed_network(ssid, pass)` /
+   `sm_wifi_set_link_info(bssid, channel, rssi)` を追加(C++ が esp_wifi の接続情報を渡す)。Kconfig プリセット SSID で
+   起動する構成が同じ問題を持つため。ヘッダ再生成。
+
+**テスト**(コア): seed 後の `Networks` 読み出しが 1 件・connected 追従、`ScanNetworks` の TLV(フィルタ一致/不一致/
+無し、driver 情報あり/推定エントリ/空)、同一 SSID の AddOrUpdate で connected 維持、既存 ConnectNetwork 遅延応答テスト不変。
+**ゲート**: cargo 全緑、AirQ FW ビルド(esp toolchain)、実機で smctl `any read 0x11 0 0x0031 1` が 1 件、
+`any invoke`(あれば)で ScanNetworks 応答確認 → Alexa で再試行。
