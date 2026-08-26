@@ -547,7 +547,11 @@ impl<C: Crypto, DAC: DacProvider, const N: usize, FT: FabricAccess<C, N>>
         while let Some((tag, v)) = f.next() {
             match (tag, v) {
                 (0, TlvValue::ByteString(b)) => noc = b,
-                (1, TlvValue::ByteString(b)) => icac = Some(b),
+                // Apple Home 等は ICAC 不使用(NOC が RCAC 直下)でも AddNOC の ICACValue を
+                // **空オクテット列**で送る(chip-tool は省略)。空スライスを証明書として
+                // パースすると Decode になり AddNOC が InvalidNOC で失敗するため、空は
+                // 「ICAC なし」= None として扱う(実機: Apple Home 2026-08-27)。
+                (1, TlvValue::ByteString(b)) => icac = (!b.is_empty()).then_some(b),
                 (2, TlvValue::ByteString(b)) => ipk = b,
                 // 3: caseAdminSubject。AddNOC 成功時に bootstrap admin ACL を生成する(§11.17.6.8)。
                 (3, val) => case_admin_subject = val.as_unsigned().unwrap_or(0),
