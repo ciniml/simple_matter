@@ -45,7 +45,7 @@ use simple_matter::discovery::client::MdnsClient;
 use simple_matter::discovery::{MATTER_PORT, MDNS_PORT};
 use simple_matter::dm::meta::{AttributeId, ClusterId, CommandId, EndpointId};
 use simple_matter::im::client::{AttrReports, ImClient, ImEvent, MAX_CLIENT_SUBSCRIPTIONS};
-use simple_matter::im::wire::{AttributePath, AttributeReportRef, CommandPath};
+use simple_matter::im::wire::{AttributePath, AttributeReportRef, CommandPath, ImStatus};
 use simple_matter::kvs::Kvs;
 use simple_matter::sc::case::common::{CASE_RESUMPTION_ID_LEN, SHARED_SECRET_LEN};
 use simple_matter::sc::initiator::{ScEvent, ScInitiator};
@@ -490,6 +490,14 @@ impl CtrlShim {
         self.nodes.iter().position(|n| n.node_id == node_id)
     }
 
+    /// ノードの live セッション記録を捨てる(次の op は CASE を張り直す)。ノード帳の
+    /// アドレス/resumption 素材は残す。
+    fn invalidate_session(&mut self, node_id: u64) {
+        if let Some(i) = self.node_index(node_id) {
+            self.nodes[i].session = None;
+        }
+    }
+
     /// ノードのアドレス / セッションを記録する(無ければ追加)。
     fn set_node(&mut self, node_id: u64, addr: SocketAddr, session: Option<SessionId>) {
         if let Some(i) = self.node_index(node_id) {
@@ -768,6 +776,13 @@ fn drive_awaitop(s: &mut CtrlShim, node_id: u64, op: PendingOp) {
             e.phase = 0xF0; // 診断: IM Failed 経路。
             s.push_event(e);
             s.activity = Activity::Idle;
+            // タイムアウト = 相手がこのセッションを知らない可能性(デバイス再起動等。暗号化
+            // パケットは黙って捨てられ応答が来ない)。セッションを捨てて次の op で CASE
+            // (resumption 可)を張り直す(§16.6 P6。捨てないと Tab5 再起動まで全 op が
+            // 死んだセッションでタイムアウトし続ける — AirQ 実機 2026-08-26)。
+            if matches!(status, ImStatus::Timeout) {
+                s.invalidate_session(node_id);
+            }
         }
         // 予期しないイベント: 失敗扱いで終端する。
         (op, other) => {
@@ -1014,6 +1029,9 @@ fn handle_sub_event(s: &mut CtrlShim, ev: &ImEvent) -> bool {
         ImEvent::SubscriptionLost { subscription_id } => {
             if let Some(idx) = sub_index_by_id(s, subscription_id) {
                 let entry = s.subs.swap_remove(idx);
+                // keep-alive 途絶 = セッション/デバイスが死んだ可能性が高い。再購読は新しい
+                // CASE(resumption 可)で行わせる(§16.6 P6)。
+                s.invalidate_session(entry.node_id);
                 let mut e = CtrlShim::ev(sm_ctrl_event_kind_t::SM_CTRL_EV_SUBSCRIPTION_LOST);
                 e.node_id = entry.node_id;
                 e.value_u64 = subscription_id as u64;
@@ -1945,9 +1963,17 @@ pub extern "C" fn sm_ctrl_abort_op() -> i32 {
     if matches!(s.activity, Activity::Idle) {
         return 0;
     }
+    // 中断対象ノードのセッションも捨てる(§16.6 P6: 応答が無い相手のセッションは信用しない)。
+    let victim = match s.activity {
+        Activity::Connecting { node_id, .. } | Activity::AwaitOp { node_id, .. } => Some(node_id),
+        _ => None,
+    };
     s.stack.abort_handshake();
     s.stack.abort_op();
     s.comm = None;
+    if let Some(n) = victim {
+        s.invalidate_session(n);
+    }
     // 中断した Subscribe の引数を捨てる(次の Subscribe に混ざらないように。§16.2)。
     s.pending_sub_paths.clear();
     #[cfg(feature = "ble")]

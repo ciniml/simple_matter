@@ -1816,3 +1816,10 @@ SUBSCRIPTION_LOST + テーブル除去、(d) 購読中に別 op(read)を発行�
 
 **ゲート**: cargo 全緑 → docker C6(onoff_light_cpp)/ P4(Tab5)→ 実機で NanoC6 `pools:` の `sub=` が
 1 で安定(Tab5 の ⟳ / 再起動を数回挟んでも増えない)、ボタン→Tab5 反映を長時間(数時間)観測。
+
+**追記(P6、2026-08-26 実機で確定)**: shim は op の IM タイムアウト / `sm_ctrl_abort_op` / `SubscriptionLost` の
+いずれでも **ノードの live セッションを無効化していなかった**。デバイスが再起動すると、shim は死んだ CASE
+セッションで暗号化パケットを送り続け(デバイスは未知セッションとして黙殺)、Tab5 を再起動するまで全 op が
+タイムアウトし続ける(今朝の「AirQ unreachable」の正体)。修正: 3 経路で `invalidate_session(node)`(次の op は
+CASE(resumption 可)を張り直す)。回帰テスト `tests/session_invalidation.rs`(仮想時計ハーネス、3 シナリオ)。
+実機: AirQ リセット → Tab5 が LOST → 2 分後の再試行で Tab5 無再起動のまま再購読成功(購読 ID=1 = 幽霊なし)。
