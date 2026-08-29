@@ -1,0 +1,16 @@
+# ESP32-S3 専用の既定(sdkconfig.defaults に加えて IDF が自動連結する)。
+# AirQ は WiFi + BLE(NimBLE)coex 構成。BLE コミッショニング(pairing ble-wifi)。
+
+# example の Kconfig: BLE を有効化する(S3 でも既定 y だが明示)。
+CONFIG_SM_ENABLE_BLE=y
+
+# Bluetooth LE + NimBLE ホスト(peripheral のみ = RAM 削減)。
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+
+# WiFi/BLE 同時運用(coex)。commissioning 中は BLE、その後 WiFi 運用へ遷移。
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y

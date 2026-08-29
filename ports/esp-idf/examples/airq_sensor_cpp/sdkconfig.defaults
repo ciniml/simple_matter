@@ -1,0 +1,21 @@
+# airq_sensor_cpp 既定設定(ターゲット非依存の共通分)。
+# ターゲットは `idf.py set-target esp32s3` で選ぶ(BLE/coex は
+# sdkconfig.defaults.esp32s3 が上乗せする)。
+
+# カスタムパーティション(partitions.csv、2.5MB app)。4MB flash 想定。
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# メインタスクは軽い(pump は別タスク)。
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
+
+# lwIP: IPv6 + マルチキャスト(mDNS の v4 IGMP / v6 MLD join)。
+CONFIG_LWIP_IPV6=y
+CONFIG_LWIP_IPV6_AUTOCONFIG=y
+CONFIG_LWIP_SO_REUSE=y
+CONFIG_LWIP_MAX_SOCKETS=10
+
+# C++: 例外・RTTI は不要。
+CONFIG_COMPILER_CXX_EXCEPTIONS=n
+CONFIG_COMPILER_CXX_RTTI=n

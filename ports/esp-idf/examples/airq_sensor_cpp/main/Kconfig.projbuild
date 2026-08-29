@@ -1,0 +1,64 @@
+menu "simple-matter airq_sensor example"
+
+    config SM_WIFI_SSID
+        string "WiFi SSID"
+        default "my-ssid"
+        help
+            接続先 WiFi の SSID。ビルドを通すためのプレースホルダ。**起動時に自動
+            接続はしない**(BLE コミッショニングで投入された資格情報のみ join)。
+            BLE 無効ビルドのフォールバック経路でのみ使う。
+
+    config SM_WIFI_PASSWORD
+        string "WiFi password"
+        default "my-password"
+        help
+            WiFi パスフレーズ(WPA2-PSK)。SM_WIFI_SSID と同じくフォールバック用。
+
+    config SM_I2C_SDA_GPIO
+        int "Sensor I2C SDA GPIO"
+        default 11
+        help
+            SEN55 / SCD40 が載る I2C バスの SDA(M5Stack AirQ = GPIO11)。
+
+    config SM_I2C_SCL_GPIO
+        int "Sensor I2C SCL GPIO"
+        default 12
+        help
+            SEN55 / SCD40 が載る I2C バスの SCL(M5Stack AirQ = GPIO12)。
+
+    config SM_SEN55_POWER_GPIO
+        int "SEN55 power control GPIO (-1 to disable)"
+        default 10
+        help
+            SEN55 のロードスイッチ(M5Stack AirQ = GPIO10、LOW で ON)。-1 で無効
+            (電源制御なし = 常時給電ボード)。
+
+    config SM_POWER_HOLD_GPIO
+        int "Battery power-hold GPIO (-1 to disable)"
+        default 46
+        help
+            バッテリー動作時の電源維持(M5Stack AirQ = GPIO46、HIGH で HOLD)。
+            USB 給電では無害。-1 で無効。
+
+    config SM_FACTORY_DATA
+        bool "Use factory data partition (esp-matter-mfg-tool compatible)"
+        default n
+        help
+            esp-matter-mfg-tool 生成の factory NVS パーティション(chip-factory
+            namespace)から DAC/PAI/DAC 鍵・SPAKE2+ verifier・discriminator・VID/PID を
+            読み、sm_config_t に供給する。未 flash / 失敗時は dev 定数へフォールバック。
+
+    config SM_FACTORY_PARTITION
+        string "Factory data partition label"
+        default "nvs_factory"
+        depends on SM_FACTORY_DATA
+
+    config SM_ENABLE_BLE
+        bool "Enable BLE (NimBLE) commissioning"
+        default y
+        help
+            BLE(NimBLE)給餌によるコミッショニング(pairing ble-wifi)を有効にする。
+            有効時は起動時 WiFi join を止め、ConnectNetwork 駆動でプロビジョンする。
+            AirQ は BLE + WiFi coex を前提にするため既定 y。
+
+endmenu
