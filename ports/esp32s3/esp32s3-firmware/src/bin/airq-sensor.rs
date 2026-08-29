@@ -1262,19 +1262,14 @@ async fn main(_spawner: Spawner) {
                 None => println!("[kvs] wifi credentials record invalid; ignoring"),
             },
             Ok(None) => {
-                // ビルド時プリセット(`SM_WIFI_SSID=... SM_WIFI_PASS=... cargo build`)。
-                // BLE を使わない on-network コミッショニング(pairing address)の入口。
-                if let (Some(ssid), Some(pass)) =
-                    (option_env!("SM_WIFI_SSID"), option_env!("SM_WIFI_PASS"))
-                {
-                    println!("[wifi] using build-time preset credentials (ssid={})", ssid);
-                    EspWifiDriver.connect(ssid.as_bytes(), pass.as_bytes());
-                    // 同上(doc §9): プリセット join もクラスタを通らないため seed する。
-                    stack
-                        .device_mut()
-                        .net
-                        .seed_network(ssid.as_bytes(), pass.as_bytes());
-                }
+                // 通常の Matter デバイス挙動: コミッショニング前は WiFi 資格情報を持たない。
+                // 起動時の自動接続は行わず、BLE(BTP)コミッショニングで NetworkCommissioning
+                // (AddOrUpdateWiFiNetwork → ConnectNetwork)により資格情報が投入されるのを待つ。
+                // 投入後は KVS に保存され、以降のリブートでは上の `Ok(Some(..))` 経路で再 join する。
+                //
+                // (以前はビルド時プリセット `SM_WIFI_SSID`/`SM_WIFI_PASS` で自動接続していたが、
+                //  実機コミッショナ(Apple Home 等)がホームの WiFi を投入する挙動と競合するため削除。)
+                println!("[wifi] no stored credentials; waiting for commissioning to provision WiFi");
             }
             Err(e) => println!("[kvs] wifi credentials read failed: {:?}", e),
         }
