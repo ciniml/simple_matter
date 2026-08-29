@@ -27,6 +27,7 @@
 
 #include "sdkconfig.h"
 
+#include "esp_heap_caps.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -516,19 +517,29 @@ static int open_mdns_socket() {
     close(fd);
     return -1;
   }
+  return fd;
+}
+
+// mDNS マルチキャストグループ(224.0.0.251 / ff02::fb)へ join する。
+// **インターフェースに IP が付いてから**呼ぶこと(IP 取得前は errno=125 で失敗し、
+// 以降マルチキャストを受信できない)。got_ip 後に呼び、失敗時は次周期で再試行する。
+// 両ファミリとも成功したら true。
+static bool join_mdns_groups(int fd) {
+  bool ok = true;
   ip_mreq mreq4{};
   inet_pton(AF_INET, "224.0.0.251", &mreq4.imr_multiaddr);
   mreq4.imr_interface.s_addr = htonl(INADDR_ANY);
-  if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq4, sizeof(mreq4)) != 0) {
-    ESP_LOGW(TAG, "IP_ADD_MEMBERSHIP (v4) failed: errno=%d (ignored)", errno);
-  }
+  int r4 = setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq4, sizeof(mreq4));
+  int e4 = errno;
+  if (r4 != 0 && e4 != EADDRINUSE) ok = false;
   ipv6_mreq mreq6{};
   inet_pton(AF_INET6, "ff02::fb", &mreq6.ipv6mr_multiaddr);
   mreq6.ipv6mr_interface = 0;
-  if (setsockopt(fd, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP, &mreq6, sizeof(mreq6)) != 0) {
-    ESP_LOGW(TAG, "IPV6_ADD_MEMBERSHIP (v6) failed: errno=%d (ignored)", errno);
-  }
-  return fd;
+  int r6 = setsockopt(fd, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP, &mreq6, sizeof(mreq6));
+  int e6 = errno;
+  if (r6 != 0 && e6 != EADDRINUSE) ok = false;
+  (void)e4; (void)e6;
+  return ok;
 }
 
 // ---- タスク間メッセージ ----------------------------------------------------
@@ -765,12 +776,14 @@ static void matter_task(void *) {
   sensors_init(SM_I2C_SDA, SM_I2C_SCL, SM_SEN55_POWER, SM_POWER_HOLD);
 
   int udp_fd = open_matter_udp();
-  int mdns_fd = open_mdns_socket();
-  if (udp_fd < 0 || mdns_fd < 0) {
-    ESP_LOGE(TAG, "socket open failed");
+  if (udp_fd < 0) {
+    ESP_LOGE(TAG, "matter UDP socket open failed");
     vTaskDelete(nullptr);
     return;
   }
+  // mDNS ソケットは WiFi/IP 確立後に開く(pump 開始時点では netif に IP が無く、
+  // マルチキャスト join が errno=125 で失敗して以降マルチキャストを受信できない)。
+  int mdns_fd = -1;
 
   auto make_sender = [](int fd) {
     return [fd](const uint8_t *buf, size_t len, const sm_addr_t &dst) {
@@ -781,11 +794,34 @@ static void matter_task(void *) {
     };
   };
   SmStack::Sender udp_send = make_sender(udp_fd);
-  SmStack::Sender mdns_send = make_sender(mdns_fd);
+  auto mdns_send = [&mdns_fd](const uint8_t *buf, size_t len, const sm_addr_t &dst) {
+    if (mdns_fd < 0) return;
+    sockaddr_storage ss; socklen_t sl; smaddr_to_sockaddr(dst, ss, sl);
+    sendto(mdns_fd, buf, len, 0, (sockaddr *)&ss, sl);
+  };
 
   static uint8_t rx[2048];
   bool ble_conn_active = false;
+  bool mdns_joined = false;
   for (;;) {
+    // WiFi/IP 確立後に mDNS マルチキャスト join を(再)実行する。pump 開始時点では
+    // IP 未取得で join が errno=125 失敗するため、接続後にここで確実に join する。
+    // WiFi/IP 確立後に mDNS ソケットを開いてマルチキャスト join する。IPv6 link-local は
+    // DAD 完了まで少し遅れるため、両ファミリが揃うまで数回リトライする。切断で作り直す。
+    if (g_wifi_connected) {
+      if (mdns_fd < 0) {
+        mdns_fd = open_mdns_socket();
+        mdns_joined = false;
+      }
+      if (mdns_fd >= 0 && !mdns_joined) {
+        mdns_joined = join_mdns_groups(mdns_fd);
+        if (mdns_joined) ESP_LOGI(TAG, "mDNS socket opened + multicast joined (after IP)");
+      }
+    } else if (mdns_fd >= 0) {
+      close(mdns_fd);
+      mdns_fd = -1;
+      mdns_joined = false;
+    }
     uint64_t now = now_ms();
 
     // 周期センサ読み → 値注入(スナップショット更新時のみ)。
@@ -849,9 +885,11 @@ static void matter_task(void *) {
     FD_ZERO(&rfds);
     FD_SET(udp_fd, &rfds);
     int maxfd = udp_fd;
-    FD_SET(mdns_fd, &rfds);
-    if (mdns_fd > maxfd) {
-      maxfd = mdns_fd;
+    if (mdns_fd >= 0) {
+      FD_SET(mdns_fd, &rfds);
+      if (mdns_fd > maxfd) {
+        maxfd = mdns_fd;
+      }
     }
     int r = select(maxfd + 1, &rfds, nullptr, nullptr, &tv);
     now = now_ms();
@@ -865,7 +903,7 @@ static void matter_task(void *) {
         stack.udp_rx(rx, (size_t)n, sa, now, udp_send);
       }
     }
-    if (r > 0 && FD_ISSET(mdns_fd, &rfds)) {
+    if (mdns_fd >= 0 && r > 0 && FD_ISSET(mdns_fd, &rfds)) {
       sockaddr_storage src;
       socklen_t sl = sizeof(src);
       int n = recvfrom(mdns_fd, rx, sizeof(rx), 0, (sockaddr *)&src, &sl);
@@ -883,6 +921,7 @@ static void matter_task(void *) {
         s_last_pool_log = now;
         sm_pool_stats_t st = {};
         sm_pool_stats(&st);
+        ESP_LOGI(TAG, "matter stack high-water: %u bytes free", (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
         ESP_LOGI(TAG, "pools: ex=%u/%u sess=%u/%u hs=%u/%u tx=%u/%u heap=%lu", st.exchanges,
                  st.exchanges_cap, st.sessions, st.sessions_cap, st.handshakes, st.handshakes_cap,
                  st.tx_bufs, st.tx_bufs_cap, (unsigned long)esp_get_free_heap_size());
@@ -911,6 +950,14 @@ extern "C" void app_main() {
     ESP_ERROR_CHECK(nvs_flash_erase());
     ESP_ERROR_CHECK(nvs_flash_init());
   }
+  // WiFi/BLE 初期化前(ヒープが新鮮 = 連続 ~210KB)に Matter タスク用 128KB スタックを
+  // 予約する。init 後だと断片化で連続 ~72KB しか取れず 128KB が確保できない(実測)。
+  static const size_t kMatterStackBytes = 128 * 1024;
+  static StaticTask_t s_matter_tcb;
+  StackType_t *matter_stack = (StackType_t *)heap_caps_malloc(
+      kMatterStackBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  ESP_LOGI(TAG, "reserved matter stack %uB @ %p", (unsigned)kMatterStackBytes, matter_stack);
+
   ESP_ERROR_CHECK(esp_netif_init());
   ESP_ERROR_CHECK(esp_event_loop_create_default());
 
@@ -924,5 +971,18 @@ extern "C" void app_main() {
 
   // sm_* を単線で扱う pump タスク(sans-IO 契約)。スタック 128KB 必須級
   // (sm_init のスタック構築 + コミッショニング中の P-256 署名チェーンが深い)。
-  xTaskCreate(&matter_task, "matter", 128 * 1024, nullptr, 5, nullptr);
+  // この S3(PSRAM なし、内部 ~270KB)では WiFi+BLE(coex)後の連続空きが ~72KB。
+  // 128KB は入らないので、連続ブロックに収まる 64KB スタックを動的確保する
+  // (sm_init 用ヒープも ~70KB 残す)。実使用は high-water mark でログ監視。
+  ESP_LOGI(TAG, "before matter task: free_internal=%u largest_block=%u",
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  if (!matter_stack) {
+    ESP_LOGE(TAG, "matter stack reservation failed; aborting");
+    return;
+  }
+  TaskHandle_t th = xTaskCreateStatic(&matter_task, "matter",
+                                      kMatterStackBytes / sizeof(StackType_t), nullptr, 5,
+                                      matter_stack, &s_matter_tcb);
+  ESP_LOGI(TAG, "matter task create(static 128KB pre-reserved): %s", th ? "OK" : "FAILED");
 }
