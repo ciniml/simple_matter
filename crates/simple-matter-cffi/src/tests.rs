@@ -537,6 +537,55 @@ pub(crate) fn build_composition(buf: &mut [u8]) -> usize {
     w.len()
 }
 
+/// 空気質センサ構成の composition TLV blob を組み立てる(W1)。
+///
+/// EP1 = Air Quality Sensor(0x002C): Identify + AirQuality + CO2 + PM1/PM2.5/PM10。
+/// EP2 = Temperature Sensor(0x0302): Temperature。
+/// EP3 = Humidity Sensor(0x0307): RelativeHumidity。
+#[cfg(test)]
+pub(crate) fn build_airq_composition(buf: &mut [u8]) -> usize {
+    use simple_matter::tlv::{ContainerType, TlvTag, TlvWriter};
+    let mut w = TlvWriter::new(buf);
+    w.start_container(&TlvTag::Anonymous, ContainerType::List)
+        .unwrap();
+    // EP1 = Air Quality Sensor。
+    w.start_struct(&TlvTag::Anonymous).unwrap();
+    w.write_u16(&TlvTag::ContextSpecific(0), 1).unwrap();
+    w.write_u32(&TlvTag::ContextSpecific(1), 0x002C).unwrap();
+    w.write_u8(&TlvTag::ContextSpecific(2), 1).unwrap();
+    w.start_container(&TlvTag::ContextSpecific(3), ContainerType::Array)
+        .unwrap();
+    // Identify(0x0003)/ AirQuality(0x005B)/ CO2(0x040D)/ PM1(0x042C)/
+    // PM2.5(0x042A)/ PM10(0x042D)。
+    for id in [0x0003u32, 0x005B, 0x040D, 0x042C, 0x042A, 0x042D] {
+        w.write_u32(&TlvTag::Anonymous, id).unwrap();
+    }
+    w.end_container().unwrap();
+    w.end_container().unwrap();
+    // EP2 = Temperature Sensor。
+    w.start_struct(&TlvTag::Anonymous).unwrap();
+    w.write_u16(&TlvTag::ContextSpecific(0), 2).unwrap();
+    w.write_u32(&TlvTag::ContextSpecific(1), 0x0302).unwrap();
+    w.write_u8(&TlvTag::ContextSpecific(2), 2).unwrap();
+    w.start_container(&TlvTag::ContextSpecific(3), ContainerType::Array)
+        .unwrap();
+    w.write_u32(&TlvTag::Anonymous, 0x0402).unwrap();
+    w.end_container().unwrap();
+    w.end_container().unwrap();
+    // EP3 = Humidity Sensor。
+    w.start_struct(&TlvTag::Anonymous).unwrap();
+    w.write_u16(&TlvTag::ContextSpecific(0), 3).unwrap();
+    w.write_u32(&TlvTag::ContextSpecific(1), 0x0307).unwrap();
+    w.write_u8(&TlvTag::ContextSpecific(2), 2).unwrap();
+    w.start_container(&TlvTag::ContextSpecific(3), ContainerType::Array)
+        .unwrap();
+    w.write_u32(&TlvTag::Anonymous, 0x0405).unwrap();
+    w.end_container().unwrap();
+    w.end_container().unwrap();
+    w.end_container().unwrap();
+    w.len()
+}
+
 /// Descriptor(DeviceTypeList / ServerList / PartsList)が合成結果と整合すること。
 ///
 /// `Light` を(シム static ではなく)leak したヒープ上に組んで検証する
@@ -654,6 +703,140 @@ fn descriptor_synthesis_matches_composition() {
     assert_eq!(u_list(&b[..n]), vec![0x0302]);
     let n = read(2, 0x0001, &mut b);
     assert_eq!(u_list(&b[..n]), vec![0x0402, 0x0405, 0x001D]);
+}
+
+/// W1: 空気質センサ構成(EP1=AirQuality+CO2+PM×3 / EP2=Temp / EP3=Hum)が
+/// Descriptor の ServerList/DeviceTypeList と整合し、`sm_attr_set_value` 経路で
+/// 各センサ値を注入 → read で一致 → 購読の dirty が立つこと。
+#[test]
+fn air_quality_composition_values_and_descriptor() {
+    use super::compose::{
+        v_f, v_u, CL_AIR_QUALITY, CL_CO2, CL_HUM, CL_PM1, CL_PM10, CL_PM25, CL_TEMP,
+    };
+    use simple_matter::dm::codec::AttrEncoder;
+    use simple_matter::dm::meta::{AccessContext, AttributeId, Privilege, SessionKind};
+    use simple_matter::dm::DataModel;
+    use simple_matter::tlv::{TlvReader, TlvTag, TlvValue, TlvWriter};
+
+    let rng = CRng {
+        fill: test_rng,
+        ctx: core::ptr::null_mut(),
+    };
+    let owned: &'static Owned = Box::leak(Box::new(Owned {
+        crypto: RustCrypto::new(rng),
+        fabrics: RefCell::new(FabricTable::new()),
+        acl: RefCell::new(AclTable::new()),
+        window: RefCell::new(CommissioningWindow::new()),
+        groups: RefCell::new(DefaultGroupStore::new()),
+        dac_store: DacStore::default(),
+    }));
+    let dac = ShimDac::Test(TestDacProvider::new(&RustCrypto::new(rng)).unwrap());
+    let light: &'static mut Light = Box::leak(Box::new(build_light(
+        owned,
+        rng,
+        sm_network_t::SM_NET_ETHERNET,
+        dac,
+    )));
+
+    let mut buf = [0u8; 256];
+    let n = build_airq_composition(&mut buf);
+    let spec = compose::parse(&buf[..n]).unwrap();
+    light.install_composition(&spec, &owned.groups).unwrap();
+    light.install_custom(custom::PendingRegistry::new());
+
+    // 合成 EP は EP0 + EP1/EP2/EP3。
+    let eps: Vec<u16> = light.endpoints().iter().map(|m| m.id.0).collect();
+    assert_eq!(eps, vec![0, 1, 2, 3]);
+    // EP1 ServerList = 宣言クラスタ(宣言順)+ 自動 Descriptor。
+    let ep1: Vec<u32> = light
+        .clusters_on(EndpointId(1))
+        .iter()
+        .map(|c| c.0)
+        .collect();
+    assert_eq!(
+        ep1,
+        vec![0x0003, 0x005B, 0x040D, 0x042C, 0x042A, 0x042D, 0x001D]
+    );
+
+    // sm_attr_set_value 経路で値を注入する(is_active 分岐と同じ Composed::set_value)。
+    let set = |light: &mut Light, ep: u16, cl: u32, val: sm_attr_value_t| {
+        light.composed.set_value(ep, cl, 0x0000, &val).unwrap();
+    };
+    // AirQuality = Moderate(3、enum8)。
+    set(light, 1, CL_AIR_QUALITY, v_u(sm_attr_type_t::SM_T_U8, 3));
+    // CO2 / PM は f32。
+    set(light, 1, CL_CO2, v_f(sm_attr_type_t::SM_T_F32, 612.5));
+    set(light, 1, CL_PM1, v_f(sm_attr_type_t::SM_T_F32, 3.5));
+    set(light, 1, CL_PM25, v_f(sm_attr_type_t::SM_T_F32, 12.5));
+    set(light, 1, CL_PM10, v_f(sm_attr_type_t::SM_T_F32, 20.0));
+    // Temp / Hum も注入(後方互換の他クラスタ)。
+    set(light, 2, CL_TEMP, v_u(sm_attr_type_t::SM_T_I16, 2100));
+    set(light, 3, CL_HUM, v_u(sm_attr_type_t::SM_T_U16, 4500));
+
+    // get_value 経路で読み戻して一致すること。
+    assert_eq!(
+        unsafe {
+            light
+                .composed
+                .get_value(1, CL_AIR_QUALITY, 0x0000)
+                .unwrap()
+                .v
+                .u
+        },
+        3
+    );
+    for (cl, exp) in [
+        (CL_CO2, 612.5f32),
+        (CL_PM1, 3.5),
+        (CL_PM25, 12.5),
+        (CL_PM10, 20.0),
+    ] {
+        let v = light.composed.get_value(1, cl, 0x0000).unwrap();
+        assert!(!v.is_null);
+        assert_eq!(unsafe { v.v.f }, exp, "cluster {cl:#x}");
+    }
+
+    // 購読 dirty が立つ(レポート契機)。
+    for cl in [CL_AIR_QUALITY, CL_CO2, CL_PM1, CL_PM25, CL_PM10] {
+        assert!(
+            light.composed.cluster_mut(1, cl).unwrap().take_dirty(),
+            "dirty for {cl:#x}"
+        );
+    }
+
+    // MeasuredValue を IM read してワイヤ値が f32 で返ること(CO2 = 612.5)。
+    let acc = AccessContext::new(
+        SessionKind::Case,
+        core::num::NonZeroU8::new(1),
+        0,
+        Privilege::Administer,
+    )
+    .with_env(0, [0u8; 16]);
+    let mut out = [0u8; 32];
+    let mut w = TlvWriter::new(&mut out);
+    {
+        let mut e = AttrEncoder::new(&mut w, TlvTag::Anonymous);
+        light
+            .cluster(EndpointId(1), ClusterId(CL_CO2))
+            .unwrap()
+            .read_attribute(AttributeId(0x0000), &mut e, &acc)
+            .unwrap();
+    }
+    let m = w.len();
+    let mut r = TlvReader::new(&out[..m]);
+    match r.read_next().unwrap().unwrap().value {
+        TlvValue::Float(f) => assert_eq!(f, 612.5),
+        other => panic!("expected f32 CO2 measured, got {other:?}"),
+    }
+
+    // 範囲外の enum8(99)は RC_TYPE。
+    let mut over = sm_attr_value_t::zero();
+    over.r#type = sm_attr_type_t::SM_T_U8;
+    over.v.u = 99;
+    assert_eq!(
+        light.composed.set_value(1, CL_AIR_QUALITY, 0x0000, &over),
+        Err(compose::RC_TYPE)
+    );
 }
 
 mod compose_mode {

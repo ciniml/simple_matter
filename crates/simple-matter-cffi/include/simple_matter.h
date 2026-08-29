@@ -40,6 +40,21 @@
 // timed invoke 必須。
 #define SM_CMD_TIMED (1 << 0)
 
+// Air Quality(0x005B)。
+#define CL_AIR_QUALITY 91
+
+// PM2.5 Concentration Measurement(0x042A)。
+#define CL_PM25 1066
+
+// PM1 Concentration Measurement(0x042C)。
+#define CL_PM1 1068
+
+// PM10 Concentration Measurement(0x042D)。
+#define CL_PM10 1069
+
+// Carbon Dioxide Concentration Measurement(0x040D)。
+#define CL_CO2 1037
+
 // 属性/引数のスカラ型タグ(§8.1)。
 typedef enum {
   SM_T_BOOL = 0,

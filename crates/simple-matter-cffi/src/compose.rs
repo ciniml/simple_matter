@@ -33,11 +33,12 @@ use core::cell::RefCell;
 
 use heapless::Vec;
 use simple_matter::dm::clusters::{
-    BooleanStateCluster, ColorControlCluster, DoorLockCluster, FanControlCluster,
-    FlowMeasurementCluster, GroupsCluster, IdentifyCluster, IlluminanceMeasurementCluster,
-    LevelControlCluster, OccupancySensingCluster, OnOffCluster, PressureMeasurementCluster,
-    RelativeHumidityMeasurementCluster, SwitchCluster, TemperatureMeasurementCluster,
-    ThermostatCluster,
+    AirQualityCluster, AirQualityEnum, BooleanStateCluster, CarbonDioxideConcentrationCluster,
+    ColorControlCluster, DoorLockCluster, FanControlCluster, FlowMeasurementCluster, GroupsCluster,
+    IdentifyCluster, IlluminanceMeasurementCluster, LevelControlCluster, OccupancySensingCluster,
+    OnOffCluster, Pm10ConcentrationCluster, Pm1ConcentrationCluster, Pm25ConcentrationCluster,
+    PressureMeasurementCluster, RelativeHumidityMeasurementCluster, SwitchCluster,
+    TemperatureMeasurementCluster, ThermostatCluster,
 };
 use simple_matter::dm::ServerCluster;
 use simple_matter::groups::DefaultGroupStore;
@@ -76,6 +77,11 @@ const N_LOCK: usize = 1;
 const N_THERMO: usize = 1;
 const N_IDENTIFY: usize = 8;
 const N_GROUPS: usize = 8;
+const N_AIRQ: usize = 2;
+const N_CO2: usize = 2;
+const N_PM1: usize = 2;
+const N_PM25: usize = 2;
+const N_PM10: usize = 2;
 
 // 合成可能クラスタ ID。
 /// Identify(0x0003)。
@@ -88,6 +94,8 @@ pub const CL_ONOFF: u32 = 0x0006;
 pub const CL_LEVEL: u32 = 0x0008;
 /// Switch(0x003B)。
 pub const CL_SWITCH: u32 = 0x003B;
+/// Air Quality(0x005B)。
+pub const CL_AIR_QUALITY: u32 = 0x005B;
 /// Boolean State(0x0045)。
 pub const CL_BOOL: u32 = 0x0045;
 /// Door Lock(0x0101)。
@@ -110,6 +118,14 @@ pub const CL_FLOW: u32 = 0x0404;
 pub const CL_HUM: u32 = 0x0405;
 /// Occupancy Sensing(0x0406)。
 pub const CL_OCC: u32 = 0x0406;
+/// PM2.5 Concentration Measurement(0x042A)。
+pub const CL_PM25: u32 = 0x042A;
+/// PM1 Concentration Measurement(0x042C)。
+pub const CL_PM1: u32 = 0x042C;
+/// PM10 Concentration Measurement(0x042D)。
+pub const CL_PM10: u32 = 0x042D;
+/// Carbon Dioxide Concentration Measurement(0x040D)。
+pub const CL_CO2: u32 = 0x040D;
 /// Descriptor(0x001D、自動付与)。
 pub const CL_DESCRIPTOR: u32 = 0x001D;
 
@@ -343,6 +359,14 @@ pub fn v_i(t: sm_attr_type_t, i: i64) -> sm_attr_value_t {
     v
 }
 
+/// 単精度浮動小数点値を作る。
+pub fn v_f(t: sm_attr_type_t, f: f32) -> sm_attr_value_t {
+    let mut v = sm_attr_value_t::zero();
+    v.r#type = t;
+    v.v.f = f;
+    v
+}
+
 /// null 値を作る(型タグのみ有効)。
 fn v_null(t: sm_attr_type_t) -> sm_attr_value_t {
     let mut v = sm_attr_value_t::zero();
@@ -401,6 +425,39 @@ fn as_i64(v: &sm_attr_value_t) -> Option<i64> {
     }
 }
 
+/// 値を f32 として読む(SM_T_F32、または整数からのキャスト)。
+fn as_f32(v: &sm_attr_value_t) -> Option<f32> {
+    // SAFETY: union は `type` タグに従って読む(C 側の契約)。
+    unsafe {
+        match v.r#type {
+            sm_attr_type_t::SM_T_F32 => Some(v.v.f),
+            sm_attr_type_t::SM_T_U8
+            | sm_attr_type_t::SM_T_U16
+            | sm_attr_type_t::SM_T_U32
+            | sm_attr_type_t::SM_T_U64 => Some(v.v.u as f32),
+            sm_attr_type_t::SM_T_I8
+            | sm_attr_type_t::SM_T_I16
+            | sm_attr_type_t::SM_T_I32
+            | sm_attr_type_t::SM_T_I64 => Some(v.v.i as f32),
+            _ => None,
+        }
+    }
+}
+
+/// enum8(u8)値を [`AirQualityEnum`] へ写す(0..=6 のみ有効)。
+fn as_air_quality(v: &sm_attr_value_t) -> Option<AirQualityEnum> {
+    Some(match as_u64(v)? {
+        0 => AirQualityEnum::Unknown,
+        1 => AirQualityEnum::Good,
+        2 => AirQualityEnum::Fair,
+        3 => AirQualityEnum::Moderate,
+        4 => AirQualityEnum::Poor,
+        5 => AirQualityEnum::VeryPoor,
+        6 => AirQualityEnum::ExtremelyPoor,
+        _ => return None,
+    })
+}
+
 /// 値を bool として読む(0/非 0)。
 fn as_bool(v: &sm_attr_value_t) -> Option<bool> {
     // SAFETY: 同上。
@@ -430,7 +487,9 @@ impl Snap {
                 bits: 0,
             };
         }
-        let bits = as_u64(v).or_else(|| as_i64(v).map(|i| i as u64));
+        let bits = as_u64(v)
+            .or_else(|| as_i64(v).map(|i| i as u64))
+            .or_else(|| as_f32(v).map(|f| f.to_bits() as u64));
         match bits {
             Some(b) => Self {
                 valid: true,
@@ -450,7 +509,8 @@ impl Snap {
 fn watch_attrs(cluster: u32) -> &'static [u32] {
     match cluster {
         CL_ONOFF | CL_LEVEL | CL_BOOL | CL_OCC | CL_TEMP | CL_HUM | CL_ILLUM | CL_PRESS
-        | CL_FLOW | CL_LOCK | CL_IDENTIFY => &[0x0000],
+        | CL_FLOW | CL_LOCK | CL_IDENTIFY | CL_AIR_QUALITY | CL_CO2 | CL_PM1 | CL_PM25
+        | CL_PM10 => &[0x0000],
         CL_SWITCH => &[0x0001],
         CL_FAN => &[0x0000, 0x0002],
         CL_THERMO => &[0x0000, 0x001C],
@@ -504,6 +564,11 @@ pub struct Composed {
     thermo: Vec<ThermostatCluster, N_THERMO>,
     identify: Vec<IdentifyCluster, N_IDENTIFY>,
     groups: Vec<GroupsCluster<'static, 6, 8, 8>, N_GROUPS>,
+    airq: Vec<AirQualityCluster, N_AIRQ>,
+    co2: Vec<CarbonDioxideConcentrationCluster, N_CO2>,
+    pm1: Vec<Pm1ConcentrationCluster, N_PM1>,
+    pm25: Vec<Pm25ConcentrationCluster, N_PM25>,
+    pm10: Vec<Pm10ConcentrationCluster, N_PM10>,
     slots: Vec<Slot, MAX_SLOTS>,
     /// 合成済みエンドポイント(宣言順)。
     eps: Vec<EpEntry, MAX_COMPOSED_EPS>,
@@ -609,6 +674,23 @@ impl Composed {
             ),
             CL_FLOW => push!(self.flow, FlowMeasurementCluster::new(Some(0), Some(10000))),
             CL_SWITCH => push!(self.switches, SwitchCluster::new()),
+            CL_AIR_QUALITY => push!(self.airq, AirQualityCluster::new()),
+            CL_CO2 => push!(
+                self.co2,
+                CarbonDioxideConcentrationCluster::new(Some(0.0), Some(10000.0))
+            ),
+            CL_PM1 => push!(
+                self.pm1,
+                Pm1ConcentrationCluster::new(Some(0.0), Some(1000.0))
+            ),
+            CL_PM25 => push!(
+                self.pm25,
+                Pm25ConcentrationCluster::new(Some(0.0), Some(1000.0))
+            ),
+            CL_PM10 => push!(
+                self.pm10,
+                Pm10ConcentrationCluster::new(Some(0.0), Some(1000.0))
+            ),
             CL_FAN => push!(self.fan, FanControlCluster::new()),
             CL_LOCK => push!(self.lock, DoorLockCluster::new()),
             CL_THERMO => push!(self.thermo, ThermostatCluster::new()),
@@ -645,6 +727,11 @@ impl Composed {
             CL_FAN => self.fan.get(i)?,
             CL_LOCK => self.lock.get(i)?,
             CL_THERMO => self.thermo.get(i)?,
+            CL_AIR_QUALITY => self.airq.get(i)?,
+            CL_CO2 => self.co2.get(i)?,
+            CL_PM1 => self.pm1.get(i)?,
+            CL_PM25 => self.pm25.get(i)?,
+            CL_PM10 => self.pm10.get(i)?,
             _ => return None,
         })
     }
@@ -669,6 +756,11 @@ impl Composed {
             CL_FAN => self.fan.get_mut(i)?,
             CL_LOCK => self.lock.get_mut(i)?,
             CL_THERMO => self.thermo.get_mut(i)?,
+            CL_AIR_QUALITY => self.airq.get_mut(i)?,
+            CL_CO2 => self.co2.get_mut(i)?,
+            CL_PM1 => self.pm1.get_mut(i)?,
+            CL_PM25 => self.pm25.get_mut(i)?,
+            CL_PM10 => self.pm10.get_mut(i)?,
             _ => return None,
         })
     }
@@ -763,6 +855,20 @@ impl Composed {
                 sm_attr_type_t::SM_T_U16,
                 self.identify[i].identify_time() as u64,
             )),
+            (CL_AIR_QUALITY, 0x0000) => Ok(v_u(
+                sm_attr_type_t::SM_T_U8,
+                self.airq[i].air_quality() as u64,
+            )),
+            (CL_CO2, 0x0000) => {
+                nullable!(self.co2[i].measured(), sm_attr_type_t::SM_T_F32, v_f)
+            }
+            (CL_PM1, 0x0000) => nullable!(self.pm1[i].measured(), sm_attr_type_t::SM_T_F32, v_f),
+            (CL_PM25, 0x0000) => {
+                nullable!(self.pm25[i].measured(), sm_attr_type_t::SM_T_F32, v_f)
+            }
+            (CL_PM10, 0x0000) => {
+                nullable!(self.pm10[i].measured(), sm_attr_type_t::SM_T_F32, v_f)
+            }
             _ => Err(RC_NO_ATTR),
         }
     }
@@ -793,6 +899,16 @@ impl Composed {
                 }
             };
         }
+        /// nullable f32 の書き込み値を取り出す。
+        macro_rules! nvf {
+            () => {
+                if v.is_null {
+                    None
+                } else {
+                    Some(as_f32(v).ok_or(RC_TYPE)?)
+                }
+            };
+        }
         match (cluster, attr) {
             (CL_ONOFF, 0x0000) => self.onoff[i].set(as_bool(v).ok_or(RC_TYPE)?),
             (CL_BOOL, 0x0000) => self.boolean[i].set_state(as_bool(v).ok_or(RC_TYPE)?),
@@ -803,6 +919,13 @@ impl Composed {
             (CL_PRESS, 0x0000) => self.press[i].set_measured(nv!(as_i64, i16)),
             (CL_FLOW, 0x0000) => self.flow[i].set_measured(nv!(as_u64, u16)),
             (CL_THERMO, 0x0000) => self.thermo[i].set_local_temperature(nv!(as_i64, i16)),
+            (CL_AIR_QUALITY, 0x0000) => {
+                self.airq[i].set_air_quality(as_air_quality(v).ok_or(RC_TYPE)?)
+            }
+            (CL_CO2, 0x0000) => self.co2[i].set_measured(nvf!()),
+            (CL_PM1, 0x0000) => self.pm1[i].set_measured(nvf!()),
+            (CL_PM25, 0x0000) => self.pm25[i].set_measured(nvf!()),
+            (CL_PM10, 0x0000) => self.pm10[i].set_measured(nvf!()),
             (CL_SWITCH, 0x0001) => {
                 let p = u8::try_from(as_u64(v).ok_or(RC_TYPE)?).map_err(|_| RC_TYPE)?;
                 if p == 0 {
