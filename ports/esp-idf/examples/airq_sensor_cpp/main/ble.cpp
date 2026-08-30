@@ -73,7 +73,7 @@ static int gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     ble_hs_mbuf_to_flat(ctxt->om, c.frag, copied, &copied);
     c.frag_len = copied;
     if (s_queue) {
-      xQueueSend(s_queue, &c, 0);
+      if (xQueueSend(s_queue, &c, 0) != pdTRUE) ESP_LOGW(TAG, "C1 queue FULL, dropped");
     }
     (void)conn_handle;
     return 0;
@@ -255,6 +255,22 @@ void sm_ble_init(QueueHandle_t q) {
 
   nimble_port_freertos_init(host_task);
   ESP_LOGI(TAG, "NimBLE started");
+}
+
+void sm_ble_stop() {
+  // コミッショニング完了後に BLE/BT を完全停止して無線を WiFi に明け渡す。
+  // WiFi/BT SW coex が有効なままだと、再送のないマルチキャスト(mDNS)が coex
+  // ギャップで両方向とも落ちる。BT コントローラを止めることでこれを解消する。
+  if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+    ble_gap_terminate(s_conn_handle, 0x13);
+  }
+  ble_gap_adv_stop();
+  int rc = nimble_port_stop();
+  ESP_LOGI(TAG, "NimBLE stopping rc=%d", rc);
+  if (rc == 0) {
+    nimble_port_deinit();
+    ESP_LOGI(TAG, "NimBLE + BT controller deinitialized (radio freed for WiFi)");
+  }
 }
 
 void sm_ble_set_adv(const uint8_t *adv, size_t len) {

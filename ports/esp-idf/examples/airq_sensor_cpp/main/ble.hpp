@@ -17,6 +17,9 @@
 // NimBLE を初期化し、GATT サービス登録 + host タスク起動。BLE イベントは `q` に載る。
 void sm_ble_init(QueueHandle_t q);
 
+// コミッショニング完了後に BLE/BT を停止し無線を WiFi へ明け渡す(coex 排除)。
+void sm_ble_stop();
+
 // commissionable 広告データを設定する(`sm_ble_adv_data` の出力をそのまま渡す)。
 // len==0 は広告停止。接続中は広告しない(切断時に再開)。
 void sm_ble_set_adv(const uint8_t *adv, size_t len);

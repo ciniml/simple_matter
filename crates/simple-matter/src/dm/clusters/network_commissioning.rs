@@ -359,7 +359,18 @@ impl<W: WifiDriver> NetworkCommissioningWifi<W> {
         let entry = match self.driver.current_network() {
             Some(info) if info.ssid_len > 0 => info,
             _ if self.ssid_len > 0 => WifiNetworkInfo::estimated(self.network_id()),
-            _ => return None,
+            // フレッシュ機(未 seed / 未 join でドライバのリンク情報も無い)。実スキャン
+            // 機構は持たないが、directed ScanNetworks(tag0 に目的 SSID)には**その SSID の
+            // 推定エントリ**を返す。Apple/Google は目的 SSID がスキャン結果に無いと
+            // ConnectNetwork へ進まず「ネットワークに接続できませんでした」で中断するため
+            // (chip-tool は ScanNetworks を既定でスキップするので従来も通っていた)。
+            // 実際の接続可否はこの後の ConnectNetwork(実 join)で検証される。
+            _ => {
+                return match filter {
+                    Some(f) if !f.is_empty() => Some(WifiNetworkInfo::estimated(f)),
+                    _ => None,
+                };
+            }
         };
         match filter {
             Some(f) if f != entry.ssid() => None,
@@ -1755,6 +1766,26 @@ mod wifi_tests {
         let mut net3 = NetworkCommissioningWifi::new();
         net3.seed_network(b"", b"pass");
         assert_eq!(read_networks_attr(&net3).0, 0);
+    }
+
+    /// フレッシュ機でも directed ScanNetworks(filter=目的 SSID)には、その SSID の推定
+    /// エントリを 1 件返す(Apple/Google が目的 SSID 不在で中断するのを防ぐ)。
+    #[test]
+    fn scan_networks_fresh_directed_returns_estimated_filter_entry() {
+        let mut net = NetworkCommissioningWifi::with_driver(RecordingDriver::new());
+        let (rid, out, len) = scan(&mut net, Some(b"iotap"));
+        assert_eq!(rid, 0x01);
+        let (_security, ssid, ssid_len, _bssid, _channel, _band, _rssi) =
+            scan_results(&out[..len]).expect("directed scan は推定エントリ 1 件を返す");
+        assert_eq!(&ssid[..ssid_len], b"iotap");
+    }
+
+    /// フレッシュ機の undirected ScanNetworks(filter=None)は従来どおり空。
+    #[test]
+    fn scan_networks_fresh_undirected_is_empty() {
+        let mut net = NetworkCommissioningWifi::with_driver(RecordingDriver::new());
+        let (_rid, out, len) = scan(&mut net, None);
+        assert!(scan_results(&out[..len]).is_none(), "undirected は空のまま");
     }
 
     /// ネットワーク未設定・driver 情報なしなら従来どおり空の ScanNetworksResponse。

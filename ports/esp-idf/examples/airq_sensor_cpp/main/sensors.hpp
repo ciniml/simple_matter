@@ -7,8 +7,9 @@
 //   - I2C: SDA=GPIO11 / SCL=GPIO12、100kHz。CRC-8(poly 0x31, init 0xFF)。
 //
 // 値注入(sm_attr_set_value)は main.cpp が担う。本モジュールは物理量スナップショット
-// (f32)と AirQualityEnum の算出(worst-of)だけを提供する。全 API は matter_task
-// (単線)から呼ぶ前提でロックを持たない。
+// (f32)と AirQualityEnum の算出(worst-of)を提供する。実際の I2C 読取は専用の
+// センサタスク(sensors_start_task)が担い、公開スナップショットはミューテックスで
+// 保護する。pump(matter_task)は sensors_snapshot() でコピーを読むだけでよい。
 #pragma once
 
 #include <cstddef>
@@ -35,8 +36,16 @@ bool sensors_init(int sda_gpio, int scl_gpio, int sen55_power_gpio, int hold_gpi
 // 更新されたら true。main.cpp は true のとき sm_attr_set_value で反映する。
 bool sensors_poll(uint64_t now_ms);
 
-// 現在のスナップショットを取得する。
-const SensorSnapshot &sensors_snapshot();
+// 現在の公開スナップショットをコピー取得する(ミューテックス保護、非ブロッキング)。
+void sensors_snapshot(SensorSnapshot &out);
+
+// センサ読取タスクを起動する(sensors_init 後に一度だけ呼ぶ)。以降 I2C 読取は
+// このタスクだけが行い、pump ループをブロックしない。
+void sensors_start_task();
+
+// 前回取得以降にスナップショットが更新されていれば true を返し、フラグをクリアする
+// (pump はこれが true のときだけ sm_attr_set_value で注入すればよい)。
+bool sensors_take_dirty();
 
 // worst-of(CO2 / PM2.5 / VOC index / NOx index)で AirQualityEnum(0..6)を算出する。
 // 判定材料が 1 つも無ければ 0(Unknown)。docs/design/airq-port.md §4.3 / §4.3b。

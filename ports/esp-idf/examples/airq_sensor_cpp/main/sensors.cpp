@@ -17,6 +17,9 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+
+#include "esp_timer.h"
 
 #include "driver/gpio.h"
 
@@ -51,7 +54,10 @@ static i2c_master_bus_handle_t s_bus = nullptr;
 static i2c_master_dev_handle_t s_sen55 = nullptr;
 static i2c_master_dev_handle_t s_scd40 = nullptr;
 static bool s_ready = false;
-static SensorSnapshot s_snap;
+static SensorSnapshot s_snap;          // センサタスク専用の作業スナップショット
+static SensorSnapshot s_pub;           // 公開スナップショット(ロック保護)
+static SemaphoreHandle_t s_lock = nullptr;
+static volatile bool s_dirty = false;
 static uint64_t s_last_sen55 = 0;
 static uint64_t s_last_scd40 = 0;
 
@@ -115,6 +121,9 @@ static bool add_dev(uint8_t addr, i2c_master_dev_handle_t *out) {
 }
 
 bool sensors_init(int sda_gpio, int scl_gpio, int sen55_power_gpio, int hold_gpio) {
+  if (!s_lock) {
+    s_lock = xSemaphoreCreateMutex();
+  }
   // AirQ 固有の電源制御(airq-port.md §2)。
   if (hold_gpio >= 0) {
     gpio_config_t io = {};
@@ -239,10 +248,52 @@ bool sensors_poll(uint64_t now_ms) {
       changed = true;
     }
   }
+  if (changed && s_lock) {
+    // 作業スナップショット s_snap を公開スナップショット s_pub へ短時間ロックでコピー。
+    if (xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
+      s_pub = s_snap;
+      s_dirty = true;
+      xSemaphoreGive(s_lock);
+    }
+  }
   return changed;
 }
 
-const SensorSnapshot &sensors_snapshot() { return s_snap; }
+void sensors_snapshot(SensorSnapshot &out) {
+  if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
+    out = s_pub;
+    xSemaphoreGive(s_lock);
+  } else {
+    out = s_pub; // ロック取得失敗(まれ)。値はほぼ原子的なので許容。
+  }
+}
+
+bool sensors_take_dirty() {
+  if (!s_lock) {
+    return false;
+  }
+  bool d = false;
+  if (xSemaphoreTake(s_lock, 0) == pdTRUE) {
+    d = s_dirty;
+    s_dirty = false;
+    xSemaphoreGive(s_lock);
+  }
+  return d;
+}
+
+// センサ読取タスク: I2C ブロッキング読取をここに隔離し、pump(matter_task)を塞がない。
+static void sensors_task_fn(void *) {
+  for (;;) {
+    uint64_t now = (uint64_t)(esp_timer_get_time() / 1000);
+    sensors_poll(now);
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+void sensors_start_task() {
+  // stack 4096 words(16KB): I2C 読取は浅い。優先度 4(matter_task=5 より低)。
+  xTaskCreate(&sensors_task_fn, "sensors", 4096, nullptr, 4, nullptr);
+}
 
 // ---- AirQualityEnum 算出(worst-of)----------------------------------------
 //

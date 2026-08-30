@@ -426,7 +426,8 @@ static void set_hum_pct(float pct) {
 
 // 現行スナップショットを全 EP のクラスタへ反映する。
 static void inject_snapshot() {
-  const SensorSnapshot &s = sensors_snapshot();
+  SensorSnapshot s;
+  sensors_snapshot(s);
   if (s.has_co2) set_f32(kEpAirQuality, kClCo2, s.co2_ppm);
   if (s.has_pm1) set_f32(kEpAirQuality, kClPm1, s.pm1);
   if (s.has_pm25) set_f32(kEpAirQuality, kClPm25, s.pm25);
@@ -498,6 +499,9 @@ static int open_matter_udp() {
   return fd;
 }
 
+// STA netif(下方で定義)。マルチキャスト join / 送出インターフェース指定に使う。
+static esp_netif_t *g_sta_netif;
+
 static int open_mdns_socket() {
   int fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
   if (fd < 0) {
@@ -517,29 +521,52 @@ static int open_mdns_socket() {
     close(fd);
     return -1;
   }
+  // マルチキャスト**送出インターフェース**を STA に固定する。これが無いと ff02::fb
+  // (リンクローカル)への送信が経路不明で ENETUNREACH(errno=118)になり、mDNS
+  // 通知/応答を一切送れない。v6 は netif index、v4 は STA の IP を指定する。
+  if (g_sta_netif) {
+    unsigned ifidx = esp_netif_get_netif_impl_index(g_sta_netif);
+    setsockopt(fd, IPPROTO_IPV6, IPV6_MULTICAST_IF, &ifidx, sizeof(ifidx));
+    esp_netif_ip_info_t ip{};
+    if (esp_netif_get_ip_info(g_sta_netif, &ip) == ESP_OK && ip.ip.addr != 0) {
+      struct in_addr ifaddr{};
+      ifaddr.s_addr = ip.ip.addr;
+      setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, &ifaddr, sizeof(ifaddr));
+    }
+  }
   return fd;
 }
 
 // mDNS マルチキャストグループ(224.0.0.251 / ff02::fb)へ join する。
 // **インターフェースに IP が付いてから**呼ぶこと(IP 取得前は errno=125 で失敗し、
 // 以降マルチキャストを受信できない)。got_ip 後に呼び、失敗時は次周期で再試行する。
-// 両ファミリとも成功したら true。
+// v6 join が成立したら true。
 static bool join_mdns_groups(int fd) {
-  bool ok = true;
+  // STA netif の lwIP インターフェース index。v6 マルチキャスト join(ff02::fb は
+  // link-local)には必須で、0 のままだと lwIP が送出インターフェースを決定できず
+  // EADDRNOTAVAIL(errno=125)で失敗する。
+  unsigned ifidx = g_sta_netif ? esp_netif_get_netif_impl_index(g_sta_netif) : 0;
+
+  // v6 join(ff02::fb)= Matter 運用探索の主経路。これが成立すれば運用探索は動く。
+  ipv6_mreq mreq6{};
+  inet_pton(AF_INET6, "ff02::fb", &mreq6.ipv6mr_multiaddr);
+  mreq6.ipv6mr_interface = ifidx;
+  int r6 = setsockopt(fd, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP, &mreq6, sizeof(mreq6));
+  int e6 = errno;
+  bool v6ok = (r6 == 0) || (e6 == EADDRINUSE);
+
+  // v4 join(224.0.0.251)。AF_INET6 デュアルスタックソケットでは lwIP が
+  // IP_ADD_MEMBERSHIP を受け付けず ENOMEM(errno=12)になり得るが、v6 が主経路の
+  // ため失敗しても致命ではない(必須にしない)。
   ip_mreq mreq4{};
   inet_pton(AF_INET, "224.0.0.251", &mreq4.imr_multiaddr);
   mreq4.imr_interface.s_addr = htonl(INADDR_ANY);
   int r4 = setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq4, sizeof(mreq4));
   int e4 = errno;
-  if (r4 != 0 && e4 != EADDRINUSE) ok = false;
-  ipv6_mreq mreq6{};
-  inet_pton(AF_INET6, "ff02::fb", &mreq6.ipv6mr_multiaddr);
-  mreq6.ipv6mr_interface = 0;
-  int r6 = setsockopt(fd, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP, &mreq6, sizeof(mreq6));
-  int e6 = errno;
-  if (r6 != 0 && e6 != EADDRINUSE) ok = false;
-  (void)e4; (void)e6;
-  return ok;
+
+  ESP_LOGI(TAG, "mdns join: ifidx=%u v4 r=%d errno=%d / v6 r=%d errno=%d", ifidx, r4, e4, r6,
+           e6);
+  return v6ok;
 }
 
 // ---- タスク間メッセージ ----------------------------------------------------
@@ -548,7 +575,7 @@ static QueueHandle_t g_cmd_queue = nullptr;
 
 // ---- WiFi ------------------------------------------------------------------
 
-static esp_netif_t *g_sta_netif = nullptr;
+// g_sta_netif は上方(join_mdns_groups の前)で前方定義済み。
 static volatile bool g_wifi_connected = false;
 static volatile bool g_wifi_joining = false;
 
@@ -774,6 +801,8 @@ static void matter_task(void *) {
 
   // センサ初期化(I2C + SEN55/SCD40)。失敗しても Matter は動く(値は None)。
   sensors_init(SM_I2C_SDA, SM_I2C_SCL, SM_SEN55_POWER, SM_POWER_HOLD);
+  // I2C 読取は専用タスクへ隔離し、pump ループをブロックしない。
+  sensors_start_task();
 
   int udp_fd = open_matter_udp();
   if (udp_fd < 0) {
@@ -803,6 +832,7 @@ static void matter_task(void *) {
   static uint8_t rx[2048];
   bool ble_conn_active = false;
   bool mdns_joined = false;
+  static bool g_ble_stopped = false;
   for (;;) {
     // WiFi/IP 確立後に mDNS マルチキャスト join を(再)実行する。pump 開始時点では
     // IP 未取得で join が errno=125 失敗するため、接続後にここで確実に join する。
@@ -824,8 +854,9 @@ static void matter_task(void *) {
     }
     uint64_t now = now_ms();
 
-    // 周期センサ読み → 値注入(スナップショット更新時のみ)。
-    if (sensors_poll(now)) {
+    // センサ値注入は「更新があったときだけ」。実 I2C 読取はセンサタスク側で行うため、
+    // pump ループはここでブロックしない(BLE コミッショニング中も応答性を保つ)。
+    if (sensors_take_dirty()) {
       inject_snapshot();
     }
 
@@ -850,6 +881,13 @@ static void matter_task(void *) {
       case CmdKind::BleDisconnected:
         sm_ble_event(SM_BLE_DISCONNECTED, 0, nullptr, 0, now);
         ble_conn_active = false;
+        // コミッショニング済み(fabric あり)で BLE が切れたら、BT を完全停止して
+        // 無線を WiFi に明け渡す(coex による mDNS マルチキャスト欠落を解消)。
+        if (stack.fabric_count() > 0 && !g_ble_stopped) {
+          g_ble_stopped = true;
+          ESP_LOGI(TAG, "commissioned; stopping BLE/BT to free radio for WiFi");
+          sm_ble_stop();
+        }
         break;
       case CmdKind::BleC1Write:
         sm_ble_event(SM_BLE_C1_WRITE, 0, c.frag, c.frag_len, now);
@@ -868,18 +906,24 @@ static void matter_task(void *) {
 
     uint64_t cap_ms = ble_conn_active ? 20 : 1000;
     uint64_t dl = stack.next_deadline(now);
-    struct timeval tv;
+    uint64_t wait;
     if (dl == SM_NO_DEADLINE) {
-      tv.tv_sec = cap_ms / 1000;
-      tv.tv_usec = (cap_ms % 1000) * 1000;
+      wait = cap_ms;
     } else {
-      uint64_t wait = (dl > now) ? (dl - now) : 0;
+      wait = (dl > now) ? (dl - now) : 0;
       if (wait > cap_ms) {
         wait = cap_ms;
       }
-      tv.tv_sec = wait / 1000;
-      tv.tv_usec = (wait % 1000) * 1000;
     }
+    // 下限 10ms(=1 tick @ FREERTOS_HZ=100)。これ未満だと select() が 0 tick に丸められ
+    // 即リターンし、matter タスクが CPU を手放さず busy-spin して IDLE / 他タスク(BLE を
+    // 含む)を餓死させる(WDT 発火の実測原因)。下限を設けて必ず 1 tick は譲る。
+    if (wait < 10) {
+      wait = 10;
+    }
+    struct timeval tv;
+    tv.tv_sec = wait / 1000;
+    tv.tv_usec = (wait % 1000) * 1000;
 
     fd_set rfds;
     FD_ZERO(&rfds);
@@ -961,7 +1005,7 @@ extern "C" void app_main() {
   ESP_ERROR_CHECK(esp_netif_init());
   ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-  g_cmd_queue = xQueueCreate(8, sizeof(Cmd));
+  g_cmd_queue = xQueueCreate(32, sizeof(Cmd));
 
   wifi_init_sta();
 
@@ -981,8 +1025,10 @@ extern "C" void app_main() {
     ESP_LOGE(TAG, "matter stack reservation failed; aborting");
     return;
   }
-  TaskHandle_t th = xTaskCreateStatic(&matter_task, "matter",
-                                      kMatterStackBytes / sizeof(StackType_t), nullptr, 5,
-                                      matter_stack, &s_matter_tcb);
-  ESP_LOGI(TAG, "matter task create(static 128KB pre-reserved): %s", th ? "OK" : "FAILED");
+  // matter タスクは CPU1 に固定する。NimBLE ホスト・BT コントローラは CPU0 固定
+  // (BT_*_PINNED_TO_CORE_0)なので、pump ループの CPU 使用が BLE スタックを餓死させない。
+  TaskHandle_t th = xTaskCreateStaticPinnedToCore(
+      &matter_task, "matter", kMatterStackBytes / sizeof(StackType_t), nullptr, 5,
+      matter_stack, &s_matter_tcb, 1);
+  ESP_LOGI(TAG, "matter task create(static 128KB pre-reserved, core1): %s", th ? "OK" : "FAILED");
 }
