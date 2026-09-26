@@ -33,3 +33,7 @@ CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=0
 CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=6
 CONFIG_BT_NIMBLE_TRANSPORT_ACL_SIZE=251
 CONFIG_LWIP_MLDV6_TMR_INTERVAL=5
+# NimBLE の自動「Reattempt advertising」は ble_gap_adv_set_fields で保存した fields で広告を再開する。
+# 本ポートは ble_gap_adv_set_data(生データ)を使うため空の広告になり、デバイスが発見不能になる。
+# 接続確立失敗時の再広告は gap_event_cb(DISCONNECT)で自前で行うので無効化する。
+CONFIG_BT_NIMBLE_ENABLE_CONN_REATTEMPT=n

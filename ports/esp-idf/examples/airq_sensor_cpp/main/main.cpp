@@ -577,6 +577,10 @@ static QueueHandle_t g_cmd_queue = nullptr;
 
 // g_sta_netif は上方(join_mdns_groups の前)で前方定義済み。
 static volatile bool g_wifi_connected = false;
+// IPv6 link-local が確定したか。mDNS の開始(socket/join/announce)はこれを待つ。
+// IPv4 取得直後に運用名を問い合わせてくる Google のコミッショナに AAAA 無し/v6 送信失敗
+// (errno=118)で答えると、以後再問い合わせされず CASE 不成立 → fail-safe 期限切れになる。
+static volatile bool g_have_v6 = false;
 static volatile bool g_wifi_joining = false;
 
 static void on_wifi_event(void *, esp_event_base_t base, int32_t id, void *) {
@@ -587,6 +591,7 @@ static void on_wifi_event(void *, esp_event_base_t base, int32_t id, void *) {
     esp_wifi_connect();
 #endif
   } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+    g_have_v6 = false;
     if (g_wifi_connected) {
       esp_wifi_connect();
     } else if (g_wifi_joining) {
@@ -628,6 +633,7 @@ static void on_got_ip6(void *, esp_event_base_t, int32_t, void *event_data) {
   c.kind = CmdKind::IpV6;
   memcpy(c.v6, ev->ip6_info.ip.addr, 16);
   ESP_LOGI(TAG, "got IPv6: " IPV6STR, IPV62STR(ev->ip6_info.ip));
+  g_have_v6 = true;
   if (g_cmd_queue) {
     xQueueSend(g_cmd_queue, &c, 0);
   }
@@ -693,6 +699,9 @@ static void report_wifi_link_and_seed() {
 
 // ---- pump タスク -----------------------------------------------------------
 
+// コミッション後(または fabric 復元起動時)に BLE/BT を停止済みか。
+static bool g_ble_stopped = false;
+
 static void matter_task(void *) {
   // 開発用 dev SPAKE2+ verifier(passcode 20202021 相当)。デバイスは passcode を保持しない。
   static const uint8_t kDevSalt[16] = {'S', 'P', 'A', 'K', 'E', '2', 'P', ' ',
@@ -731,6 +740,17 @@ static void matter_task(void *) {
   cfg.kvs_ctx = nullptr;
   cfg.rng_fill = rng_fill;
   cfg.rng_ctx = nullptr;
+  // ReportData チャンク上限。本ポートは内部 RAM が枯渇気味(free ≈10KB / DMA ≈3KB)で
+  // 1.2KB 級データグラムの WiFi 送信が ENOMEM(errno=12)になるため、実測で通る 700B に抑える
+  // (Google Home のワイルドカード複数パス読取が無応答になる問題。2026-08-30)。
+  cfg.report_chunk_limit = 700;
+  // BasicInformation の識別情報。Apple Home はシリアル番号でアクセサリを識別するため、
+  // cffi 既定("OnOffLight"/"SM-ONOFF-0001" = 他の cffi デバイスと同一)ではなく MAC 由来の一意値を与える。
+  static char s_serial[32];
+  snprintf(s_serial, sizeof(s_serial), "SM-AIRQ-%02X%02X%02X%02X%02X%02X", cfg.mac[0], cfg.mac[1], cfg.mac[2], cfg.mac[3],
+           cfg.mac[4], cfg.mac[5]);
+  cfg.product_name = "AirQualitySensor";
+  cfg.serial_number = s_serial;
   cfg.network = SM_NET_WIFI;
   cfg.composition = compose_blob;
   cfg.composition_len = compose_len;
@@ -782,7 +802,14 @@ static void matter_task(void *) {
   });
 
 #if CONFIG_SM_ENABLE_BLE
-  {
+  if (stack.fabric_count() > 0) {
+    // 既にコミッショニング済み(fabric 復元)なら BLE/BT は起動しない(コミッション完了時に
+    // BT を停止するのと同じ方針: 無線を WiFi に明け渡す)。以後の追加コミッショニング
+    // (AdministratorCommissioning の ECM 窓)は on-network(mDNS/UDP)経由になる。
+    g_ble_stopped = true;
+    ESP_LOGI(TAG, "fabrics=%u at boot; BLE/BT not started (on-network only)", stack.fabric_count());
+    sm_ble_stop();
+  } else {
     uint8_t adv[31];
     size_t n = sm_ble_adv_data(adv, sizeof(adv));
     sm_ble_set_adv(adv, n);
@@ -823,22 +850,23 @@ static void matter_task(void *) {
     };
   };
   SmStack::Sender udp_send = make_sender(udp_fd);
+  static uint32_t s_mdns_rx = 0, s_mdns_tx = 0;
   auto mdns_send = [&mdns_fd](const uint8_t *buf, size_t len, const sm_addr_t &dst) {
     if (mdns_fd < 0) return;
     sockaddr_storage ss; socklen_t sl; smaddr_to_sockaddr(dst, ss, sl);
     sendto(mdns_fd, buf, len, 0, (sockaddr *)&ss, sl);
+    s_mdns_tx++;
   };
 
   static uint8_t rx[2048];
   bool ble_conn_active = false;
   bool mdns_joined = false;
-  static bool g_ble_stopped = false;
   for (;;) {
     // WiFi/IP 確立後に mDNS マルチキャスト join を(再)実行する。pump 開始時点では
     // IP 未取得で join が errno=125 失敗するため、接続後にここで確実に join する。
     // WiFi/IP 確立後に mDNS ソケットを開いてマルチキャスト join する。IPv6 link-local は
     // DAD 完了まで少し遅れるため、両ファミリが揃うまで数回リトライする。切断で作り直す。
-    if (g_wifi_connected) {
+    if (g_wifi_connected && g_have_v6) {
       if (mdns_fd < 0) {
         mdns_fd = open_mdns_socket();
         mdns_joined = false;
@@ -851,6 +879,7 @@ static void matter_task(void *) {
       close(mdns_fd);
       mdns_fd = -1;
       mdns_joined = false;
+      g_have_v6 = false;
     }
     uint64_t now = now_ms();
 
@@ -889,9 +918,13 @@ static void matter_task(void *) {
           sm_ble_stop();
         }
         break;
-      case CmdKind::BleC1Write:
-        sm_ble_event(SM_BLE_C1_WRITE, 0, c.frag, c.frag_len, now);
+      case CmdKind::BleC1Write: {
+        int rc = sm_ble_event(SM_BLE_C1_WRITE, 0, c.frag, c.frag_len, now);
+        if (rc != 0) {
+          ESP_LOGW(TAG, "C1 write rc=%d (len=%u b0=%02x)", rc, (unsigned)c.frag_len, c.frag[0]);
+        }
         break;
+      }
       case CmdKind::BleC2Subscribed:
         sm_ble_event(SM_BLE_C2_SUBSCRIBED, 0, nullptr, 0, now);
         break;
@@ -952,6 +985,7 @@ static void matter_task(void *) {
       socklen_t sl = sizeof(src);
       int n = recvfrom(mdns_fd, rx, sizeof(rx), 0, (sockaddr *)&src, &sl);
       if (n > 0) {
+        s_mdns_rx++;
         sm_addr_t sa = sockaddr_to_smaddr(src);
         stack.mdns_rx(rx, (size_t)n, sa, mdns_send);
       }
@@ -966,9 +1000,13 @@ static void matter_task(void *) {
         sm_pool_stats_t st = {};
         sm_pool_stats(&st);
         ESP_LOGI(TAG, "matter stack high-water: %u bytes free", (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
-        ESP_LOGI(TAG, "pools: ex=%u/%u sess=%u/%u hs=%u/%u tx=%u/%u heap=%lu", st.exchanges,
+        ESP_LOGI(TAG, "pools: ex=%u/%u sess=%u/%u hs=%u/%u tx=%u/%u heap=%lu mdns rx=%lu tx=%lu", st.exchanges,
                  st.exchanges_cap, st.sessions, st.sessions_cap, st.handshakes, st.handshakes_cap,
-                 st.tx_bufs, st.tx_bufs_cap, (unsigned long)esp_get_free_heap_size());
+                 st.tx_bufs, st.tx_bufs_cap, (unsigned long)esp_get_free_heap_size(),
+                 (unsigned long)s_mdns_rx, (unsigned long)s_mdns_tx);
+        ESP_LOGI(TAG, "heap: internal free=%u largest=%u dma free=%u largest=%u", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT), (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
       }
     }
 #if CONFIG_SM_ENABLE_BLE
@@ -977,6 +1015,7 @@ static void matter_task(void *) {
       size_t fn;
       while ((fn = sm_ble_poll(now, frag, sizeof(frag))) > 0) {
         if (!sm_ble_indicate(frag, fn)) {
+          ESP_LOGW(TAG, "IND< send FAILED, break (fragment deferred)");
           break;
         }
       }

@@ -89,7 +89,9 @@ static const struct ble_gatt_chr_def s_chrs[] = {
         .access_cb = gatt_access_cb,
         .arg = nullptr,
         .descriptors = nullptr,
-        .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+        .flags = BLE_GATT_CHR_F_WRITE, // Matter C1 は Write(応答あり)。WRITE_NO_RSP を出すと iPhone が
+                                          // 応答なし書き込みを連投し、NimBLE の mbuf 枯渇で BTP セグメントが落ちる
+                                          // (Apple の CSR 後沈黙→切断、2026-08-30)。
         .min_key_size = 0,
         .val_handle = nullptr,
     },
@@ -120,16 +122,30 @@ static const struct ble_gatt_svc_def s_svcs[] = {
 static int gap_event_cb(struct ble_gap_event *event, void *arg) {
   (void)arg;
   switch (event->type) {
-  case BLE_GAP_EVENT_CONNECT:
-    if (event->connect.status == 0) {
+  case BLE_GAP_EVENT_CONNECT: {
+    // NimBLE(peripheral)は LE Read Remote Features の結果を status に載せて CONNECT を通知する。
+    // BT 4.0 の central(slave-initiated feature exchange 非対応)では status=0x21a
+    // (Unsupported Remote Feature)になるがリンク自体は確立している。status ではなく
+    // 接続の実在で判定しないと、conn_handle 未登録 → C2 indication 全滅 → BTP handshake 不成立になる。
+    struct ble_gap_conn_desc desc;
+    bool alive = event->connect.conn_handle != BLE_HS_CONN_HANDLE_NONE &&
+                 ble_gap_conn_find(event->connect.conn_handle, &desc) == 0;
+    if (alive) {
       s_conn_handle = event->connect.conn_handle;
       s_connected_sent = false;
-      ESP_LOGI(TAG, "connected conn=%d", s_conn_handle);
+      if (event->connect.status != 0) {
+        ESP_LOGW(TAG, "connected conn=%d (feature read status=0x%x, ignored)", s_conn_handle,
+                 event->connect.status);
+      } else {
+        ESP_LOGI(TAG, "connected conn=%d", s_conn_handle);
+      }
     } else {
       // 接続失敗: 広告を再開する。
+      ESP_LOGW(TAG, "connect failed status=0x%x, re-advertising", event->connect.status);
       start_advertising();
     }
     return 0;
+  }
 
   case BLE_GAP_EVENT_DISCONNECT: {
     ESP_LOGI(TAG, "disconnected reason=%d", event->disconnect.reason);
@@ -304,10 +320,12 @@ bool sm_ble_indicate(const uint8_t *frag, size_t len) {
   int rc = ble_gatts_indicate_custom(conn, s_c2_val_handle, om);
   if (rc != 0) {
     // 失敗時は NimBLE が om を解放済み。
+    ESP_LOGW(TAG, "indicate_custom rc=%d (len=%u)", rc, (unsigned)len);
     return false;
   }
   // 確認(EDONE)まで待つ。リンク断で来なければタイムアウト。
   if (!s_ind_sem || xSemaphoreTake(s_ind_sem, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    ESP_LOGW(TAG, "indicate EDONE timeout (len=%u)", (unsigned)len);
     return false;
   }
   return true;
