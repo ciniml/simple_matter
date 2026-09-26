@@ -975,3 +975,49 @@ mod signed {
         );
     }
 }
+
+// 実機回帰: Alexa(Echo Pop、2026-09-27)が AddNOC で送った実チェーン(RCAC/ICAC/NOC)。
+// 拡張の TLV 出現順が正準順(BC, KU, EKU, SKID, AKID)と異なる(RCAC: BC, SKID, KU, AKID /
+// ICAC・NOC: BC, AKID, SKID, KU[, EKU])。DER 再構築を正準順に並べ替えると TBS が変わり
+// 全署名が Crypto エラー → AddNOC が InvalidPublicKey になっていた。
+mod alexa_echo_pop {
+    use super::*;
+    use crate::crypto::rustcrypto::RustCrypto;
+    use crate::crypto::Rng;
+    struct DummyRng;
+    impl Rng for DummyRng {
+        fn fill_bytes(&mut self, dest: &mut [u8]) -> crate::error::Result<()> {
+            dest.iter_mut().for_each(|b| *b = 7);
+            Ok(())
+        }
+    }
+    const RCAC: &[u8] = include_bytes!("testdata_alexa/alexa_rcac.tlv");
+    const ICAC: &[u8] = include_bytes!("testdata_alexa/alexa_icac.tlv");
+    const NOC: &[u8] = include_bytes!("testdata_alexa/alexa_noc.tlv");
+
+    #[test]
+    fn alexa_chain_with_noncanonical_extension_order_verifies() {
+        let crypto = RustCrypto::new(DummyRng);
+        let rcac = MatterCert::parse(RCAC).unwrap();
+        let icac = MatterCert::parse(ICAC).unwrap();
+        let noc = MatterCert::parse(NOC).unwrap();
+        rcac.verify_signature(&crypto, rcac.public_key()).unwrap();
+        icac.verify_signature(&crypto, rcac.public_key()).unwrap();
+        noc.verify_signature(&crypto, icac.public_key()).unwrap();
+        let eff = noc
+            .not_before()
+            .max(icac.not_before())
+            .max(rcac.not_before());
+        verify_chain(&crypto, &noc, Some(&icac), &rcac, eff).unwrap();
+        // ICAC は fabric-id を持たず、NOC の subject は fabric-id → node-id の順。
+        assert_eq!(icac.subject().fabric_id().unwrap(), None);
+        assert_eq!(
+            noc.subject().node_id().unwrap(),
+            Some(0x077a_4e9c_937f_9660)
+        );
+        assert_eq!(
+            noc.subject().fabric_id().unwrap(),
+            Some(0x02f4_1a62_b891_da02)
+        );
+    }
+}

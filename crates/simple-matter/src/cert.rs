@@ -419,6 +419,12 @@ pub struct Extensions<'a> {
     subject_key_id: Option<&'a [u8]>,
     authority_key_id: Option<&'a [u8]>,
     future_extensions: Option<&'a [u8]>,
+    /// TLV 上の出現順(拡張のコンテキストタグ列)。X.509 の DER 再構築は元の証明書と
+    /// 同じ順序でなければ TBS が一致せず署名検証に失敗する(Matter TLV は X.509 の
+    /// 順序を保存する。chip も TLV 順で符号化する)。実機: Alexa(Echo Pop)の RCAC/ICAC/NOC は
+    /// SKID→KeyUsage→AKID / AKID→SKID の順で、正準順に並べ替えると全署名が不一致になった。
+    order: [u8; 6],
+    order_len: u8,
 }
 
 impl<'a> Extensions<'a> {
@@ -1016,93 +1022,107 @@ fn civil_from_unix(secs: u64) -> (i64, u8, u8, u8, u8, u8) {
 
 /// 拡張リストを X.509 extensions(`[3] { SEQUENCE OF Extension }`)として符号化する。
 ///
-/// 符号化順序は Matter TLV の正準順(basic-constraints, key-usage, ext-key-usage,
-/// subject-key-id, authority-key-id, future-extensions)に一致させる。
+/// 符号化順序は **TLV の出現順**に一致させる(元の X.509 と同じ順序でなければ TBS が
+/// 変わり署名検証に失敗する。chip の DecodeConvertExtensions と同じ振る舞い)。
 fn encode_extensions(w: &mut DerWriter<'_>, ext: &Extensions<'_>) -> Result<()> {
     w.start_ctx(3)?;
     w.start_seq()?;
 
-    if let Some(bc) = ext.basic_constraints {
-        w.start_seq()?;
-        w.oid(&OID_BASIC_CONSTRAINTS)?;
-        w.boolean(true)?; // critical
-        w.start_octet_string()?;
-        w.start_seq()?;
-        if bc.is_ca {
-            w.boolean(true)?;
-        }
-        if let Some(p) = bc.path_len_constraint {
-            w.integer(&[p])?;
-        }
-        w.end_container()?; // SEQUENCE
-        w.end_container()?; // OCTET STRING
-        w.end_container()?; // Extension SEQUENCE
-    }
-
-    if let Some(ku) = ext.key_usage {
-        w.start_seq()?;
-        w.oid(&OID_KEY_USAGE)?;
-        w.boolean(true)?; // critical
-        w.start_octet_string()?;
-        // X.509 の BIT STRING は各バイト内でビット順が反転する。
-        let bits = [
-            reverse_byte((ku & 0xff) as u8),
-            reverse_byte((ku >> 8) as u8),
-        ];
-        w.bit_string(true, &bits)?;
-        w.end_container()?; // OCTET STRING
-        w.end_container()?; // Extension SEQUENCE
-    }
-
-    if let Some(raw) = ext.extended_key_usage {
-        w.start_seq()?;
-        w.oid(&OID_EXT_KEY_USAGE)?;
-        w.boolean(true)?; // critical
-        w.start_octet_string()?;
-        w.start_seq()?;
-        let mut r = TlvReader::new(raw);
-        r.read_next()?; // array 開始トークン(context tag 3)を消費。
-        loop {
-            let elem = r.read_next()?.ok_or(Error::Decode)?;
-            if elem.value == TlvValue::ContainerEnd {
-                break;
+    for &ctx in &ext.order[..usize::from(ext.order_len)] {
+        match ctx {
+            EXT_BASIC_CONSTRAINTS => {
+                if let Some(bc) = ext.basic_constraints {
+                    w.start_seq()?;
+                    w.oid(&OID_BASIC_CONSTRAINTS)?;
+                    w.boolean(true)?; // critical
+                    w.start_octet_string()?;
+                    w.start_seq()?;
+                    if bc.is_ca {
+                        w.boolean(true)?;
+                    }
+                    if let Some(p) = bc.path_len_constraint {
+                        w.integer(&[p])?;
+                    }
+                    w.end_container()?; // SEQUENCE
+                    w.end_container()?; // OCTET STRING
+                    w.end_container()?; // Extension SEQUENCE
+                }
             }
-            let purpose = match elem.value {
-                TlvValue::UnsignedInteger(v) => u8::try_from(v).map_err(|_| Error::Decode)?,
-                _ => return Err(Error::Decode),
-            };
-            w.oid(eku_oid(purpose)?)?;
+            EXT_KEY_USAGE => {
+                if let Some(ku) = ext.key_usage {
+                    w.start_seq()?;
+                    w.oid(&OID_KEY_USAGE)?;
+                    w.boolean(true)?; // critical
+                    w.start_octet_string()?;
+                    // X.509 の BIT STRING は各バイト内でビット順が反転する。
+                    let bits = [
+                        reverse_byte((ku & 0xff) as u8),
+                        reverse_byte((ku >> 8) as u8),
+                    ];
+                    w.bit_string(true, &bits)?;
+                    w.end_container()?; // OCTET STRING
+                    w.end_container()?; // Extension SEQUENCE
+                }
+            }
+            EXT_EXTENDED_KEY_USAGE => {
+                if let Some(raw) = ext.extended_key_usage {
+                    w.start_seq()?;
+                    w.oid(&OID_EXT_KEY_USAGE)?;
+                    w.boolean(true)?; // critical
+                    w.start_octet_string()?;
+                    w.start_seq()?;
+                    let mut r = TlvReader::new(raw);
+                    r.read_next()?; // array 開始トークン(context tag 3)を消費。
+                    loop {
+                        let elem = r.read_next()?.ok_or(Error::Decode)?;
+                        if elem.value == TlvValue::ContainerEnd {
+                            break;
+                        }
+                        let purpose = match elem.value {
+                            TlvValue::UnsignedInteger(v) => {
+                                u8::try_from(v).map_err(|_| Error::Decode)?
+                            }
+                            _ => return Err(Error::Decode),
+                        };
+                        w.oid(eku_oid(purpose)?)?;
+                    }
+                    w.end_container()?; // SEQUENCE
+                    w.end_container()?; // OCTET STRING
+                    w.end_container()?; // Extension SEQUENCE
+                }
+            }
+            EXT_SUBJECT_KEY_ID => {
+                if let Some(skid) = ext.subject_key_id {
+                    w.start_seq()?;
+                    w.oid(&OID_SUBJECT_KEY_ID)?;
+                    // 非 critical。
+                    w.start_octet_string()?;
+                    w.octet_string(skid)?;
+                    w.end_container()?; // OCTET STRING
+                    w.end_container()?; // Extension SEQUENCE
+                }
+            }
+            EXT_AUTHORITY_KEY_ID => {
+                if let Some(akid) = ext.authority_key_id {
+                    w.start_seq()?;
+                    w.oid(&OID_AUTHORITY_KEY_ID)?;
+                    // 非 critical。
+                    w.start_octet_string()?;
+                    w.start_seq()?;
+                    w.ctx_primitive(0, akid)?; // [0] keyIdentifier
+                    w.end_container()?; // SEQUENCE
+                    w.end_container()?; // OCTET STRING
+                    w.end_container()?; // Extension SEQUENCE
+                }
+            }
+            EXT_FUTURE_EXTENSIONS => {
+                if let Some(fe) = ext.future_extensions {
+                    // future-extensions は DER 符号化済みの X.509 Extension をそのまま格納する。
+                    w.raw(fe)?;
+                }
+            }
+            _ => return Err(Error::Decode),
         }
-        w.end_container()?; // SEQUENCE
-        w.end_container()?; // OCTET STRING
-        w.end_container()?; // Extension SEQUENCE
-    }
-
-    if let Some(skid) = ext.subject_key_id {
-        w.start_seq()?;
-        w.oid(&OID_SUBJECT_KEY_ID)?;
-        // 非 critical。
-        w.start_octet_string()?;
-        w.octet_string(skid)?;
-        w.end_container()?; // OCTET STRING
-        w.end_container()?; // Extension SEQUENCE
-    }
-
-    if let Some(akid) = ext.authority_key_id {
-        w.start_seq()?;
-        w.oid(&OID_AUTHORITY_KEY_ID)?;
-        // 非 critical。
-        w.start_octet_string()?;
-        w.start_seq()?;
-        w.ctx_primitive(0, akid)?; // [0] keyIdentifier
-        w.end_container()?; // SEQUENCE
-        w.end_container()?; // OCTET STRING
-        w.end_container()?; // Extension SEQUENCE
-    }
-
-    if let Some(fe) = ext.future_extensions {
-        // future-extensions は DER 符号化済みの X.509 Extension をそのまま格納する。
-        w.raw(fe)?;
     }
 
     w.end_container()?; // SEQUENCE OF Extension
@@ -1147,6 +1167,8 @@ fn parse_extensions(raw: &[u8]) -> Result<Extensions<'_>> {
     let mut subject_key_id = None;
     let mut authority_key_id = None;
     let mut future_extensions = None;
+    let mut order = [0u8; 6];
+    let mut order_len = 0u8;
 
     loop {
         let pos = r.position();
@@ -1158,6 +1180,14 @@ fn parse_extensions(raw: &[u8]) -> Result<Extensions<'_>> {
             TlvTag::ContextSpecific(c) => c,
             _ => return Err(Error::Decode),
         };
+        if (EXT_BASIC_CONSTRAINTS..=EXT_FUTURE_EXTENSIONS).contains(&ctx) {
+            // 同一拡張の重複は不正(順序配列の溢れ防止も兼ねる)。
+            if order[..usize::from(order_len)].contains(&ctx) {
+                return Err(Error::Decode);
+            }
+            order[usize::from(order_len)] = ctx;
+            order_len += 1;
+        }
         match ctx {
             EXT_BASIC_CONSTRAINTS => {
                 if elem.value.as_container()? != ContainerType::Structure {
@@ -1190,6 +1220,8 @@ fn parse_extensions(raw: &[u8]) -> Result<Extensions<'_>> {
         subject_key_id,
         authority_key_id,
         future_extensions,
+        order,
+        order_len,
     })
 }
 
