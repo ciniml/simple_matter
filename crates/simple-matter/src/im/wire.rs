@@ -1017,6 +1017,12 @@ impl<'a> ReportDataRef<'a> {
 /// 手前に置く。
 const REPORT_TAIL_MARGIN: usize = 12;
 
+/// ReportData 1 チャンク(TLV 本体)の最大長。送信データグラム上限からヘッダと MIC を引く。
+pub const MAX_REPORT_CHUNK: usize = crate::transport::net::MAX_TX_PACKET_SIZE
+    - crate::transport::header::PacketHeader::MAX_LEN
+    - crate::transport::header::PayloadHeader::MAX_LEN
+    - crate::crypto::AES_CCM_TAG_LEN;
+
 /// ReportData を **1 属性ずつ試し書きしながら**組み立てるビルダ(設計 §5.4)。
 ///
 /// [`encode_report_data`] が「全レポートを 1 クロージャで書く」単発 API なのに対し、本ビルダは
@@ -1048,7 +1054,23 @@ impl<'b> ReportChunkBuilder<'b> {
     ///
     /// `subscription_id` は購読レポートでのみ `Some`(プライミング/通常 Read は `None`)。
     pub fn new(tx: &'b mut [u8], subscription_id: Option<u32>) -> Result<Self> {
-        let cap = tx.len();
+        Self::with_limit(tx, subscription_id, MAX_REPORT_CHUNK)
+    }
+
+    /// チャンク上限 `limit`(TLV 本体バイト数)を指定して生成する。
+    ///
+    /// 1 チャンクは送信データグラム上限(IPv6 最小 MTU 由来の `MAX_TX_PACKET_SIZE`)から
+    /// PacketHeader/PayloadHeader/MIC を引いた [`MAX_REPORT_CHUNK`] を超えない。バッファ長
+    /// (`MAX_PACKET_SIZE`=1600)を基準にすると 1500B 超の ReportData が生成され、chip-tool /
+    /// Google Home は受理しない(実機: ワイルドカード複数パス読取で 1526B を送出 → 応答なしと
+    /// 見なされコミッショニング停止、2026-08-30)。ポートは送信バッファ事情に応じて
+    /// さらに小さい値を与えてよい([`InteractionModel::set_report_chunk_limit`])。
+    pub fn with_limit(
+        tx: &'b mut [u8],
+        subscription_id: Option<u32>,
+        limit: usize,
+    ) -> Result<Self> {
+        let cap = tx.len().min(MAX_REPORT_CHUNK).min(limit);
         let mut w = TlvWriter::new(tx);
         w.start_struct(&TlvTag::Anonymous)?;
         if let Some(id) = subscription_id {

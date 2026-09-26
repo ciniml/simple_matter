@@ -50,7 +50,7 @@ use crate::im::wire::{
     CmdRespWriter, CommandDataRef, CommandPath, ConcreteAttrPath, EventPath, ImOpCode, ImStatus,
     InvokeRequestRef, InvokeResponseHeader, ReadRequestRef, ReportChunkBuilder, StatusIB,
     StatusResponse, SubscribeRequestRef, SubscribeResponse, TimedRequest, WriteRequestRef,
-    PROTO_ID_INTERACTION_MODEL,
+    MAX_REPORT_CHUNK, PROTO_ID_INTERACTION_MODEL,
 };
 use crate::tlv::{TlvReader, TlvWriter};
 use crate::transport::session::fixed::FixedVec;
@@ -602,6 +602,8 @@ pub struct InteractionModel<D: DataModel, const READS: usize, const SUBS: usize,
     deferred: Option<DeferredInvoke>,
     /// イベントログ(リングバッファ、設計 §12)。StartUp 等をここに積む。
     events: EventLog<EVENT_LOG_CAP>,
+    /// ReportData 1 チャンクの上限(TLV 本体)。既定は [`MAX_REPORT_CHUNK`]。
+    report_chunk_limit: usize,
 }
 
 impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
@@ -618,7 +620,22 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
             data_version: 1,
             deferred: None,
             events: EventLog::new(),
+            report_chunk_limit: MAX_REPORT_CHUNK,
         }
+    }
+
+    /// ReportData 1 チャンクの上限(TLV 本体バイト数)を設定する。
+    ///
+    /// [`MAX_REPORT_CHUNK`] を超える値は切り詰め、極端に小さい値(256 未満)は 256 に丸める。
+    /// 送信バッファが乏しいポート(例: ESP-IDF 版 AirQ は内部 RAM 枯渇で 1.2KB 級データグラムの
+    /// WiFi 送信が ENOMEM になる)が、MTU 未満に抑えるために使う。
+    pub fn set_report_chunk_limit(&mut self, limit: usize) {
+        self.report_chunk_limit = limit.clamp(256, MAX_REPORT_CHUNK);
+    }
+
+    /// 現在の ReportData チャンク上限。
+    pub fn report_chunk_limit(&self) -> usize {
+        self.report_chunk_limit
     }
 
     /// データモデルへの共有参照(アプリからの属性読み取り等)。
@@ -769,7 +786,7 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         let outcome;
         let len;
         {
-            let mut builder = ReportChunkBuilder::new(tx, None)?;
+            let mut builder = ReportChunkBuilder::with_limit(tx, None, self.report_chunk_limit)?;
             outcome = emit_chunk(&self.dm, &mut txn, &mut builder, self.data_version)?;
             if outcome == ChunkOutcome::Done {
                 emit_events(&self.dm, &self.events, &mut txn, &mut builder)?;
@@ -846,7 +863,8 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         {
             // プライミングレポートにも SubscriptionId を含める(chip の ReadClient は
             // SubscriptionId 欠如の priming ReportData を Invalid argument で拒否する。実測)。
-            let mut builder = ReportChunkBuilder::new(tx, Some(id))?;
+            let mut builder =
+                ReportChunkBuilder::with_limit(tx, Some(id), self.report_chunk_limit)?;
             outcome = emit_chunk(&self.dm, &mut txn, &mut builder, self.data_version)?;
             len = match outcome {
                 ChunkOutcome::Done => {
@@ -953,7 +971,7 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
                 ReadKind::Report(id) | ReadKind::Priming(id) => Some(id),
                 ReadKind::Read => None,
             };
-            let mut builder = ReportChunkBuilder::new(tx, sub_id)?;
+            let mut builder = ReportChunkBuilder::with_limit(tx, sub_id, self.report_chunk_limit)?;
             outcome = emit_chunk(dm, txn, &mut builder, dv)?;
             // 最終チャンクでイベントレポートを付ける(Read / Subscribe プライミング / 購読レポート、
             // 設計 §12)。txn.event_paths/event_min は各 open 経路で載せてある。
@@ -1380,7 +1398,8 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         let outcome;
         let len;
         {
-            let mut builder = ReportChunkBuilder::new(tx, Some(subscription))?;
+            let mut builder =
+                ReportChunkBuilder::with_limit(tx, Some(subscription), self.report_chunk_limit)?;
             outcome = emit_chunk(&self.dm, &mut txn, &mut builder, self.data_version)?;
             if outcome == ChunkOutcome::Done {
                 emit_events(&self.dm, &self.events, &mut txn, &mut builder)?;
