@@ -159,7 +159,7 @@ static CFG: BasicInfoConfig = BasicInfoConfig {
     vendor_name: "SimpleMatter",
     vendor_id: 0xFFF1,
     product_name: "AirQualitySensor",
-    product_id: 0x8007,
+    product_id: 0x8001, // テスト DAC(FFF1/8001)と一致させる(厳格 attestation は DAC PID = 報告 PID を要求)
     hardware_version: 1,
     hardware_version_string: "HW1",
     software_version: 0x0001_0000,
@@ -756,16 +756,29 @@ fn open_mdns_socket() -> Option<UdpSocket> {
     socket
         .bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, MDNS_PORT)).into())
         .ok()?;
+    // `SM_IPV4` 指定時はそのインターフェースで join/送信する(既定ルート以外の網で運用するため)。
+    let ifaddr = std::env::var("SM_IPV4")
+        .ok()
+        .and_then(|v| v.parse::<Ipv4Addr>().ok())
+        .unwrap_or(Ipv4Addr::UNSPECIFIED);
+    if ifaddr != Ipv4Addr::UNSPECIFIED {
+        let _ = socket.set_multicast_if_v4(&ifaddr);
+    }
     let socket: UdpSocket = socket.into();
-    socket
-        .join_multicast_v4(&MDNS_IPV4, &Ipv4Addr::UNSPECIFIED)
-        .ok()?;
+    socket.join_multicast_v4(&MDNS_IPV4, &ifaddr).ok()?;
     socket.set_nonblocking(true).ok()?;
     Some(socket)
 }
 
 /// ローカルの IPv4 アドレスを推定する(外部宛 UDP ソケットの `local_addr` から)。
 fn discover_local_ipv4() -> Ipv4Addr {
+    // `SM_IPV4` で明示指定(`SM_IFACE` と併用。A レコードと v4 マルチキャスト join に使う)。
+    if let Some(ip) = std::env::var("SM_IPV4")
+        .ok()
+        .and_then(|v| v.parse::<Ipv4Addr>().ok())
+    {
+        return ip;
+    }
     UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
         .and_then(|s| {
             s.connect((Ipv4Addr::new(8, 8, 8, 8), 53))?;
@@ -877,6 +890,12 @@ fn discover_local_ipv6() -> Option<(Ipv6Addr, u32)> {
 /// `/proc/net/route` から IPv4 既定経路(Destination=00000000)の iface 名を得る。
 #[cfg(target_os = "linux")]
 fn default_route_ifname() -> Option<String> {
+    // `SM_IFACE` で明示指定(既定ルート以外の網、例: 試験用 WiFi で運用する場合)。
+    if let Ok(name) = std::env::var("SM_IFACE") {
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
     let text = std::fs::read_to_string("/proc/net/route").ok()?;
     for line in text.lines().skip(1) {
         let mut cols = line.split_whitespace();
