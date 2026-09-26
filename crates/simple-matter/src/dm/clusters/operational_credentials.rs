@@ -235,6 +235,17 @@ pub struct OpCredsCluster<
     pending_root_len: usize,
     /// CSRRequest で生成した pending 運用鍵ペア(AddNOC で消費)。
     pending_keypair: Option<C::Keypair>,
+    /// 事前生成した運用鍵ペア(次の CSRRequest で消費)。
+    ///
+    /// CSR 応答は「鍵生成 + CSR 自己署名 + アテステーション署名」で、ソフト P-256 の
+    /// 実機(ESP32-S3/RustCrypto)では約 0.8 秒かかる。BLE(BTP)経由の Apple Home は MRP 再送が
+    /// 使えないため最初の再送タイマ(~0.7 秒)で exchange を放棄する(実機で CSR 後の沈黙→切断を
+    /// 観測、2026-08-30)。鍵生成をアイドル時([`pregenerate_keypair`](Self::pregenerate_keypair))
+    /// に前倒しして応答を短縮する。鍵は未使用の新鮮なものなので仕様上の「CSR ごとに新規鍵」を満たす。
+    spare_keypair: Option<C::Keypair>,
+    /// `spare_keypair` に対応する事前構築済み CSR DER(長さ付き)。CSR の自己署名はノンスに
+    /// 依存しないため前倒しでき、CSRRequest 時の処理はアテステーション署名 1 回になる。
+    spare_csr: ([u8; cert::MAX_CSR_DER_LEN], usize),
     /// 直近の AddNOC で追加したが、まだ CommissioningComplete していない fabric index
     /// (fail-safe クリーンアップで巻き戻す対象、Core Spec §11.10)。CommissioningComplete で
     /// 確定すると `None` に戻る。
@@ -252,6 +263,8 @@ impl<C: Crypto, DAC: DacProvider, const N: usize> OpCredsCluster<C, DAC, N> {
             pending_root: [0u8; MAX_CERT_TLV_LEN],
             pending_root_len: 0,
             pending_keypair: None,
+            spare_keypair: None,
+            spare_csr: ([0u8; cert::MAX_CSR_DER_LEN], 0),
             noc_added: None,
             dirty: Dirty::new(),
         }
@@ -273,6 +286,8 @@ impl<'f, C: Crypto, DAC: DacProvider, const N: usize>
             pending_root: [0u8; MAX_CERT_TLV_LEN],
             pending_root_len: 0,
             pending_keypair: None,
+            spare_keypair: None,
+            spare_csr: ([0u8; cert::MAX_CSR_DER_LEN], 0),
             noc_added: None,
             dirty: Dirty::new(),
         }
@@ -282,6 +297,27 @@ impl<'f, C: Crypto, DAC: DacProvider, const N: usize>
 impl<C: Crypto, DAC: DacProvider, const N: usize, FT: FabricAccess<C, N>>
     OpCredsCluster<C, DAC, N, FT>
 {
+    /// 次の CSRRequest 用の運用鍵ペアをアイドル時に事前生成する(既にあれば何もしない)。
+    ///
+    /// 戻り値は生成を行ったか。コミッショニング窓を開いた時や起動直後に呼ぶ。
+    pub fn pregenerate_keypair(&mut self) -> bool {
+        if self.spare_keypair.is_some() {
+            return false;
+        }
+        match self.crypto.p256_generate_keypair() {
+            Ok(kp) => {
+                let mut csr = [0u8; cert::MAX_CSR_DER_LEN];
+                let Ok(len) = cert::write_csr(&kp, &mut csr) else {
+                    return false;
+                };
+                self.spare_csr = (csr, len);
+                self.spare_keypair = Some(kp);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// 背後の fabric テーブルへの参照(コミッショニング結果の検査用)。
     pub fn fabrics(&self) -> impl Deref<Target = FabricTable<C, N>> + '_ {
         self.fabrics.get()
@@ -483,13 +519,23 @@ impl<C: Crypto, DAC: DacProvider, const N: usize, FT: FabricAccess<C, N>>
             return Err(ImStatus::ConstraintError);
         }
 
-        // 運用鍵ペア生成 + CSR 構築。
-        let kp = self
-            .crypto
-            .p256_generate_keypair()
-            .map_err(|_| ImStatus::Failure)?;
+        // 運用鍵ペア(事前生成があればそれを消費)+ CSR 構築。
         let mut csr = [0u8; cert::MAX_CSR_DER_LEN];
-        let csr_len = cert::write_csr(&kp, &mut csr).map_err(|_| ImStatus::Failure)?;
+        let (kp, csr_len) = match self.spare_keypair.take() {
+            Some(kp) => {
+                let (buf, len) = &self.spare_csr;
+                csr[..*len].copy_from_slice(&buf[..*len]);
+                (kp, *len)
+            }
+            None => {
+                let kp = self
+                    .crypto
+                    .p256_generate_keypair()
+                    .map_err(|_| ImStatus::Failure)?;
+                let len = cert::write_csr(&kp, &mut csr).map_err(|_| ImStatus::Failure)?;
+                (kp, len)
+            }
+        };
         self.pending_keypair = Some(kp);
 
         // NOCSRElements TLV: { 1: csr, 2: CSRNonce }。
