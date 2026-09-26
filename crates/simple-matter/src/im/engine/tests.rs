@@ -189,47 +189,76 @@ fn wildcard_read_all_attributes() {
     let rlen = encode_read_request(&mut req, false, |p| p.push(&AttributePath::default())).unwrap();
     let h = phdr(ImOpCode::ReadRequest.to_u8());
 
+    // 1 チャンクは送信 MTU 由来の上限(MAX_REPORT_CHUNK)に収まるため、全属性(45)は複数チャンクに
+    // またがる。各チャンクを走査して内容を検証し、StatusResponse(SUCCESS)で続きを取り出す。
+    let mut count = 0;
+    let mut on_off_seen = false;
+    let mut vendor_seen = false;
+    let mut scan = |buf: &[u8]| -> bool {
+        let rd = ReportDataRef::new(buf).unwrap();
+        for r in rd.attr_reports().unwrap() {
+            count += 1;
+            if let AttributeReportRef::Data(d) = r.unwrap() {
+                if d.path.cluster == Some(ClusterId(0x0006))
+                    && d.path.attribute == Some(AttributeId(0x0000))
+                {
+                    let mut v = d.value();
+                    assert_eq!(
+                        v.read_next().unwrap().unwrap().value,
+                        TlvValue::Boolean(false)
+                    );
+                    on_off_seen = true;
+                }
+                if d.path.cluster == Some(ClusterId(0x0028))
+                    && d.path.attribute == Some(AttributeId(0x0001))
+                {
+                    let mut v = d.value();
+                    assert_eq!(
+                        v.read_next().unwrap().unwrap().value,
+                        TlvValue::Utf8String("TestVendor")
+                    );
+                    vendor_seen = true;
+                }
+            }
+        }
+        rd.more_chunks().unwrap()
+    };
+
     let mut tx = [0u8; 2048];
     let a = im
         .handle(&rxm(&h, &req[..rlen], ex), &mut tx, &mut mgr, 0)
         .unwrap();
     let (op, len, is_close) = parts(a);
     assert_eq!(op, ImOpCode::ReportData.to_u8());
-    assert!(is_close, "single-shot read ends the exchange");
+    let mut more = scan(&tx[..len]);
+    assert_eq!(
+        is_close, !more,
+        "exchange closes exactly with the final chunk"
+    );
 
-    let rd = ReportDataRef::new(&tx[..len]).unwrap();
-    assert!(!rd.more_chunks().unwrap());
-
-    let mut count = 0;
-    let mut on_off_seen = false;
-    let mut vendor_seen = false;
-    for r in rd.attr_reports().unwrap() {
-        count += 1;
-        if let AttributeReportRef::Data(d) = r.unwrap() {
-            if d.path.cluster == Some(ClusterId(0x0006))
-                && d.path.attribute == Some(AttributeId(0x0000))
-            {
-                let mut v = d.value();
-                assert_eq!(
-                    v.read_next().unwrap().unwrap().value,
-                    TlvValue::Boolean(false)
-                );
-                on_off_seen = true;
-            }
-            if d.path.cluster == Some(ClusterId(0x0028))
-                && d.path.attribute == Some(AttributeId(0x0001))
-            {
-                let mut v = d.value();
-                assert_eq!(
-                    v.read_next().unwrap().unwrap().value,
-                    TlvValue::Utf8String("TestVendor")
-                );
-                vendor_seen = true;
-            }
-        }
+    let sh = phdr(ImOpCode::StatusResponse.to_u8());
+    let mut guard = 0;
+    while more {
+        guard += 1;
+        assert!(guard < 100, "chunk loop must terminate");
+        let mut sbuf = [0u8; 16];
+        let slen = StatusResponse::new(ImStatus::Success)
+            .encode(&mut sbuf)
+            .unwrap();
+        let mut ctx = [0u8; 2048];
+        let a = im
+            .handle(&rxm(&sh, &sbuf[..slen], ex), &mut ctx, &mut mgr, 0)
+            .unwrap();
+        let (op, len, is_close) = parts(a);
+        assert_eq!(op, ImOpCode::ReportData.to_u8());
+        more = scan(&ctx[..len]);
+        assert_eq!(
+            is_close, !more,
+            "exchange closes exactly with the final chunk"
+        );
     }
-    // ep0: basic(11)+desc(4)=15 固有 +10 global、ep1: on_off(1)+desc(4)=5 固有 +10 global → 40。
-    assert_eq!(count, 40);
+    // ep0: basic(16)+desc(4)=20 固有 +10 global、ep1: on_off(1)+desc(4)=5 固有 +10 global → 45。
+    assert_eq!(count, 45);
     assert!(on_off_seen && vendor_seen);
     assert_eq!(
         im.active_read_count(),
@@ -295,7 +324,7 @@ fn chunked_read_resumes_on_status() {
             break;
         }
     }
-    assert_eq!(total, 40, "all attributes delivered across chunks");
+    assert_eq!(total, 45, "all attributes delivered across chunks");
     assert_eq!(im.active_read_count(), 0, "continuation slot freed");
 }
 

@@ -40,10 +40,19 @@ pub struct BasicInfoConfig {
     pub serial_number: &'static str,
 }
 
+/// SpecificationVersion 属性(0x0015)の値。本実装が準拠する Matter 仕様(1.3.0)。
+pub const SPECIFICATION_VERSION: u32 = 0x0103_0000;
+/// MaxPathsPerInvoke 属性(0x0016)。本実装は 1 InvokeRequest あたり 1 コマンドパス。
+pub const MAX_PATHS_PER_INVOKE: u16 = 1;
+/// CapabilityMinima(0x0013)の CaseSessionsPerFabric / SubscriptionsPerFabric(仕様の最小値 3 を保証)。
+pub const CAPABILITY_MINIMA: (u16, u16) = (3, 3);
+
 /// Basic Information クラスタ(0x0028)。
 #[derive(Debug)]
 pub struct BasicInformationCluster {
     cfg: &'static BasicInfoConfig,
+    /// Location(0x0006、ISO 3166-1 alpha-2、管理者が書き込み可)。既定 "XX"。
+    location: [u8; 2],
     /// NodeLabel(0x0005、書き込み可)の UTF-8 バイト。
     node_label: [u8; NODE_LABEL_MAX],
     /// NodeLabel の有効バイト長。
@@ -56,6 +65,7 @@ impl BasicInformationCluster {
     pub const fn new(cfg: &'static BasicInfoConfig) -> Self {
         Self {
             cfg,
+            location: *b"XX",
             node_label: [0u8; NODE_LABEL_MAX],
             node_label_len: 0,
             dirty: Dirty::new(),
@@ -69,6 +79,34 @@ impl BasicInformationCluster {
     }
 
     /// NodeLabel(0x0005)を書き込む。
+    /// 現在の Location(2 文字)を返す。
+    pub fn location(&self) -> &str {
+        core::str::from_utf8(&self.location).unwrap_or("XX")
+    }
+
+    /// Location(0x0006)を書き込む(2 文字固定、ConstraintError)。
+    fn write_location(
+        &mut self,
+        data: AttrWrite<'_>,
+        _acc: &AccessContext,
+    ) -> Result<(), ImStatus> {
+        let b = data.as_str()?.as_bytes();
+        if b.len() != 2 {
+            return Err(ImStatus::ConstraintError);
+        }
+        self.location.copy_from_slice(b);
+        self.dirty.mark();
+        Ok(())
+    }
+
+    /// CapabilityMinima(0x0013)を書く。
+    fn read_capability_minima(&self, e: &mut AttrEncoder<'_, '_>) -> Result<(), ImStatus> {
+        e.write_struct(|s| {
+            s.field_u16(0, CAPABILITY_MINIMA.0)?;
+            s.field_u16(1, CAPABILITY_MINIMA.1)
+        })
+    }
+
     fn write_node_label(
         &mut self,
         data: AttrWrite<'_>,
@@ -124,6 +162,11 @@ cluster! {
                 read: (|c: &BasicInformationCluster, e: &mut AttrEncoder<'_, '_>| e.write_str(c.node_label())),
                 write: (Manage, |c: &mut BasicInformationCluster, data, acc| c.write_node_label(data, acc))
             },
+            0x0006 Location {
+                access: View, quality: [NONVOLATILE], subscribe: false,
+                read: (|c: &BasicInformationCluster, e: &mut AttrEncoder<'_, '_>| e.write_str(c.location())),
+                write: (Administer, |c: &mut BasicInformationCluster, data, acc| c.write_location(data, acc))
+            },
             0x0007 HardwareVersion {
                 access: View, quality: [FIXED], subscribe: false,
                 read: (|c: &BasicInformationCluster, e: &mut AttrEncoder<'_, '_>| e.write_u16(c.cfg.hardware_version)),
@@ -147,6 +190,27 @@ cluster! {
             0x000F SerialNumber {
                 access: View, quality: [FIXED], subscribe: false,
                 read: (|c: &BasicInformationCluster, e: &mut AttrEncoder<'_, '_>| e.write_str(c.cfg.serial_number)),
+                write: _
+            },
+            // UniqueID(rev 3 では任意、rev 4 で必須)。デバイス固有値として SerialNumber を流用する。
+            0x0012 UniqueID {
+                access: View, quality: [FIXED], subscribe: false,
+                read: (|c: &BasicInformationCluster, e: &mut AttrEncoder<'_, '_>| e.write_str(c.cfg.serial_number)),
+                write: _
+            },
+            0x0013 CapabilityMinima {
+                access: View, quality: [FIXED], subscribe: false,
+                read: (|c: &BasicInformationCluster, e: &mut AttrEncoder<'_, '_>| c.read_capability_minima(e)),
+                write: _
+            },
+            0x0015 SpecificationVersion {
+                access: View, quality: [FIXED], subscribe: false,
+                read: (|_c: &BasicInformationCluster, e: &mut AttrEncoder<'_, '_>| e.write_u32(SPECIFICATION_VERSION)),
+                write: _
+            },
+            0x0016 MaxPathsPerInvoke {
+                access: View, quality: [FIXED], subscribe: false,
+                read: (|_c: &BasicInformationCluster, e: &mut AttrEncoder<'_, '_>| e.write_u16(MAX_PATHS_PER_INVOKE)),
                 write: _
             },
         ],

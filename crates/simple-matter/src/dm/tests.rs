@@ -385,8 +385,9 @@ fn expand_full_wildcard() {
     // 全端点 × 全クラスタ × 全属性(固有 + グローバル 5)。
     let paths = [AttributePath::default()];
     let (_, n) = expand_all(&dev, &paths);
-    // ep0: basic(11+5)+desc(4+5)=25、ep1: on_off(1+5)+desc(4+5)=15 → 40。
-    assert_eq!(n, 40);
+    // ep0: basic(16+5)+desc(4+5)=30、ep1: on_off(1+5)+desc(4+5)=15 → 45(BasicInformation は
+    // Location/UniqueID/CapabilityMinima/SpecificationVersion/MaxPathsPerInvoke を含む 16 属性)。
+    assert_eq!(n, 45);
 }
 
 #[test]
