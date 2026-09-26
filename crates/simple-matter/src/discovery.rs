@@ -390,20 +390,34 @@ impl<const NOPS: usize> MdnsResponder<NOPS> {
 
         // どのサービスに応答するかをまず判定する(回答→追加情報の 2 パスのため)。
         let mut emit_comm = false;
+        let mut comm_inst = false;
         let mut op_mask = [false; NOPS];
+        let mut op_inst = [false; NOPS];
         let mut emit_host_only = false;
 
         for q in query.questions() {
-            self.match_question(&q, &mut emit_comm, &mut op_mask, &mut emit_host_only);
+            self.match_question(
+                &q,
+                &mut emit_comm,
+                &mut comm_inst,
+                &mut op_mask,
+                &mut op_inst,
+                &mut emit_host_only,
+            );
         }
 
-        if !emit_comm && !op_mask.iter().any(|b| *b) && !emit_host_only {
+        let any_op = op_mask.iter().any(|b| *b) || op_inst.iter().any(|b| *b);
+        if !emit_comm && !comm_inst && !any_op && !emit_host_only {
             return None;
         }
 
         let mut w = dns::MsgWriter::new(out).ok()?;
 
-        // --- 回答セクション: PTR 群 ---
+        // --- 回答セクション ---
+        // 質問に直接答えるレコードは Answer に置く(RFC 6762 §6)。PTR 質問(サービス型/
+        // サブタイプ/メタ)には PTR 群、インスタンス名質問(SRV/TXT/ANY)には SRV/TXT、
+        // ホスト名質問(A/AAAA)には A/AAAA。Google Home 等の解決器は SRV 質問への答えが
+        // Additional にしか無いと解決できない(実機で CASE 不成立を観測)。
         if emit_comm {
             if let Some(c) = &self.commissionable {
                 let _ = self.write_commissionable_ptrs(&mut w, c, Section::Answer);
@@ -415,21 +429,33 @@ impl<const NOPS: usize> MdnsResponder<NOPS> {
                 let _ = self.write_operational_ptrs(&mut w, op, Section::Answer, &mut dnssd_op_ptr);
             }
         }
+        if comm_inst {
+            if let Some(c) = &self.commissionable {
+                let _ = self.write_commissionable_srv_txt(&mut w, c, Section::Answer);
+            }
+        }
+        for (i, op) in self.operational.iter().enumerate() {
+            if op_inst.get(i).copied().unwrap_or(false) {
+                let _ = self.write_operational_srv_txt(&mut w, op, Section::Answer);
+            }
+        }
+        if emit_host_only {
+            let _ = self.write_host_records(&mut w, Section::Answer);
+        }
 
         // --- 追加情報セクション: SRV / TXT / A / AAAA ---
-        let mut any = emit_comm || emit_host_only;
-        if emit_comm {
+        if emit_comm && !comm_inst {
             if let Some(c) = &self.commissionable {
                 let _ = self.write_commissionable_srv_txt(&mut w, c, Section::Additional);
             }
         }
         for (i, op) in self.operational.iter().enumerate() {
-            if op_mask.get(i).copied().unwrap_or(false) {
+            if op_mask.get(i).copied().unwrap_or(false) && !op_inst.get(i).copied().unwrap_or(false)
+            {
                 let _ = self.write_operational_srv_txt(&mut w, op, Section::Additional);
-                any = true;
             }
         }
-        if any {
+        if !emit_host_only {
             let _ = self.write_host_records(&mut w, Section::Additional);
         }
 
@@ -446,7 +472,9 @@ impl<const NOPS: usize> MdnsResponder<NOPS> {
         &self,
         q: &dns::Question,
         emit_comm: &mut bool,
+        comm_inst: &mut bool,
         op_mask: &mut [bool; NOPS],
+        op_inst: &mut [bool; NOPS],
         emit_host_only: &mut bool,
     ) {
         let name = &q.name;
@@ -473,9 +501,9 @@ impl<const NOPS: usize> MdnsResponder<NOPS> {
             if want_ptr && name.eq_ci(&[b"_matterc", b"_udp", b"local"]) {
                 *emit_comm = true;
             }
-            // インスタンス(SRV/TXT/ANY/A/AAAA)
+            // インスタンス(SRV/TXT/ANY)→ SRV/TXT を Answer に。
             if name.eq_ci(&[&id_hex, b"_matterc", b"_udp", b"local"]) {
-                *emit_comm = true;
+                *comm_inst = true;
             }
             // サブタイプ PTR
             if want_ptr && self.commissionable_subtype_matches(c, name) {
@@ -494,9 +522,9 @@ impl<const NOPS: usize> MdnsResponder<NOPS> {
             let mut inst = [0u8; 33];
             let inst_len = operational_instance(op, &mut inst);
             let inst_label = &inst[..inst_len];
-            // インスタンス(SRV/TXT/ANY)
+            // インスタンス(SRV/TXT/ANY)→ SRV/TXT を Answer に。
             if name.eq_ci(&[inst_label, b"_matter", b"_tcp", b"local"]) {
-                if let Some(m) = op_mask.get_mut(i) {
+                if let Some(m) = op_inst.get_mut(i) {
                     *m = true;
                 }
             }
