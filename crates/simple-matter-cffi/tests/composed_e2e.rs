@@ -423,6 +423,9 @@ fn composed_device_commission_read_write_invoke_subscribe() {
         composition_len: blob_len,
         on_cluster_change: Some(on_change),
         cluster_change_ctx: std::ptr::null_mut(),
+        report_chunk_limit: 0,
+        product_name: core::ptr::null(),
+        serial_number: core::ptr::null(),
     };
     assert_eq!(sm_init(&cfg, now_ms()), 0, "sm_init(composition)");
     let v4 = [127u8, 0, 0, 1];

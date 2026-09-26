@@ -525,8 +525,9 @@ fn build_shim_dac(o: &'static Owned, cfg: &sm_config_t, rng: CRng) -> Option<Shi
 }
 type Stack = DefaultStack<'static, Backend, CRng, Light>;
 
-/// BasicInformation の固定設定(プリセットデバイス。VID/PID はテスト DAC = 0xFFF1/0x8001)。
-static CFG: BasicInfoConfig = BasicInfoConfig {
+/// BasicInformation の既定設定(VID/PID はテスト DAC = 0xFFF1/0x8001)。`sm_init` で
+/// `sm_config_t.product_name` / `serial_number` が与えられれば [`BASIC_CFG`] に反映する。
+static DEFAULT_CFG: BasicInfoConfig = BasicInfoConfig {
     vendor_name: "SimpleMatter",
     vendor_id: 0xFFF1,
     product_name: "OnOffLight",
@@ -537,6 +538,37 @@ static CFG: BasicInfoConfig = BasicInfoConfig {
     software_version_string: "1.0.0",
     serial_number: "SM-ONOFF-0001",
 };
+
+/// 実際に使う BasicInformation 設定(`sm_init` が一度だけ書く。以後は不変、単線契約)。
+static mut BASIC_CFG: BasicInfoConfig = DEFAULT_CFG;
+/// `product_name` / `serial_number` の永続ストレージ(`&'static str` 化のため)。
+static mut BASIC_STR: [[u8; 32]; 2] = [[0; 32]; 2];
+
+/// C 文字列 `src` を `slot` へ写して `&'static str` を返す(NULL/空/非 UTF-8 は `None`)。
+///
+/// SAFETY 契約: `sm_init` の中で一度だけ、他のスレッドから触られない状態で呼ぶ。
+unsafe fn intern_cstr(slot: usize, src: *const c_char) -> Option<&'static str> {
+    if src.is_null() {
+        return None;
+    }
+    let mut n = 0usize;
+    while n < 32 && *src.add(n) != 0 {
+        n += 1;
+    }
+    if n == 0 {
+        return None;
+    }
+    let buf = core::ptr::addr_of_mut!(BASIC_STR[slot]);
+    core::ptr::copy_nonoverlapping(src as *const u8, buf as *mut u8, n);
+    let bytes = core::slice::from_raw_parts(buf as *const u8, n);
+    core::str::from_utf8(bytes).ok()
+}
+
+/// BasicInformation 設定への `'static` 参照。
+fn basic_cfg() -> &'static BasicInfoConfig {
+    // SAFETY: sm_init 完了後は不変。
+    unsafe { &*core::ptr::addr_of!(BASIC_CFG) }
+}
 
 // ==========================================================================
 // C ABI 型(cbindgen が simple_matter.h を生成する)
@@ -668,6 +700,18 @@ pub struct sm_config_t {
     pub on_cluster_change: SmClusterChange,
     /// `on_cluster_change` の ctx。
     pub cluster_change_ctx: *mut c_void,
+    /// ReportData 1 チャンク上限(TLV 本体バイト数)。0 = コア既定(送信 MTU 由来 ≒1.18KB)。
+    ///
+    /// 送信バッファが乏しいポート(内部 RAM 枯渇で 1.2KB 級データグラムの WiFi 送信が
+    /// ENOMEM になる等)は 700 程度に下げる。256 未満は 256、既定超は既定に丸める。
+    pub report_chunk_limit: usize,
+    /// BasicInformation ProductName(NUL 終端 UTF-8、最大 32 バイト。NULL = 既定 "OnOffLight")。
+    pub product_name: *const c_char,
+    /// BasicInformation SerialNumber(NUL 終端、最大 32 バイト。NULL = 既定 "SM-ONOFF-0001")。
+    ///
+    /// **Apple Home はシリアル番号でアクセサリを識別する**ため、同一ホームに同じシリアルの
+    /// デバイスが既にあると CSR 後に黙って失敗する。ポートは MAC 等から一意な値を与えること。
+    pub serial_number: *const c_char,
 }
 
 /// v4/v6 両対応の datagram 宛先/送信元。
@@ -1241,7 +1285,7 @@ fn build_light(o: &'static Owned, rng: CRng, network: sm_network_t, dac: ShimDac
     Light {
         acl: &o.acl,
         access_control: AccessControlCluster::new(&o.acl),
-        basic: BasicInformationCluster::new(&CFG),
+        basic: BasicInformationCluster::new(basic_cfg()),
         gc: GeneralCommissioning::default_config(),
         net: new_netcomm(network),
         admin: AdminCommissioningCluster::new(&o.window),
@@ -1347,7 +1391,7 @@ impl Shim {
     fn commissionable_ad(&self, discriminator: u16, mode: CommissioningMode) -> Commissionable {
         Commissionable {
             device_type: Some(0x0100),
-            device_name: Some(CFG.product_name),
+            device_name: Some(basic_cfg().product_name),
             sii: None,
             sai: None,
             ..Commissionable::new(
@@ -1511,6 +1555,7 @@ impl Shim {
             } else if !self.boot_window_open && count == 0 && !self.owned.window.borrow().is_open()
             {
                 self.boot_window_open = true;
+                self.stack.device_mut().opcreds.pregenerate_keypair();
                 if let Some(cfg) = self.dev_pase.build() {
                     self.stack.set_pase_config(cfg);
                     self.stack.set_pase_enabled(true);
@@ -1546,6 +1591,7 @@ impl Shim {
         if let Some(wev) = wev {
             match wev {
                 WindowEvent::OpenedEnhanced { discriminator } => {
+                    self.stack.device_mut().opcreds.pregenerate_keypair();
                     if let Some(cfg) = self.owned.window.borrow().pase_config() {
                         self.stack.set_pase_config(cfg);
                         self.stack.set_pase_enabled(true);
@@ -1557,6 +1603,7 @@ impl Shim {
                     }
                 }
                 WindowEvent::OpenedBasic => {
+                    self.stack.device_mut().opcreds.pregenerate_keypair();
                     if let Some(cfg) = self.dev_pase.build() {
                         self.stack.set_pase_config(cfg);
                         self.stack.set_pase_enabled(true);
@@ -1714,6 +1761,18 @@ pub extern "C" fn sm_init(cfg: *const sm_config_t, now_ms: u64) -> i32 {
     }
     // SAFETY: cfg は有効な sm_config_t を指す契約。
     let cfg = unsafe { &*cfg };
+    // BasicInformation の ProductName / SerialNumber 上書き(NULL は既定のまま)。
+    // SAFETY: 単線契約の sm_init 内で一度だけ書く。
+    unsafe {
+        let mut bc = DEFAULT_CFG;
+        if let Some(pn) = intern_cstr(0, cfg.product_name) {
+            bc.product_name = pn;
+        }
+        if let Some(sn) = intern_cstr(1, cfg.serial_number) {
+            bc.serial_number = sn;
+        }
+        core::ptr::addr_of_mut!(BASIC_CFG).write(bc);
+    }
     let Some(rng_fill) = cfg.rng_fill else {
         return -3;
     };
@@ -1777,7 +1836,9 @@ pub extern "C" fn sm_init(cfg: *const sm_config_t, now_ms: u64) -> i32 {
         let im = InteractionModel::new(build_light(o, rng, cfg.network, dac));
         let mut stack: Stack = MatterStack::new(&o.crypto, sc, im);
         stack.set_group_keys(&o.groups);
-        let _ = stack.post_startup_event(CFG.software_version, 0);
+        let _ = stack.post_startup_event(basic_cfg().software_version, 0);
+        // 起動時の commissionable 窓に備えて運用鍵ペアを事前生成(CSR 応答短縮)。
+        stack.device_mut().opcreds.pregenerate_keypair();
 
         addr_of_mut!((*sp).stack).write(stack);
         // Host は sm_set_addrs 前は A/AAAA 無し(--at ユニキャストで解決可)。
@@ -1802,6 +1863,12 @@ pub extern "C" fn sm_init(cfg: *const sm_config_t, now_ms: u64) -> i32 {
         addr_of_mut!((*sp).commissionable_disc).write(None);
         addr_of_mut!((*sp).on_cluster_change).write(cfg.on_cluster_change);
         addr_of_mut!((*sp).cluster_change_ctx).write(cfg.cluster_change_ctx);
+        if cfg.report_chunk_limit != 0 {
+            (*sp)
+                .stack
+                .im_mut()
+                .set_report_chunk_limit(cfg.report_chunk_limit);
+        }
         addr_of_mut!((*sp).events).write(EventRing::new());
         #[cfg(feature = "ble")]
         {
@@ -2413,8 +2480,14 @@ pub extern "C" fn sm_ble_event(
                 };
                 // SAFETY: caller が有効な data/len を与える契約。
                 let frag = unsafe { core::slice::from_raw_parts(data, len) };
-                if s.btp.process_incoming(frag, s.ble_mtu, now_ms).is_err() {
-                    return -3;
+                if let Err(e) = s.btp.process_incoming(frag, s.ble_mtu, now_ms) {
+                    // [一時デバッグ] エラー種別を戻り値で区別する。
+                    return match e {
+                        simple_matter::Error::InvalidState => -3,
+                        simple_matter::Error::Decode => -4,
+                        simple_matter::Error::NoSpace => -5,
+                        _ => -6,
+                    };
                 }
                 // 再組立できた Matter メッセージを stack へ渡し、応答を BTP に積む。
                 let mut sdu = [0u8; MAX_RX_PACKET_SIZE];

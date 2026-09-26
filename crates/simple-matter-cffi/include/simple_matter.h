@@ -305,6 +305,18 @@ typedef struct {
   SmClusterChange on_cluster_change;
   // `on_cluster_change` の ctx。
   void *cluster_change_ctx;
+  // ReportData 1 チャンク上限(TLV 本体バイト数)。0 = コア既定(送信 MTU 由来 ≒1.18KB)。
+  //
+  // 送信バッファが乏しいポート(内部 RAM 枯渇で 1.2KB 級データグラムの WiFi 送信が
+  // ENOMEM になる等)は 700 程度に下げる。256 未満は 256、既定超は既定に丸める。
+  size_t report_chunk_limit;
+  // BasicInformation ProductName(NUL 終端 UTF-8、最大 32 バイト。NULL = 既定 "OnOffLight")。
+  const char *product_name;
+  // BasicInformation SerialNumber(NUL 終端、最大 32 バイト。NULL = 既定 "SM-ONOFF-0001")。
+  //
+  // **Apple Home はシリアル番号でアクセサリを識別する**ため、同一ホームに同じシリアルの
+  // デバイスが既にあると CSR 後に黙って失敗する。ポートは MAC 等から一意な値を与えること。
+  const char *serial_number;
 } sm_config_t;
 
 // v4/v6 両対応の datagram 宛先/送信元。

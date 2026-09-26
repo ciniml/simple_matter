@@ -345,6 +345,9 @@ fn dead_session_is_invalidated_and_case_reestablished() {
         composition_len: blob_len,
         on_cluster_change: None,
         cluster_change_ctx: std::ptr::null_mut(),
+        report_chunk_limit: 0,
+        product_name: core::ptr::null(),
+        serial_number: core::ptr::null(),
     };
     let mut sim = Sim::new();
     assert_eq!(sm_init(&cfg, sim.now), 0, "sm_init(composition)");

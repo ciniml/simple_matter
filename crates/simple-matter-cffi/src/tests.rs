@@ -111,6 +111,9 @@ fn ffi_lifecycle_roundtrip() {
         composition_len: 0,
         on_cluster_change: None,
         cluster_change_ctx: core::ptr::null_mut(),
+        report_chunk_limit: 0,
+        product_name: core::ptr::null(),
+        serial_number: core::ptr::null(),
     };
     assert_eq!(sm_init(&cfg, 0), 0);
     // 二重初期化は拒否。
