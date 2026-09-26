@@ -31,7 +31,10 @@ CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=0
 # 単一パケットに収まる 251(BLE 標準の最大 ACL データ長)にする。128 に削ると 244B 送信時に
 # NimBLE の host 側フラグメント分割(mem_split_frag)を通り、LoadProhibited でクラッシュする。
 CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=6
-CONFIG_BT_NIMBLE_TRANSPORT_ACL_SIZE=251
+# 255 = IDF 既定(HCI ACL データ部の最大、4B ヘッダ含まず)。251 にすると相手(iPhone/Echo、DLE 251)からの
+# 244B 値の Write(L2CAP 4 + ATT 247 = ACL 251B)がホストに届かず、AddTrustedRootCertificate 以降が
+# 失われて BLE コミッショニングが CSR 後に停止する(2026-09-27)。128 では送信側で mbuf 分割クラッシュ。
+CONFIG_BT_NIMBLE_TRANSPORT_ACL_SIZE=255
 CONFIG_LWIP_MLDV6_TMR_INTERVAL=5
 # NimBLE の自動「Reattempt advertising」は ble_gap_adv_set_fields で保存した fields で広告を再開する。
 # 本ポートは ble_gap_adv_set_data(生データ)を使うため空の広告になり、デバイスが発見不能になる。
