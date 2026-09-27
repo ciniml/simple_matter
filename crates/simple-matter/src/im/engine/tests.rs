@@ -2334,3 +2334,192 @@ fn failed_status_response_to_report_drops_subscription() {
     );
     assert!(im.next_deadline(2_100).is_none());
 }
+
+// ==========================================================================
+// 差分購読レポート(設計 §6.2、実機: Apple Home 2026-09-27)
+// ==========================================================================
+
+/// ワイルドカード購読のプライミング(複数チャンク)を完走させ、購読 ID を返す。
+fn prime_wildcard_subscription(im: &mut Im, mgr: &mut SessionManager<2>, ex: ExchangeId) -> u32 {
+    let mut req = [0u8; 64];
+    let slen = encode_subscribe_request(&mut req, false, 1, 10, false, |p| {
+        p.push(&AttributePath::default())
+    })
+    .unwrap();
+    let sh = phdr(ImOpCode::SubscribeRequest.to_u8());
+    let mut tx = [0u8; 2048];
+    let a = im
+        .handle(&rxm(&sh, &req[..slen], ex), &mut tx, mgr, 0)
+        .unwrap();
+    let (op, len, _) = parts(a);
+    assert_eq!(op, ImOpCode::ReportData.to_u8());
+    let mut more = ReportDataRef::new(&tx[..len])
+        .unwrap()
+        .more_chunks()
+        .unwrap();
+    let stath = phdr(ImOpCode::StatusResponse.to_u8());
+    let mut guard = 0;
+    loop {
+        guard += 1;
+        assert!(guard < 100);
+        let mut stat = [0u8; 16];
+        let stlen = StatusResponse::new(ImStatus::Success)
+            .encode(&mut stat)
+            .unwrap();
+        let mut tx2 = [0u8; 2048];
+        let a = im
+            .handle(&rxm(&stath, &stat[..stlen], ex), &mut tx2, mgr, 0)
+            .unwrap();
+        let (op, len, _) = parts(a);
+        if op == ImOpCode::SubscribeResponse.to_u8() {
+            assert!(
+                !more,
+                "SubscribeResponse only after the final priming chunk"
+            );
+            return SubscribeResponse::decode(&tx2[..len])
+                .unwrap()
+                .subscription_id;
+        }
+        assert_eq!(op, ImOpCode::ReportData.to_u8());
+        more = ReportDataRef::new(&tx2[..len])
+            .unwrap()
+            .more_chunks()
+            .unwrap();
+    }
+}
+
+/// レポート内の (cluster, endpoint) 別属性数を数える。
+fn count_cluster_reports(buf: &[u8], cluster: u32) -> usize {
+    let rd = ReportDataRef::new(buf).unwrap();
+    rd.attr_reports()
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .filter(|r| matches!(r, AttributeReportRef::Data(d) if d.path.cluster == Some(ClusterId(cluster))))
+        .count()
+}
+
+#[test]
+fn wildcard_subscription_reports_only_dirty_cluster_then_empty_keepalive() {
+    let (mut im, mut mgr, ex) = setup();
+    let sid = ex.session();
+    let sub_id = prime_wildcard_subscription(&mut im, &mut mgr, ex);
+    assert_eq!(im.active_read_count(), 0);
+
+    // OnOff だけ変更 → レポートは OnOff クラスタ(ep1)の属性のみで 1 チャンクに収まる。
+    im.data_model_mut().on_off.set(true);
+    assert_eq!(
+        im.poll_subscriptions(2_000),
+        Some(SubDue {
+            subscription: sub_id,
+            session: sid
+        })
+    );
+    let ex2 = ExchangeId::from_parts(sid, 0x2222);
+    let mut rtx = [0u8; 2048];
+    let rlen = im.build_report(sub_id, ex2, &mut rtx, 2_000).unwrap();
+    let rd = ReportDataRef::new(&rtx[..rlen]).unwrap();
+    assert!(
+        !rd.more_chunks().unwrap(),
+        "differential report fits one chunk"
+    );
+    assert!(
+        count_cluster_reports(&rtx[..rlen], 0x0006) >= 1,
+        "OnOff attributes present"
+    );
+    assert_eq!(
+        count_cluster_reports(&rtx[..rlen], 0x0028),
+        0,
+        "untouched BasicInformation omitted"
+    );
+    assert_eq!(
+        count_cluster_reports(&rtx[..rlen], 0x001D),
+        0,
+        "untouched Descriptor omitted"
+    );
+    assert_eq!(
+        im.active_read_count(),
+        0,
+        "single-chunk report needs no continuation slot"
+    );
+
+    // 終端 StatusResponse で in-flight 解除。
+    let stath = phdr(ImOpCode::StatusResponse.to_u8());
+    let h2 = PayloadHeader {
+        exch_id: 0x2222,
+        ..stath
+    };
+    let mut stat = [0u8; 16];
+    let stlen = StatusResponse::new(ImStatus::Success)
+        .encode(&mut stat)
+        .unwrap();
+    let mut tx = [0u8; 64];
+    let _ = im
+        .handle(&rxm(&h2, &stat[..stlen], ex2), &mut tx, &mut mgr, 2_100)
+        .unwrap();
+
+    // 変更なしで max interval 到達 → キープアライブは属性を含まない空レポート。
+    assert!(im.poll_subscriptions(5_000).is_none());
+    let t = 2_000 + 10_000;
+    assert_eq!(
+        im.poll_subscriptions(t),
+        Some(SubDue {
+            subscription: sub_id,
+            session: sid
+        })
+    );
+    let ex3 = ExchangeId::from_parts(sid, 0x3333);
+    let rlen = im.build_report(sub_id, ex3, &mut rtx, t).unwrap();
+    let rd = ReportDataRef::new(&rtx[..rlen]).unwrap();
+    assert!(!rd.more_chunks().unwrap());
+    assert_eq!(
+        rd.attr_reports().unwrap().count(),
+        0,
+        "keepalive report is empty"
+    );
+    assert_eq!(rd.subscription_id().unwrap(), Some(sub_id));
+}
+
+#[test]
+fn subscription_report_waits_while_continuation_slots_are_full() {
+    let (mut im, mut mgr, ex) = setup();
+    let sid = ex.session();
+    let sub_id = prime_wildcard_subscription(&mut im, &mut mgr, ex);
+
+    // 継続 slot(READS=2)を、途中で放置した複数チャンク Read 2 本で埋める。
+    for eid in [0x4444u16, 0x5555] {
+        let mut req = [0u8; 64];
+        let rlen =
+            encode_read_request(&mut req, false, |p| p.push(&AttributePath::default())).unwrap();
+        let h = PayloadHeader {
+            exch_id: eid,
+            ..phdr(ImOpCode::ReadRequest.to_u8())
+        };
+        let exr = ExchangeId::from_parts(sid, eid);
+        let mut tx = [0u8; 2048];
+        let a = im
+            .handle(&rxm(&h, &req[..rlen], exr), &mut tx, &mut mgr, 100)
+            .unwrap();
+        let (op, len, _) = parts(a);
+        assert_eq!(op, ImOpCode::ReportData.to_u8());
+        assert!(ReportDataRef::new(&tx[..len])
+            .unwrap()
+            .more_chunks()
+            .unwrap());
+    }
+    assert_eq!(im.active_read_count(), 2);
+
+    // dirty でも slot 満杯中は due にしない(途中で閉じる不完全なチャンク列を送らない)。
+    im.data_model_mut().on_off.set(true);
+    assert!(im.poll_subscriptions(2_000).is_none());
+
+    // Read のタイムアウト回収で slot が空けば due になる。
+    im.on_tick(100 + 30_001);
+    assert_eq!(im.active_read_count(), 0);
+    assert_eq!(
+        im.poll_subscriptions(31_000),
+        Some(SubDue {
+            subscription: sub_id,
+            session: sid
+        })
+    );
+}

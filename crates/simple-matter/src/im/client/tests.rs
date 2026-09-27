@@ -1100,15 +1100,18 @@ fn chunked_device_report() {
     let im = &cli_mgr.handler().im;
     assert!(!im.is_sub_truncated());
     assert!(im.report_exchange().is_none());
+    // 差分レポート(設計 §6.2): 変更した OnOff クラスタの属性(固有 + グローバル)だけが
+    // 複数チャンクにまたがって届き、他クラスタは含まれない。
     let mut data = 0;
     for r in im.sub_reports() {
-        if let AttributeReportRef::Data(_) = r.unwrap() {
+        if let AttributeReportRef::Data(d) = r.unwrap() {
+            assert_eq!(d.path.cluster, Some(ClusterId(0x0006)));
             data += 1;
         }
     }
     assert!(
-        data > 8,
-        "chunked report aggregated many attributes: {data}"
+        data > 3,
+        "chunked report aggregated the OnOff cluster attributes: {data}"
     );
 }
 

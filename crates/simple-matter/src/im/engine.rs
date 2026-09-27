@@ -70,6 +70,13 @@ const READ_TXN_TIMEOUT_MS: u64 = 30_000;
 /// MRP の give-up 上限(累計 ~34 秒)に余裕を足した値で強制回収する。
 pub const REPORT_INFLIGHT_TIMEOUT_MS: u64 = 40_000;
 
+/// 購読 1 件が前回レポート以降に記憶する dirty クラスタ (endpoint, cluster) の上限。
+///
+/// 超えた場合は「全パス再送」に退避する(設計 §6.2 の初期スコープと同じ挙動)。
+/// 実機(Apple Home、2026-09-27)ではセンサ更新ごとにワイルドカード購読へ全属性 7 チャンク
+/// (≈4.5KB)を送っていたため、変更クラスタだけに絞る差分レポートを既定にする。
+pub const DIRTY_CLUSTER_CAP: usize = 8;
+
 /// イベントログ(リングバッファ)の固定容量(設計 §12)。
 const EVENT_LOG_CAP: usize = 8;
 
@@ -319,6 +326,12 @@ struct Subscription<const P: usize> {
     last_report_ms: u64,
     /// 前回レポート以降に交差クラスタが変更されたか。
     dirty: bool,
+    /// 前回レポート以降に変更された (endpoint, cluster)(差分レポート用、設計 §6.2)。
+    dirty_clusters: [(EndpointId, ClusterId); DIRTY_CLUSTER_CAP],
+    /// `dirty_clusters` の有効長。
+    n_dirty: usize,
+    /// dirty クラスタが上限を超えた(または送出失敗で内容が不明)ため全パスを再送する。
+    dirty_overflow: bool,
     /// 直近の device 発レポートを運んだ exchange(MRP 諦め時の購読破棄の逆引き用、
     /// 設計 §6.3。単一チャンクレポートは reads に継続 slot を持たないため購読側で覚える)。
     report_exchange: Option<ExchangeId>,
@@ -352,6 +365,9 @@ impl<const P: usize> Subscription<P> {
             max_interval_s,
             last_report_ms: now_ms,
             dirty: false,
+            dirty_clusters: [(EndpointId(0), ClusterId(0)); DIRTY_CLUSTER_CAP],
+            n_dirty: 0,
+            dirty_overflow: false,
             report_exchange: None,
             report_sent_ms: 0,
             state: SubState::Priming,
@@ -373,6 +389,44 @@ fn sub_has_new_event<const P: usize>(sub: &Subscription<P>, log: &EventLog<EVENT
 }
 
 /// いずれかの購読パスが (endpoint, cluster) を含むか。
+/// 差分レポートのパス列を組む。dirty クラスタ集合と購読パスの交差を具象 (endpoint, cluster)
+/// に落として `out` に書く。全パス再送が必要なら `false`(呼び出し側が購読パスをそのまま使う)。
+fn report_paths_for_dirty<const P: usize>(
+    sub: &Subscription<P>,
+    out: &mut [AttributePath; P],
+    n_out: &mut usize,
+) -> bool {
+    if sub.dirty_overflow {
+        return false;
+    }
+    let mut n = 0;
+    for &(ep, cl) in &sub.dirty_clusters[..sub.n_dirty] {
+        for i in 0..sub.npaths {
+            let p = &sub.paths[i];
+            let ep_ok = p.endpoint.is_none_or(|e| e == ep);
+            let cl_ok = p.cluster.is_none_or(|c| c == cl);
+            if !(ep_ok && cl_ok) {
+                continue;
+            }
+            let mut np = *p;
+            np.endpoint = Some(ep);
+            np.cluster = Some(cl);
+            if out[..n].iter().any(|q| {
+                q.endpoint == np.endpoint && q.cluster == np.cluster && q.attribute == np.attribute
+            }) {
+                continue;
+            }
+            if n >= P {
+                return false;
+            }
+            out[n] = np;
+            n += 1;
+        }
+    }
+    *n_out = n;
+    true
+}
+
 fn sub_covers<const P: usize>(sub: &Subscription<P>, ep: EndpointId, cl: ClusterId) -> bool {
     for i in 0..sub.npaths {
         let p = &sub.paths[i];
@@ -1337,6 +1391,11 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
     pub fn poll_subscriptions(&mut self, now_ms: u64) -> Option<SubDue> {
         self.sweep_dirty();
         self.sweep_events();
+        // 継続 slot が無いと複数チャンクのレポートを完走できない(途中で閉じると相手が購読を
+        // 異常終了させる)。slot が空くまで due にしない。
+        if self.reads.is_full() {
+            return None;
+        }
         for s in self.subs.iter() {
             if s.state != SubState::Active {
                 continue;
@@ -1386,8 +1445,13 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         let mut txn = ReadTxn::<PATHS>::new(exchange, acc, ReadKind::Report(subscription), now_ms);
         {
             let sub = &self.subs[si];
-            txn.npaths = sub.npaths;
-            txn.paths[..sub.npaths].copy_from_slice(&sub.paths[..sub.npaths]);
+            // 差分レポート: 前回以降に変更されたクラスタに交差するパスだけを送る(設計 §6.2)。
+            // dirty 集合が上限超過・送出失敗後・パス上限に収まらない場合は全パスに退避する。
+            // dirty クラスタが無い(max interval のキープアライブ / イベントのみ)なら属性は空。
+            if !report_paths_for_dirty(sub, &mut txn.paths, &mut txn.npaths) {
+                txn.npaths = sub.npaths;
+                txn.paths[..sub.npaths].copy_from_slice(&sub.paths[..sub.npaths]);
+            }
             // イベントパスと「未配信のみ」フィルタ(floor)を載せる(設計 §12)。
             txn.n_event_paths = sub.n_event_paths;
             txn.event_paths[..sub.n_event_paths]
@@ -1426,9 +1490,14 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
             }
             ChunkOutcome::More => {
                 if self.reads.push(txn).is_err() {
-                    // 継続 slot が無い場合は打ち切り(報告済み扱いにして stall を避ける)。
-                    self.set_event_floor(subscription, self.events.next_number());
-                    self.mark_reported(subscription, now_ms);
+                    // 継続 slot が無い。MoreChunkedMessages=true のチャンクだけ送って exchange を
+                    // 閉じると相手の ReadClient が購読を異常終了させる(実機: Apple Home が
+                    // 「応答なし」、2026-09-27)ので送らず、in-flight 記録を戻して次回 poll で
+                    // 再試行する(`poll_subscriptions` は slot 満杯中は due を返さない)。
+                    self.subs[si].report_exchange = None;
+                    self.subs[si].dirty = true;
+                    self.subs[si].dirty_overflow = true;
+                    return Err(Error::NoSpace);
                 }
                 Ok(len)
             }
@@ -1443,7 +1512,11 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
     pub fn on_report_send_failed(&mut self, subscription: u32) {
         let idx = self.subs.iter().position(|s| s.id == subscription);
         if let Some(i) = idx {
-            self.subs[i].report_exchange = None;
+            let s = &mut self.subs[i];
+            s.report_exchange = None;
+            // 組み立て時に dirty 集合はクリア済みで内容が失われているので、次回は全パスを送る。
+            s.dirty = true;
+            s.dirty_overflow = true;
         }
     }
 
@@ -1688,7 +1761,16 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
                 self.data_version = self.data_version.wrapping_add(1);
                 for i in 0..self.subs.len() {
                     if sub_covers(&self.subs[i], ep, cl) {
-                        self.subs[i].dirty = true;
+                        let s = &mut self.subs[i];
+                        s.dirty = true;
+                        if !s.dirty_clusters[..s.n_dirty].contains(&(ep, cl)) {
+                            if s.n_dirty < DIRTY_CLUSTER_CAP {
+                                s.dirty_clusters[s.n_dirty] = (ep, cl);
+                                s.n_dirty += 1;
+                            } else {
+                                s.dirty_overflow = true;
+                            }
+                        }
                     }
                 }
             }
@@ -1717,6 +1799,8 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
             s.state = SubState::Active;
             s.last_report_ms = now_ms;
             s.dirty = false;
+            s.n_dirty = 0;
+            s.dirty_overflow = false;
         }
     }
 
@@ -1735,6 +1819,8 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
             let s = &mut self.subs[i];
             s.last_report_ms = now_ms;
             s.dirty = false;
+            s.n_dirty = 0;
+            s.dirty_overflow = false;
         }
     }
 }
