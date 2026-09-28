@@ -4,6 +4,8 @@ on:
   push:
     branches: [master, main]
   pull_request:
+  # 手動実行(ブランチ指定で esp-firmware ジョブ等を試す用)。
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -142,5 +144,68 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: demos-${{ runner.os == 'Windows' && 'windows' || 'linux' }}
+          path: dist/
+          if-no-files-found: error
+
+  # ESP32-S3 ファーム(M5Stack AirQ、ports/esp-idf/examples/airq_sensor_cpp)のビルド。
+  # Xtensa は esp channel の Rust(espup)で staticlib を作り(経路 (a) SM_PREBUILT_A)、
+  # ESP-IDF v5.4 の docker で idf.py を回す(ローカルの手順と同一)。PR では走らせない
+  # (ツールチェーン取得 + イメージ pull が重いため main への push と手動実行のみ)。
+  esp-firmware-airq:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache esp Rust toolchain
+        id: cache-esp
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains/esp
+            ~/.espup
+            ~/export-esp.sh
+          key: espup-esp32s3-${{ runner.os }}-v1
+      - name: Install esp Rust toolchain (espup)
+        if: steps.cache-esp.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL https://github.com/esp-rs/espup/releases/latest/download/espup-x86_64-unknown-linux-gnu -o /tmp/espup
+          chmod +x /tmp/espup
+          /tmp/espup install --targets esp32s3 --export-file "$HOME/export-esp.sh"
+      - name: Build simple-matter-cffi staticlib (xtensa-esp32s3-none-elf)
+        run: |
+          . "$HOME/export-esp.sh"
+          cargo +esp build -p simple-matter-cffi --release \
+            --target xtensa-esp32s3-none-elf -Zbuild-std=core --features panic-abort
+          ls -la target/xtensa-esp32s3-none-elf/release/libsimple_matter_cffi.a
+      - name: Build firmware (ESP-IDF v5.4)
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE":/w \
+            -w /w/ports/esp-idf/examples/airq_sensor_cpp -e CCACHE_DISABLE=1 \
+            espressif/idf:release-v5.4 bash -ec '
+              A=/w/target/xtensa-esp32s3-none-elf/release/libsimple_matter_cffi.a
+              idf.py -DSM_PREBUILT_A=$A set-target esp32s3
+              idf.py -DSM_PREBUILT_A=$A build
+              idf.py size'
+      - name: Stage firmware
+        run: |
+          d=ports/esp-idf/examples/airq_sensor_cpp/build
+          mkdir -p dist/airq_sensor_cpp
+          cp "$d/airq_sensor_cpp.bin" "$d/bootloader/bootloader.bin" \
+             "$d/partition_table/partition-table.bin" "$d/flash_args" dist/airq_sensor_cpp/
+          cat > dist/airq_sensor_cpp/README.md <<'EOR'
+          # airq_sensor_cpp (ESP32-S3 / M5Stack AirQ)
+
+          書き込み(ESP-IDF の esptool、ポートは環境に合わせて):
+
+              esptool.py --chip esp32s3 --port /dev/ttyACM0 -b 460800 \
+                --before default_reset --after hard_reset write_flash @flash_args
+
+          初期化(NVS 消去 = 工場出荷状態):
+
+              esptool.py --chip esp32s3 --port /dev/ttyACM0 erase_region 0x9000 0x6000
+          EOR
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-airq_sensor_cpp-esp32s3
           path: dist/
           if-no-files-found: error
