@@ -1,6 +1,6 @@
 # タグ push(v*)でデモバイナリをビルドし GitHub Release に添付する。
 # 内容物は CI の demo-binaries ジョブ(ci.yml)と同じ「便利セット」:
-#   smctl(--features ble)+ クラスターデモ examples + commissioner/ble-commissioner
+#   smctl / smweb(--features ble)+ クラスターデモ examples + commissioner/ble-commissioner
 #   (ble-onoff-light = bluer デバイス側は Linux のみ)
 name: Release
 
@@ -34,6 +34,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - name: Build smctl (BLE)
         run: cargo build -p smctl --release --features ble
+      - name: Build smweb (BLE)
+        run: cargo build -p smweb --release --features ble
       - name: Build cluster demos + commissioner
         run: cargo build -p simple-matter --release --examples --features controller
       - name: Build BLE commissioner demo
@@ -53,6 +55,7 @@ jobs:
           cp docs/README-demos.md "stage/${name}/README.md"
           cp README.md "stage/${name}/README-repo.md"
           cp "target/release/smctl${ext}" "stage/${name}/"
+          cp "target/release/smweb${ext}" "stage/${name}/"
           for ex in onoff-light dimmable-light color-light door-lock thermostat \
                     air-quality-sensor sensor-hub switch-demo commissioner ble-commissioner; do
             cp "target/release/examples/${ex}${ext}" "stage/${name}/"

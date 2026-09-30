@@ -99,6 +99,14 @@ jobs:
         run: cargo test -p smctl --features ble
       - name: Clippy smctl (BLE feature)
         run: cargo clippy -p smctl --features ble -- -D warnings
+      # smweb(Web コントローラ、docs/design/web-controller.md)。Windows ネイティブで
+      # BLE feature 込みのビルド/テスト/クリッピを検証する。
+      - name: Build smweb (BLE feature)
+        run: cargo build -p smweb --features ble
+      - name: Test smweb (Windows)
+        run: cargo test -p smweb --features ble
+      - name: Clippy smweb (BLE feature)
+        run: cargo clippy -p smweb --features ble -- -D warnings
 
   # デモバイナリの配布ビルド(Linux / Windows)。smctl(BLE 有効)+ クラスターデモ
   # examples を release でビルドし、artifact として保存する(手元で試せる「便利セット」)。
@@ -118,6 +126,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - name: Build smctl (BLE)
         run: cargo build -p smctl --release --features ble
+      - name: Build smweb (BLE)
+        run: cargo build -p smweb --release --features ble
       - name: Build cluster demos + commissioner
         run: cargo build -p simple-matter --release --examples --features controller
       - name: Build BLE commissioner demo
@@ -133,6 +143,7 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then ext=".exe"; fi
           mkdir -p dist
           cp "target/release/smctl${ext}" dist/
+          cp "target/release/smweb${ext}" dist/
           for ex in onoff-light dimmable-light color-light door-lock thermostat \
                     air-quality-sensor sensor-hub switch-demo commissioner ble-commissioner; do
             cp "target/release/examples/${ex}${ext}" dist/
