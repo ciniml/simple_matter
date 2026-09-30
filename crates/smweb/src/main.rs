@@ -6,6 +6,8 @@
 //!
 //! W1: コントローラスレッド + `/api/info` `/api/nodes` `/api/nodes/{id}/connect`
 //! `/api/nodes/{id}/attr/...` `/api/nodes/{id}/invoke/...` `/api/clusters` `/ws` + 最小 UI。
+//! W2: Describe(汎用モデル)+ 種別判定 + 既定購読 / watch + 値キャッシュ + `Event::Attr` +
+//! Dashboard / Devices / Log の単一ページ。
 //!
 //! `smctl` と同じ状態ディレクトリを共有するが、**同時実行は非サポート**(§4.4)。
 
@@ -28,8 +30,10 @@ macro_rules! wlog {
 
 mod api;
 mod ctrl;
+mod describe;
 mod error;
 mod model;
+mod store;
 mod value;
 mod ws;
 
@@ -133,7 +137,28 @@ fn main() -> ExitCode {
     smctl::log::init(smctl::log::resolve(opts.globals.log_level));
     smctl::log::init_color(opts.globals.color);
 
-    let handle = ctrl::spawn(opts.globals.clone());
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("smweb: tokio runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // 待ち受けを先に確保する。bind に失敗したらコントローラ(状態ディレクトリへの
+    // アクセス・state.lock)は一切起動しない。
+    let bind = opts.bind;
+    let listener = match rt.block_on(tokio::net::TcpListener::bind(bind)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("smweb: bind {bind}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let (handle, thread) = ctrl::spawn(opts.globals.clone());
     {
         let events = handle.events.clone();
         smctl::log::set_hook(Box::new(move |l, tag, msg| {
@@ -146,37 +171,57 @@ fn main() -> ExitCode {
         }));
     }
 
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("smweb: tokio runtime: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
     let r: Result<(), String> = rt.block_on(async move {
-        let listener = tokio::net::TcpListener::bind(opts.bind)
-            .await
-            .map_err(|e| format!("bind {}: {e}", opts.bind))?;
-        if !opts.bind.ip().is_loopback() {
+        if !bind.ip().is_loopback() {
             wlog!(
                 Level::Warn,
                 "listening on a non-loopback address without authentication/TLS"
             );
         }
-        wlog!(Level::Info, "listening on http://{}/", opts.bind);
-        axum::serve(listener, api::router(handle))
-            .await
-            .map_err(|e| format!("http server: {e}"))
+        wlog!(Level::Info, "listening on http://{bind}/");
+        let serve = axum::serve(listener, api::router(handle));
+        tokio::select! {
+            r = serve => r.map_err(|e| format!("http server: {e}")),
+            _ = shutdown_signal() => {
+                wlog!(Level::Info, "shutting down");
+                Ok(())
+            }
+        }
     });
+    // コントローラを止める(状態ファイルのロック区間は短いので、長いネットワーク待ちの
+    // 途中なら待たずに抜ける)。
+    if !thread.shutdown(Duration::from_secs(3)) {
+        wlog!(Level::Debug, "controller thread still busy; exiting anyway");
+    }
+    rt.shutdown_timeout(Duration::from_millis(500));
     match r {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("smweb: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Ctrl-C(全 OS)/ SIGTERM(unix)。
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = term => {}
     }
 }
 

@@ -7,6 +7,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+
+use crate::model::AttrPath;
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
@@ -41,6 +43,8 @@ pub fn router(h: CtrlHandle) -> Router {
         .route("/api/nodes", get(list_nodes))
         .route("/api/nodes/:id", get(get_node))
         .route("/api/nodes/:id/connect", post(connect))
+        .route("/api/nodes/:id/describe", post(describe))
+        .route("/api/nodes/:id/watch", post(watch_add).delete(watch_remove))
         .route(
             "/api/nodes/:id/attr/:ep/:cluster/:attr",
             get(read_attr).put(write_attr),
@@ -79,7 +83,9 @@ async fn info(State(h): State<CtrlHandle>) -> ApiResult {
 }
 
 async fn list_nodes(State(h): State<CtrlHandle>) -> ApiResult {
-    Ok(Json(json!(h.snapshot().nodes)))
+    Ok(Json(Value::Array(
+        h.snapshot().nodes.iter().map(|n| n.summary()).collect(),
+    )))
 }
 
 async fn get_node(State(h): State<CtrlHandle>, Path(id): Path<String>) -> ApiResult {
@@ -94,6 +100,68 @@ async fn get_node(State(h): State<CtrlHandle>, Path(id): Path<String>) -> ApiRes
 async fn connect(State(h): State<CtrlHandle>, Path(id): Path<String>) -> ApiResult {
     let node_id = parse_id(&id)?;
     h.call(Command::Connect { node_id }).await.map(Json)
+}
+
+async fn describe(State(h): State<CtrlHandle>, Path(id): Path<String>) -> ApiResult {
+    let node_id = parse_id(&id)?;
+    h.call(Command::Describe { node_id }).await.map(Json)
+}
+
+/// ID(数値 or 10 進 / `0x` 文字列 or クラスタ表の名前)の JSON 値を文字列にする。
+fn id_text(v: Option<&Value>, what: &str) -> Result<String, ApiError> {
+    match v {
+        Some(Value::Number(n)) => Ok(n.to_string()),
+        Some(Value::String(s)) => Ok(s.clone()),
+        _ => Err(ApiError::bad_request(format!(
+            "path.{what} must be a number or string"
+        ))),
+    }
+}
+
+/// `{ "paths": [ {ep, cluster, attr} ] }` をパースする。
+pub fn parse_watch_body(body: &Value) -> Result<Vec<AttrPath>, ApiError> {
+    let list = body
+        .get("paths")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ApiError::bad_request("body must be {\"paths\": [{ep, cluster, attr}]}"))?;
+    let mut out = Vec::new();
+    for p in list {
+        let ep = parse_endpoint(&id_text(p.get("ep").or_else(|| p.get("endpoint")), "ep")?)?;
+        let (cluster, def) = resolve_cluster(&id_text(p.get("cluster"), "cluster")?)?;
+        let attr = resolve_attr(
+            def,
+            &id_text(p.get("attr").or_else(|| p.get("attribute")), "attr")?,
+        )?;
+        out.push(AttrPath::new(ep, cluster.0, attr.0));
+    }
+    if out.is_empty() {
+        return Err(ApiError::bad_request("`paths` is empty"));
+    }
+    Ok(out)
+}
+
+async fn watch_add(State(h): State<CtrlHandle>, Path(id): Path<String>, body: Bytes) -> ApiResult {
+    watch(h, id, body, true).await
+}
+
+async fn watch_remove(
+    State(h): State<CtrlHandle>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult {
+    watch(h, id, body, false).await
+}
+
+async fn watch(h: CtrlHandle, id: String, body: Bytes, add: bool) -> ApiResult {
+    let node_id = parse_id(&id)?;
+    let paths = parse_watch_body(&parse_body(&body)?)?;
+    h.call(Command::Watch {
+        node_id,
+        paths,
+        add,
+    })
+    .await
+    .map(Json)
 }
 
 /// `?raw=1` / `?raw=true` を真とみなす。
@@ -208,4 +276,33 @@ async fn invoke(
 
 async fn clusters() -> ApiResult {
     Ok(Json(clusters_json()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watch_body_parsing() {
+        let v = json!({"paths": [
+            {"ep": 1, "cluster": 91, "attr": 0},
+            {"ep": "0x2", "cluster": "temperature-measurement", "attr": "measured-value"},
+            {"endpoint": 0, "cluster": "0x0028", "attribute": "0x5"},
+        ]});
+        let p = parse_watch_body(&v).unwrap();
+        assert_eq!(
+            p,
+            vec![
+                AttrPath::new(1, 0x5B, 0),
+                AttrPath::new(2, 0x0402, 0),
+                AttrPath::new(0, 0x0028, 5),
+            ]
+        );
+        assert!(parse_watch_body(&json!({})).is_err());
+        assert!(parse_watch_body(&json!({"paths": []})).is_err());
+        assert!(parse_watch_body(&json!({"paths": [{"ep": 1, "cluster": 6}]})).is_err());
+        assert!(
+            parse_watch_body(&json!({"paths": [{"ep": 70000, "cluster": 6, "attr": 0}]})).is_err()
+        );
+    }
 }

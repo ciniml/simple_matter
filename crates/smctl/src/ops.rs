@@ -305,6 +305,9 @@ pub struct Exec<'a> {
     /// `AttestationPolicy::Verify`(PAA まで完全検証)、空なら既定の
     /// `AttestationPolicy::VerifyNoPaa`(§8.4)。`--bypass-attestation` 時は `Skip`。
     paa_store: Vec<Vec<u8>>,
+    /// 埋め込み用: 購読系イベントを表示せずデータとして溜める先(`None` = CLI 表示、
+    /// [`embed`] の `enable_sub_capture` で有効化)。
+    sub_capture: Option<Vec<embed::SubEvent>>,
 }
 
 impl<'a> Exec<'a> {
@@ -342,6 +345,7 @@ impl<'a> Exec<'a> {
             subs: Vec::new(),
             batch,
             paa_store,
+            sub_capture: None,
         })
     }
 
@@ -506,6 +510,10 @@ impl<'a> Exec<'a> {
 
     /// 購読系イベントを処理する(レポート表示 + 要約カウント)。
     fn on_sub_event(&mut self, ev: ImEvent) {
+        if self.sub_capture.is_some() {
+            self.capture_sub_event(ev);
+            return;
+        }
         match ev {
             ImEvent::SubscriptionReport {
                 subscription_id, ..

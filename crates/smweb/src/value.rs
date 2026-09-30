@@ -257,7 +257,35 @@ pub fn args_to_fields(
     Ok(out)
 }
 
-/// クラスタ表全体を JSON にする(`GET /api/clusters`)。
+/// AirQuality.AirQuality(enum8)の表示名(0..=6)。
+pub const AIR_QUALITY_NAMES: [&str; 7] = [
+    "Unknown",
+    "Good",
+    "Fair",
+    "Moderate",
+    "Poor",
+    "VeryPoor",
+    "ExtremelyPoor",
+];
+
+/// 属性値の表示ヒント(§5.3: `unit` / `scale` / 列挙名)。smweb 側の表で持ち、
+/// smctl のクラスタ表(CLI 出力)には手を入れない。
+pub fn display_hint(cluster: u32, attr: u32) -> Option<Value> {
+    let measured = attr <= 2; // MeasuredValue / Min / Max
+    match cluster {
+        0x005B if attr == 0 => Some(json!({ "enum": AIR_QUALITY_NAMES })),
+        0x0402 if measured => Some(json!({ "unit": "°C", "scale": 0.01 })),
+        0x0405 if measured => Some(json!({ "unit": "%", "scale": 0.01 })),
+        0x0403 if measured => Some(json!({ "unit": "kPa", "scale": 0.1 })),
+        0x0404 if measured => Some(json!({ "unit": "m³/h", "scale": 0.1 })),
+        0x040D | 0x0413 if measured => Some(json!({ "unit": "ppm" })),
+        0x042A | 0x042C | 0x042D if measured => Some(json!({ "unit": "µg/m³" })),
+        _ => None,
+    }
+}
+
+/// クラスタ表全体を JSON にする(`GET /api/clusters`)。属性には表示ヒント
+/// ([`display_hint`])の `unit` / `scale` / `enum` を足す。
 pub fn clusters_json() -> Value {
     Value::Array(
         clusters::CLUSTERS
@@ -266,12 +294,20 @@ pub fn clusters_json() -> Value {
                 json!({
                     "id": c.id.0,
                     "name": c.name,
-                    "attributes": c.attrs.iter().map(|a| json!({
-                        "id": a.id.0,
-                        "name": a.name,
-                        "kind": a.kind.name(),
-                        "writable": a.writable,
-                    })).collect::<Vec<_>>(),
+                    "attributes": c.attrs.iter().map(|a| {
+                        let mut o = json!({
+                            "id": a.id.0,
+                            "name": a.name,
+                            "kind": a.kind.name(),
+                            "writable": a.writable,
+                        });
+                        if let Some(Value::Object(h)) = display_hint(c.id.0, a.id.0) {
+                            for (k, v) in h {
+                                o[k] = v;
+                            }
+                        }
+                        o
+                    }).collect::<Vec<_>>(),
                     "commands": c.cmds.iter().map(|m| json!({
                         "id": m.id.0,
                         "name": m.name,
@@ -418,5 +454,22 @@ mod tests {
             .unwrap()
             .iter()
             .any(|c| c["name"] == "toggle"));
+        assert!(onoff["attributes"][0].get("unit").is_none());
+        let find = |id: u32| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        let t = find(0x0402);
+        assert_eq!(t["attributes"][0]["unit"], "°C");
+        assert_eq!(t["attributes"][0]["scale"], 0.01);
+        let aq = find(0x005B);
+        assert_eq!(aq["attributes"][0]["enum"][5], "VeryPoor");
+        assert_eq!(find(0x040D)["attributes"][0]["unit"], "ppm");
+        assert_eq!(find(0x042A)["attributes"][0]["unit"], "µg/m³");
+        assert_eq!(find(0x0405)["attributes"][0]["scale"], 0.01);
     }
 }

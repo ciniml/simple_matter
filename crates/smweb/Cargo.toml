@@ -13,7 +13,7 @@ path = "src/main.rs"
 # 駆動コード(ランナー・状態ストア・クラスタ表・Exec)は smctl ライブラリを再利用する
 # (docs/design/web-controller.md §3)。
 smctl = { path = "../smctl" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal"] }
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

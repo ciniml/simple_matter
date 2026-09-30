@@ -9,49 +9,63 @@
 <body>
 <header>
   <h1>smweb</h1>
+  <nav id="tabs">
+    <button type="button" data-tab="dashboard" class="tab active">Dashboard</button>
+    <button type="button" data-tab="devices" class="tab">Devices</button>
+    <button type="button" data-tab="log" class="tab">Log</button>
+  </nav>
   <span id="info" class="muted">loading...</span>
   <span id="ws" class="badge offline">ws: -</span>
 </header>
 <main>
-  <section>
-    <h2>Nodes</h2>
-    <table id="nodes">
-      <thead><tr><th>Node ID</th><th>Label</th><th>Address</th><th>State</th><th>Last seen</th><th></th></tr></thead>
-      <tbody><tr><td colspan="6" class="muted">loading...</td></tr></tbody>
-    </table>
+  <!-- Dashboard: per-node cards (sensor = 5 tiles, light = state + buttons). -->
+  <section id="tab-dashboard" class="tab-panel">
+    <div id="dash-sensors" class="cards"></div>
+    <div id="dash-lights" class="cards lights"></div>
+    <div id="dash-others" class="cards"></div>
+    <p id="dash-empty" class="muted" hidden>No paired nodes. Commission a device with <code>smctl pairing ...</code> first.</p>
   </section>
 
-  <section class="forms">
-    <form id="read-form">
-      <h2>Read attribute</h2>
-      <label>Node <select name="node" class="node-select"></select></label>
-      <label>Endpoint <input name="ep" value="0" size="5"></label>
-      <label>Cluster <input name="cluster" list="cluster-list" value="basic-information" placeholder="name or 0x..."></label>
-      <label>Attribute <input name="attr" list="attr-list" value="product-name" placeholder="name or 0x..."></label>
-      <label class="inline"><input type="checkbox" name="raw"> raw TLV</label>
-      <button type="submit">Read</button>
-    </form>
+  <!-- Devices: node list, expandable endpoint / cluster / attribute tree, raw forms. -->
+  <section id="tab-devices" class="tab-panel" hidden>
+    <div id="node-list"></div>
 
-    <form id="invoke-form">
-      <h2>Invoke command</h2>
-      <label>Node <select name="node" class="node-select"></select></label>
-      <label>Endpoint <input name="ep" value="1" size="5"></label>
-      <label>Cluster <input name="cluster" list="cluster-list" value="onoff" placeholder="name or 0x..."></label>
-      <label>Command <input name="cmd" list="cmd-list" value="toggle" placeholder="name or 0x..."></label>
-      <label>Args (JSON) <input name="args" placeholder='{"level": 128}'></label>
-      <label>TLV hex <input name="tlv" placeholder="1518 (empty struct)"></label>
-      <label>Timed (ms) <input name="timed" size="6" placeholder="none"></label>
-      <button type="submit">Invoke</button>
-    </form>
-  </section>
+    <h2>Raw operations</h2>
+    <div class="forms">
+      <form id="read-form">
+        <h3>Read attribute</h3>
+        <label>Node <select name="node" class="node-select"></select></label>
+        <label>Endpoint <input name="ep" value="0" size="5"></label>
+        <label>Cluster <input name="cluster" list="cluster-list" value="basic-information" placeholder="name or 0x..."></label>
+        <label>Attribute <input name="attr" list="attr-list" value="product-name" placeholder="name or 0x..."></label>
+        <label class="inline"><input type="checkbox" name="raw"> raw TLV</label>
+        <button type="submit">Read</button>
+      </form>
 
-  <section>
+      <form id="invoke-form">
+        <h3>Invoke command</h3>
+        <label>Node <select name="node" class="node-select"></select></label>
+        <label>Endpoint <input name="ep" value="1" size="5"></label>
+        <label>Cluster <input name="cluster" list="cluster-list" value="onoff" placeholder="name or 0x..."></label>
+        <label>Command <input name="cmd" list="cmd-list" value="toggle" placeholder="name or 0x..."></label>
+        <label>Args (JSON) <input name="args" placeholder='{"level": 128}'></label>
+        <label>TLV hex <input name="tlv" placeholder="1518 (empty struct)"></label>
+        <label>Timed (ms) <input name="timed" size="6" placeholder="none"></label>
+        <button type="submit">Invoke</button>
+      </form>
+    </div>
+
     <h2>Result</h2>
     <pre id="result" class="result muted">(no request yet)</pre>
   </section>
 
-  <section>
-    <h2>Log</h2>
+  <!-- Log: Event::Log tail. -->
+  <section id="tab-log" class="tab-panel" hidden>
+    <div class="log-tools">
+      <label class="inline">Filter <input id="log-filter" placeholder="text or [tag]"></label>
+      <label class="inline"><input type="checkbox" id="log-attr"> include attribute updates</label>
+      <button type="button" id="log-clear">Clear</button>
+    </div>
     <pre id="log" class="log"></pre>
   </section>
 </main>
