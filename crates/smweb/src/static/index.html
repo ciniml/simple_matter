@@ -12,6 +12,7 @@
   <nav id="tabs">
     <button type="button" data-tab="dashboard" class="tab active">Dashboard</button>
     <button type="button" data-tab="devices" class="tab">Devices</button>
+    <button type="button" data-tab="pair" class="tab">Pair</button>
     <button type="button" data-tab="log" class="tab">Log</button>
   </nav>
   <span id="info" class="muted">loading...</span>
@@ -23,7 +24,7 @@
     <div id="dash-sensors" class="cards"></div>
     <div id="dash-lights" class="cards lights"></div>
     <div id="dash-others" class="cards"></div>
-    <p id="dash-empty" class="muted" hidden>No paired nodes. Commission a device with <code>smctl pairing ...</code> first.</p>
+    <p id="dash-empty" class="muted" hidden>No paired nodes. Commission a device from the <a href="#" data-goto="pair">Pair</a> tab.</p>
   </section>
 
   <!-- Devices: node list, expandable endpoint / cluster / attribute tree, raw forms. -->
@@ -59,6 +60,61 @@
     <pre id="result" class="result muted">(no request yet)</pre>
   </section>
 
+  <!-- Pair: commissioning form + live progress (WS `progress` events). -->
+  <section id="tab-pair" class="tab-panel" hidden>
+    <div class="pair-grid">
+      <form id="pair-form" autocomplete="off">
+        <h3>Commission a device</h3>
+        <div class="method-row" role="radiogroup" aria-label="Method">
+          <label class="inline"><input type="radio" name="method" value="onnetwork" checked> On-network</label>
+          <label class="inline"><input type="radio" name="method" value="address"> IP address</label>
+          <label class="inline ble-only"><input type="radio" name="method" value="ble-wifi"> BLE &rarr; Wi-Fi</label>
+          <label class="inline ble-only"><input type="radio" name="method" value="ble-thread"> BLE &rarr; Thread</label>
+        </div>
+        <p id="ble-note" class="muted small" hidden>BLE methods need a build with <code>--features ble</code>.</p>
+
+        <label>Setup code (QR payload or manual pairing code)
+          <input name="code" class="mono" placeholder="MT:-24J0AFN00KA0648G00  or  3497-011-2332" spellcheck="false">
+        </label>
+        <div id="code-preview" class="code-preview muted small">Paste a QR payload / manual code, or give discriminator + passcode below.</div>
+        <div class="row2">
+          <label>Discriminator <input name="discriminator" placeholder="0..4095 (optional)" size="10"></label>
+          <label>Passcode <input name="passcode" placeholder="8 digits" size="10"></label>
+        </div>
+
+        <div class="row2" data-show="address">
+          <label>IP address <input name="ip" placeholder="192.168.1.20 or fe80::..."></label>
+          <label>Port <input name="port" placeholder="5540" size="6"></label>
+        </div>
+        <div class="row2" data-show="ble-wifi">
+          <label>Wi-Fi SSID <input name="ssid" placeholder="SSID"></label>
+          <label>Wi-Fi password <input name="password" type="password" placeholder="password"></label>
+        </div>
+        <label data-show="ble-thread">Thread operational dataset (TLV hex)
+          <textarea name="dataset" rows="3" class="mono" placeholder="0e080000..." spellcheck="false"></textarea>
+        </label>
+
+        <div class="row2">
+          <label>Node ID <input name="node_id" placeholder="auto (next free)" size="10"></label>
+          <label>Label <input name="label" placeholder="optional" maxlength="64"></label>
+        </div>
+        <div class="btn-row">
+          <button type="submit" id="pair-start">Start</button>
+          <button type="button" id="discover-btn" class="secondary">Scan commissionable (5 s)</button>
+        </div>
+        <div id="pair-error" class="err small" hidden></div>
+      </form>
+
+      <div>
+        <h3>Commissionable devices</h3>
+        <div id="discover-result" class="muted small">Not scanned yet.</div>
+      </div>
+    </div>
+
+    <h2>Progress</h2>
+    <div id="pair-ops"><p class="muted small">No pairing started in this page yet.</p></div>
+  </section>
+
   <!-- Log: Event::Log tail. -->
   <section id="tab-log" class="tab-panel" hidden>
     <div class="log-tools">
@@ -69,9 +125,17 @@
     <pre id="log" class="log"></pre>
   </section>
 </main>
+<!-- In-page modal (rename / unpair confirm / share). -->
+<div id="modal" class="modal" hidden>
+  <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal-head"><h3 id="modal-title"></h3><button type="button" class="small secondary" id="modal-x" aria-label="Close">&times;</button></div>
+    <div id="modal-body"></div>
+  </div>
+</div>
 <datalist id="cluster-list"></datalist>
 <datalist id="attr-list"></datalist>
 <datalist id="cmd-list"></datalist>
+<script src="/qrcode.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

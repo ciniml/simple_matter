@@ -19,6 +19,9 @@ pub const VERSION: u32 = 1;
 /// ノード 1 個分の保存内容。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct StoredNode {
+    /// ラベル(`nodes.tlv` と同じ値の控え。`PATCH /api/nodes/{id}` / pairing で更新)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     #[serde(default)]
     pub kind: NodeKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]

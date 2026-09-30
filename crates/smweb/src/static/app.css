@@ -36,6 +36,7 @@
   }
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body {
   margin: 0;
   background: var(--bg);
@@ -200,3 +201,43 @@ pre.result.error, pre.node-result.error { color: var(--err); }
 /* ---------- Log ---------- */
 .log-tools { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
 pre.log { height: calc(100vh - 170px); min-height: 240px; font-size: 12px; margin: 0; }
+
+/* ---------- Pair ---------- */
+.pair-grid { display: grid; grid-template-columns: minmax(320px, 560px) 1fr; gap: 16px; align-items: start; }
+@media (max-width: 800px) { .pair-grid { grid-template-columns: 1fr; } }
+.method-row { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 4px; }
+.method-row label { color: var(--fg); font-size: 13px; }
+.method-row label.disabled { opacity: 0.45; }
+.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+textarea { font: inherit; color: var(--fg); background: var(--bg); border: 1px solid var(--border); padding: 4px 6px; resize: vertical; }
+.code-preview { min-height: 1.4em; }
+.code-preview.ok { color: var(--ok); }
+.code-preview.bad { color: var(--err); }
+.err { color: var(--err); }
+.disc-item { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 6px; background: var(--card); color: var(--fg); }
+.op { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; margin-bottom: 10px; }
+.op-head { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 4px; }
+.op-lines { font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; max-height: 260px; overflow: auto; }
+.op-line { display: grid; grid-template-columns: 70px 150px 1fr; gap: 8px; padding: 1px 0; }
+.op-line.log { color: var(--muted); }
+.op-line.failed, .op-line.commission_failed { color: var(--err); }
+.op-line.done { color: var(--ok); font-weight: 600; }
+.badge.running { background: var(--accent); }
+.badge.ok { background: var(--ok); }
+.badge.failed { background: var(--err); }
+
+/* ---------- Modal / Share ---------- */
+.modal { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.45); display: flex; align-items: center; justify-content: center; z-index: 10; }
+.modal[hidden] { display: none; }
+.modal-box { background: var(--card); color: var(--fg); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; width: min(560px, calc(100vw - 32px)); max-height: calc(100vh - 32px); overflow: auto; }
+.modal-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+.modal-head h3 { margin: 0; font-size: 16px; }
+.modal-body-text { margin: 0 0 12px; }
+.modal-actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; margin-top: 12px; }
+button.danger { background: var(--err); color: #fff; }
+.share-code { font-size: 32px; font-weight: 700; letter-spacing: 0.06em; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; text-align: center; margin: 6px 0; }
+.share-qr { display: flex; justify-content: center; margin: 8px 0; }
+.share-qr svg { width: 220px; height: 220px; background: #fff; border-radius: 6px; }
+.share-countdown { text-align: center; font-size: 14px; }
+.share-countdown.expired { color: var(--err); }
+.share-payload { text-align: center; word-break: break-all; }

@@ -8,6 +8,8 @@
 //! `/api/nodes/{id}/attr/...` `/api/nodes/{id}/invoke/...` `/api/clusters` `/ws` + 最小 UI。
 //! W2: Describe(汎用モデル)+ 種別判定 + 既定購読 / watch + 値キャッシュ + `Event::Attr` +
 //! Dashboard / Devices / Log の単一ページ。
+//! W3: Pairing(on-network / address / BLE-WiFi / BLE-Thread、進捗は WS)+ unpair / ラベル +
+//! Share(コミッショニングウィンドウ + manual code / QR)+ commissionable 探索 + Pair タブ。
 //!
 //! `smctl` と同じ状態ディレクトリを共有するが、**同時実行は非サポート**(§4.4)。
 
@@ -33,6 +35,8 @@ mod ctrl;
 mod describe;
 mod error;
 mod model;
+mod onboarding;
+mod pairing;
 mod store;
 mod value;
 mod ws;
@@ -46,6 +50,7 @@ options:
   --paa-trust-store-path <dir>   verify attestation against PAA certs (*.der)
   --bypass-attestation           skip device attestation entirely
   --timeout <secs>               per-operation timeout (default 20)
+  --ble-adapter <name>           BLE adapter for BLE pairing (sets SM_BLE_ADAPTER, e.g. hci1)
   --log <level>                  error|warn|info|debug|trace (default: $SMCTL_LOG or info)
   -h, --help                     show this help
 
@@ -60,6 +65,8 @@ const DEFAULT_TIMEOUT_S: f64 = 20.0;
 struct Opts {
     bind: SocketAddr,
     globals: Globals,
+    /// `--ble-adapter`(`SM_BLE_ADAPTER` として smctl の BLE ランナーへ渡す)。
+    ble_adapter: Option<String>,
 }
 
 /// 引数をパースする。`Ok(None)` は `--help`。
@@ -67,6 +74,7 @@ fn parse_args(args: &[String]) -> Result<Option<Opts>, String> {
     let mut g = Globals::defaults();
     g.timeout = Duration::from_secs_f64(DEFAULT_TIMEOUT_S);
     let mut bind: SocketAddr = DEFAULT_BIND.parse().expect("default bind");
+    let mut ble_adapter = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let (flag, inline) = match a.split_once('=') {
@@ -102,11 +110,22 @@ fn parse_args(args: &[String]) -> Result<Option<Opts>, String> {
                     .ok_or_else(|| format!("invalid --timeout {v:?} (seconds > 0)"))?;
                 g.timeout = Duration::from_secs_f64(s);
             }
+            "--ble-adapter" => {
+                let v = value(flag)?;
+                if v.trim().is_empty() {
+                    return Err("--ble-adapter requires a non-empty adapter name".into());
+                }
+                ble_adapter = Some(v);
+            }
             "--log" | "--log-level" => g.log_level = Some(Level::parse(&value(flag)?)?),
             other => return Err(format!("unknown argument {other:?} (see --help)")),
         }
     }
-    Ok(Some(Opts { bind, globals: g }))
+    Ok(Some(Opts {
+        bind,
+        globals: g,
+        ble_adapter,
+    }))
 }
 
 fn level_name(l: Level) -> &'static str {
@@ -132,6 +151,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // smctl の BLE ランナーは SM_BLE_ADAPTER でアダプタを選ぶ(スレッド起動前に設定する)。
+    if let Some(a) = &opts.ble_adapter {
+        std::env::set_var("SM_BLE_ADAPTER", a);
+    }
 
     // ログ: smctl と同じ stderr 出力(起動からの ms 付き)+ WebSocket への Event::Log。
     smctl::log::init(smctl::log::resolve(opts.globals.log_level));
@@ -252,6 +276,8 @@ mod tests {
             "--bypass-attestation",
             "--log",
             "debug",
+            "--ble-adapter",
+            "hci1",
         ]))
         .unwrap()
         .unwrap();
@@ -260,6 +286,8 @@ mod tests {
         assert_eq!(o.globals.timeout, Duration::from_millis(7500));
         assert!(o.globals.bypass_attestation);
         assert_eq!(o.globals.log_level, Some(Level::Debug));
+        assert_eq!(o.ble_adapter.as_deref(), Some("hci1"));
+        assert!(parse_args(&args(&["--ble-adapter="])).is_err());
         assert!(parse_args(&args(&["--help"])).unwrap().is_none());
         assert!(parse_args(&args(&["--bind", "nope"])).is_err());
         assert!(parse_args(&args(&["--timeout", "0"])).is_err());

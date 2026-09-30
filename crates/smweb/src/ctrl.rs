@@ -14,11 +14,17 @@
 //! `SubscriptionLost` は `stale` にして再接続をバックオフ付きで予約する。自動(再)接続は
 //! 先に別スレッドで運用 mDNS 解決(probe)してから CASE に進む — 生きていないノードの
 //! mDNS 待ち(最大 ~26 s、その間 UDP を回せない)でコントローラを塞がないため。
+//!
+//! W3: Pair(UDP = `Exec::pair_addr`、BLE = `runner::ble::pair_ble_with_ca`)/ Unpair /
+//! ラベル変更 / コミッショニングウィンドウ(Share)の開閉と状態。pairing は Command 1 件として
+//! コントローラスレッドを専有する(その間は他の Command と UDP 受信が止まる)。UDP pairing 中は
+//! 既存の購読をローカルで外しておく(コアの `Commissioner` は IM イベントを 1 本のキューから
+//! 取り出すため、他ノードの購読レポートが割り込むとフェーズ機械が Protocol 失敗になる)。
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
@@ -30,7 +36,10 @@ use smctl::clusters::{self, ValueKind};
 use smctl::log::Level;
 use smctl::ops::embed::{ReadItem, ReadOutcome, SubEvent};
 use smctl::ops::{Exec, Parsed};
-use smctl::runner::mdns;
+use smctl::runner::{mdns, Backend};
+use smctl::simple_matter::controller::ca::Ca;
+use smctl::simple_matter::controller::Phase;
+use smctl::simple_matter::discovery::onboarding::random_discriminator;
 use smctl::simple_matter::dm::meta::{AttributeId, ClusterId, CommandId, EndpointId};
 use smctl::simple_matter::im::wire::AttributePath;
 use smctl::simple_matter::transport::session::SessionId;
@@ -44,6 +53,7 @@ use crate::model::{
     unix_now, unix_now_ms, AttrPath, AttrValue, Event, Info, NodeKind, NodeSnap, NodeState,
     Snapshot,
 };
+use crate::pairing::next_free_node_id;
 use crate::store::Store;
 use crate::value::{raw_json, to_hex, value_json};
 
@@ -66,6 +76,10 @@ const READ_CHUNK: usize = 6;
 /// probe(運用 mDNS 解決)の窓。キャッシュホストへの QU 直叩き → マルチキャスト。
 const PROBE_AT_TIMEOUT: Duration = Duration::from_secs(3);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+/// UDP コミッショニング全体(PASE〜CommissioningComplete)の最低タイムアウト。
+const PAIR_MIN_TIMEOUT: Duration = Duration::from_secs(60);
+/// AdministratorCommissioning(0x003C)。
+const ADMIN_COMMISSIONING: u32 = 0x003C;
 
 /// コントローラへの要求(§4.2 の W2 部分集合)。
 ///
@@ -111,24 +125,87 @@ pub enum Command {
         paths: Vec<AttrPath>,
         add: bool,
     },
+    /// コミッショニング(進捗は `Event::Progress{op_id}`、終端は HTTP 側が流す)。
+    Pair { op_id: u64, job: PairJob },
+    /// unpair(RemoveFabric + ローカル状態削除)。`force` はローカル状態だけ消す。
+    Unpair { node_id: u64, force: bool },
+    /// ラベル変更(`nodes.tlv` + `smweb.json`)。
+    SetLabel { node_id: u64, label: String },
+    /// ECM 窓オープン(Share)。
+    OpenWindow {
+        node_id: u64,
+        timeout_s: u16,
+        discriminator: Option<u16>,
+        passcode: Option<u32>,
+    },
+    /// RevokeCommissioning。
+    Revoke { node_id: u64 },
+    /// 窓の状態(AdministratorCommissioning の WindowStatus 等を読む)。
+    WindowStatus { node_id: u64 },
+}
+
+/// コミッショニング対象(mDNS 解決は HTTP 側で済ませてから投入する)。
+#[derive(Debug, Clone)]
+pub enum PairTarget {
+    /// UDP(on-network / アドレス直指定)。
+    Udp(SocketAddr),
+    /// BLE(feature `ble`)。`wifi` / `thread` のどちらか。
+    Ble {
+        discriminator: Option<u16>,
+        wifi: Option<(String, String)>,
+        thread: Option<Vec<u8>>,
+    },
+}
+
+/// `Command::Pair` の中身。
+#[derive(Debug, Clone)]
+pub struct PairJob {
+    /// 明示 node ID(`None` = アドレス帳の次の空き番号)。
+    pub node_id: Option<u64>,
+    pub label: String,
+    pub passcode: u32,
+    pub target: PairTarget,
 }
 
 impl Command {
-    fn node_id(&self) -> u64 {
+    /// 対象ノード(アドレス帳に存在することを要求する)。Pair は `None`。
+    fn node_id(&self) -> Option<u64> {
         match self {
             Command::Connect { node_id }
             | Command::Describe { node_id }
             | Command::Read { node_id, .. }
             | Command::Invoke { node_id, .. }
             | Command::Write { node_id, .. }
-            | Command::Watch { node_id, .. } => *node_id,
+            | Command::Watch { node_id, .. }
+            | Command::Unpair { node_id, .. }
+            | Command::SetLabel { node_id, .. }
+            | Command::OpenWindow { node_id, .. }
+            | Command::Revoke { node_id }
+            | Command::WindowStatus { node_id } => Some(*node_id),
+            Command::Pair { .. } => None,
+        }
+    }
+
+    /// 結果をノードの到達性(Online / Offline)に反映する操作か。
+    fn touches_device(&self) -> bool {
+        match self {
+            Command::Pair { .. } | Command::SetLabel { .. } => false,
+            Command::Unpair { force, .. } => !*force,
+            _ => true,
         }
     }
 
     fn is_long(&self) -> bool {
         matches!(
             self,
-            Command::Connect { .. } | Command::Describe { .. } | Command::Watch { .. }
+            Command::Connect { .. }
+                | Command::Describe { .. }
+                | Command::Watch { .. }
+                | Command::Pair { .. }
+                | Command::Unpair { .. }
+                | Command::OpenWindow { .. }
+                | Command::Revoke { .. }
+                | Command::WindowStatus { .. }
         )
     }
 }
@@ -148,6 +225,7 @@ pub struct CtrlHandle {
     pub events: broadcast::Sender<Event>,
     pub snapshot: Arc<RwLock<Snapshot>>,
     wait: Duration,
+    op_seq: Arc<AtomicU64>,
 }
 
 impl CtrlHandle {
@@ -158,6 +236,11 @@ impl CtrlHandle {
         } else {
             self.wait
         };
+        self.call_with(cmd, wait).await
+    }
+
+    /// 待ち時間を指定して Command を投入する(pairing のような長時間操作用)。
+    pub async fn call_with(&self, cmd: Command, wait: Duration) -> Reply {
         let (rtx, rrx) = oneshot::channel();
         match self.tx.try_send(Request { cmd, reply: rtx }) {
             Ok(()) => {}
@@ -185,6 +268,16 @@ impl CtrlHandle {
                 "no reply from controller within the timeout",
             )),
         }
+    }
+
+    /// 長時間操作の ID を払い出す(1 始まり)。
+    pub fn next_op_id(&self) -> u64 {
+        self.op_seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// イベントを流す(HTTP 側で完結する進捗用)。
+    pub fn emit(&self, e: Event) {
+        let _ = self.events.send(e);
     }
 
     /// スナップショットの読み取り(毒化しても中身は使う)。
@@ -322,6 +415,7 @@ pub fn spawn(g: Globals) -> (CtrlHandle, CtrlThread) {
             events,
             snapshot,
             wait,
+            op_seq: Arc::new(AtomicU64::new(0)),
         },
         CtrlThread { stop, join },
     )
@@ -378,6 +472,7 @@ fn thread_main(g: Globals, rx: Receiver<Request>, shared: Shared, stop: Arc<Atom
             .iter()
             .map(|e| {
                 let mut n = NodeSnap::new(e.node_id, e.label.clone(), addr_string(e.last_addr));
+                // ラベルの正は nodes.tlv(smctl と共有)。smweb.json の控えは表示に使わない。
                 if let Some(st) = store.nodes.get(&e.node_id) {
                     n.kind = st.kind;
                     n.model = st.model.clone();
@@ -396,20 +491,14 @@ fn thread_main(g: Globals, rx: Receiver<Request>, shared: Shared, stop: Arc<Atom
         store_path.display()
     );
 
-    // 2) CA(fabric)。W2 は pairing を持たないので、無ければ操作を受け付けない。
+    // 2) CA(fabric)。無ければ smctl の pairing と同じく新規生成して保存する(W3: smweb
+    //    自身が pairing できるので、空の状態ディレクトリからでも始められる)。
     let crypto = smctl::simple_matter::crypto::rustcrypto::RustCrypto::new(OsRng);
     let ca = match state
         .lock()
-        .and_then(|_l| ca_state::load(&state.ca_path(), &crypto))
+        .and_then(|_l| ca_state::load_or_create(&state.ca_path(), &crypto))
     {
-        Ok(Some(ca)) => ca,
-        Ok(None) => {
-            return fail(
-                "no CA state in the state directory; commission a device first \
-                 (`smctl pairing ...`)"
-                    .into(),
-            )
-        }
+        Ok(ca) => ca,
         Err(e) => return fail(e),
     };
     shared.with(|s| {
@@ -434,6 +523,10 @@ fn thread_main(g: Globals, rx: Receiver<Request>, shared: Shared, stop: Arc<Atom
     let (probe_tx, probe_rx) = mpsc::channel();
     let mut ctl = Ctl {
         exec,
+        g: g.clone(),
+        crypto: &crypto,
+        ca: &ca,
+        windows: BTreeMap::new(),
         shared,
         store,
         store_path,
@@ -535,6 +628,14 @@ type ProbeResult = (u64, Result<SocketAddr, String>);
 /// コントローラの状態(スレッド内専有)。
 struct Ctl<'a> {
     exec: Exec<'a>,
+    /// 共通オプション(BLE pairing へ渡す)。
+    g: Globals,
+    crypto: &'a Backend,
+    /// Exec と共有する CA(BLE pairing でも同じ serial カウンタを使う)。
+    #[cfg_attr(not(feature = "ble"), allow(dead_code))]
+    ca: &'a Ca<Backend>,
+    /// このプロセスで開いた窓(node → 払い出し情報 JSON)。
+    windows: BTreeMap<u64, Value>,
     shared: Shared,
     store: Store,
     store_path: PathBuf,
@@ -556,13 +657,28 @@ impl Ctl<'_> {
 
     /// 1 Command の処理。
     fn handle(&mut self, cmd: Command) -> Reply {
-        let node_id = cmd.node_id();
-        if self.shared.with(|s| s.node(node_id).is_none()) {
-            return Err(ApiError::not_found(format!(
-                "node {node_id:#x} is not in the address book"
-            )));
+        let target = cmd.node_id();
+        if let Some(node_id) = target {
+            if self.shared.with(|s| s.node(node_id).is_none()) {
+                return Err(ApiError::not_found(format!(
+                    "node {node_id:#x} is not in the address book"
+                )));
+            }
         }
+        let node_id = target.unwrap_or(0);
+        let device = target.is_some() && cmd.touches_device();
         let r = match cmd {
+            Command::Pair { op_id, job } => self.pair(op_id, job),
+            Command::Unpair { node_id, force } => self.unpair(node_id, force),
+            Command::SetLabel { node_id, label } => self.set_label(node_id, label),
+            Command::OpenWindow {
+                node_id,
+                timeout_s,
+                discriminator,
+                passcode,
+            } => self.open_window(node_id, timeout_s, discriminator, passcode),
+            Command::Revoke { node_id } => self.revoke(node_id),
+            Command::WindowStatus { node_id } => self.window_status(node_id),
             Command::Connect { node_id } => self.connect_full(node_id, false),
             Command::Describe { node_id } => self.connect_full(node_id, true),
             Command::Watch {
@@ -607,6 +723,9 @@ impl Ctl<'_> {
                 ))
             }
         };
+        if !device {
+            return r;
+        }
         // 成功した操作は到達性の証拠(Online)、タイムアウト等は Offline(§4.3)。
         match &r {
             Ok(_) => {
@@ -1014,6 +1133,398 @@ impl Ctl<'_> {
     }
 
     // ------------------------------------------------------------------
+    // Pair / Unpair / ラベル(W3)
+    // ------------------------------------------------------------------
+
+    fn progress(&self, op_id: u64, phase: &str, detail: impl Into<String>, node_id: Option<u64>) {
+        self.shared
+            .emit(Event::progress(op_id, phase, detail, node_id));
+    }
+
+    /// アドレス帳(nodes.tlv)とスナップショットにある node ID。
+    fn known_node_ids(&self) -> Result<Vec<u64>, ApiError> {
+        let st = self.exec.state_dir();
+        let mut ids: Vec<u64> = st
+            .lock()
+            .and_then(|_l| nodes::load(&st.nodes_path()))
+            .map_err(|e| ApiError::new(ErrorCode::Internal, e))?
+            .iter()
+            .map(|e| e.node_id)
+            .collect();
+        self.shared
+            .with(|s| ids.extend(s.nodes.iter().map(|n| n.node_id)));
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    /// 購読をすべてローカルで外す(UDP pairing の前)。外したノードを返す。
+    fn pause_subs(&mut self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self.subs.iter().map(|s| s.node_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        for &id in &ids {
+            self.drop_sub(id);
+        }
+        // slot に残っているレポートを捨てる(外した購読のものは照合で落ちる)。
+        let _ = self.exec.idle();
+        self.pump_sub_events();
+        if !ids.is_empty() {
+            wlog!(
+                Level::Info,
+                "pausing {} subscription(s) during commissioning",
+                ids.len()
+            );
+        }
+        ids
+    }
+
+    /// [`Self::pause_subs`] で外した購読を張り直す。
+    fn resume_subs(&mut self, ids: Vec<u64>) {
+        for id in ids {
+            if let Err(e) = self.resubscribe(id) {
+                self.connect_failed(id, &e.message);
+            }
+        }
+    }
+
+    /// コミッショニング → アドレス帳へ記帳(smctl と同じ)→ Connect(Describe + 既定購読)。
+    fn pair(&mut self, op_id: u64, job: PairJob) -> Reply {
+        let known = self.known_node_ids()?;
+        let node_id = match job.node_id {
+            Some(id) if known.contains(&id) => {
+                return Err(ApiError::bad_request(format!(
+                    "node id {id} ({id:#x}) is already in the address book (unpair it first \
+                     or choose another id)"
+                )))
+            }
+            Some(id) => id,
+            None => next_free_node_id(&known),
+        };
+        let how = match &job.target {
+            PairTarget::Udp(a) => format!("UDP {a}"),
+            PairTarget::Ble { wifi: Some(_), .. } => "BLE + Wi-Fi".to_string(),
+            PairTarget::Ble { .. } => "BLE + Thread".to_string(),
+        };
+        self.progress(
+            op_id,
+            "commissioning",
+            format!("node id {node_id} ({node_id:#x}) via {how}"),
+            Some(node_id),
+        );
+        wlog!(
+            Level::Info,
+            "pairing op {op_id}: node {node_id:#x} via {how}"
+        );
+        let shared = self.shared.clone();
+        let prev = smctl::ops::set_phase_hook(Some(Box::new(move |p| {
+            if let Some((phase, detail)) = phase_info(p) {
+                shared.emit(Event::progress(op_id, phase, detail, Some(node_id)));
+            }
+        })));
+        let r = match job.target {
+            PairTarget::Udp(addr) => {
+                let paused = self.pause_subs();
+                let timeout = self.g.timeout.max(PAIR_MIN_TIMEOUT);
+                let r = self
+                    .exec
+                    .pair_addr(node_id, job.passcode, addr, &job.label, timeout);
+                self.resume_subs(paused);
+                r
+            }
+            PairTarget::Ble {
+                discriminator,
+                wifi,
+                thread,
+            } => self.pair_ble(
+                node_id,
+                job.passcode,
+                &job.label,
+                discriminator,
+                wifi,
+                thread,
+            ),
+        };
+        smctl::ops::set_phase_hook(prev);
+        r.map_err(|e| ApiError::new(ErrorCode::Internal, e))?;
+
+        // スナップショットと smweb.json に載せる(アドレスは smctl が記帳したもの)。
+        let addr = self.current_addr(node_id);
+        let snap = NodeSnap::new(node_id, job.label.clone(), addr.clone());
+        self.shared.with(|s| {
+            s.nodes.retain(|n| n.node_id != node_id);
+            s.nodes.push(snap.clone());
+            s.nodes.sort_by_key(|n| n.node_id);
+        });
+        self.store.nodes.remove(&node_id);
+        self.store.node_mut(node_id).label = Some(job.label.clone());
+        self.save_store();
+        self.described.retain(|&n| n != node_id);
+        self.shared.emit(Event::NodeAdded {
+            node: Box::new(snap),
+        });
+        self.progress(
+            op_id,
+            "connect",
+            format!(
+                "commissioned{}; describing and subscribing",
+                addr.as_deref()
+                    .map(|a| format!(" at {a}"))
+                    .unwrap_or_default()
+            ),
+            Some(node_id),
+        );
+        match self.connect_full(node_id, true) {
+            Ok(v) => Ok(json!({ "node_id": node_id, "addr": addr, "connect": v })),
+            Err(e) => {
+                self.connect_failed(node_id, &e.message);
+                Ok(json!({
+                    "node_id": node_id,
+                    "addr": addr,
+                    "warning": format!("commissioned, but connecting failed: {}", e.message),
+                }))
+            }
+        }
+    }
+
+    #[cfg(feature = "ble")]
+    fn pair_ble(
+        &mut self,
+        node_id: u64,
+        passcode: u32,
+        label: &str,
+        discriminator: Option<u16>,
+        wifi: Option<(String, String)>,
+        thread: Option<Vec<u8>>,
+    ) -> Result<(), String> {
+        let mut g = self.g.clone();
+        g.label = Some(label.to_string());
+        smctl::runner::ble::pair_ble_with_ca(
+            &g,
+            self.crypto,
+            self.ca,
+            node_id,
+            passcode,
+            discriminator,
+            false,
+            wifi,
+            thread,
+        )
+        .map(|_| ())
+    }
+
+    #[cfg(not(feature = "ble"))]
+    fn pair_ble(
+        &mut self,
+        _node_id: u64,
+        _passcode: u32,
+        _label: &str,
+        _discriminator: Option<u16>,
+        _wifi: Option<(String, String)>,
+        _thread: Option<Vec<u8>>,
+    ) -> Result<(), String> {
+        let _ = self.crypto;
+        Err("BLE not compiled in (rebuild smweb with `--features ble`)".into())
+    }
+
+    /// unpair。`force` = デバイスへは触らずローカル状態だけ消す。
+    fn unpair(&mut self, node_id: u64, force: bool) -> Reply {
+        let fabric_index = if force {
+            self.drop_sub(node_id);
+            self.exec
+                .forget_local_node(node_id)
+                .map_err(|e| ApiError::new(ErrorCode::Internal, e))?;
+            None
+        } else {
+            let fi = self.exec.unpair_data(node_id).map_err(|e| {
+                let mut a = ApiError::from_exec(e);
+                a.message
+                    .push_str(" (use ?force=1 to drop the local state only)");
+                a
+            })?;
+            Some(fi)
+        };
+        self.remove_node_local(node_id);
+        wlog!(
+            Level::Info,
+            "node {node_id:#x} {}",
+            if force {
+                "removed locally (device not contacted)"
+            } else {
+                "unpaired (RemoveFabric) and removed"
+            }
+        );
+        Ok(json!({
+            "node_id": node_id,
+            "removed_from_device": !force,
+            "fabric_index": fabric_index,
+        }))
+    }
+
+    /// ノードを smweb の管理から外す(購読・予約・スナップショット・smweb.json)。
+    fn remove_node_local(&mut self, node_id: u64) {
+        self.drop_sub(node_id);
+        self.exec.forget_session(node_id);
+        self.retry.remove(&node_id);
+        self.ready.retain(|&n| n != node_id);
+        self.described.retain(|&n| n != node_id);
+        self.windows.remove(&node_id);
+        self.shared
+            .with(|s| s.nodes.retain(|n| n.node_id != node_id));
+        if self.store.nodes.remove(&node_id).is_some() {
+            self.save_store();
+        }
+        self.shared.emit(Event::NodeRemoved { node_id });
+    }
+
+    /// ラベル変更(`nodes.tlv` が正、`smweb.json` に控え)。
+    fn set_label(&mut self, node_id: u64, label: String) -> Reply {
+        let st = self.exec.state_dir();
+        st.lock()
+            .and_then(|_l| {
+                let path = st.nodes_path();
+                let mut entries = nodes::load(&path)?;
+                let e = entries
+                    .iter_mut()
+                    .find(|e| e.node_id == node_id)
+                    .ok_or_else(|| format!("node {node_id} not in address book"))?;
+                e.label = label.clone();
+                nodes::save(&path, &entries)
+            })
+            .map_err(ApiError::from_exec)?;
+        self.shared.with_node(node_id, |n| n.label = label.clone());
+        self.store.node_mut(node_id).label = Some(label.clone());
+        self.save_store();
+        self.shared.emit(Event::NodeLabel {
+            node_id,
+            label: label.clone(),
+        });
+        Ok(json!({ "node_id": node_id, "label": label }))
+    }
+
+    // ------------------------------------------------------------------
+    // Share: コミッショニングウィンドウ(Tab5 T9 相当)
+    // ------------------------------------------------------------------
+
+    fn open_window(
+        &mut self,
+        node_id: u64,
+        timeout_s: u16,
+        discriminator: Option<u16>,
+        passcode: Option<u32>,
+    ) -> Reply {
+        let discriminator = match discriminator {
+            Some(d) => d,
+            None => random_discriminator(&mut OsRng)
+                .map_err(|e| ApiError::new(ErrorCode::Internal, format!("rng: {e:?}")))?,
+        };
+        let (out, info) = self
+            .exec
+            .open_window_data(node_id, timeout_s, discriminator, passcode)
+            .map_err(ApiError::from_exec)?;
+        if !out.status.is_success() {
+            return Err(ApiError::im_status(
+                out.status.to_u8(),
+                format!(
+                    "OpenCommissioningWindow failed: {:?}{}",
+                    out.status,
+                    admin_cluster_status(out.cluster_status)
+                ),
+            ));
+        }
+        let now = unix_now();
+        let v = window_json(node_id, &info, now);
+        wlog!(
+            Level::Info,
+            "node {node_id:#x}: commissioning window open for {timeout_s}s \
+             (discriminator {discriminator}, manual code {})",
+            info.manual_code
+        );
+        self.windows.insert(node_id, v.clone());
+        self.shared.emit(Event::Window {
+            node_id,
+            open: true,
+            window: Some(v.clone()),
+        });
+        Ok(v)
+    }
+
+    fn revoke(&mut self, node_id: u64) -> Reply {
+        let out = self
+            .exec
+            .revoke_data(node_id)
+            .map_err(ApiError::from_exec)?;
+        self.windows.remove(&node_id);
+        self.shared.emit(Event::Window {
+            node_id,
+            open: false,
+            window: None,
+        });
+        if !out.status.is_success() {
+            return Err(ApiError::im_status(
+                out.status.to_u8(),
+                format!(
+                    "RevokeCommissioning failed: {:?}{}",
+                    out.status,
+                    admin_cluster_status(out.cluster_status)
+                ),
+            ));
+        }
+        wlog!(
+            Level::Info,
+            "node {node_id:#x}: commissioning window revoked"
+        );
+        Ok(json!({ "node_id": node_id, "revoked": true }))
+    }
+
+    /// AdministratorCommissioning の WindowStatus / AdminFabricIndex / AdminVendorId を読み、
+    /// このプロセスで開いた窓の情報(期限内なら)を添える。
+    fn window_status(&mut self, node_id: u64) -> Reply {
+        let items = self.read_chunked(
+            node_id,
+            &[
+                AttrPath::new(0, ADMIN_COMMISSIONING, 0),
+                AttrPath::new(0, ADMIN_COMMISSIONING, 1),
+                AttrPath::new(0, ADMIN_COMMISSIONING, 2),
+            ],
+        )?;
+        let status = item_uint(&items, ADMIN_COMMISSIONING, 0)
+            .flatten()
+            .ok_or_else(|| {
+                ApiError::new(ErrorCode::Internal, "device did not report WindowStatus")
+            })?;
+        let open = status != 0;
+        let now = unix_now();
+        let cached = if open {
+            self.windows
+                .get(&node_id)
+                .filter(|w| w["expires_at"].as_u64().is_some_and(|t| t > now))
+                .cloned()
+        } else {
+            self.windows.remove(&node_id);
+            None
+        };
+        let mut v = json!({
+            "node_id": node_id,
+            "open": open,
+            "window_status": status,
+            "window_status_name": match status {
+                0 => "WindowNotOpen",
+                1 => "EnhancedWindowOpen",
+                2 => "BasicWindowOpen",
+                _ => "Unknown",
+            },
+            "admin_fabric_index": item_uint(&items, ADMIN_COMMISSIONING, 1).flatten(),
+            "admin_vendor_id": item_uint(&items, ADMIN_COMMISSIONING, 2).flatten(),
+            "window": cached,
+        });
+        if let Some(t) = v["window"]["expires_at"].as_u64() {
+            v["remaining_s"] = json!(t.saturating_sub(now));
+        }
+        Ok(v)
+    }
+
+    // ------------------------------------------------------------------
     // 自動(再)接続: probe(別スレッドで mDNS)→ CASE
     // ------------------------------------------------------------------
 
@@ -1163,6 +1674,82 @@ fn probe(state_dir: &Path, node_id: u64, last: Option<SocketAddr>) -> Result<Soc
         }
     }
     mdns::resolve_operational(&ca, node_id, PROBE_TIMEOUT)
+}
+
+/// コミッショニングのフェーズ → 進捗イベントの `(phase, detail)`。
+fn phase_info(p: Phase) -> Option<(&'static str, String)> {
+    let (phase, detail) = match p {
+        Phase::Idle => return None,
+        Phase::Pase => ("pase", "PASE handshake".to_string()),
+        Phase::ArmFailSafe => ("arm_fail_safe", "ArmFailSafe".to_string()),
+        Phase::Attestation => ("attestation", "device attestation".to_string()),
+        Phase::Csr => ("csr", "CSRRequest".to_string()),
+        Phase::AddTrustedRoot => ("add_trusted_root", "AddTrustedRootCertificate".to_string()),
+        Phase::AddNoc => ("add_noc", "AddNOC".to_string()),
+        Phase::AddWifiNetwork => ("add_network", "AddOrUpdate network credentials".to_string()),
+        Phase::ConnectNetwork => ("connect_network", "ConnectNetwork".to_string()),
+        Phase::Case => ("case", "CASE handshake".to_string()),
+        Phase::Complete => (
+            "commissioning_complete",
+            "CommissioningComplete".to_string(),
+        ),
+        Phase::Done { .. } => (
+            "commissioned",
+            "operational CASE session established".to_string(),
+        ),
+        Phase::Failed { stage, reason } => (
+            "commission_failed",
+            format!("failed at stage {stage}: {reason:?}"),
+        ),
+    };
+    Some((phase, detail))
+}
+
+/// AdministratorCommissioning のクラスタ固有ステータスの説明。
+fn admin_cluster_status(cs: Option<u8>) -> String {
+    match cs {
+        None => String::new(),
+        Some(2) => " (Busy: a commissioning window is already open)".into(),
+        Some(3) => " (PAKEParameterError)".into(),
+        Some(4) => " (WindowNotOpen: no commissioning window is open)".into(),
+        Some(c) => format!(" (cluster status {c:#04x})"),
+    }
+}
+
+/// 窓オープン結果の JSON(`POST /api/nodes/{id}/window` の応答形)。
+pub fn window_json(node_id: u64, w: &smctl::ops::embed::WindowInfo, now: u64) -> Value {
+    json!({
+        "node_id": node_id,
+        "manual_code": w.manual_code,
+        "qr_payload": w.qr_payload,
+        "discriminator": w.discriminator,
+        "passcode": w.passcode,
+        "passcode_str": format!("{:08}", w.passcode),
+        "timeout_s": w.timeout_s,
+        "opened_at": now,
+        "expires_at": now + w.timeout_s as u64,
+        "vendor_id": w.vendor_id,
+        "product_id": w.product_id,
+    })
+}
+
+/// Read 結果から符号なし整数属性を取り出す(`None` = 報告なし、`Some(None)` = null / 非整数)。
+fn item_uint(items: &[ReadItem], cluster: u32, attr: u32) -> Option<Option<u64>> {
+    use smctl::simple_matter::tlv::{TlvReader, TlvValue};
+    let it = items
+        .iter()
+        .find(|i| i.cluster == Some(cluster) && i.attribute == Some(attr))?;
+    let ReadOutcome::Data(raw) = &it.outcome else {
+        return Some(None);
+    };
+    let mut r = TlvReader::new(raw);
+    Some(match r.read_next() {
+        Ok(Some(e)) => match e.value {
+            TlvValue::UnsignedInteger(v) => Some(v),
+            _ => None,
+        },
+        _ => None,
+    })
 }
 
 /// 具象属性パス。
@@ -1340,6 +1927,56 @@ mod tests {
         let v = item_value(&s, 0).unwrap();
         assert_eq!(v.value["status"], "UnsupportedAttribute");
         assert_eq!(v.raw_hex, "");
+    }
+
+    #[test]
+    fn window_response_shape() {
+        let w = smctl::ops::embed::WindowInfo {
+            timeout_s: 300,
+            discriminator: 3840,
+            passcode: 1234567,
+            manual_code: "12345678901".into(),
+            qr_payload: "MT:ABC".into(),
+            vendor_id: 0xFFF1,
+            product_id: 0x8001,
+        };
+        let v = window_json(33, &w, 1_000);
+        for k in [
+            "manual_code",
+            "qr_payload",
+            "discriminator",
+            "passcode",
+            "expires_at",
+        ] {
+            assert!(v.get(k).is_some(), "missing {k}");
+        }
+        assert_eq!(v["expires_at"], 1_300);
+        assert_eq!(v["passcode"], 1234567);
+        assert_eq!(v["passcode_str"], "01234567");
+        assert_eq!(v["discriminator"], 3840);
+        assert_eq!(v["node_id"], 33);
+    }
+
+    #[test]
+    fn uint_items_and_phase_names() {
+        let mut buf = [0u8; 8];
+        let mut w = TlvWriter::new(&mut buf);
+        w.write_u8(&TlvTag::ContextSpecific(2), 1).unwrap();
+        let raw = w.written().to_vec();
+        let items = vec![ReadItem {
+            endpoint: Some(0),
+            cluster: Some(0x3C),
+            attribute: Some(0),
+            list_append: false,
+            data_version: None,
+            outcome: ReadOutcome::Data(raw),
+        }];
+        assert_eq!(item_uint(&items, 0x3C, 0), Some(Some(1)));
+        assert_eq!(item_uint(&items, 0x3C, 1), None);
+        assert_eq!(phase_info(Phase::Idle), None);
+        assert_eq!(phase_info(Phase::Pase).unwrap().0, "pase");
+        assert!(admin_cluster_status(Some(2)).contains("already open"));
+        assert_eq!(admin_cluster_status(None), "");
     }
 
     #[test]

@@ -1,23 +1,34 @@
-//! REST ハンドラ(設計 doc §6 の W1 部分集合)と同梱 UI の配信。
+//! REST ハンドラ(設計 doc §6)と同梱 UI の配信。
+//!
+//! W3: `POST /api/pairing`(即 `{op_id}` を返し、進捗は WS の `progress`)、
+//! `DELETE/PATCH /api/nodes/{id}`(unpair / ラベル)、`/api/nodes/{id}/window`(Share)、
+//! `GET /api/discover/commissionable`。mDNS ブラウズは ControllerStack を使わないので
+//! コントローラスレッドを塞がないよう `spawn_blocking` で行う。
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use smctl::runner::mdns::{self, CommissionableInfo};
 
 use crate::model::AttrPath;
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
-use crate::ctrl::{Command, CtrlHandle};
-use crate::error::ApiError;
+use crate::ctrl::{Command, CtrlHandle, PairJob, PairTarget};
+use crate::error::{ApiError, ErrorCode};
+use crate::model::Event;
+use crate::onboarding::Disc;
+use crate::pairing::{check_label, parse_pair_request, parse_window_request, PairMethod};
 use crate::value::{
     args_to_fields, clusters_json, from_hex, parse_endpoint, parse_id, resolve_attr,
     resolve_cluster, resolve_cmd,
 };
+use smctl::log::Level;
 
 type ApiResult = Result<Json<Value>, ApiError>;
 
@@ -32,6 +43,14 @@ impl IntoResponse for ApiError {
 const INDEX_HTML: &str = include_str!("static/index.html");
 const APP_JS: &str = include_str!("static/app.js");
 const APP_CSS: &str = include_str!("static/app.css");
+const QRCODE_JS: &str = include_str!("static/qrcode.js");
+
+/// pairing の HTTP 側待ち時間(BLE-WiFi は scan + BLE 90 s + join 待ち 120 s + UDP 30 s)。
+const PAIR_WAIT: Duration = Duration::from_secs(600);
+/// on-network pairing の commissionable ブラウズ窓(デバイスの再 announce 30 s を拾える長さ)。
+const PAIR_BROWSE_TIMEOUT: Duration = Duration::from_secs(35);
+/// `GET /api/discover/commissionable` の既定スキャン秒数。
+const DISCOVER_DEFAULT_S: u64 = 5;
 
 /// ルータを組み立てる。
 pub fn router(h: CtrlHandle) -> Router {
@@ -41,7 +60,17 @@ pub fn router(h: CtrlHandle) -> Router {
         .route("/app.css", get(app_css))
         .route("/api/info", get(info))
         .route("/api/nodes", get(list_nodes))
-        .route("/api/nodes/:id", get(get_node))
+        .route("/qrcode.js", get(qrcode_js))
+        .route(
+            "/api/nodes/:id",
+            get(get_node).delete(unpair).patch(patch_node),
+        )
+        .route(
+            "/api/nodes/:id/window",
+            get(window_status).post(open_window).delete(revoke_window),
+        )
+        .route("/api/pairing", post(pairing))
+        .route("/api/discover/commissionable", get(discover_commissionable))
         .route("/api/nodes/:id/connect", post(connect))
         .route("/api/nodes/:id/describe", post(describe))
         .route("/api/nodes/:id/watch", post(watch_add).delete(watch_remove))
@@ -72,6 +101,13 @@ async fn app_js() -> impl IntoResponse {
 
 async fn app_css() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], APP_CSS)
+}
+
+async fn qrcode_js() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        QRCODE_JS,
+    )
 }
 
 async fn not_found() -> ApiError {
@@ -278,9 +314,334 @@ async fn clusters() -> ApiResult {
     Ok(Json(clusters_json()))
 }
 
+// ---------------------------------------------------------------------------
+// W3: unpair / label / Share / pairing / discover
+// ---------------------------------------------------------------------------
+
+/// `DELETE /api/nodes/{id}[?force=1]`: RemoveFabric + ローカル状態削除。`force` は
+/// デバイスへ触らずにローカル状態(nodes.tlv / resume / smweb.json)だけを消す。
+async fn unpair(
+    State(h): State<CtrlHandle>,
+    Path(id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let node_id = parse_id(&id)?;
+    h.call(Command::Unpair {
+        node_id,
+        force: flag(&q, "force"),
+    })
+    .await
+    .map(Json)
+}
+
+/// `PATCH /api/nodes/{id}` `{label}`。
+pub fn parse_label_body(body: &Value) -> Result<String, ApiError> {
+    match body.get("label") {
+        Some(Value::String(s)) => check_label(s),
+        Some(Value::Null) => Ok(String::new()),
+        _ => Err(ApiError::bad_request("body must be {\"label\": \"...\"}")),
+    }
+}
+
+async fn patch_node(State(h): State<CtrlHandle>, Path(id): Path<String>, body: Bytes) -> ApiResult {
+    let node_id = parse_id(&id)?;
+    let label = parse_label_body(&parse_body(&body)?)?;
+    h.call(Command::SetLabel { node_id, label }).await.map(Json)
+}
+
+async fn window_status(State(h): State<CtrlHandle>, Path(id): Path<String>) -> ApiResult {
+    let node_id = parse_id(&id)?;
+    h.call(Command::WindowStatus { node_id }).await.map(Json)
+}
+
+async fn open_window(
+    State(h): State<CtrlHandle>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult {
+    let node_id = parse_id(&id)?;
+    let (timeout_s, discriminator, passcode) = parse_window_request(&parse_body(&body)?)?;
+    h.call(Command::OpenWindow {
+        node_id,
+        timeout_s,
+        discriminator,
+        passcode,
+    })
+    .await
+    .map(Json)
+}
+
+async fn revoke_window(State(h): State<CtrlHandle>, Path(id): Path<String>) -> ApiResult {
+    let node_id = parse_id(&id)?;
+    h.call(Command::Revoke { node_id }).await.map(Json)
+}
+
+/// commissionable ノード 1 件の JSON。
+fn commissionable_json(c: &CommissionableInfo) -> Value {
+    json!({
+        "instance": c.instance,
+        "discriminator": c.discriminator,
+        "vendor_id": c.vendor_product.map(|v| v.0),
+        "product_id": c.vendor_product.map(|v| v.1),
+        "commissioning_mode": c.commissioning_mode,
+        "port": c.port,
+        "addrs": c.addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+    })
+}
+
+/// `GET /api/discover/commissionable[?timeout=5][&discriminator=N]`。
+async fn discover_commissionable(Query(q): Query<HashMap<String, String>>) -> ApiResult {
+    let secs = match q.get("timeout").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        None => DISCOVER_DEFAULT_S,
+        Some(s) => s
+            .parse::<u64>()
+            .ok()
+            .filter(|t| (1..=60).contains(t))
+            .ok_or_else(|| ApiError::bad_request("timeout must be 1..=60 seconds"))?,
+    };
+    let disc = match q
+        .get("discriminator")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        None => None,
+        Some(s) => Some(
+            parse_id(s)
+                .ok()
+                .filter(|d| *d <= 0x0FFF)
+                .ok_or_else(|| ApiError::bad_request("discriminator must be 0..=4095"))?
+                as u16,
+        ),
+    };
+    let list = tokio::task::spawn_blocking(move || {
+        mdns::browse_commissionable_nodes(disc, Duration::from_secs(secs), |_| false)
+    })
+    .await
+    .map_err(|e| ApiError::new(ErrorCode::Internal, format!("discover task: {e}")))?
+    .map_err(|e| ApiError::new(ErrorCode::Internal, e))?;
+    Ok(Json(json!({
+        "timeout_s": secs,
+        "nodes": list.iter().map(commissionable_json).collect::<Vec<_>>(),
+    })))
+}
+
+/// `POST /api/pairing`: 検証してすぐ `{op_id}` を返す。進捗は WS の `progress`。
+async fn pairing(State(h): State<CtrlHandle>, body: Bytes) -> ApiResult {
+    let req = parse_pair_request(&parse_body(&body)?, cfg!(feature = "ble"))?;
+    if let Some(id) = req.node_id {
+        if h.snapshot().node(id).is_some() {
+            return Err(ApiError::bad_request(format!(
+                "node id {id} ({id:#x}) is already in the address book"
+            )));
+        }
+    }
+    let op_id = h.next_op_id();
+    let resp = json!({
+        "op_id": op_id,
+        "method": req.method.name(),
+        "node_id": req.node_id,
+        "code": req.code,
+    });
+    tokio::spawn(run_pairing(h, op_id, req));
+    Ok(Json(resp))
+}
+
+/// on-network pairing の commissionable 探索(ブロッキング)。
+fn find_commissionable(disc: Option<Disc>) -> Result<CommissionableInfo, String> {
+    let want = |c: &CommissionableInfo| {
+        !c.addrs.is_empty()
+            && match disc {
+                None => true,
+                Some(d) => c.discriminator.is_some_and(|x| d.matches(x)),
+            }
+    };
+    let found =
+        mdns::browse_commissionable_nodes(disc.and_then(Disc::long), PAIR_BROWSE_TIMEOUT, |c| {
+            want(c)
+        })?;
+    found.into_iter().find(|c| want(c)).ok_or_else(|| {
+        format!(
+            "no commissionable device{} found within {}s (is the device in commissioning mode?)",
+            match disc {
+                Some(Disc::Long(d)) => format!(" with discriminator {d}"),
+                Some(Disc::Short(s)) => format!(" with short discriminator {s}"),
+                None => String::new(),
+            },
+            PAIR_BROWSE_TIMEOUT.as_secs()
+        )
+    })
+}
+
+/// pairing の非同期本体: (on-network なら)探索 → Command::Pair → 終端イベント。
+async fn run_pairing(h: CtrlHandle, op_id: u64, req: crate::pairing::PairRequest) {
+    let fail = |h: &CtrlHandle, msg: String, node_id: Option<u64>| {
+        wlog!(Level::Warn, "pairing op {op_id} failed: {msg}");
+        h.emit(Event::Progress {
+            op_id,
+            phase: "failed".into(),
+            detail: msg.clone(),
+            node_id,
+            error: Some(msg),
+            result: None,
+            ts: crate::model::unix_now_ms(),
+        });
+    };
+    wlog!(
+        Level::Info,
+        "pairing op {op_id}: {} requested",
+        req.method.name()
+    );
+    h.emit(Event::progress(
+        op_id,
+        "queued",
+        format!("pairing ({})", req.method.name()),
+        req.node_id,
+    ));
+    let target = match req.method {
+        PairMethod::OnNetwork { disc } => {
+            h.emit(Event::progress(
+                op_id,
+                "discover",
+                match disc {
+                    Some(Disc::Long(d)) => {
+                        format!("browsing _matterc._udp for discriminator {d}...")
+                    }
+                    Some(Disc::Short(s)) => {
+                        format!("browsing _matterc._udp for short discriminator {s}...")
+                    }
+                    None => "browsing _matterc._udp for any commissionable device...".into(),
+                },
+                req.node_id,
+            ));
+            match tokio::task::spawn_blocking(move || find_commissionable(disc)).await {
+                Ok(Ok(c)) => {
+                    let addr = c.preferred_addr().expect("filtered on non-empty addrs");
+                    wlog!(
+                        Level::Info,
+                        "pairing op {op_id}: found commissionable {} at {addr}",
+                        c.instance
+                    );
+                    h.emit(Event::progress(
+                        op_id,
+                        "found",
+                        format!(
+                            "{} at {addr} (discriminator {}{})",
+                            c.instance,
+                            c.discriminator
+                                .map(|d| d.to_string())
+                                .unwrap_or_else(|| "?".into()),
+                            c.vendor_product
+                                .map(|(v, p)| format!(", vid/pid {v:#06x}/{p:#06x}"))
+                                .unwrap_or_default()
+                        ),
+                        req.node_id,
+                    ));
+                    PairTarget::Udp(addr)
+                }
+                Ok(Err(e)) => return fail(&h, e, req.node_id),
+                Err(e) => return fail(&h, format!("discover task: {e}"), req.node_id),
+            }
+        }
+        PairMethod::Address { addr } => PairTarget::Udp(addr),
+        PairMethod::BleWifi {
+            disc,
+            ssid,
+            password,
+        } => PairTarget::Ble {
+            discriminator: ble_disc(&h, op_id, disc, req.node_id),
+            wifi: Some((ssid, password)),
+            thread: None,
+        },
+        PairMethod::BleThread { disc, dataset } => PairTarget::Ble {
+            discriminator: ble_disc(&h, op_id, disc, req.node_id),
+            wifi: None,
+            thread: Some(dataset),
+        },
+    };
+    let job = PairJob {
+        node_id: req.node_id,
+        label: req.label,
+        passcode: req.passcode,
+        target,
+    };
+    match h.call_with(Command::Pair { op_id, job }, PAIR_WAIT).await {
+        Ok(v) => {
+            let node_id = v["node_id"].as_u64();
+            wlog!(Level::Info, "pairing op {op_id}: done ({v})");
+            let detail = match v["warning"].as_str() {
+                Some(w) => w.to_string(),
+                None => format!(
+                    "node {} commissioned and online",
+                    node_id.map(|n| n.to_string()).unwrap_or_default()
+                ),
+            };
+            h.emit(Event::Progress {
+                op_id,
+                phase: "done".into(),
+                detail,
+                node_id,
+                error: None,
+                result: Some(v),
+                ts: crate::model::unix_now_ms(),
+            });
+        }
+        Err(e) => fail(&h, e.message, req.node_id),
+    }
+}
+
+/// BLE スキャンの discriminator(long のみ。manual code の short は照合できないので任意)。
+fn ble_disc(h: &CtrlHandle, op_id: u64, disc: Option<Disc>, node_id: Option<u64>) -> Option<u16> {
+    match disc {
+        Some(Disc::Long(d)) => Some(d),
+        Some(Disc::Short(s)) => {
+            h.emit(Event::progress(
+                op_id,
+                "note",
+                format!(
+                    "manual code carries only the short discriminator ({s}); the BLE scan \
+                     accepts the first commissionable device"
+                ),
+                node_id,
+            ));
+            None
+        }
+        None => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn label_body_parsing() {
+        assert_eq!(
+            parse_label_body(&json!({"label": " Kitchen "})).unwrap(),
+            "Kitchen"
+        );
+        assert_eq!(parse_label_body(&json!({"label": null})).unwrap(), "");
+        assert!(parse_label_body(&json!({})).is_err());
+        assert!(parse_label_body(&json!({"label": 3})).is_err());
+        assert!(parse_label_body(&json!({"label": "x".repeat(65)})).is_err());
+    }
+
+    #[test]
+    fn commissionable_entry_json() {
+        let c = CommissionableInfo {
+            instance: "ABCDEF0123456789".into(),
+            discriminator: Some(3840),
+            vendor_product: Some((0xFFF1, 0x8001)),
+            commissioning_mode: Some(2),
+            port: 5540,
+            addrs: vec!["192.168.8.163:5540".parse().unwrap()],
+        };
+        let v = commissionable_json(&c);
+        assert_eq!(v["discriminator"], 3840);
+        assert_eq!(v["vendor_id"], 0xFFF1);
+        assert_eq!(v["product_id"], 0x8001);
+        assert_eq!(v["addrs"][0], "192.168.8.163:5540");
+        assert_eq!(v["commissioning_mode"], 2);
+    }
 
     #[test]
     fn watch_body_parsing() {

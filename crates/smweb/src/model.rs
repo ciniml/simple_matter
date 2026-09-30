@@ -314,6 +314,35 @@ pub enum Event {
     SubLost { node_id: u64, sub_id: u32 },
     /// watch パスの変更。
     Watch { node_id: u64, watch: Vec<AttrPath> },
+    /// 長時間操作(pairing)の進捗。`phase` が `done` / `failed` で終端。
+    Progress {
+        op_id: u64,
+        phase: String,
+        detail: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        node_id: Option<u64>,
+        /// `failed` の理由。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        /// `done` の結果(接続結果など)。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result: Option<Value>,
+        /// UNIX ミリ秒。
+        ts: u64,
+    },
+    /// ノードの追加(pairing 成功)。
+    NodeAdded { node: Box<NodeSnap> },
+    /// ノードの削除(unpair)。
+    NodeRemoved { node_id: u64 },
+    /// ラベルの変更。
+    NodeLabel { node_id: u64, label: String },
+    /// コミッショニングウィンドウの開閉(Share)。
+    Window {
+        node_id: u64,
+        open: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        window: Option<Value>,
+    },
     Log {
         level: &'static str,
         tag: String,
@@ -324,6 +353,24 @@ pub enum Event {
 }
 
 impl Event {
+    /// 進捗イベント(途中経過)。
+    pub fn progress(
+        op_id: u64,
+        phase: &str,
+        detail: impl Into<String>,
+        node_id: Option<u64>,
+    ) -> Self {
+        Event::Progress {
+            op_id,
+            phase: phase.to_string(),
+            detail: detail.into(),
+            node_id,
+            error: None,
+            result: None,
+            ts: unix_now_ms(),
+        }
+    }
+
     /// 値キャッシュ要素から `Attr` を作る。
     pub fn attr(node_id: u64, v: &AttrValue) -> Self {
         Event::Attr {
@@ -373,6 +420,39 @@ mod tests {
         assert_eq!(v["state"], "online");
         assert_eq!(v["node_id"], 5);
         assert!(v.get("error").is_none());
+    }
+
+    #[test]
+    fn progress_and_node_events_json() {
+        let v =
+            serde_json::to_value(Event::progress(7, "pase", "PASE handshake", Some(34))).unwrap();
+        assert_eq!(v["type"], "progress");
+        assert_eq!(v["op_id"], 7);
+        assert_eq!(v["phase"], "pase");
+        assert_eq!(v["node_id"], 34);
+        assert!(v.get("error").is_none() && v.get("result").is_none());
+        let v = serde_json::to_value(Event::NodeAdded {
+            node: Box::new(NodeSnap::new(34, "AirQ".into(), None)),
+        })
+        .unwrap();
+        assert_eq!(v["type"], "node_added");
+        assert_eq!(v["node"]["node_id"], 34);
+        assert_eq!(v["node"]["state"], "offline");
+        let v = serde_json::to_value(Event::NodeLabel {
+            node_id: 34,
+            label: "Kitchen".into(),
+        })
+        .unwrap();
+        assert_eq!(v["type"], "node_label");
+        assert_eq!(v["label"], "Kitchen");
+        let v = serde_json::to_value(Event::Window {
+            node_id: 33,
+            open: false,
+            window: None,
+        })
+        .unwrap();
+        assert_eq!(v["type"], "window");
+        assert!(v.get("window").is_none());
     }
 
     fn av(

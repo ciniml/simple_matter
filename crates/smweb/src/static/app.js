@@ -1,5 +1,6 @@
-// smweb UI (W2): Dashboard / Devices / Log, live from the WebSocket.
-// Plain ES2020, no build step, no external dependencies.
+// smweb UI (W3): Dashboard / Devices / Pair / Log, live from the WebSocket.
+// Plain ES2020, no build step. The only dependency is the vendored MIT QR generator
+// (/qrcode.js, global `qrcode`) used by the Share panel.
 "use strict";
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -314,7 +315,10 @@ function nodeRow(n) {
     showNodeResult(n.node_id, `describe`, r);
     describe.disabled = false;
   } });
-  row.append(connect, describe);
+  const rename = el("button", { type: "button", class: "small secondary", text: "Rename", onclick: () => openRename(n.node_id) });
+  const share = el("button", { type: "button", class: "small secondary", text: "Share", title: "open a commissioning window for another controller", onclick: () => openShare(n.node_id) });
+  const unpairBtn = el("button", { type: "button", class: "small danger", text: "Unpair", onclick: () => openUnpair(n.node_id) });
+  row.append(connect, describe, rename, share, unpairBtn);
   return row;
 }
 
@@ -533,7 +537,7 @@ function renderDevices() {
   const list = $("#node-list");
   list.textContent = "";
   const all = [...nodes.values()].sort((a, b) => a.node_id - b.node_id);
-  if (all.length === 0) list.appendChild(el("p", { class: "muted", text: "No paired nodes (commission with smctl first)." }));
+  if (all.length === 0) list.appendChild(el("p", { class: "muted", text: "No paired nodes (commission one from the Pair tab)." }));
   for (const n of all) renderNodePanel(n.node_id);
   for (const sel of document.querySelectorAll(".node-select")) {
     const prev = sel.value;
@@ -643,6 +647,561 @@ $("#log-attr").addEventListener("change", rerenderLog);
 $("#log-clear").addEventListener("click", () => { logLines.length = 0; rerenderLog(); });
 
 // ---------------------------------------------------------------------------
+// Modal (in-page; no window.confirm)
+// ---------------------------------------------------------------------------
+
+let modalClose = null;
+
+function openModal(title, body, onClose) {
+  if (modalClose) modalClose();
+  $("#modal-title").textContent = title;
+  const b = $("#modal-body");
+  b.textContent = "";
+  b.appendChild(body);
+  $("#modal").hidden = false;
+  modalClose = () => {
+    modalClose = null;
+    $("#modal").hidden = true;
+    $("#modal-body").textContent = "";
+    if (onClose) onClose();
+  };
+  const first = b.querySelector("input, select, button");
+  if (first) first.focus();
+}
+
+function closeModal() {
+  if (modalClose) modalClose();
+}
+
+$("#modal-x").addEventListener("click", closeModal);
+$("#modal").addEventListener("click", (ev) => { if (ev.target.id === "modal") closeModal(); });
+document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && modalClose) closeModal(); });
+
+// ---------------------------------------------------------------------------
+// Devices: rename / unpair
+// ---------------------------------------------------------------------------
+
+function openRename(nodeId) {
+  const n = nodes.get(nodeId);
+  if (!n) return;
+  const input = el("input", { value: n.label || "", maxlength: "64", placeholder: "label (empty to clear)" });
+  const msg = el("div", { class: "err small" });
+  const save = el("button", { type: "submit", text: "Save" });
+  const form = el("form", { class: "plain", onsubmit: async (ev) => {
+    ev.preventDefault();
+    save.disabled = true;
+    const r = await api("PATCH", `/api/nodes/${nodeId}`, { label: input.value });
+    save.disabled = false;
+    if (!r.ok) {
+      msg.textContent = errText(r);
+      return;
+    }
+    const m = nodes.get(nodeId);
+    if (m) m.label = r.data.label;
+    renderDevices();
+    scheduleDashboard();
+    closeModal();
+  } },
+    el("label", {}, `Label for node ${nodeId} (${hex(nodeId)})`, input),
+    msg,
+    el("div", { class: "modal-actions" }, el("button", { type: "button", class: "secondary", text: "Cancel", onclick: closeModal }), save),
+  );
+  openModal("Rename node", form);
+}
+
+function openUnpair(nodeId) {
+  const n = nodes.get(nodeId);
+  if (!n) return;
+  const msg = el("div", { class: "err small" });
+  const status = el("div", { class: "muted small" });
+  const cancel = el("button", { type: "button", class: "secondary", text: "Cancel", onclick: closeModal });
+  const go = el("button", { type: "button", class: "danger", text: "Unpair" });
+  const force = el("button", { type: "button", class: "danger", text: "Remove locally only", hidden: true });
+  const run = async (forced) => {
+    go.disabled = true;
+    force.disabled = true;
+    cancel.disabled = true;
+    msg.textContent = "";
+    status.textContent = forced ? "Removing local state..." : "Sending RemoveFabric to the device...";
+    const r = await api("DELETE", `/api/nodes/${nodeId}` + (forced ? "?force=1" : ""));
+    go.disabled = false;
+    force.disabled = false;
+    cancel.disabled = false;
+    status.textContent = "";
+    if (!r.ok) {
+      msg.textContent = errText(r);
+      force.hidden = false;
+      return;
+    }
+    removeNodeLocal(nodeId);
+    closeModal();
+  };
+  go.onclick = () => run(false);
+  force.onclick = () => run(true);
+  openModal("Unpair node", el("div", {},
+    el("p", { class: "modal-body-text" },
+      "Remove ", el("b", { text: nodeTitle(n) }), ` (node ${nodeId}, ${hex(nodeId)}) from this fabric? `,
+      "This sends RemoveFabric to the device and deletes it from the address book (nodes.tlv) and smweb.json."),
+    el("p", { class: "muted small", text: "If the device is unreachable, the request fails; you can then remove it locally only (the device keeps its fabric entry)." }),
+    status, msg,
+    el("div", { class: "modal-actions" }, cancel, force, go),
+  ));
+}
+
+function removeNodeLocal(nodeId) {
+  nodes.delete(nodeId);
+  values.delete(nodeId);
+  expanded.delete(nodeId);
+  renderDashboard();
+  renderDevices();
+}
+
+// ---------------------------------------------------------------------------
+// Share: commissioning window + manual code + QR
+// ---------------------------------------------------------------------------
+
+/** Active share panel: { nodeId, timer, window } */
+let share = null;
+
+function fmtManual(code) {
+  const c = String(code || "");
+  return c.length === 11 ? `${c.slice(0, 4)}-${c.slice(4, 7)}-${c.slice(7)}` : c;
+}
+
+function qrSvg(text) {
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg");
+  if (typeof qrcode !== "function") {
+    svg.setAttribute("viewBox", "0 0 10 10");
+    return svg;
+  }
+  const q = qrcode(0, "M");
+  // Matter QR payloads use the base38 alphabet (0-9 A-Z - .) plus "MT:", all in the
+  // QR alphanumeric set.
+  q.addData(text, /^[0-9A-Z $%*+\-./:]*$/.test(text) ? "Alphanumeric" : "Byte");
+  q.make();
+  const n = q.getModuleCount();
+  const m = 4; // quiet zone
+  svg.setAttribute("viewBox", `0 0 ${n + 2 * m} ${n + 2 * m}`);
+  svg.setAttribute("shape-rendering", "crispEdges");
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", `QR code: ${text}`);
+  const bg = document.createElementNS(NS, "rect");
+  bg.setAttribute("width", String(n + 2 * m));
+  bg.setAttribute("height", String(n + 2 * m));
+  bg.setAttribute("fill", "#fff");
+  svg.appendChild(bg);
+  let d = "";
+  for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) if (q.isDark(r, c)) d += `M${c + m} ${r + m}h1v1h-1z`;
+  const path = document.createElementNS(NS, "path");
+  path.setAttribute("d", d);
+  path.setAttribute("fill", "#000");
+  svg.appendChild(path);
+  return svg;
+}
+
+function openShare(nodeId) {
+  const n = nodes.get(nodeId);
+  if (!n) return;
+  const body = el("div", { class: "share" });
+  share = { nodeId, timer: null, body };
+  openModal(`Share ${nodeTitle(n)} (node ${nodeId})`, body, () => {
+    if (share && share.timer) clearInterval(share.timer);
+    share = null;
+  });
+  renderShareIdle("Checking the current window state...");
+  refreshShareStatus();
+}
+
+async function refreshShareStatus() {
+  if (!share) return;
+  const id = share.nodeId;
+  const r = await api("GET", `/api/nodes/${id}/window`);
+  if (!share || share.nodeId !== id) return;
+  if (!r.ok) {
+    renderShareIdle(`Could not read the window state: ${errText(r)}`, true);
+    return;
+  }
+  if (r.data.open && r.data.window) renderShareOpen(r.data.window);
+  else if (r.data.open) renderShareForeign(r.data);
+  else renderShareIdle("No commissioning window is open.");
+}
+
+function renderShareIdle(note, isErr = false) {
+  if (!share) return;
+  if (share.timer) clearInterval(share.timer);
+  share.timer = null;
+  const b = share.body;
+  b.textContent = "";
+  const sel = el("select", {},
+    ...[[180, "3 minutes"], [300, "5 minutes"], [600, "10 minutes"], [900, "15 minutes"]].map(([v, t]) => el("option", { value: String(v), text: t, selected: v === 300 })));
+  const msg = el("div", { class: "err small" });
+  const open = el("button", { type: "button", text: "Open window" });
+  open.onclick = async () => {
+    open.disabled = true;
+    msg.textContent = "";
+    const id = share.nodeId;
+    const r = await api("POST", `/api/nodes/${id}/window`, { timeout_s: Number(sel.value) });
+    open.disabled = false;
+    if (!share || share.nodeId !== id) return;
+    if (!r.ok) {
+      msg.textContent = errText(r);
+      return;
+    }
+    renderShareOpen(r.data);
+  };
+  b.append(
+    el("p", { class: isErr ? "err small" : "muted small", text: note }),
+    el("p", { class: "modal-body-text", text: "Open an enhanced commissioning window (random passcode) so a second controller (phone app, Tab5, chip-tool, another smweb) can add this device to its fabric." }),
+    el("label", { class: "inline" }, "Window timeout", sel),
+    msg,
+    el("div", { class: "modal-actions" }, el("button", { type: "button", class: "secondary", text: "Close", onclick: closeModal }), open),
+  );
+}
+
+function renderShareForeign(st) {
+  if (!share) return;
+  const b = share.body;
+  b.textContent = "";
+  const msg = el("div", { class: "err small" });
+  const revoke = el("button", { type: "button", class: "danger", text: "Revoke" });
+  revoke.onclick = () => doRevoke(revoke, msg);
+  b.append(
+    el("p", { class: "modal-body-text", text: `A commissioning window is open (${st.window_status_name}, opened by fabric index ${st.admin_fabric_index ?? "?"}), but its code was not issued by this smweb.` }),
+    msg,
+    el("div", { class: "modal-actions" }, el("button", { type: "button", class: "secondary", text: "Refresh", onclick: refreshShareStatus }), revoke),
+  );
+}
+
+async function doRevoke(btn, msg) {
+  if (!share) return;
+  const id = share.nodeId;
+  btn.disabled = true;
+  const r = await api("DELETE", `/api/nodes/${id}/window`);
+  btn.disabled = false;
+  if (!share || share.nodeId !== id) return;
+  if (!r.ok) {
+    msg.textContent = errText(r);
+    return;
+  }
+  renderShareIdle("Window revoked.");
+}
+
+function renderShareOpen(w) {
+  if (!share) return;
+  if (share.timer) clearInterval(share.timer);
+  const b = share.body;
+  b.textContent = "";
+  const countdown = el("div", { class: "share-countdown" });
+  const tick = () => {
+    const left = Math.max(0, Math.round(w.expires_at - Date.now() / 1000));
+    if (left > 0) {
+      countdown.textContent = `Window open: ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")} remaining`;
+      countdown.classList.remove("expired");
+    } else {
+      countdown.textContent = "Window expired.";
+      countdown.classList.add("expired");
+      clearInterval(share.timer);
+      share.timer = null;
+    }
+  };
+  const msg = el("div", { class: "err small" });
+  const revoke = el("button", { type: "button", class: "danger", text: "Revoke" });
+  revoke.onclick = () => doRevoke(revoke, msg);
+  const pass = w.passcode_str || String(w.passcode).padStart(8, "0");
+  b.append(
+    el("div", { class: "muted small", text: "Manual pairing code" }),
+    el("div", { class: "share-code", text: fmtManual(w.manual_code) }),
+    w.qr_payload ? el("div", { class: "share-qr" }, qrSvg(w.qr_payload)) : "",
+    w.qr_payload ? el("div", { class: "share-payload mono small", text: w.qr_payload }) : "",
+    countdown,
+    el("div", { class: "kv", style: "margin-top:10px" },
+      el("span", { class: "muted", text: "Discriminator" }), el("span", { class: "mono", text: String(w.discriminator) }),
+      el("span", { class: "muted", text: "Passcode" }), el("span", { class: "mono", text: pass }),
+      el("span", { class: "muted", text: "VID / PID" }), el("span", { class: "mono", text: `${hex(w.vendor_id)} / ${hex(w.product_id)}` }),
+      el("span", { class: "muted", text: "Expires" }), el("span", { text: new Date(w.expires_at * 1000).toLocaleTimeString() }),
+    ),
+    msg,
+    el("div", { class: "modal-actions" },
+      el("button", { type: "button", class: "secondary", text: "Refresh state", onclick: refreshShareStatus }),
+      el("button", { type: "button", class: "secondary", text: "Close", onclick: closeModal }),
+      revoke),
+  );
+  tick();
+  share.timer = setInterval(tick, 1000);
+}
+
+// ---------------------------------------------------------------------------
+// Pair: setup-code preview (client-side decode; the server re-validates)
+// ---------------------------------------------------------------------------
+
+const B38 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-.";
+
+function passcodeValid(p) {
+  const bad = [0, 11111111, 22222222, 33333333, 44444444, 55555555, 66666666, 77777777, 88888888, 99999999, 12345678, 87654321];
+  return Number.isInteger(p) && p >= 1 && p <= 99999998 && !bad.includes(p);
+}
+
+function decodeQr(t) {
+  const body = t.slice(3).split("*")[0].toUpperCase();
+  const bytes = [];
+  for (let i = 0; i < body.length;) {
+    const rem = body.length - i;
+    const [chars, nb] = rem >= 5 ? [5, 3] : rem === 4 ? [4, 2] : rem === 2 ? [2, 1] : [0, 0];
+    if (!chars) throw new Error("invalid QR payload length");
+    let v = 0;
+    for (let k = chars - 1; k >= 0; k--) {
+      const d = B38.indexOf(body[i + k]);
+      if (d < 0) throw new Error(`invalid character ${JSON.stringify(body[i + k])}`);
+      v = v * 38 + d;
+    }
+    if (v >= 2 ** (8 * nb)) throw new Error("invalid base38 chunk");
+    for (let k = 0; k < nb; k++) bytes.push(Math.floor(v / 2 ** (8 * k)) % 256);
+    i += chars;
+  }
+  if (bytes.length < 11) throw new Error("QR payload too short");
+  const bits = (off, w) => {
+    let v = 0;
+    for (let i = 0; i < w; i++) if ((bytes[(off + i) >> 3] >> ((off + i) & 7)) & 1) v += 2 ** i;
+    return v;
+  };
+  if (bits(0, 3) !== 0) throw new Error("unsupported QR version");
+  const r = { source: "QR", vid: bits(3, 16), pid: bits(19, 16), caps: bits(37, 8), disc: bits(45, 12), passcode: bits(57, 27) };
+  if (!passcodeValid(r.passcode)) throw new Error("invalid passcode in QR payload");
+  return r;
+}
+
+function verhoeffOk(ds) {
+  const D = [[0,1,2,3,4,5,6,7,8,9],[1,2,3,4,0,6,7,8,9,5],[2,3,4,0,1,7,8,9,5,6],[3,4,0,1,2,8,9,5,6,7],[4,0,1,2,3,9,5,6,7,8],[5,9,8,7,6,0,4,3,2,1],[6,5,9,8,7,1,0,4,3,2],[7,6,5,9,8,2,1,0,4,3],[8,7,6,5,9,3,2,1,0,4],[9,8,7,6,5,4,3,2,1,0]];
+  const P = [[0,1,2,3,4,5,6,7,8,9],[1,5,7,6,2,8,3,0,9,4],[5,8,0,3,7,9,6,1,4,2],[8,9,1,6,0,4,3,5,2,7],[9,4,5,3,1,2,6,8,7,0],[4,2,8,6,5,7,3,9,0,1],[2,7,9,3,8,0,6,4,1,5],[7,0,4,6,9,1,3,2,5,8]];
+  let c = 0;
+  [...ds].reverse().forEach((d, i) => { c = D[c][P[i % 8][d]]; });
+  return c === 0;
+}
+
+function decodeManual(t) {
+  if (/[^0-9\s-]/.test(t)) throw new Error("expected MT:... or an 11/21-digit manual code");
+  const ds = t.replace(/[\s-]/g, "").split("").map(Number);
+  if (ds.length !== 11 && ds.length !== 21) throw new Error(`manual code must have 11 or 21 digits (got ${ds.length})`);
+  if (!verhoeffOk(ds)) throw new Error("check digit mismatch (typo?)");
+  const num = (a, b) => Number(ds.slice(a, b).join(""));
+  const d1 = ds[0];
+  if (d1 > 7) throw new Error("invalid leading digit");
+  const c2 = num(1, 6);
+  const c3 = num(6, 10);
+  const short = ((d1 & 3) << 2) | ((c2 >> 14) & 3);
+  const passcode = c3 * 16384 + (c2 & 0x3fff);
+  if (!passcodeValid(passcode)) throw new Error("invalid passcode in manual code");
+  const r = { source: "manual code", short, passcode };
+  if ((d1 >> 2) & 1) {
+    r.vid = num(10, 15);
+    r.pid = num(15, 20);
+  }
+  return r;
+}
+
+function decodeSetupCode(s) {
+  const t = s.trim();
+  if (!t) return null;
+  return /^mt:/i.test(t) ? decodeQr(t) : decodeManual(t);
+}
+
+function updateCodePreview() {
+  const f = $("#pair-form");
+  const p = $("#code-preview");
+  p.classList.remove("ok", "bad");
+  const v = f.code.value;
+  f.discriminator.disabled = f.passcode.disabled = !!v.trim();
+  if (!v.trim()) {
+    p.textContent = "Paste a QR payload / manual code, or give discriminator + passcode below.";
+    return;
+  }
+  try {
+    const r = decodeSetupCode(v);
+    const parts = [`${r.source}:`];
+    parts.push(r.disc !== undefined ? `discriminator ${r.disc}` : `short discriminator ${r.short} (discriminators ${r.short * 256}..${r.short * 256 + 255})`);
+    parts.push(`passcode ${String(r.passcode).padStart(8, "0")}`);
+    if (r.vid !== undefined) parts.push(`VID/PID ${hex(r.vid)}/${hex(r.pid)}`);
+    if (r.caps !== undefined) {
+      const caps = [];
+      if (r.caps & 1) caps.push("SoftAP");
+      if (r.caps & 2) caps.push("BLE");
+      if (r.caps & 4) caps.push("on-network");
+      parts.push(`discovery: ${caps.join("+") || "none"}`);
+    }
+    p.textContent = parts.join("  ");
+    p.classList.add("ok");
+  } catch (e) {
+    p.textContent = `Invalid code: ${e.message}`;
+    p.classList.add("bad");
+  }
+}
+
+function pairMethod() {
+  const f = $("#pair-form");
+  const m = f.querySelector('input[name="method"]:checked');
+  return m ? m.value : "onnetwork";
+}
+
+function updatePairMethod() {
+  const m = pairMethod();
+  for (const e of document.querySelectorAll("#pair-form [data-show]")) e.hidden = !e.dataset.show.split(" ").includes(m);
+}
+
+function updateBleAvailability() {
+  const ble = !!(info && info.features && info.features.includes("ble"));
+  for (const l of document.querySelectorAll("#pair-form .ble-only")) {
+    const input = l.querySelector("input");
+    input.disabled = !ble;
+    l.classList.toggle("disabled", !ble);
+    l.title = ble ? "" : "BLE not compiled in (build smweb with --features ble)";
+    if (!ble && input.checked) {
+      $('#pair-form input[value="onnetwork"]').checked = true;
+      updatePairMethod();
+    }
+  }
+  $("#ble-note").hidden = ble;
+}
+
+$("#pair-form").code.addEventListener("input", updateCodePreview);
+for (const r of document.querySelectorAll('#pair-form input[name="method"]')) r.addEventListener("change", updatePairMethod);
+
+$("#pair-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const f = ev.target;
+  const m = pairMethod();
+  const body = { method: m };
+  const opt = (k, v) => { if (v !== undefined && String(v).trim() !== "") body[k] = String(v).trim(); };
+  if (f.code.value.trim()) body.code = f.code.value.trim();
+  else {
+    opt("discriminator", f.discriminator.value);
+    opt("passcode", f.passcode.value);
+  }
+  if (m === "address") {
+    opt("ip", f.ip.value);
+    opt("port", f.port.value);
+  }
+  if (m === "ble-wifi") {
+    body.ssid = f.ssid.value;
+    body.password = f.password.value;
+  }
+  if (m === "ble-thread") opt("dataset", f.dataset.value);
+  opt("node_id", f.node_id.value);
+  opt("label", f.label.value);
+  const err = $("#pair-error");
+  err.hidden = true;
+  const btn = $("#pair-start");
+  btn.disabled = true;
+  const r = await api("POST", "/api/pairing", body);
+  btn.disabled = false;
+  if (!r.ok) {
+    err.textContent = errText(r);
+    err.hidden = false;
+    return;
+  }
+  opBlock(r.data.op_id, `${m}${r.data.node_id ? ` -> node ${r.data.node_id}` : ""}${body.label ? ` "${body.label}"` : ""}`);
+});
+
+$("#discover-btn").addEventListener("click", async () => {
+  const btn = $("#discover-btn");
+  const out = $("#discover-result");
+  btn.disabled = true;
+  out.textContent = "Scanning _matterc._udp (5 s)...";
+  const r = await api("GET", "/api/discover/commissionable?timeout=5");
+  btn.disabled = false;
+  out.textContent = "";
+  if (!r.ok) {
+    out.appendChild(el("span", { class: "err", text: errText(r) }));
+    return;
+  }
+  if (!r.data.nodes.length) {
+    out.appendChild(el("span", { class: "muted", text: "No commissionable device found (is a window open / the device in pairing mode?)." }));
+    return;
+  }
+  for (const c of r.data.nodes) {
+    const use = el("button", { type: "button", class: "small", text: "Use", onclick: () => {
+      const f = $("#pair-form");
+      f.code.value = "";
+      updateCodePreview();
+      if (c.discriminator !== null && c.discriminator !== undefined) f.discriminator.value = String(c.discriminator);
+      if (pairMethod() === "address" && c.addrs.length) {
+        const a = c.addrs[0];
+        const i = a.lastIndexOf(":");
+        f.ip.value = a.slice(0, i).replace(/^\[|\]$/g, "");
+        f.port.value = a.slice(i + 1);
+      }
+      f.passcode.focus();
+    } });
+    out.appendChild(el("div", { class: "disc-item" },
+      el("span", { class: "mono", text: `D=${c.discriminator ?? "?"}` }),
+      c.vendor_id !== null && c.vendor_id !== undefined ? el("span", { class: "mono small", text: `${hex(c.vendor_id)}/${hex(c.product_id)}` }) : "",
+      el("span", { class: "small", text: `CM=${c.commissioning_mode ?? "?"}` }),
+      el("span", { class: "mono small muted", text: c.addrs.join(", ") }),
+      el("span", { class: "muted small", text: c.instance }),
+      use));
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Pair: live progress (WS `progress` events keyed by op_id)
+// ---------------------------------------------------------------------------
+
+/** op_id -> { box, lines, badge, done } */
+const ops = new Map();
+const LOG_TAGS_IN_OPS = new Set(["ctl", "dis", "ble", "btp"]);
+
+function opBlock(opId, title) {
+  let o = ops.get(opId);
+  if (o) {
+    if (title) o.title.textContent = `#${opId} ${title}`;
+    return o;
+  }
+  const holder = $("#pair-ops");
+  if (!ops.size) holder.textContent = "";
+  const badge = el("span", { class: "badge running", text: "running" });
+  const titleEl = el("span", { class: "mono", text: `#${opId} ${title || "pairing"}` });
+  const lines = el("div", { class: "op-lines" });
+  const box = el("div", { class: "op" }, el("div", { class: "op-head" }, titleEl, badge), lines);
+  holder.prepend(box);
+  o = { box, lines, badge, title: titleEl, done: false };
+  ops.set(opId, o);
+  return o;
+}
+
+function opLine(o, cls, time, phase, detail) {
+  const atBottom = o.lines.scrollTop + o.lines.clientHeight >= o.lines.scrollHeight - 4;
+  o.lines.appendChild(el("div", { class: `op-line ${cls}` }, el("span", { class: "muted", text: time }), el("span", { text: phase }), el("span", { text: detail })));
+  if (atBottom) o.lines.scrollTop = o.lines.scrollHeight;
+}
+
+function onProgress(ev) {
+  const o = opBlock(ev.op_id);
+  const t = new Date(ev.ts || Date.now()).toLocaleTimeString();
+  opLine(o, ev.phase, t, ev.phase, ev.detail);
+  if (ev.phase === "done") {
+    o.done = true;
+    o.badge.className = "badge ok";
+    o.badge.textContent = ev.result && ev.result.warning ? "commissioned (offline)" : "done";
+    if (ev.node_id) {
+      o.box.querySelector(".op-head").appendChild(el("button", { type: "button", class: "small secondary", text: "Show on Dashboard", onclick: () => showTab("dashboard") }));
+    }
+  } else if (ev.phase === "failed") {
+    o.done = true;
+    o.badge.className = "badge failed";
+    o.badge.textContent = "failed";
+  }
+  appendLog(`${t} [pair] #${ev.op_id} ${ev.phase}: ${ev.detail}`);
+}
+
+/** Forward commissioning-related log lines to the running op (single active op only). */
+function logToOps(ev) {
+  if (!LOG_TAGS_IN_OPS.has(ev.tag)) return;
+  const active = [...ops.values()].filter((o) => !o.done);
+  if (active.length !== 1) return;
+  opLine(active[0], "log", new Date(ev.ts).toLocaleTimeString(), `[${ev.tag}]`, ev.msg);
+}
+
+// ---------------------------------------------------------------------------
 // Snapshot / events
 // ---------------------------------------------------------------------------
 
@@ -655,6 +1214,7 @@ function renderInfo() {
   if (info.error) parts.push(`ERROR: ${info.error}`);
   $("#info").textContent = parts.join(" | ");
   $("#info").title = parts.join("\n");
+  updateBleAvailability();
 }
 
 function setNode(n) {
@@ -749,7 +1309,38 @@ function onEvent(ev) {
       scheduleDashboard();
       break;
     }
+    case "progress":
+      onProgress(ev);
+      break;
+    case "node_added": {
+      setNode(ev.node);
+      renderDashboard();
+      renderDevices();
+      appendLog(`${t} [node] ${ev.node.node_id}: added (${ev.node.label || "no label"})`);
+      break;
+    }
+    case "node_removed":
+      if (nodes.has(ev.node_id)) removeNodeLocal(ev.node_id);
+      if (share && share.nodeId === ev.node_id) closeModal();
+      appendLog(`${t} [node] ${ev.node_id}: removed`);
+      break;
+    case "node_label": {
+      const n = nodes.get(ev.node_id);
+      if (!n) break;
+      n.label = ev.label;
+      renderDevices();
+      scheduleDashboard();
+      break;
+    }
+    case "window":
+      if (share && share.nodeId === ev.node_id) {
+        if (ev.open && ev.window) renderShareOpen(ev.window);
+        else if (!ev.open) renderShareIdle("No commissioning window is open.");
+      }
+      appendLog(`${t} [share] ${ev.node_id}: window ${ev.open ? "opened" : "closed"}`);
+      break;
     case "log":
+      logToOps(ev);
       appendLog(`${new Date(ev.ts).toLocaleTimeString()} [${ev.tag}] ${ev.level !== "info" ? ev.level + ": " : ""}${ev.msg}`);
       break;
     case "lagged":
@@ -804,13 +1395,16 @@ function showTab(name) {
   if (name === "log") $("#log").scrollTop = $("#log").scrollHeight;
 }
 for (const b of document.querySelectorAll("button.tab")) b.addEventListener("click", () => showTab(b.dataset.tab));
+for (const a of document.querySelectorAll("a[data-goto]")) a.addEventListener("click", (ev) => { ev.preventDefault(); showTab(a.dataset.goto); });
 
 (async () => {
   let saved = null;
   try {
     saved = localStorage.getItem("smweb.tab");
   } catch (_) { /* storage unavailable */ }
-  showTab(["dashboard", "devices", "log"].includes(saved) ? saved : "dashboard");
+  showTab(["dashboard", "devices", "pair", "log"].includes(saved) ? saved : "dashboard");
+  updatePairMethod();
+  updateCodePreview();
   const r = await api("GET", "/api/clusters");
   if (r.ok) {
     clusters = r.data;
