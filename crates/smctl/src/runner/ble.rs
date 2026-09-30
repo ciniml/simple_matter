@@ -81,6 +81,39 @@ pub fn pair_ble(
         ca.controller_node_id()
     );
 
+    pair_ble_with_ca(
+        g,
+        &crypto,
+        &ca,
+        node_id,
+        passcode,
+        discriminator,
+        handoff,
+        wifi,
+        thread,
+    )
+    .map(|_| ())
+}
+
+/// 埋め込み用(`smweb`): 呼び出し側が保持する CA で BLE pairing を行う。
+///
+/// [`pair_ble`] との違いは CA をファイルから読み直さないことだけ(同一プロセスで
+/// UDP pairing も行う埋め込み側が、発行済み serial のカウンタを 1 個の [`Ca`] で
+/// 共有するため)。成功時は CA 状態を保存し、アドレス帳へ記帳して、記帳した運用
+/// アドレス(未解決なら port=0 の sentinel)を返す。BLE アダプタは `SM_BLE_ADAPTER`。
+#[allow(clippy::too_many_arguments)]
+pub fn pair_ble_with_ca(
+    g: &Globals,
+    crypto: &Backend,
+    ca: &Ca<Backend>,
+    node_id: u64,
+    passcode: u32,
+    discriminator: Option<u16>,
+    handoff: bool,
+    wifi: Option<(String, String)>,
+    thread: Option<Vec<u8>>,
+) -> Result<SocketAddr, String> {
+    let state = StateDir::open(&g.state_dir)?;
     // attestation ポリシ用の PAA 信頼ストア(--paa-trust-store-path、§8.4)。
     let paa_store: Vec<Vec<u8>> = match &g.paa_trust_store_path {
         Some(dir) => crate::ops::load_paa_store(dir)?,
@@ -92,8 +125,8 @@ pub fn pair_ble(
         .build()
         .map_err(|e| format!("tokio runtime: {e}"))?;
     let recorded = rt.block_on(run_ble(
-        &crypto,
-        &ca,
+        crypto,
+        ca,
         node_id,
         passcode,
         discriminator,
@@ -108,7 +141,7 @@ pub fn pair_ble(
     // 発行済み serial を CA 状態に反映し、アドレス帳へ記帳する。
     {
         let _lock = state.lock()?;
-        ca_state::save(&state.ca_path(), &ca)?;
+        ca_state::save(&state.ca_path(), ca)?;
         nodes::upsert(
             &state.nodes_path(),
             nodes::NodeEntry {
@@ -130,7 +163,7 @@ pub fn pair_ble(
             g.state_dir.display()
         );
     }
-    Ok(())
+    Ok(recorded)
 }
 
 /// BLE 上のコミッショニング本体。記帳すべき運用アドレス(未解決なら port=0 の sentinel)を返す。

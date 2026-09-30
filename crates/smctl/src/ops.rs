@@ -1827,7 +1827,28 @@ pub fn pase_verifier(passcode: u32, salt: Option<Vec<u8>>, iterations: u32) -> R
     Ok(())
 }
 
+thread_local! {
+    /// 埋め込み用のフェーズ通知フック([`set_phase_hook`])。
+    static PHASE_HOOK: std::cell::RefCell<Option<PhaseHook>> = const { std::cell::RefCell::new(None) };
+}
+
+/// コミッショニングのフェーズ遷移を受け取るフック(`smweb` の進捗表示用)。
+pub type PhaseHook = Box<dyn FnMut(Phase)>;
+
+/// 呼び出しスレッドのフェーズ通知フックを設定する(`None` で解除)。前のフックを返す。
+///
+/// UDP / BLE の pairing は遷移ごとにログ行([`report_phase`])を出すが、埋め込み側
+/// (`smweb`)はそれを構造化データとしても受け取る。CLI は設定しないので挙動は不変。
+pub fn set_phase_hook(hook: Option<PhaseHook>) -> Option<PhaseHook> {
+    PHASE_HOOK.with(|h| std::mem::replace(&mut *h.borrow_mut(), hook))
+}
+
 pub(crate) fn report_phase(phase: Phase) {
+    PHASE_HOOK.with(|h| {
+        if let Some(f) = h.borrow_mut().as_mut() {
+            f(phase);
+        }
+    });
     // タグはフェーズの主レイヤに合わせる: PASE/CASE = Secure Channel、
     // クラスタコマンド群 = Interaction Model、開始/終了 = コントローラ。
     let (tag, name) = match phase {

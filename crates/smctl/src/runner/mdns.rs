@@ -287,6 +287,109 @@ pub fn browse_commissionable_list(
     Ok(set.len())
 }
 
+/// commissionable ノード 1 件の所有データ([`browse_commissionable_nodes`] の結果)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommissionableInfo {
+    /// DNS-SD インスタンス名。
+    pub instance: String,
+    /// TXT `D`(12 ビット long discriminator)。
+    pub discriminator: Option<u16>,
+    /// TXT `VP`(Vendor ID, Product ID)。
+    pub vendor_product: Option<(u16, u16)>,
+    /// TXT `CM`(commissioning mode)。
+    pub commissioning_mode: Option<u8>,
+    /// SRV ポート(0 なら既定の 5540 に補完済み)。
+    pub port: u16,
+    /// 接続用アドレス(fe80 は scope 付き)。IPv4 を先頭に並べる。
+    pub addrs: Vec<SocketAddr>,
+}
+
+impl CommissionableInfo {
+    /// 接続先として推す 1 アドレス(IPv4 優先。`browse_commissionable` と同じ規則)。
+    pub fn preferred_addr(&self) -> Option<SocketAddr> {
+        self.addrs.first().copied()
+    }
+}
+
+/// 埋め込み用: `_matterc._udp.local` をブラウズし、見つかった commissionable ノードを
+/// データとして返す(表示しない。重複はインスタンス名で除去)。
+///
+/// `discriminator` 指定時は long discriminator サブタイプでクエリし TXT `D` で絞る。
+/// `stop` が `true` を返したノードが見つかった時点で打ち切る(常に `false` なら
+/// `timeout` いっぱいブラウズする)。
+pub fn browse_commissionable_nodes(
+    discriminator: Option<u16>,
+    timeout: Duration,
+    mut stop: impl FnMut(&CommissionableInfo) -> bool,
+) -> Result<Vec<CommissionableInfo>, String> {
+    let trace = mdns_trace();
+    let socks = MdnsSockets::open().ok_or("open mDNS browse socket failed")?;
+    let build = |buf: &mut [u8; 128], qu: bool| match discriminator {
+        Some(d) => MdnsClient::build_browse_discriminator(buf, d, qu),
+        None => MdnsClient::build_browse_commissionable(buf, qu),
+    };
+    let mut set: CommissionableSet<16> = CommissionableSet::default();
+    let mut out: Vec<CommissionableInfo> = Vec::new();
+    let start = Instant::now();
+    let mut last_query = Instant::now() - MDNS_REQUERY_INTERVAL;
+    let mut rx = [0u8; 1500];
+    while start.elapsed() < timeout {
+        if last_query.elapsed() >= MDNS_REQUERY_INTERVAL {
+            socks.send_query(build);
+            last_query = Instant::now();
+        }
+        match socks.recv(&mut rx) {
+            Some((n, src)) => {
+                let ingest = match discriminator {
+                    Some(d) => set.ingest_filtered(&rx[..n], d),
+                    None => set.ingest(&rx[..n]),
+                };
+                if trace {
+                    dis_trace!("rx {n}B from {src} ingest={ingest:?}");
+                }
+                if ingest != Ingest::Added {
+                    continue;
+                }
+                let Some(node) = set.iter().last() else {
+                    continue;
+                };
+                let port = if node.port != 0 {
+                    node.port
+                } else {
+                    MATTER_PORT
+                };
+                // fe80 の scope は応答を受けた IF を優先する(マルチホームで既定経路と
+                // 別の IF にいるデバイス。無ければ v6 ソケットの scope)。
+                let scope = match src {
+                    SocketAddr::V6(v6) if v6.scope_id() != 0 => Some(v6.scope_id()),
+                    _ => socks.v6_scope,
+                };
+                let mut addrs: Vec<SocketAddr> = node
+                    .addrs
+                    .iter()
+                    .map(|ip| socket_addr_with_scope(*ip, port, scope))
+                    .collect();
+                addrs.sort_by_key(|a| !a.is_ipv4());
+                let info = CommissionableInfo {
+                    instance: String::from_utf8_lossy(node.instance()).into_owned(),
+                    discriminator: node.discriminator,
+                    vendor_product: node.vendor_product,
+                    commissioning_mode: node.commissioning_mode,
+                    port,
+                    addrs,
+                };
+                let done = stop(&info);
+                out.push(info);
+                if done {
+                    break;
+                }
+            }
+            None => std::thread::sleep(MDNS_POLL_SLEEP),
+        }
+    }
+    Ok(out)
+}
+
 /// commissionable ノード 1 件を 1 行で表示する(`--json` では 1 行 JSON)。
 ///
 /// `at` が `Some` のとき(`--at` 経由)は、広告の A/AAAA でなく採用したユニキャスト

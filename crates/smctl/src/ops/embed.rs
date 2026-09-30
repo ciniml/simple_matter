@@ -5,21 +5,28 @@
 //! (キャッシュ → キャッシュアドレス → mDNS 再解決 → resumption 保存)、トランザクション
 //! 待ち、静穏化はすべて CLI と同じ内部実装を共有する。
 
-use std::time::Instant;
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
 use simple_matter::controller::ca::Ca;
+use simple_matter::controller::{OpenWindowParams, DEFAULT_WINDOW_ITERATIONS};
+use simple_matter::discovery::onboarding::{
+    manual_pairing_code, passcode_is_valid, qr_payload, random_passcode, OnboardingPayload,
+    DISCOVERY_CAP_ON_NETWORK, QR_PAYLOAD_MAX_LEN,
+};
 use simple_matter::dm::meta::{AttributeId, ClusterId, CommandId, EndpointId};
 use simple_matter::im::wire::{AttributePath, AttributeReportRef, CommandPath, ImStatus};
 use simple_matter::im::ImEvent;
 use simple_matter::tlv::{TlvTag, TlvWriter};
 use simple_matter::transport::session::SessionId;
 
-use super::{transcode_tlv, write_value, Exec, Parsed};
+use super::{decode_noc_status_code, transcode_tlv, write_value, Exec, Parsed, Target};
 use crate::clusters::ValueKind;
 use crate::log::{logf, Level};
 use crate::runner::udp::send_dir;
 use crate::runner::Backend;
-use crate::state::StateDir;
+use crate::state::{nodes, resume, StateDir};
+use crate::OsRng;
 
 /// Read 結果の 1 要素(AttributeReportIB 1 個)。
 #[derive(Debug, Clone)]
@@ -97,6 +104,25 @@ pub struct SubscribeOutcome {
     pub max_interval_s: u16,
     /// プライミングレポート(購読パスの初期値)。
     pub priming: Vec<ReadItem>,
+}
+
+/// OpenCommissioningWindow で払い出した窓の情報([`Exec::open_window_data`])。
+#[derive(Debug, Clone)]
+pub struct WindowInfo {
+    /// 窓を開けておく秒数。
+    pub timeout_s: u16,
+    /// 窓の 12 ビット discriminator。
+    pub discriminator: u16,
+    /// 払い出した setup passcode。
+    pub passcode: u32,
+    /// 11 桁 manual pairing code。
+    pub manual_code: String,
+    /// QR payload(`MT:...`。VID/PID は BasicInformation から best-effort、取れなければ 0)。
+    pub qr_payload: String,
+    /// QR に載せた VendorID。
+    pub vendor_id: u16,
+    /// QR に載せた ProductID。
+    pub product_id: u16,
 }
 
 /// AttributeReportIB 列を所有データへ写す。
@@ -372,5 +398,201 @@ impl<'a> Exec<'a> {
         };
         self.flush();
         Ok(out)
+    }
+
+    // ------------------------------------------------------------------
+    // pairing / 窓 / unpair(W3、CLI 経路の表示を伴わないデータ版)
+    // ------------------------------------------------------------------
+
+    /// アドレス直指定の UDP コミッショニング(`pairing address` と同じ内部実装)。
+    ///
+    /// `label` / `timeout` はこの呼び出しに限って共通オプションを上書きする。成功時は
+    /// CLI と同じく CA 状態(発行済み serial)を保存し、アドレス帳に記帳し、確立した
+    /// 運用 CASE セッションをキャッシュする。フェーズ遷移は [`super::set_phase_hook`] の
+    /// フックへ通知される。
+    pub fn pair_addr(
+        &mut self,
+        node_id: u64,
+        passcode: u32,
+        addr: SocketAddr,
+        label: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let saved_label = self.g.label.replace(label.to_string());
+        let saved_timeout = std::mem::replace(&mut self.g.timeout, timeout);
+        let r = self.pair(node_id, passcode, &Target::Addr(addr));
+        self.g.label = saved_label;
+        self.g.timeout = saved_timeout;
+        r
+    }
+
+    /// ECM 窓オープン(`admincommissioning open-window` のデータ版)。
+    ///
+    /// passcode 省略時は乱数生成。VID/PID は BasicInformation から best-effort で読む。
+    /// 戻り値の [`InvokeOutcome`] が非成功(窓が既に開いている = Failure + cluster
+    /// status 2(Busy)等)なら [`WindowInfo`] は無効。
+    pub fn open_window_data(
+        &mut self,
+        node_id: u64,
+        timeout_s: u16,
+        discriminator: u16,
+        passcode: Option<u32>,
+    ) -> Result<(InvokeOutcome, WindowInfo), String> {
+        use simple_matter::crypto::Rng as _;
+
+        let passcode = match passcode {
+            Some(p) if !passcode_is_valid(p) => {
+                return Err(format!("invalid setup passcode: {p}"));
+            }
+            Some(p) => p,
+            None => random_passcode(&mut OsRng).map_err(|e| format!("rng: {e:?}"))?,
+        };
+        let mut salt = [0u8; 16];
+        OsRng
+            .fill_bytes(&mut salt)
+            .map_err(|e| format!("rng: {e:?}"))?;
+        let session = self.case_session(node_id)?;
+        let vendor_id = self.read_basic_u16(session, 0x0002).unwrap_or(0);
+        let product_id = self.read_basic_u16(session, 0x0004).unwrap_or(0);
+        let params = OpenWindowParams {
+            timeout_s,
+            discriminator,
+            passcode,
+            salt,
+            iterations: DEFAULT_WINDOW_ITERATIONS,
+        };
+        let now = self.now_ms();
+        let dir = self
+            .stack
+            .start_open_commissioning_window(session, &params, now, &mut self.tx)
+            .map_err(|e| format!("start_open_commissioning_window: {e:?}"))?;
+        let out = self.finish_invoke_data(node_id, dir, "open commissioning window")?;
+
+        let manual = manual_pairing_code(discriminator, passcode);
+        let mut qr_buf = [0u8; QR_PAYLOAD_MAX_LEN];
+        let qr = qr_payload(
+            &OnboardingPayload {
+                vendor_id,
+                product_id,
+                discriminator,
+                passcode,
+                discovery_caps: DISCOVERY_CAP_ON_NETWORK,
+            },
+            &mut qr_buf,
+        )
+        .map(|n| String::from_utf8_lossy(&qr_buf[..n]).into_owned())
+        .unwrap_or_default();
+        Ok((
+            out,
+            WindowInfo {
+                timeout_s,
+                discriminator,
+                passcode,
+                manual_code: String::from_utf8_lossy(&manual).into_owned(),
+                qr_payload: qr,
+                vendor_id,
+                product_id,
+            },
+        ))
+    }
+
+    /// RevokeCommissioning(`admincommissioning revoke` のデータ版)。
+    pub fn revoke_data(&mut self, node_id: u64) -> Result<InvokeOutcome, String> {
+        let session = self.case_session(node_id)?;
+        let now = self.now_ms();
+        let dir = self
+            .stack
+            .start_revoke_commissioning(session, now, &mut self.tx)
+            .map_err(|e| format!("start_revoke_commissioning: {e:?}"))?;
+        self.finish_invoke_data(node_id, dir, "revoke commissioning")
+    }
+
+    /// 送出済み invoke の応答を待って結果をデータで返す(表示なし)。
+    fn finish_invoke_data(
+        &mut self,
+        node_id: u64,
+        dir: simple_matter::stack::SendDirective,
+        what: &str,
+    ) -> Result<InvokeOutcome, String> {
+        send_dir(&self.socket, &self.tx, &dir);
+        let out = match self.wait_txn_event(Instant::now() + self.g.timeout)? {
+            Some(ImEvent::InvokeDone { status }) => InvokeOutcome {
+                status,
+                cluster_status: self.stack.im_last_cluster_status(),
+                response: self.stack.im_result().to_vec(),
+            },
+            Some(ev) => return Err(format!("{what} failed: {ev:?}")),
+            None => {
+                return Err(self
+                    .op_timeout(node_id, what)
+                    .err()
+                    .unwrap_or_else(|| format!("{what} timed out")))
+            }
+        };
+        self.flush();
+        Ok(out)
+    }
+
+    /// `pairing unpair` のデータ版: 自 fabric を RemoveFabric で削除し、成功したら
+    /// ローカル状態(アドレス帳エントリ + resumption 素材)を消す。戻り値 = 削除した
+    /// fabric index(デバイス視点)。失敗時はローカル状態を温存する(CLI と同じ)。
+    pub fn unpair_data(&mut self, node_id: u64) -> Result<u8, String> {
+        let session = self.case_session(node_id)?;
+        let fabric_index = self.read_current_fabric_index(node_id, session)?;
+        let path = CommandPath::new(EndpointId(0), ClusterId(0x003E), CommandId(0x0A));
+        let now = self.now_ms();
+        let dir = self
+            .stack
+            .start_invoke(
+                session,
+                path,
+                move |w: &mut TlvWriter<'_>, t: &TlvTag| {
+                    w.start_struct(t)?;
+                    w.write_u8(&TlvTag::ContextSpecific(0), fabric_index)?;
+                    w.end_container()
+                },
+                now,
+                &mut self.tx,
+            )
+            .map_err(|e| format!("start_invoke(RemoveFabric): {e:?}"))?;
+        send_dir(&self.socket, &self.tx, &dir);
+        match self.wait_txn_event(Instant::now() + self.g.timeout)? {
+            Some(ImEvent::InvokeDone { status }) => {
+                if !status.is_success() {
+                    return Err(format!(
+                        "RemoveFabric failed: IM status {status:?} (local state kept)"
+                    ));
+                }
+                if let Some(code) = decode_noc_status_code(self.stack.im_result()) {
+                    if code != 0 {
+                        return Err(format!(
+                            "RemoveFabric returned NOCResponse statusCode={code} \
+                             (0=Ok; local state kept)"
+                        ));
+                    }
+                }
+            }
+            Some(ev) => return Err(format!("RemoveFabric failed: {ev:?} (local state kept)")),
+            None => {
+                return Err(self
+                    .op_timeout(node_id, "unpair (RemoveFabric)")
+                    .err()
+                    .unwrap_or_else(|| "unpair timed out".into()))
+            }
+        }
+        self.cases.retain(|(n, _)| *n != node_id);
+        self.forget_local_node(node_id)?;
+        Ok(fabric_index)
+    }
+
+    /// ローカル状態だけを消す(アドレス帳エントリ + resumption 素材 + CASE キャッシュ)。
+    /// デバイスに到達できないノードを手元から外すとき(`smweb` の force unpair)に使う。
+    /// 戻り値 = アドレス帳にエントリがあったか。
+    pub fn forget_local_node(&mut self, node_id: u64) -> Result<bool, String> {
+        self.cases.retain(|(n, _)| *n != node_id);
+        let _lock = self.state.lock()?;
+        let removed = nodes::remove(&self.state.nodes_path(), node_id)?;
+        resume::remove(&self.state.resume_path(node_id))?;
+        Ok(removed)
     }
 }
