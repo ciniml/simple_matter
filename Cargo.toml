@@ -6,6 +6,7 @@ members = [
     "crates/bloat-check",
     "crates/simple-matter-ble",
     "crates/smctl",
+    "crates/smweb",
     "crates/sm-script-api",
 ]
 # wasm32-unknown-unknown 専用のサンプル(no_std + panic_handler + cdylib)は

@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>smweb</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header>
+  <h1>smweb</h1>
+  <span id="info" class="muted">loading...</span>
+  <span id="ws" class="badge offline">ws: -</span>
+</header>
+<main>
+  <section>
+    <h2>Nodes</h2>
+    <table id="nodes">
+      <thead><tr><th>Node ID</th><th>Label</th><th>Address</th><th>State</th><th>Last seen</th><th></th></tr></thead>
+      <tbody><tr><td colspan="6" class="muted">loading...</td></tr></tbody>
+    </table>
+  </section>
+
+  <section class="forms">
+    <form id="read-form">
+      <h2>Read attribute</h2>
+      <label>Node <select name="node" class="node-select"></select></label>
+      <label>Endpoint <input name="ep" value="0" size="5"></label>
+      <label>Cluster <input name="cluster" list="cluster-list" value="basic-information" placeholder="name or 0x..."></label>
+      <label>Attribute <input name="attr" list="attr-list" value="product-name" placeholder="name or 0x..."></label>
+      <label class="inline"><input type="checkbox" name="raw"> raw TLV</label>
+      <button type="submit">Read</button>
+    </form>
+
+    <form id="invoke-form">
+      <h2>Invoke command</h2>
+      <label>Node <select name="node" class="node-select"></select></label>
+      <label>Endpoint <input name="ep" value="1" size="5"></label>
+      <label>Cluster <input name="cluster" list="cluster-list" value="onoff" placeholder="name or 0x..."></label>
+      <label>Command <input name="cmd" list="cmd-list" value="toggle" placeholder="name or 0x..."></label>
+      <label>Args (JSON) <input name="args" placeholder='{"level": 128}'></label>
+      <label>TLV hex <input name="tlv" placeholder="1518 (empty struct)"></label>
+      <label>Timed (ms) <input name="timed" size="6" placeholder="none"></label>
+      <button type="submit">Invoke</button>
+    </form>
+  </section>
+
+  <section>
+    <h2>Result</h2>
+    <pre id="result" class="result muted">(no request yet)</pre>
+  </section>
+
+  <section>
+    <h2>Log</h2>
+    <pre id="log" class="log"></pre>
+  </section>
+</main>
+<datalist id="cluster-list"></datalist>
+<datalist id="attr-list"></datalist>
+<datalist id="cmd-list"></datalist>
+<script src="/app.js"></script>
+</body>
+</html>

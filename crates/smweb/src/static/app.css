@@ -1,0 +1,102 @@
+:root {
+  --bg: #f7f7f8;
+  --fg: #1d1d1f;
+  --muted: #6b6b73;
+  --card: #ffffff;
+  --border: #d9d9de;
+  --accent: #2563eb;
+  --ok: #15803d;
+  --warn: #b45309;
+  --off: #8a8a93;
+  --err: #b91c1c;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16161a;
+    --fg: #e8e8ec;
+    --muted: #9a9aa3;
+    --card: #1f1f25;
+    --border: #34343c;
+    --accent: #60a5fa;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --off: #7a7a83;
+    --err: #f87171;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+header {
+  display: flex;
+  gap: 16px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--card);
+}
+header h1 { margin: 0; font-size: 18px; }
+main { padding: 16px; max-width: 1100px; margin: 0 auto; }
+section { margin-bottom: 20px; }
+h2 { font-size: 15px; margin: 0 0 8px; }
+.muted { color: var(--muted); }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--card);
+  border: 1px solid var(--border);
+}
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+td.mono, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  color: #fff;
+  background: var(--off);
+}
+.badge.online { background: var(--ok); }
+.badge.stale { background: var(--warn); }
+.badge.offline { background: var(--off); }
+.forms { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+form {
+  background: var(--card);
+  border: 1px solid var(--border);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+label { display: flex; flex-direction: column; font-size: 12px; color: var(--muted); }
+label.inline { flex-direction: row; gap: 6px; align-items: center; }
+input, select, button {
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  padding: 4px 6px;
+}
+button {
+  cursor: pointer;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  padding: 6px 12px;
+}
+button:disabled { opacity: 0.5; cursor: default; }
+pre {
+  background: var(--card);
+  border: 1px solid var(--border);
+  padding: 10px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+pre.result.error { color: var(--err); }
+pre.log { max-height: 260px; font-size: 12px; }
