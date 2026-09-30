@@ -43,6 +43,8 @@ use crate::runner::{mdns, Backend, Ctrl};
 use crate::state::{ca as ca_state, nodes, resume, StateDir};
 use crate::OsRng;
 
+pub mod embed;
+
 /// mDNS ブラウズの最低タイムアウト。デバイスの再 announce 間隔(既定 30 秒)より長く取る。
 const BROWSE_TIMEOUT_MIN: Duration = Duration::from_secs(35);
 /// operational mDNS 解決のタイムアウト。
@@ -1736,7 +1738,7 @@ const TIMED_INVOKE_TIMEOUT_MS: u16 = 10_000;
 ///
 /// 各ファイルの生バイト列(X.509 DER)を返す。ディレクトリが読めない・`.der` が 1 つも
 /// 無い場合はエラー(誤設定を検証スキップに退化させないため)。
-pub(crate) fn load_paa_store(dir: &std::path::Path) -> Result<Vec<Vec<u8>>, String> {
+pub fn load_paa_store(dir: &std::path::Path) -> Result<Vec<Vec<u8>>, String> {
     let entries = std::fs::read_dir(dir)
         .map_err(|e| format!("--paa-trust-store-path {}: {e}", dir.display()))?;
     let mut store = Vec::new();

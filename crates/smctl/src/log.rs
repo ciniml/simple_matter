@@ -83,6 +83,19 @@ static COLOR: AtomicBool = AtomicBool::new(false);
 static FILE: OnceLock<Mutex<File>> = OnceLock::new();
 /// ファイル書き込みエラーの warn を 1 回に抑えるフラグ。
 static FILE_ERR: AtomicBool = AtomicBool::new(false);
+/// 埋め込み側(`smweb`)のログ転送フック。未設定なら何もしない(CLI の挙動は不変)。
+static HOOK: OnceLock<LogHook> = OnceLock::new();
+
+/// ログ転送フックの型: `(レベル, レイヤタグ, 本文)`。
+pub type LogHook = Box<dyn Fn(Level, &str, &str) + Send + Sync>;
+
+/// stderr へ出す行を併せて受け取るフックを設定する(プロセスで 1 回。2 回目以降は `false`)。
+///
+/// `smweb` が `Event::Log` として WebSocket へ流すために使う。フックは stderr の
+/// レベル判定を通った行に対してだけ呼ばれる。
+pub fn set_hook(hook: LogHook) -> bool {
+    HOOK.set(hook).is_ok()
+}
 
 /// CLI 指定(`--log-level`/`-v`/`-vv`)と環境変数 `SMCTL_LOG` から有効レベルを決める。
 /// CLI 指定が優先。どちらも無ければ info。
@@ -298,6 +311,9 @@ fn emit(l: Level, tag: &str, args: std::fmt::Arguments<'_>, to_stderr: bool) {
             eprintln!("[{DIM}{t:>6}{RESET}][{tc}{tag}{tc_end}] {lc}{sev}{msg}{lc_end}");
         } else {
             eprintln!("[{t:>6}][{tag}] {sev}{msg}");
+        }
+        if let Some(hook) = HOOK.get() {
+            hook(l, tag, &msg);
         }
     }
     if file_enabled() {
