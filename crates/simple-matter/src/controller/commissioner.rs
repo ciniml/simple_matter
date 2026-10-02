@@ -1096,7 +1096,7 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
         }
 
         // 5. CD の CMS SignedData 検証 + VID/PID クロスチェック(attestation.md §7)。
-        //    既知署名者は chip テスト CD 署名鍵のみ(CSA 本物の CD 署名 CA は割り切り)。
+        //    既知署名者は chip と同じ(テスト CD 署名鍵 + CSA 公式 CD 署名鍵 001〜005)。
         let cms =
             crate::cert::cms::parse_cms_signed_data(cd).map_err(|_| AttestationError::CdParse)?;
         let signer_pubkey = crate::cert::cms::KNOWN_CD_SIGNERS
