@@ -317,6 +317,12 @@ impl<
         self.mgr.handler_mut().im.take_event()
     }
 
+    /// トランザクション系の IM イベントだけを取り出す(購読系イベントは残す)。
+    /// [`ImClient::take_txn_event`] 参照。
+    pub fn im_take_txn_event(&mut self) -> Option<ImEvent> {
+        self.mgr.handler_mut().im.take_txn_event()
+    }
+
     /// 直近の InvokeResponse のクラスタ固有ステータス(無ければ `None`)。
     ///
     /// [`ImEvent::InvokeDone`] の `status` が `Failure` のとき、クラスタ固有コード

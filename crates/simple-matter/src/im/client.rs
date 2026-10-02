@@ -291,6 +291,16 @@ impl<const RESULT: usize> ImClient<RESULT> {
         self.event.take().or_else(|| self.sub_event.take())
     }
 
+    /// トランザクション系イベント(Read / Invoke / Write / Subscribe の完了・失敗)だけを取り出す。
+    ///
+    /// 購読系イベント(SubscriptionReport / SubscriptionLost)は残す。コミッショナのように自分の
+    /// トランザクション完了だけを待つ利用者が、同じスタックで動いている他ノードの購読レポートを
+    /// 「想定外のイベント」として誤って消費・失敗扱いしないため(実機: Tab5 で既存ノードの購読
+    /// レポートが CommissioningComplete 待ちに割り込み Protocol エラーで失敗した)。
+    pub fn take_txn_event(&mut self) -> Option<ImEvent> {
+        self.event.take()
+    }
+
     /// 直近イベントの結果 payload(生 TLV)を返す(§4.4)。
     ///
     /// Read では `AttributeReportIB` の連結(→ [`ImClient::read_reports`] で走査)、Invoke では

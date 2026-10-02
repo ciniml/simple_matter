@@ -1724,3 +1724,32 @@ fn same_subscription_id_on_two_sessions_is_not_confused() {
         "残った B の購読は引き続き受理する"
     );
 }
+
+/// コミッショナ用の take_txn_event はトランザクション系イベントだけを取り、購読系イベントは
+/// 残す(実機: Tab5 で既存ノードの購読レポートが CommissioningComplete 待ちに割り込み、
+/// Commissioner が Protocol エラーで失敗した)。
+#[test]
+fn take_txn_event_leaves_subscription_events_for_the_app() {
+    let mut c = ImC::new();
+    let report = ImEvent::SubscriptionReport {
+        session: SessionId::from_raw(5),
+        subscription_id: 9,
+    };
+    c.sub_event = Some(report);
+    assert_eq!(c.take_txn_event(), None, "no transaction event yet");
+    c.event = Some(ImEvent::InvokeDone {
+        status: ImStatus::Success,
+    });
+    assert_eq!(
+        c.take_txn_event(),
+        Some(ImEvent::InvokeDone {
+            status: ImStatus::Success
+        })
+    );
+    assert_eq!(c.take_txn_event(), None);
+    assert_eq!(
+        c.take_event(),
+        Some(report),
+        "the app still gets the report"
+    );
+}

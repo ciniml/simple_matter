@@ -811,7 +811,7 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
         // `VerifyNoPaa` の att_step 3 は Basic Information の Read(ReadDone を待つ、§8.3)。
         // 他フェーズ・他ステップは Invoke / SC イベントなので通常経路へ落とす。
         if matches!(self.phase, Phase::Attestation) && self.att_step == 3 {
-            match stack.im_take_event() {
+            match stack.im_take_txn_event() {
                 Some(ImEvent::ReadDone) => self.on_reported_vid_pid(stack),
                 Some(ImEvent::Failed { status }) => self.enter_failed(CommissionError::Im(status)),
                 Some(_) => self.enter_failed(CommissionError::Protocol),
@@ -848,7 +848,8 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
             },
             // 残りは IM トランザクション。
             _ => {
-                let ev = stack.im_take_event();
+                // 購読系イベント(同じスタック上の他ノードの購読レポート等)は消費しない。
+                let ev = stack.im_take_txn_event();
                 let done = match ev {
                     Some(ImEvent::InvokeDone { status }) => {
                         if status.is_success() {
