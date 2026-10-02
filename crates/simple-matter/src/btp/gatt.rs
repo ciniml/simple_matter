@@ -273,6 +273,9 @@ pub trait GattCentral {
 pub struct ScanFilter {
     /// 照合する 12bit discriminator(`None` なら任意)。
     pub discriminator: Option<u16>,
+    /// 照合する 4bit short discriminator(12bit の上位 4 ビット。11 桁の手動コードはこれしか
+    /// 持たない)。`None` なら任意。
+    pub short_discriminator: Option<u8>,
     /// 照合する (Vendor ID, Product ID)(`None` なら任意)。
     pub vendor_product: Option<(u16, u16)>,
 }

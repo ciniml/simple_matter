@@ -159,6 +159,8 @@ pub enum PairTarget {
     /// BLE(feature `ble`)。`wifi` / `thread` のどちらか。
     Ble {
         discriminator: Option<u16>,
+        /// 11 桁の手動コード由来の short discriminator(BLE スキャンの照合に使う)。
+        short_discriminator: Option<u8>,
         wifi: Option<(String, String)>,
         thread: Option<Vec<u8>>,
     },
@@ -1341,6 +1343,7 @@ impl Ctl<'_> {
             }
             PairTarget::Ble {
                 discriminator,
+                short_discriminator,
                 wifi,
                 thread,
             } => self.pair_ble(
@@ -1348,6 +1351,7 @@ impl Ctl<'_> {
                 job.passcode,
                 &job.label,
                 discriminator,
+                short_discriminator,
                 wifi,
                 thread,
             ),
@@ -1395,12 +1399,14 @@ impl Ctl<'_> {
     }
 
     #[cfg(feature = "ble")]
+    #[allow(clippy::too_many_arguments)]
     fn pair_ble(
         &mut self,
         node_id: u64,
         passcode: u32,
         label: &str,
         discriminator: Option<u16>,
+        short_discriminator: Option<u8>,
         wifi: Option<(String, String)>,
         thread: Option<Vec<u8>>,
     ) -> Result<(), String> {
@@ -1413,6 +1419,7 @@ impl Ctl<'_> {
             node_id,
             passcode,
             discriminator,
+            short_discriminator,
             false,
             wifi,
             thread,
@@ -1421,12 +1428,14 @@ impl Ctl<'_> {
     }
 
     #[cfg(not(feature = "ble"))]
+    #[allow(clippy::too_many_arguments)]
     fn pair_ble(
         &mut self,
         _node_id: u64,
         _passcode: u32,
         _label: &str,
         _discriminator: Option<u16>,
+        _short_discriminator: Option<u8>,
         _wifi: Option<(String, String)>,
         _thread: Option<Vec<u8>>,
     ) -> Result<(), String> {

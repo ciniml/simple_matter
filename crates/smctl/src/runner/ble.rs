@@ -88,6 +88,7 @@ pub fn pair_ble(
         node_id,
         passcode,
         discriminator,
+        None,
         handoff,
         wifi,
         thread,
@@ -109,6 +110,7 @@ pub fn pair_ble_with_ca(
     node_id: u64,
     passcode: u32,
     discriminator: Option<u16>,
+    short_discriminator: Option<u8>,
     handoff: bool,
     wifi: Option<(String, String)>,
     thread: Option<Vec<u8>>,
@@ -130,6 +132,7 @@ pub fn pair_ble_with_ca(
         node_id,
         passcode,
         discriminator,
+        short_discriminator,
         handoff,
         wifi.as_ref().map(|(s, p)| (s.as_bytes(), p.as_bytes())),
         thread.as_deref(),
@@ -174,6 +177,7 @@ async fn run_ble(
     node_id: u64,
     passcode: u32,
     discriminator: Option<u16>,
+    short_discriminator: Option<u8>,
     handoff: bool,
     wifi: Option<(&[u8], &[u8])>,
     thread: Option<&[u8]>,
@@ -204,13 +208,16 @@ async fn run_ble(
         crate::log::Level::Info,
         "ble",
         "scanning for 0xFFF6 commissionable (discriminator={})...",
-        discriminator
-            .map(|d| d.to_string())
-            .unwrap_or_else(|| "any".into())
+        match (discriminator, short_discriminator) {
+            (Some(d), _) => d.to_string(),
+            (None, Some(s)) => format!("short {s}"),
+            (None, None) => "any".into(),
+        }
     );
     let target = gatt
         .scan(ScanFilter {
             discriminator,
+            short_discriminator,
             vendor_product: None,
         })
         .await

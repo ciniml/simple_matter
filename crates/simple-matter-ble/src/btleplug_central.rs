@@ -171,7 +171,10 @@ impl GattCentral for BtleplugCentral {
                 };
                 let disc_ok = filter
                     .discriminator
-                    .is_none_or(|d| (d & 0x0FFF) == adv.discriminator);
+                    .is_none_or(|d| (d & 0x0FFF) == adv.discriminator)
+                    && filter
+                        .short_discriminator
+                        .is_none_or(|s| ((adv.discriminator >> 8) & 0x0F) as u8 == s);
                 let vp_ok = filter
                     .vendor_product
                     .is_none_or(|(v, pi)| v == adv.vendor_id && pi == adv.product_id);

@@ -640,12 +640,14 @@ async fn run_pairing(h: CtrlHandle, op_id: u64, req: crate::pairing::PairRequest
             ssid,
             password,
         } => PairTarget::Ble {
-            discriminator: ble_disc(&h, op_id, disc, req.node_id),
+            discriminator: disc.and_then(Disc::long),
+            short_discriminator: short_disc(disc),
             wifi: Some((ssid, password)),
             thread: None,
         },
         PairMethod::BleThread { disc, dataset } => PairTarget::Ble {
-            discriminator: ble_disc(&h, op_id, disc, req.node_id),
+            discriminator: disc.and_then(Disc::long),
+            short_discriminator: short_disc(disc),
             wifi: None,
             thread: Some(dataset),
         },
@@ -682,22 +684,13 @@ async fn run_pairing(h: CtrlHandle, op_id: u64, req: crate::pairing::PairRequest
 }
 
 /// BLE スキャンの discriminator(long のみ。manual code の short は照合できないので任意)。
-fn ble_disc(h: &CtrlHandle, op_id: u64, disc: Option<Disc>, node_id: Option<u64>) -> Option<u16> {
+/// 11 桁の手動コード(short discriminator のみ)なら、その 4 ビット値を返す(BLE スキャンの照合用。
+/// 以前は short のとき照合せず最初の commissionable デバイスに接続していたため、近くの別デバイスと
+/// PASE して Sc(Crypto) になった)。
+fn short_disc(disc: Option<Disc>) -> Option<u8> {
     match disc {
-        Some(Disc::Long(d)) => Some(d),
-        Some(Disc::Short(s)) => {
-            h.emit(Event::progress(
-                op_id,
-                "note",
-                format!(
-                    "manual code carries only the short discriminator ({s}); the BLE scan \
-                     accepts the first commissionable device"
-                ),
-                node_id,
-            ));
-            None
-        }
-        None => None,
+        Some(Disc::Short(s)) => Some(s),
+        _ => None,
     }
 }
 

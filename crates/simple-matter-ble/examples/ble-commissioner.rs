@@ -419,6 +419,7 @@ async fn run(opts: Opts) -> Result<(), String> {
 
     let target = gatt
         .scan(ScanFilter {
+            short_discriminator: None,
             discriminator: opts.discriminator,
             vendor_product: None,
         })
