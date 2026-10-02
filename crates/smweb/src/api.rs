@@ -537,8 +537,11 @@ async fn pairing(State(h): State<CtrlHandle>, body: Bytes) -> ApiResult {
 
 /// on-network pairing の commissionable 探索(ブロッキング)。
 fn find_commissionable(disc: Option<Disc>) -> Result<CommissionableInfo, String> {
+    // CM=0(コミッショニングモードでない)広告は除外する。手動コードは discriminator の上位 4 ビット
+    // しか持たないため、モード外の別デバイスを拾って PASE を失敗させうる。CM が無い広告は許容。
     let want = |c: &CommissionableInfo| {
         !c.addrs.is_empty()
+            && c.commissioning_mode != Some(0)
             && match disc {
                 None => true,
                 Some(d) => c.discriminator.is_some_and(|x| d.matches(x)),
