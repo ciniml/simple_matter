@@ -7,6 +7,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+// fabric テーブルの容量(= `sm_fabric_count()` の上限)。C 側が fabric ごとの静的枠
+// (SRP サービス枠など)を確保するための定数。
+#define SM_MAX_FABRICS 5
+
 // 期限なしのセンチネル([`sm_next_deadline`] が返す。C 側 `SM_NO_DEADLINE`)。
 #define SM_NO_DEADLINE UINT64_MAX
 
@@ -700,9 +704,22 @@ void sm_thread_status(bool attached,
 // `buf` へ NUL 終端で書く(`docs/design/c-ffi-shim.md` §10.1)。
 //
 // 戻り値 = NUL を除く名前長(33)。fabric 未確定 / `cap` 不足(< 34)は 0。fabric 複数時は
-// 最初の 1 つを使う(制約: マルチ fabric では代表 1 つのみ。§10.1)。
+// 最初の 1 つを返す(= `sm_operational_instance_name_at(0, ..)`)。全 fabric を列挙するには
+// `sm_operational_instance_name_at` を使う。
 size_t sm_operational_instance_name(uint8_t *buf,
                                     size_t cap);
+
+// `index` 番目(0 始まり、fabric テーブルの反復順。`0..sm_fabric_count()`)の fabric の
+// 運用インスタンス名 `<compressedFabricId>-<nodeId>` を `buf` へ NUL 終端で書く
+// (マルチ admin: fabric ごとに `_matter._tcp` を SRP 登録するための素材。
+// `docs/design/p4-thread-controller.md` §18.4 D1)。
+//
+// 戻り値 = NUL を除く名前長(33)。`index` が範囲外 / 未初期化 / `buf` NULL /
+// `cap` 不足(< 34)は 0。fabric の追加・削除で index と fabric の対応は変わり得るので、
+// `SM_EV_COMMISSIONED` / `SM_EV_FABRIC_REMOVED` のたびに全件を取り直すこと。
+size_t sm_operational_instance_name_at(uint8_t index,
+                                       uint8_t *buf,
+                                       size_t cap);
 
 // 供給メモリに構築する [`CtrlShim`] のバイトサイズ(`sm_ctrl_init` へ渡す `mem_len` の下限)。
 size_t sm_ctrl_context_size(void);

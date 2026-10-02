@@ -211,6 +211,104 @@ fn ffi_lifecycle_roundtrip() {
     // ---- F3: BLE 給餌(この時点で fabric 0・commissionable。§9)----
     #[cfg(feature = "ble")]
     ble_checks();
+
+    // ---- マルチ fabric の運用インスタンス名(§18.4 D1)----
+    #[cfg(feature = "controller")]
+    multi_fabric_instance_name_checks();
+}
+
+/// `sm_operational_instance_name_at` を 2 fabric → 1 fabric で検証する
+/// (単一 static 共有のため `ffi_lifecycle_roundtrip` 末尾から呼ぶ)。
+/// fabric は実 AddNOC を通さず、テスト CA で発行したチェーンを fabric テーブルへ直接入れる。
+#[cfg(feature = "controller")]
+fn multi_fabric_instance_name_checks() {
+    use simple_matter::controller::ca::Ca;
+    use simple_matter::crypto::{Crypto, P256Keypair, P256PublicKey};
+
+    fn name_at(index: u8) -> Option<String> {
+        let mut buf = [0xFFu8; 40];
+        let n = sm_operational_instance_name_at(index, buf.as_mut_ptr(), buf.len());
+        if n == 0 {
+            return None;
+        }
+        assert_eq!(n, 33);
+        assert_eq!(buf[33], 0, "NUL terminated");
+        Some(String::from_utf8(buf[..n].to_vec()).unwrap())
+    }
+    fn add_fabric(fabric_id: u64, node_id: u64) -> core::num::NonZeroU8 {
+        // SAFETY: 単線契約(このテストだけが初期化済みインスタンスを触る)。
+        let s = unsafe { shim() };
+        let crypto = &s.owned.crypto;
+        let mut rng = CRng {
+            fill: test_rng,
+            ctx: core::ptr::null_mut(),
+        };
+        let ca =
+            Ca::generate(crypto, &mut rng, fabric_id, 0x1_0000 + fabric_id, 0xFFF1, 0).expect("ca");
+        let kp = crypto.p256_generate_keypair().expect("keypair");
+        let mut noc = [0u8; 400];
+        let n = ca
+            .issue_noc(crypto, &kp.public_key().to_bytes(), node_id, &mut noc)
+            .expect("noc");
+        let idx = s
+            .owned
+            .fabrics
+            .borrow_mut()
+            .add(
+                crypto,
+                ca.rcac(),
+                None,
+                &noc[..n],
+                kp,
+                ca.ipk_epoch_key(),
+                0xFFF1,
+                0,
+                "",
+            )
+            .expect("fabric add");
+        idx
+    }
+
+    // fabric 0 個: どの index も 0、従来 API も 0。
+    assert_eq!(sm_fabric_count(), 0);
+    assert!(name_at(0).is_none());
+    let mut buf = [0u8; 40];
+    assert_eq!(sm_operational_instance_name(buf.as_mut_ptr(), buf.len()), 0);
+
+    // 2 fabric → index 0/1 が別名、index 2 以降は 0。
+    let idx_a = add_fabric(0xA1, 0x22);
+    let _idx_b = add_fabric(0xB2, 0x51);
+    assert_eq!(sm_fabric_count(), 2);
+    let a = name_at(0).expect("name 0");
+    let b = name_at(1).expect("name 1");
+    assert_ne!(a, b);
+    assert!(a.ends_with("-0000000000000022"), "{a}");
+    assert!(b.ends_with("-0000000000000051"), "{b}");
+    assert_eq!(a.as_bytes()[16], b'-');
+    assert!(name_at(2).is_none());
+    assert!(name_at(255).is_none());
+
+    // 従来 API は index 0 と同じ名前を返す(挙動不変)。
+    let n = sm_operational_instance_name(buf.as_mut_ptr(), buf.len());
+    assert_eq!(&buf[..n], a.as_bytes());
+
+    // cap 不足(< 34)/ NULL は 0。
+    assert_eq!(sm_operational_instance_name_at(1, buf.as_mut_ptr(), 33), 0);
+    assert_eq!(
+        sm_operational_instance_name_at(1, core::ptr::null_mut(), 40),
+        0
+    );
+
+    // 先頭 fabric を削除 → 残る 1 つが index 0 に来て、index 1 は 0。
+    unsafe { shim() }
+        .owned
+        .fabrics
+        .borrow_mut()
+        .remove(idx_a)
+        .expect("remove");
+    assert_eq!(sm_fabric_count(), 1);
+    assert_eq!(name_at(0).as_deref(), Some(b.as_str()));
+    assert!(name_at(1).is_none());
 }
 
 /// F3 の BLE/WiFi API を初期化済みインスタンス上で検証する

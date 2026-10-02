@@ -266,6 +266,11 @@ const BTP_WINDOW: usize = 6;
 
 /// fabric テーブル容量(`DefaultStack` と同じ 5)。
 const NF: usize = 5;
+
+/// fabric テーブルの容量(= `sm_fabric_count()` の上限)。C 側が fabric ごとの静的枠
+/// (SRP サービス枠など)を確保するための定数。
+pub const SM_MAX_FABRICS: u8 = 5;
+const _: () = assert!(SM_MAX_FABRICS as usize == NF);
 /// ACL テーブル容量(fabric 5 × per-fabric 上限 4)。
 const NACL: usize = 20;
 /// マージ後の総エンドポイント数上限(EP0 + プリセット EP1 or 合成 EP + カスタム)。
@@ -2788,17 +2793,31 @@ fn write_hex16_upper(out: &mut [u8], v: u64) {
 /// `buf` へ NUL 終端で書く(`docs/design/c-ffi-shim.md` §10.1)。
 ///
 /// 戻り値 = NUL を除く名前長(33)。fabric 未確定 / `cap` 不足(< 34)は 0。fabric 複数時は
-/// 最初の 1 つを使う(制約: マルチ fabric では代表 1 つのみ。§10.1)。
+/// 最初の 1 つを返す(= `sm_operational_instance_name_at(0, ..)`)。全 fabric を列挙するには
+/// `sm_operational_instance_name_at` を使う。
 #[no_mangle]
 pub extern "C" fn sm_operational_instance_name(buf: *mut u8, cap: usize) -> usize {
+    sm_operational_instance_name_at(0, buf, cap)
+}
+
+/// `index` 番目(0 始まり、fabric テーブルの反復順。`0..sm_fabric_count()`)の fabric の
+/// 運用インスタンス名 `<compressedFabricId>-<nodeId>` を `buf` へ NUL 終端で書く
+/// (マルチ admin: fabric ごとに `_matter._tcp` を SRP 登録するための素材。
+/// `docs/design/p4-thread-controller.md` §18.4 D1)。
+///
+/// 戻り値 = NUL を除く名前長(33)。`index` が範囲外 / 未初期化 / `buf` NULL /
+/// `cap` 不足(< 34)は 0。fabric の追加・削除で index と fabric の対応は変わり得るので、
+/// `SM_EV_COMMISSIONED` / `SM_EV_FABRIC_REMOVED` のたびに全件を取り直すこと。
+#[no_mangle]
+pub extern "C" fn sm_operational_instance_name_at(index: u8, buf: *mut u8, cap: usize) -> usize {
     if !INITED.load(Ordering::SeqCst) || buf.is_null() {
         return 0;
     }
     // SAFETY: 単線契約。
     let s = unsafe { shim() };
     let fb = s.owned.fabrics.borrow();
-    let Some(f) = fb.iter().next() else {
-        return 0; // fabric 未確定(コミッショニング前)。
+    let Some(f) = fb.iter().nth(index as usize) else {
+        return 0; // 範囲外(fabric 未確定を含む)。
     };
     // "<16 hex>-<16 hex>" = 33 バイト + NUL = 34。
     let mut name = [0u8; 33];

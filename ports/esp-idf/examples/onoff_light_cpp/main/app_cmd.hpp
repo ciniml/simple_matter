@@ -17,6 +17,7 @@ enum class CmdKind {
   BleC2Subscribed,  // C2 CCCD subscribe 完了
   WifiFailed,       // WiFi join 失敗(BLE プロビジョン中の再試行契機)
   ThreadRole,       // OT role 変化(thread_attached = child/router/leader なら true)
+  SrpResync,        // SRP サービス削除完了 → 枠が空いたので fabric ごとの登録を再同期
 };
 
 struct Cmd {

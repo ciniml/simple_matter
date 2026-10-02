@@ -705,20 +705,25 @@ static void register_custom() {
 
 // ---- SRP 登録(Thread 運用広告)-------------------------------------------
 //
-// fabric 確定後、運用インスタンス名 <compressedFabricId>-<nodeId>(shim が生成)で
-// _matter._tcp を SRP 登録する(§10.1)。fresh コミッション(SM_EV_COMMISSIONED)と
-// 再起動後の attach(ThreadRole)の双方から呼ぶ。二重登録は ot_thread 側で抑止。
+// 全 fabric の運用インスタンス名 <compressedFabricId>-<nodeId>(shim が生成)を集め、SRP client の
+// _matter._tcp サービス集合をそれに同期する(マルチ admin: fabric ごとに 1 インスタンス。
+// p4-thread-controller.md §18.4 D1)。fabric 追加(SM_EV_COMMISSIONED)・削除
+// (SM_EV_FABRIC_REMOVED)・再起動後の attach(ThreadRole)・SRP 削除完了(SrpResync)から呼ぶ。
+// 同期は冪等(追加済みはそのまま、消えた fabric の分だけ削除)。
 #if CONFIG_SM_NETWORK_THREAD
-static void maybe_register_srp() {
-  if (sm_fabric_count() == 0) {
-    return; // fabric 未確定。
+static_assert(SM_OT_SRP_MAX_SERVICES >= SM_MAX_FABRICS, "SRP service slots < fabric table size");
+static void sync_srp_services() {
+  static char names[SM_OT_SRP_MAX_SERVICES][40];
+  const char *ptrs[SM_OT_SRP_MAX_SERVICES];
+  size_t n = 0;
+  for (uint8_t i = 0; i < SM_OT_SRP_MAX_SERVICES; i++) {
+    if (sm_operational_instance_name_at(i, (uint8_t *)names[n], sizeof(names[n])) == 0) {
+      break; // 範囲外(fabric はここまで)。
+    }
+    ptrs[n] = names[n];
+    n++;
   }
-  char inst[40];
-  size_t n = sm_operational_instance_name((uint8_t *)inst, sizeof(inst));
-  if (n == 0) {
-    return; // インスタンス名がまだ得られない。
-  }
-  sm_ot_srp_register(inst);
+  sm_ot_srp_sync(ptrs, n);
 }
 #endif
 
@@ -836,8 +841,10 @@ static void matter_task(void *) {
       break;
     }
     case SM_EV_COMMISSIONED:
-      // fabric 確定 → SRP 登録(運用発見。attach 済みなら即、未 attach でも OT が queue する)。
-      maybe_register_srp();
+    case SM_EV_FABRIC_REMOVED:
+      // fabric 集合が変化 → SRP サービス集合を同期(運用発見。attach 済みなら即、未 attach でも
+      // OT が queue する)。2 fabric 目以降も 1 インスタンスずつ登録、削除された fabric は登録解除。
+      sync_srp_services();
       break;
 #endif
     default:
@@ -964,11 +971,15 @@ static void matter_task(void *) {
 #endif
 #if CONFIG_SM_NETWORK_THREAD
       case CmdKind::ThreadRole:
-        // OT role 変化 → 遅延 ConnectNetworkResponse を確定 + attach 済みなら SRP 登録。
+        // OT role 変化 → 遅延 ConnectNetworkResponse を確定 + attach 済みなら SRP 同期。
         sm_thread_status(c.thread_attached, now);
         if (c.thread_attached) {
-          maybe_register_srp();
+          sync_srp_services();
         }
+        break;
+      case CmdKind::SrpResync:
+        // SRP 削除完了で枠が空いた → 保留していた追加があれば登録する。
+        sync_srp_services();
         break;
 #endif
       default:

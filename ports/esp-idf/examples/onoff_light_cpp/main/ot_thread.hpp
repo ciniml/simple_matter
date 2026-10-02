@@ -1,5 +1,5 @@
 // esp_openthread 配線(Thread スタック初期化 + OT netif(lwIP 統合)+ role 監視 +
-// SRP client 登録)。docs/design/c-ffi-shim.md §10。CONFIG_SM_NETWORK_THREAD のときのみ
+// SRP client 登録(fabric ごと))。docs/design/c-ffi-shim.md §10。CONFIG_SM_NETWORK_THREAD のときのみ
 // 実体を持つ(それ以外は空スタブ)。
 //
 // esp_openthread は自前の mainloop タスクを走らせる(15.4 radio + lwIP netif)。
@@ -23,10 +23,19 @@ void sm_ot_init(QueueHandle_t q);
 // 開始する(SM_EV_THREAD_ATTACH_REQUEST 契機)。成功で true。
 bool sm_ot_apply_dataset(const uint8_t *tlv, size_t len);
 
-// SRP client で `_matter._tcp`(port 5540、TXT SII/SAI/T)を登録する。
-// host 名 = SM<MAC>、instance 名 = `instance_name`(sm_operational_instance_name の
-// NUL 終端出力)。SRP サーバ(OTBR)は autostart で netdata から自動発見する。
-void sm_ot_srp_register(const char *instance_name);
+// SRP サービス枠の数(= fabric テーブル容量 SM_MAX_FABRICS)。
+#define SM_OT_SRP_MAX_SERVICES 5
+
+// SRP client の `_matter._tcp`(port 5540、TXT SII/SAI/T)サービス集合を、現在の全 fabric の
+// 運用インスタンス名 `names[0..n)`(sm_operational_instance_name_at の NUL 終端出力)に
+// 同期する(マルチ admin、docs/design/p4-thread-controller.md §18.4 D1)。
+//   - 未登録の名前  → otSrpClientAddService
+//   - 消えた名前    → otSrpClientRemoveService(サーバ未送信なら otSrpClientClearService)
+// host 名 = SM<MAC>・host address = auto・SRP サーバ(OTBR)は autostart で netdata から
+// 自動発見(初回の追加時に 1 度だけ設定)。冪等なので SM_EV_COMMISSIONED /
+// SM_EV_FABRIC_REMOVED / attach / CmdKind::SrpResync のたびに呼んでよい。
+// 削除はサーバ応答まで枠を保持し、完了時に `q` へ CmdKind::SrpResync を載せる。
+void sm_ot_srp_sync(const char *const *names, size_t n);
 
 // 現在 attach 済みか(role = child/router/leader)。
 bool sm_ot_is_attached();
