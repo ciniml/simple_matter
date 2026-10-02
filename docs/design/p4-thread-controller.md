@@ -2066,9 +2066,22 @@ Status: 設計(2026-10-02、コード未変更)。目的: Tab5 が **自前で T
   `SM_EV_COMMISSIONED` / `SM_EV_FABRIC_REMOVED` / ThreadRole(attach) で全 fabric 名を集めて sync を呼ぶ。
   OT が保持するポインタは静的領域のまま(定常ヒープレス方針に合致)。`CONFIG_OPENTHREAD_SRP_CLIENT_MAX_SERVICES`
   (既定 5)が NF 以上であることを確認。
-- **D2(任意)`_matterc._udp` の SRP 登録**: `SM_EV_WINDOW_CHANGED` で開閉に合わせ commissionable サービス
-  (サブタイプ `_L<disc>` / `_S<disc>` / `_CM`、TXT D/CM/VP)を登録/削除。shim から TXT 素材を出す API が要るため
-  別ユニット。スマホ系コントローラの on-network 追加に必要、Tab5 の T11 ゴールには不要。
+- **D2 `_matterc._udp` の SRP 登録(実装済み、2026-10-03)**: shim の `sm_commissionable_info()` が窓オープン中の
+  commissionable 広告(instance id / discriminator / VID / PID / CM / DT)を返し、onoff_light_cpp は
+  `SM_EV_WINDOW_CHANGED` / `SM_EV_COMMISSIONED` / `SM_EV_FABRIC_REMOVED` / attach のたびに
+  `sm_ot_srp_sync(names, n, comm)` で運用サービスと一緒に同期する。サブタイプ `_L<d>` / `_S<d>>8>` / `_V<vid>` /
+  `_T<dt>` / `_CM`、TXT D / CM / VP / DT / SII / SAI。窓が閉じたら削除、ECM で discriminator が変われば削除 →
+  再登録。実機: NanoC6 ライトで ECW を開くと OTBR 経由で LAN に `_matterc._udp`(CM=2)が出て smweb の
+  commissionable 発見に載り、Revoke で消えることを確認。
+- **D3 SRP 名前重複への耐性(2026-10-03)**: SRP の更新は host 単位の一括で、1 つでも名前が他 host に予約済み
+  (OTBR は削除後も key-lease ≈ 7.9 日予約)だと `Duplicated` で全体が拒否され、既存登録の更新まで止まって
+  lease 切れで全広告が消える(実機: 別ホストの smweb が node 2 を Aqara と NanoC6 に重複採番 →
+  `C3050…-0000000000000002` が衝突し、ライトの広告が全部消えた。削除要求も同じ理由で拒否され、
+  再起動まで回復しない)。対策: 拒否されたら、一度も受理されていないサービスだけを `otSrpClientClearService`
+  で外す(残りは即座に再送される)。候補が 1 つなら犯人として 10 分〜6 時間の倍々で保留、複数なら 5 秒保留で
+  1 つずつ戻して切り分ける。削除したかった未受理サービスはそのまま捨てる。smweb は自動採番の下限を
+  `smweb.json` の `next_node_id` に保存し、失敗したコミッショニングの ID を再利用しない。
+  generic_matter_cpp の ot_thread は単一サービス版のまま(D1〜D3 未移植)。
 
 ### 18.5 実装ピース(各 1 エージェント)
 

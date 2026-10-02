@@ -658,6 +658,11 @@ void   sm_thread_status(bool attached, uint64_t now_ms);
   `_matter._tcp` を登録する(TXT の SII/SAI 推奨値は thread-port.md T3 実測 =
   SII=10000/SAI=1000。インスタンス名 `<compressedFabricId hex>-<nodeId hex>` の
   素材はシムが返す: `sm_operational_instance_name(buf, cap)`)。
+- commissionable 広告(2026-10-03、p4-thread-controller.md §18.4 D2): Thread には link-local mDNS が
+  無いので、窓オープン中だけ `_matterc._udp` を SRP 登録する。素材は
+  `bool sm_commissionable_info(sm_commissionable_t *out)`(instance_id / discriminator / vendor_id /
+  product_id / mode(CM: 1 = basic、2 = enhanced)/ device_type。窓が閉じていれば false)。
+  WiFi/Ethernet の内蔵 mDNS 応答と同じ内容(`MdnsResponder::commissionable`)を返す。
 - UDP は既存 `sm_udp_rx`/`sm_poll` のまま(OT netif は lwIP に統合されるので
   C++ のソケットコードは WiFi と同一。dual-stack の v6 経路が本線になるだけ)。
 

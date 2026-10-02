@@ -419,6 +419,26 @@ typedef struct {
   void *ctx;
 } sm_cluster_def_t;
 
+// 現在の commissionable 広告(`_matterc._udp`)の内容(`docs/design/c-ffi-shim.md` §10.1 /
+// `docs/design/p4-thread-controller.md` §18.4 D2)。
+//
+// Thread デバイスはリンクローカル mDNS を持たないため、コミッショニング窓が開いている間だけ
+// これを SRP(OTBR の advertising proxy)へ `_matterc._udp` として登録する。
+typedef struct {
+  // インスタンス名の 64 ビット識別子(16 進大文字 16 桁にして使う)。
+  uint64_t instance_id;
+  // 12 ビット discriminator(TXT `D`、サブタイプ `_L<d>` / `_S<d >> 8>`)。
+  uint16_t discriminator;
+  // Vendor ID(TXT `VP` の前半、サブタイプ `_V<vid>`)。
+  uint16_t vendor_id;
+  // Product ID(TXT `VP` の後半)。
+  uint16_t product_id;
+  // コミッショニングモード(TXT `CM`): 1 = basic(初回 / BCM)、2 = enhanced(ECM)。
+  uint8_t mode;
+  // Device Type(TXT `DT`、サブタイプ `_T<dt>`)。0 = なし。
+  uint32_t device_type;
+} sm_commissionable_t;
+
 // コントローラ初期化設定(`docs/design/c-ffi-shim.md` §11.1)。
 typedef struct {
   // コントローラ fabric の FabricId(smctl / examples と同値を推奨。例 0xFAB0000000000001)。
@@ -699,6 +719,12 @@ size_t sm_take_thread_dataset(uint8_t *tlv_out,
 // コアが遅延 ConnectNetworkResponse を BTP に積む。Thread 構成でない / ble 無効は no-op。
 void sm_thread_status(bool attached,
                       uint64_t now_ms);
+
+// 窓が開いていれば現在の commissionable 広告の内容を `out` に書いて `true` を返す
+// (`docs/design/p4-thread-controller.md` §18.4 D2)。窓が閉じている / 未初期化 / `out` NULL は
+// `false`。窓の開閉(`SM_EV_WINDOW_CHANGED`)・fabric 追加(`SM_EV_COMMISSIONED`、初回窓が閉じる)
+// のたびに取り直すこと。ECM の窓は discriminator が窓ごとに変わる。
+bool sm_commissionable_info(sm_commissionable_t *out);
 
 // SRP の運用インスタンス名素材 `<compressedFabricId>-<nodeId>`(各 16 進大文字 16 桁)を
 // `buf` へ NUL 終端で書く(`docs/design/c-ffi-shim.md` §10.1)。

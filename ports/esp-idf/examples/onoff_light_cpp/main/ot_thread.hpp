@@ -8,6 +8,7 @@
 #pragma once
 
 #include "app_cmd.hpp"
+#include "simple_matter.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -35,7 +36,16 @@ bool sm_ot_apply_dataset(const uint8_t *tlv, size_t len);
 // 自動発見(初回の追加時に 1 度だけ設定)。冪等なので SM_EV_COMMISSIONED /
 // SM_EV_FABRIC_REMOVED / attach / CmdKind::SrpResync のたびに呼んでよい。
 // 削除はサーバ応答まで枠を保持し、完了時に `q` へ CmdKind::SrpResync を載せる。
-void sm_ot_srp_sync(const char *const *names, size_t n);
+//
+// `comm` は commissionable 広告(sm_commissionable_info の出力。窓が閉じていれば nullptr)。
+// 窓オープン中だけ `_matterc._udp`(サブタイプ _L/_S/_V/_T/_CM、TXT D/CM/VP/DT)を登録し、
+// 閉じたら外す(Thread には link-local mDNS が無いので OTBR の advertising proxy 経由で
+// on-network コミッショニングを可能にする、§18.4 D2)。
+//
+// サーバ(OTBR)が更新を名前重複(Duplicated)で拒否すると、SRP の更新は全サービス一括なので
+// 既存登録の更新まで止まる。一度も受理されていないサービスを外して残りを通し、外した名前は
+// 時間を置いて 1 つずつ再試行する(他ノードが同じ名前を key-lease の間予約している場合がある)。
+void sm_ot_srp_sync(const char *const *names, size_t n, const sm_commissionable_t *comm);
 
 // 現在 attach 済みか(role = child/router/leader)。
 bool sm_ot_is_attached();

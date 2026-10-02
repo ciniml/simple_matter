@@ -208,6 +208,18 @@ fn ffi_lifecycle_roundtrip() {
     assert_eq!(sm_cluster_register(&def), -2);
     assert_eq!(sm_endpoint_register(2, 0x0100, 1), -2);
 
+    // ---- commissionable 広告の内容(SRP `_matterc._udp` 素材、§18.4 D2)----
+    // fabric 0 = 初回窓が開いている: basic(CM=1)、設定の discriminator / VID / PID。
+    let mut ci = sm_commissionable_t::default();
+    assert!(sm_commissionable_info(&mut ci));
+    assert_eq!(ci.discriminator, 3840);
+    assert_eq!(ci.vendor_id, 0xFFF1);
+    assert_eq!(ci.product_id, 0x8001);
+    assert_eq!(ci.mode, 1);
+    assert_eq!(ci.device_type, 0x0100);
+    assert_ne!(ci.instance_id, 0);
+    assert!(!sm_commissionable_info(core::ptr::null_mut()));
+
     // ---- F3: BLE 給餌(この時点で fabric 0・commissionable。§9)----
     #[cfg(feature = "ble")]
     ble_checks();

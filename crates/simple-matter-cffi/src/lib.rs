@@ -2821,6 +2821,60 @@ fn write_hex16_upper(out: &mut [u8], v: u64) {
     }
 }
 
+/// 現在の commissionable 広告(`_matterc._udp`)の内容(`docs/design/c-ffi-shim.md` §10.1 /
+/// `docs/design/p4-thread-controller.md` §18.4 D2)。
+///
+/// Thread デバイスはリンクローカル mDNS を持たないため、コミッショニング窓が開いている間だけ
+/// これを SRP(OTBR の advertising proxy)へ `_matterc._udp` として登録する。
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct sm_commissionable_t {
+    /// インスタンス名の 64 ビット識別子(16 進大文字 16 桁にして使う)。
+    pub instance_id: u64,
+    /// 12 ビット discriminator(TXT `D`、サブタイプ `_L<d>` / `_S<d >> 8>`)。
+    pub discriminator: u16,
+    /// Vendor ID(TXT `VP` の前半、サブタイプ `_V<vid>`)。
+    pub vendor_id: u16,
+    /// Product ID(TXT `VP` の後半)。
+    pub product_id: u16,
+    /// コミッショニングモード(TXT `CM`): 1 = basic(初回 / BCM)、2 = enhanced(ECM)。
+    pub mode: u8,
+    /// Device Type(TXT `DT`、サブタイプ `_T<dt>`)。0 = なし。
+    pub device_type: u32,
+}
+
+/// 窓が開いていれば現在の commissionable 広告の内容を `out` に書いて `true` を返す
+/// (`docs/design/p4-thread-controller.md` §18.4 D2)。窓が閉じている / 未初期化 / `out` NULL は
+/// `false`。窓の開閉(`SM_EV_WINDOW_CHANGED`)・fabric 追加(`SM_EV_COMMISSIONED`、初回窓が閉じる)
+/// のたびに取り直すこと。ECM の窓は discriminator が窓ごとに変わる。
+#[no_mangle]
+pub extern "C" fn sm_commissionable_info(out: *mut sm_commissionable_t) -> bool {
+    if !INITED.load(Ordering::SeqCst) || out.is_null() {
+        return false;
+    }
+    // SAFETY: 単線契約。
+    let s = unsafe { shim() };
+    let Some(c) = s.mdns.commissionable() else {
+        return false;
+    };
+    let mode = match c.mode {
+        CommissioningMode::Disabled => return false,
+        CommissioningMode::Standard => 1,
+        CommissioningMode::Enhanced => 2,
+    };
+    let info = sm_commissionable_t {
+        instance_id: c.instance_id,
+        discriminator: c.discriminator,
+        vendor_id: c.vendor_id,
+        product_id: c.product_id,
+        mode,
+        device_type: c.device_type.unwrap_or(0),
+    };
+    // SAFETY: out は非 NULL(呼び出し側が有効な領域を渡す契約)。
+    unsafe { out.write(info) };
+    true
+}
+
 /// SRP の運用インスタンス名素材 `<compressedFabricId>-<nodeId>`(各 16 進大文字 16 桁)を
 /// `buf` へ NUL 終端で書く(`docs/design/c-ffi-shim.md` §10.1)。
 ///

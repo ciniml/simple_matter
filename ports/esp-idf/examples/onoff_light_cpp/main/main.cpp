@@ -723,7 +723,10 @@ static void sync_srp_services() {
     ptrs[n] = names[n];
     n++;
   }
-  sm_ot_srp_sync(ptrs, n);
+  // 窓オープン中なら commissionable(_matterc._udp)も載せる(§18.4 D2)。
+  sm_commissionable_t comm;
+  bool open = sm_commissionable_info(&comm);
+  sm_ot_srp_sync(ptrs, n, open ? &comm : nullptr);
 }
 #endif
 
@@ -842,8 +845,9 @@ static void matter_task(void *) {
     }
     case SM_EV_COMMISSIONED:
     case SM_EV_FABRIC_REMOVED:
-      // fabric 集合が変化 → SRP サービス集合を同期(運用発見。attach 済みなら即、未 attach でも
-      // OT が queue する)。2 fabric 目以降も 1 インスタンスずつ登録、削除された fabric は登録解除。
+    case SM_EV_WINDOW_CHANGED:
+      // fabric 集合 / コミッショニング窓が変化 → SRP サービス集合を同期(運用発見と、窓オープン中
+      // の commissionable 発見。attach 済みなら即、未 attach でも OT が queue する)。2 fabric 目以降も 1 インスタンスずつ登録、削除された fabric は登録解除。
       sync_srp_services();
       break;
 #endif
