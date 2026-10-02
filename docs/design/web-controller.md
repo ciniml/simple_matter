@@ -342,3 +342,35 @@ AirQ は IPv4 も持つため初期検証は通る見込み。
 
 README は「未指定ならスキップ」と書くが、コードの既定は `VerifyNoPaa`。W4 の README 更新で
 直す(`smweb` も同じ既定・同じフラグにする)。
+
+---
+
+## 9. W5: 時系列グラフ(履歴)
+
+ダッシュボードで値の変化を見るために、サーバ側で属性値の履歴を保持してグラフ表示する。
+
+### 9.1 保持
+- コントローラスレッドが `Event::Attr` を Snapshot に書く際、**数値の属性だけ**(`ValueKind` が整数/F32/Bool/Enum)を
+  `History{ (node, ep, cluster, attr) → RingBuffer<(ts_ms, f64)> }` に追記する。1 系列あたり既定 2880 点
+  (10 秒周期で 8 時間)、`--history-points` で変更可。文字列・Raw は保持しない。
+- 永続化: 60 秒ごと、および終了時に `<state-dir>/smweb-history.bin`(独自の単純バイナリ: ヘッダ + 系列ごとの
+  (key, n, 点列))へ丸ごと書く。起動時に読み戻す。壊れていれば `.bad` に退避して空から始める。
+  SQLite 等の外部依存は入れない。
+- ノードを Unpair したら系列を削除する。
+
+### 9.2 API
+- `GET /api/nodes/{id}/history?ep=&cluster=&attr=&since=<unix_ms>&limit=<n>`  
+  → `{ "points": [[ts_ms, value], ...], "kind", "unit", "scale" }`(`since` 以降、最大 `limit`、既定 2880)。
+- `GET /api/nodes/{id}/history` (クエリ無し)→ 保持している系列の一覧 `[ {ep,cluster,attr,count,first_ts,last_ts} ]`。
+- WS: 既存の `attr` イベントをそのまま使う(クライアントは受信値を自分のバッファにも積む)。
+
+### 9.3 UI
+- Dashboard のタイルをクリックすると、そのカードの下にグラフ領域を開く(複数タイル可、トグル)。
+  範囲セレクタ 1h / 6h / 24h / all。初期表示は `/history` を取り、以後は WS の `attr` で末尾に追記。
+- 描画は依存なしの SVG 折れ線(軸の目盛・最新値・min/max を表示)。温度/湿度は `scale` 適用後の値、単位は
+  `/api/clusters` の `unit`。しきい値(§5.4 の色)を薄い帯で背景に描く。
+- Devices の属性行にも「グラフ」トグル(数値属性のみ)。
+
+### 9.4 検証
+- ユニットテスト: リングバッファの上限・`since/limit` のフィルタ・ファイル往復・非数値の除外。
+- 実機: AirQ の CO2/温度を 10 分以上保持して折れ線が伸びること、再起動後に履歴が戻ること。
