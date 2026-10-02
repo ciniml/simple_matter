@@ -12,7 +12,7 @@ use smctl::ops::embed::{ReadItem, ReadOutcome};
 use smctl::simple_matter::dm::meta::{AttributeId, ClusterId};
 
 use crate::model::{
-    AttrModel, AttrPath, BasicInfo, ClusterModel, EndpointModel, NodeKind, NodeModel,
+    AttrModel, AttrPath, BasicInfo, ClusterModel, EndpointModel, NodeKind, NodeModel, Transport,
 };
 use crate::value::generic_json;
 
@@ -27,6 +27,10 @@ pub const BASIC_INFORMATION: u32 = 0x0028;
 /// BasicInformation の Describe 対象属性(VendorName / ProductName / NodeLabel /
 /// SoftwareVersionString / SerialNumber)。
 pub const BASIC_ATTRS: [u32; 5] = [0x0001, 0x0003, 0x0005, 0x000A, 0x000F];
+/// NetworkCommissioning クラスタ(FeatureMap で媒体を判定する)。
+pub const NETWORK_COMMISSIONING: u32 = 0x0031;
+/// グローバル属性 FeatureMap。
+pub const FEATURE_MAP: u32 = 0xFFFC;
 /// グローバル属性 AttributeList。
 pub const ATTRIBUTE_LIST: u32 = 0xFFFB;
 
@@ -150,6 +154,33 @@ pub fn basic_info(items: &[ReadItem]) -> BasicInfo {
     }
 }
 
+/// 読み取り結果の NetworkCommissioning FeatureMap から媒体一覧を作る(EP 昇順、重複なし)。
+/// クラスタ無し / 読み取りエラー / 整数でない値は無視する(空 = 不明)。
+pub fn transports(items: &[ReadItem]) -> Vec<Transport> {
+    let mut maps: BTreeMap<u16, u32> = BTreeMap::new();
+    for it in items {
+        if it.cluster != Some(NETWORK_COMMISSIONING) || it.attribute != Some(FEATURE_MAP) {
+            continue;
+        }
+        let (Some(ep), ReadOutcome::Data(raw)) = (it.endpoint, &it.outcome) else {
+            continue;
+        };
+        if let Some(fm) = as_u32(&generic_json(raw)) {
+            maps.insert(ep, fm);
+        }
+    }
+    let mut out = Vec::new();
+    for t in maps
+        .values()
+        .flat_map(|&fm| Transport::from_feature_map(fm))
+    {
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
+}
+
 /// モデルを組み立てる。
 ///
 /// - `parts`: EP0 の PartsList(EP0 自身は常に含める)。
@@ -216,6 +247,8 @@ pub fn build_model(
         endpoints,
         basic,
         described_at,
+        transport: None,
+        transports: Vec::new(),
     }
 }
 
@@ -494,5 +527,28 @@ mod tests {
         let s: Vec<u64> = (0..8).map(|a| backoff(a).as_secs()).collect();
         assert_eq!(s, vec![5, 60, 120, 240, 480, 600, 600, 600]);
         assert_eq!(backoff(u32::MAX).as_secs(), 600);
+    }
+
+    #[test]
+    fn transports_from_read_items() {
+        let fm = |v: u32| enc(|w| w.write_u32(&T2, v).unwrap());
+        // クラスタ無し。
+        assert!(transports(&[]).is_empty());
+        // WiFi(AirQ)/ Thread(NanoC6)。
+        let wifi = [item(0, NETWORK_COMMISSIONING, FEATURE_MAP, fm(1), false)];
+        assert_eq!(transports(&wifi), vec![Transport::Wifi]);
+        let thread = [item(0, NETWORK_COMMISSIONING, FEATURE_MAP, fm(2), false)];
+        assert_eq!(transports(&thread), vec![Transport::Thread]);
+        // 複数 EP は EP 昇順で重複排除。他クラスタの FeatureMap は無視。
+        let multi = [
+            item(2, NETWORK_COMMISSIONING, FEATURE_MAP, fm(1), false),
+            item(0, NETWORK_COMMISSIONING, FEATURE_MAP, fm(4), false),
+            item(1, NETWORK_COMMISSIONING, FEATURE_MAP, fm(1), false),
+            item(0, ON_OFF, FEATURE_MAP, fm(2), false),
+        ];
+        assert_eq!(
+            transports(&multi),
+            vec![Transport::Ethernet, Transport::Wifi]
+        );
     }
 }

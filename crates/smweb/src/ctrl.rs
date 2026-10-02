@@ -948,8 +948,17 @@ impl Ctl<'_> {
         let paths: Vec<AttrPath> = BASIC_ATTRS
             .iter()
             .map(|&a| AttrPath::new(0, BASIC_INFORMATION, a))
+            // NetworkCommissioning を持つ EP の FeatureMap(媒体判定)も同じ Read に載せる。
+            .chain(
+                servers
+                    .iter()
+                    .filter(|(_, cl)| cl.contains(&NETWORK_COMMISSIONING))
+                    .map(|(&ep, _)| AttrPath::new(ep, NETWORK_COMMISSIONING, FEATURE_MAP)),
+            )
             .collect();
-        let basic = basic_info(&self.read_chunked(node_id, &paths)?);
+        let items = self.read_chunked(node_id, &paths)?;
+        let basic = basic_info(&items);
+        let transports = transports(&items);
         // 4) クラスタ表にある (ep, cluster) の AttributeList。
         let pairs: Vec<(u16, u32)> = servers
             .iter()
@@ -970,7 +979,7 @@ impl Ctl<'_> {
                 attr_lists.insert((ep, c), l);
             }
         }
-        let model = build_model(
+        let mut model = build_model(
             &parts,
             &device_types,
             &servers,
@@ -978,11 +987,13 @@ impl Ctl<'_> {
             basic,
             unix_now(),
         );
+        model.set_transports(transports);
         let kind = classify(&model);
         wlog!(
             Level::Info,
-            "node {node_id:#x}: {} endpoint(s), kind {kind:?}{}",
+            "node {node_id:#x}: {} endpoint(s), kind {kind:?}, transport {:?}{}",
             model.endpoints.len(),
+            model.transports,
             model
                 .basic
                 .product_name

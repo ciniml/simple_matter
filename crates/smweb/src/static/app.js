@@ -190,9 +190,37 @@ const SENSOR_TILES = [
   },
 ];
 
+const TRANSPORT_LABEL = { wifi: "WiFi", thread: "Thread", ethernet: "Ethernet" };
+
+/** Transport list of a node (described model first, then the /api/nodes summary). */
+function nodeTransports(n) {
+  const m = n.model || {};
+  const list = (m.transports && m.transports.length ? m.transports : n.transports) || [];
+  if (list.length) return list;
+  const one = m.transport || n.transport;
+  return one ? [one] : [];
+}
+
+/** "IPv6" / "IPv4" from the operational address, or "" when unresolved. */
+function addrFamily(addr) {
+  if (!addr) return "";
+  return addr.startsWith("[") || (addr.match(/:/g) || []).length > 1 ? "IPv6" : "IPv4";
+}
+
+/** Transport badges (WiFi / Thread / Ethernet); empty when unknown. */
+function transportBadges(n) {
+  return nodeTransports(n).map((t) => el("span", {
+    class: `badge transport ${t}`,
+    title: "NetworkCommissioning FeatureMap",
+    text: TRANSPORT_LABEL[t] || t,
+  }));
+}
+
 function cardHead(n) {
   const head = el("div", { class: "card-head" },
     el("span", { class: "title", text: nodeTitle(n) }),
+    ...transportBadges(n),
+    addrFamily(n.addr) ? el("span", { class: "muted small", title: n.addr, text: addrFamily(n.addr) }) : "",
     el("span", { class: "muted mono small", text: `${n.node_id} (${hex(n.node_id)})` }),
     el("span", { class: `badge ${n.state}`, text: n.state }),
   );
@@ -607,6 +635,7 @@ function nodeRow(n) {
     el("span", { class: "caret", text: expanded.has(n.node_id) ? "▾" : "▸" }),
     el("span", { class: "mono", text: `${n.node_id} (${hex(n.node_id)})` }),
     el("span", { text: nodeTitle(n) }),
+    ...transportBadges(n),
     b.vendor_name ? el("span", { class: "muted small", text: b.vendor_name }) : "",
     el("span", { class: "badge kind", text: n.kind }),
     el("span", { class: "mono small muted grow", text: n.addr || "(unresolved)" }),

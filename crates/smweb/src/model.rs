@@ -108,6 +108,33 @@ pub struct BasicInfo {
     pub software_version: Option<String>,
 }
 
+/// ネットワーク媒体(NetworkCommissioning 0x0031 の FeatureMap 由来)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Transport {
+    /// FeatureMap bit0(WI)。
+    Wifi,
+    /// FeatureMap bit1(TH)。
+    Thread,
+    /// FeatureMap bit2(ET)。
+    Ethernet,
+}
+
+impl Transport {
+    /// NetworkCommissioning FeatureMap → 媒体(bit0 WiFi / bit1 Thread / bit2 Ethernet の順)。
+    pub fn from_feature_map(fm: u32) -> Vec<Transport> {
+        [
+            (0x1, Transport::Wifi),
+            (0x2, Transport::Thread),
+            (0x4, Transport::Ethernet),
+        ]
+        .into_iter()
+        .filter(|(bit, _)| fm & bit != 0)
+        .map(|(_, t)| t)
+        .collect()
+    }
+}
+
 /// Describe の結果(§5.1。値は含めない)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct NodeModel {
@@ -117,9 +144,21 @@ pub struct NodeModel {
     /// 取得時刻(UNIX 秒)。
     #[serde(default)]
     pub described_at: u64,
+    /// 主たる媒体(`transports` の先頭。クラスタ無し / 読めなければ `None` = 不明)。
+    #[serde(default)]
+    pub transport: Option<Transport>,
+    /// 全 EP の NetworkCommissioning FeatureMap から得た媒体(EP 昇順、重複なし)。
+    #[serde(default)]
+    pub transports: Vec<Transport>,
 }
 
 impl NodeModel {
+    /// 媒体一覧を設定する(主たる媒体 = 先頭)。
+    pub fn set_transports(&mut self, transports: Vec<Transport>) {
+        self.transport = transports.first().copied();
+        self.transports = transports;
+    }
+
     /// クラスタを持つエンドポイント(EP 昇順)。
     pub fn endpoints_with(&self, cluster: u32) -> impl Iterator<Item = u16> + '_ {
         self.endpoints
@@ -215,6 +254,8 @@ impl NodeSnap {
             "state": self.state,
             "last_seen": self.last_seen,
             "product": self.model.as_ref().and_then(|m| m.basic.product_name.clone()),
+            "transport": self.model.as_ref().and_then(|m| m.transport),
+            "transports": self.model.as_ref().map(|m| m.transports.clone()).unwrap_or_default(),
             "sub_id": self.sub_id,
             "last_report": self.last_report,
             "error": self.error,
@@ -503,5 +544,42 @@ mod tests {
         let s = n.summary();
         assert_eq!(s["kind"], "other");
         assert!(s.get("values").is_none());
+    }
+
+    #[test]
+    fn feature_map_to_transports() {
+        use Transport::*;
+        assert_eq!(Transport::from_feature_map(0), vec![]);
+        assert_eq!(Transport::from_feature_map(1), vec![Wifi]);
+        assert_eq!(Transport::from_feature_map(2), vec![Thread]);
+        assert_eq!(Transport::from_feature_map(4), vec![Ethernet]);
+        assert_eq!(Transport::from_feature_map(3), vec![Wifi, Thread]);
+    }
+
+    #[test]
+    fn model_transport_json_round_trip() {
+        // 旧キャッシュ(フィールド無し)も読める。
+        let old: NodeModel =
+            serde_json::from_str(r#"{"endpoints":[],"basic":{},"described_at":5}"#).unwrap();
+        assert_eq!(old.transport, None);
+        assert!(old.transports.is_empty());
+        let v = serde_json::to_value(&old).unwrap();
+        assert!(v["transport"].is_null());
+        assert_eq!(v["transports"], json!([]));
+
+        let mut m = old.clone();
+        m.set_transports(vec![Transport::Thread, Transport::Wifi]);
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["transport"], "thread");
+        assert_eq!(v["transports"], json!(["thread", "wifi"]));
+        let back: NodeModel = serde_json::from_value(v).unwrap();
+        assert_eq!(back, m);
+
+        // 要約にも載る。
+        let mut n = NodeSnap::new(34, "light".into(), None);
+        assert!(n.summary()["transport"].is_null());
+        n.model = Some(m);
+        assert_eq!(n.summary()["transport"], "thread");
+        assert_eq!(n.summary()["transports"], json!(["thread", "wifi"]));
     }
 }

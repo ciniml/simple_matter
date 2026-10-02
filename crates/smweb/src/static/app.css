@@ -10,6 +10,9 @@
   --off: #8a8a93;
   --err: #b91c1c;
   /* tile states */
+  --tr-wifi: #1d6fb8;
+  --tr-thread: #7c4dbd;
+  --tr-ethernet: #0f766e;
   --t-good: #16a34a;
   --t-fair: #65a30d;
   --t-mod: #ca8a04;
@@ -31,6 +34,9 @@
     --warn: #fbbf24;
     --off: #7a7a83;
     --err: #f87171;
+    --tr-wifi: #7cb8ee;
+    --tr-thread: #b79bea;
+    --tr-ethernet: #5ec4b8;
     --t-neutral: #334155;
     --t-none: #4b5563;
   }
@@ -81,6 +87,10 @@ h3 { font-size: 14px; margin: 0 0 6px; }
 .badge.offline { background: var(--off); }
 .badge.kind { background: transparent; color: var(--muted); border: 1px solid var(--border); }
 .badge.sub { background: var(--accent); }
+.badge.transport { background: transparent; color: var(--muted); border: 1px solid currentColor; }
+.badge.transport.wifi { color: var(--tr-wifi); }
+.badge.transport.thread { color: var(--tr-thread); }
+.badge.transport.ethernet { color: var(--tr-ethernet); }
 
 /* ---------- Dashboard ---------- */
 .cards { display: flex; flex-direction: column; gap: 14px; margin-bottom: 14px; }

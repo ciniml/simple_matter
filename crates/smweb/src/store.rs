@@ -127,6 +127,8 @@ mod tests {
                 ..BasicInfo::default()
             },
             described_at: 1_700_000_000,
+            transport: Some(crate::model::Transport::Wifi),
+            transports: vec![crate::model::Transport::Wifi],
         });
         n.watch = vec![AttrPath::new(0, 0x28, 5)];
         n.last_online = Some(1_700_000_001);
