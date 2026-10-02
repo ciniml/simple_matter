@@ -230,10 +230,24 @@ async fn run_ble(
         target.vendor_id,
         target.product_id
     );
-    let (conn, mtu) = gatt
-        .connect(&target)
-        .await
-        .map_err(|e| format!("connect: {e:?}"))?;
+    // BlueZ は「le-connection-abort-by-local」で接続確立に散発的に失敗する(実機で頻発)ので、
+    // 少し待って数回やり直す。
+    let mut attempt = 0u32;
+    let (conn, mtu) = loop {
+        match gatt.connect(&target).await {
+            Ok(x) => break x,
+            Err(e) if attempt < 3 => {
+                attempt += 1;
+                crate::log::logf!(
+                    crate::log::Level::Warn,
+                    "ble",
+                    "connect failed ({e:?}); retry {attempt}/3"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            }
+            Err(e) => return Err(format!("connect: {e:?}")),
+        }
+    };
     crate::log::logf!(
         crate::log::Level::Info,
         "ble",

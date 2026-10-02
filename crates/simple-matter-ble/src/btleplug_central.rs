@@ -252,11 +252,28 @@ impl GattCentral for BtleplugCentral {
 
     async fn write_c1(&mut self, conn: BtpConnId, frag: &[u8]) -> Result<()> {
         let st = self.conns.get(&conn.0).ok_or(Error::NotFound)?;
-        st.peripheral
-            .write(&st.c1, frag, WriteType::WithResponse)
-            .await
-            .map_err(map_btle)?;
-        Ok(())
+        // ATT エラー応答(相手が書き込みを受理しなかった = BTP フラグメントは未消費)は一時的な
+        // ことがあるので、少し待って同じフラグメントを再送する(実機: TP-Link Tapo P110M が
+        // 散発的に ATT 0x0E を返し、ペアリングがその場で失敗していた)。ATT エラー以外
+        // (切断・タイムアウト等)は相手に届いた可能性があるため再送しない。
+        const ATT_RETRIES: u32 = 3;
+        let mut attempt = 0;
+        loop {
+            match st
+                .peripheral
+                .write(&st.c1, frag, WriteType::WithResponse)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < ATT_RETRIES && e.to_string().contains("ATT error") => {
+                    attempt += 1;
+                    eprintln!("[btleplug] C1 write rejected ({e}); retry {attempt}/{ATT_RETRIES}");
+                    tokio::time::sleep(std::time::Duration::from_millis(150 * u64::from(attempt)))
+                        .await;
+                }
+                Err(e) => return Err(map_btle(e)),
+            }
+        }
     }
 
     async fn next_indication(&mut self, conn: BtpConnId, buf: &mut [u8]) -> Result<usize> {
