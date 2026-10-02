@@ -190,12 +190,23 @@ impl RecvWindow {
     ///
     /// standalone ACK も seq を消費するため相手は当該 seq の ACK 受領を待つ
     /// (chip は ack-received タイマで未 ACK を検知して切断する)。データと違い
-    /// local window は消費しないため `level` は減らさず、遅延(2500ms)期限のみ張る
-    /// (既に保留があればそのまま)。これにより長アイドル(遅延 InvokeResponse の
+    /// 遅延(2500ms)期限を張る(既に保留があればそのまま)。これにより長アイドル(遅延 InvokeResponse の
     /// join 待ち等)でも 2.5s 周期の ACK 応酬で BTP リンクが維持される。
+    ///
+    /// ただし相手(chip の BLEEndPoint)は自分の送った standalone ACK も受信 window に数える。
+    /// こちらが数えないと、相手が「ACK 1 + データ 3」で window を使い切って停止しているのに
+    /// こちらは level=2 と見て 2.5 秒待つ(実機: TP-Link Tapo P110M が 3 秒弱で待ちきれず
+    /// C1 書き込みを ATT エラー 0x0E で拒否し、Attestation 中に失敗した)。そのため window は
+    /// データと同じく 1 消費し、`level ≤ 1` で即時 ACK にする(peer の連続受信が window を使い切る
+    /// ときだけ即時になるので、ACK の無限応酬にはならない)。
     pub fn arm_keepalive_ack(&mut self, now_ms: u64) {
         self.pending_ack = true;
-        if self.ack_deadline_ms.is_none() {
+        if self.level > 0 {
+            self.level -= 1;
+        }
+        if self.level <= 1 {
+            self.ack_deadline_ms = Some(now_ms);
+        } else if self.ack_deadline_ms.is_none() {
             self.ack_deadline_ms = Some(now_ms.saturating_add(BTP_ACK_SEND_DELAY_MS));
         }
     }

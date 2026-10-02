@@ -544,3 +544,30 @@ fn keepalive_ack_exchange_sustains_idle_link() {
     // リンクはアイドルタイムアウトしない(last_activity が更新され続ける)。
     assert!(!p.is_timed_out(7_501));
 }
+
+/// 相手の standalone ACK も受信 window を消費する(chip の BLEEndPoint と同じ数え方)。
+/// window 5 で「ACK 1 + データ 3」を受けたら相手は送信停止しているので、即時 ACK が必要
+/// (実機: Tapo P110M が 2.5 秒の遅延 ACK を待てず C1 書き込みを ATT 0x0E で拒否した)。
+#[test]
+fn peer_standalone_ack_counts_toward_window_and_forces_immediate_ack() {
+    use crate::btp::session::RecvWindow;
+    let mut w = RecvWindow::new(0);
+    w.set_window(5);
+    let t = 1_000;
+    w.accept_seq(0).unwrap();
+    w.arm_keepalive_ack(t); // 相手の standalone ACK
+    assert!(!w.ack_due(t), "a lone keep-alive ACK is still acknowledged lazily");
+    for seq in 1..=2 {
+        w.accept_seq(seq).unwrap();
+        w.arm_ack(t);
+    }
+    assert!(!w.ack_due(t), "window still has room after ACK + 2 data fragments");
+    w.accept_seq(3).unwrap();
+    w.arm_ack(t);
+    assert!(w.ack_due(t), "ACK + 3 data fragments exhaust a window of 5: ack immediately");
+    assert_eq!(w.take_ack(), Some(3));
+    // ACK を返すと window は戻り、単発の keep-alive は再び遅延 ACK。
+    w.accept_seq(4).unwrap();
+    w.arm_keepalive_ack(t);
+    assert!(!w.ack_due(t));
+}
