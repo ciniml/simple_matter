@@ -793,6 +793,18 @@ impl<'a> Exec<'a> {
 
     /// ノードへの CASE セッションを返す(プロセス内キャッシュ優先)。
     fn case_session(&mut self, node_id: u64) -> Result<SessionId, String> {
+        let r = self.case_session_inner(node_id);
+        if r.is_err() {
+            // 失敗した CASE の保留ハンドシェイクを破棄して枠を空ける。放置するとコアの
+            // HANDSHAKE_TIMEOUT(60 秒)まで次の start_case が NoSpace になり、長時間動く
+            // 埋め込み利用(smweb)では再接続のたびに NoSpace → バックオフを繰り返す
+            // (実機: 別ホストの smweb が AirQ に再接続できなくなった)。CLI は直後に終了するので無害。
+            self.stack.abort_handshake();
+        }
+        r
+    }
+
+    fn case_session_inner(&mut self, node_id: u64) -> Result<SessionId, String> {
         if let Some(&(_, s)) = self.cases.iter().find(|(n, _)| *n == node_id) {
             return Ok(s);
         }
