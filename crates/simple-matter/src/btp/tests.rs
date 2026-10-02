@@ -556,15 +556,24 @@ fn peer_standalone_ack_counts_toward_window_and_forces_immediate_ack() {
     let t = 1_000;
     w.accept_seq(0).unwrap();
     w.arm_keepalive_ack(t); // 相手の standalone ACK
-    assert!(!w.ack_due(t), "a lone keep-alive ACK is still acknowledged lazily");
+    assert!(
+        !w.ack_due(t),
+        "a lone keep-alive ACK is still acknowledged lazily"
+    );
     for seq in 1..=2 {
         w.accept_seq(seq).unwrap();
         w.arm_ack(t);
     }
-    assert!(!w.ack_due(t), "window still has room after ACK + 2 data fragments");
+    assert!(
+        !w.ack_due(t),
+        "window still has room after ACK + 2 data fragments"
+    );
     w.accept_seq(3).unwrap();
     w.arm_ack(t);
-    assert!(w.ack_due(t), "ACK + 3 data fragments exhaust a window of 5: ack immediately");
+    assert!(
+        w.ack_due(t),
+        "ACK + 3 data fragments exhaust a window of 5: ack immediately"
+    );
     assert_eq!(w.take_ack(), Some(3));
     // ACK を返すと window は戻り、単発の keep-alive は再び遅延 ACK。
     w.accept_seq(4).unwrap();
