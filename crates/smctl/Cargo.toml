@@ -15,6 +15,9 @@ simple-matter = { path = "../simple-matter", features = ["controller"] }
 socket2 = { version = "0.5", features = ["all"] }
 # OS の CSPRNG。examples の DemoRng(LCG)は製品バイナリには持ち込まない(設計 doc §2.5)。
 getrandom = "0.4"
+# mDNS をマルチホーム環境の全 LAN 向き IF で送受信するための IF 列挙(unix: getifaddrs /
+# Windows: GetAdaptersAddresses)。fe80 も列挙するため link-local feature を有効にする。
+if-addrs = { version = "0.15", features = ["link-local"] }
 
 # BLE 経路(feature "ble")。btleplug central は simple-matter-ble 経由で使う。
 # bluer(デバイス側 peripheral・Linux 限定)には依存しない(設計 doc §2.1)ため、

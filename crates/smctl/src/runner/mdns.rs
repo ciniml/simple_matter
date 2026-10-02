@@ -2,7 +2,11 @@
 //!
 //! examples/commissioner.rs(browse)と simple-matter-ble/examples/ble-commissioner.rs
 //! (operational 解決)の移植。Windows は W3 の成果(QU クエリ + エフェメラルポート、
-//! `IP_MULTICAST_IF`/join の LAN 向き IF 固定、`SM_MDNS_TRACE`)を `#[cfg]` で吸収する。
+//! `SM_MDNS_TRACE`)を `#[cfg]` で吸収する。
+//!
+//! マルチホーム対応: マルチキャストは既定経路の IF だけでなく、適格な**全 IF**
+//! (up・非 loopback・非 p2p・仮想 IF 接頭辞 deny。`SM_MDNS_IFACES=ifA,ifB` で固定可)
+//! で送受信する([`MdnsSockets`])。Windows は IF ごとの v4 QU ソケットで、v6 は対象外。
 
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket};
@@ -77,77 +81,366 @@ pub fn fill_link_local_scope(addr: SocketAddr) -> SocketAddr {
     addr
 }
 
+/// マルチキャスト mDNS を送受信する候補インターフェース(名前単位に集約)。
+#[derive(Debug, Clone, Default)]
+struct MdnsIface {
+    name: String,
+    /// if_index(不明なら 0)。v6 の join / 送信先 scope と fe80 の scope 補完に使う。
+    index: u32,
+    /// (アドレス, ネットマスク)。先頭を v4 の join / `IP_MULTICAST_IF` に使い、
+    /// 全体を v4 応答元からの到着 IF 推定(サブネット一致)に使う。
+    v4: Vec<(Ipv4Addr, Ipv4Addr)>,
+    /// fe80 リンクローカルを持つか(v6 mDNS の参加条件)。
+    has_v6_ll: bool,
+    /// v6 アドレス(プレフィクス長付き)。scope 無し v6 応答元の到着 IF 推定用。
+    v6: Vec<(Ipv6Addr, u8)>,
+}
+
+/// 自動選択で除外する仮想 IF 名の接頭辞(コンテナ/VM ブリッジ・VPN)。
+///
+/// クエリを撒いても害は小さいが、コンテナ内 responder や reflector の応答が混ざって
+/// トレースが読みにくくなり、到着 IF 推定も曖昧になるため既定では除外する。
+/// 環境変数 `SM_MDNS_IFACES=ifA,ifB` 指定時はこの規則を使わず、その IF 群に固定する。
+const MDNS_IFACE_DENY_PREFIXES: &[&str] = &[
+    "docker",
+    "br-",
+    "veth",
+    "virbr",
+    "lxc",
+    "lxd",
+    "incus",
+    "tailscale",
+    "utun",
+];
+
+/// 自動選択の可否: up(oper up)・非 loopback・非 point-to-point(VPN トンネル等、
+/// マルチキャスト非対応のことが多い)・仮想 IF 接頭辞に非該当。
+///
+/// `IFF_MULTICAST` は if-addrs が公開しないため、p2p 除外 + 接頭辞 deny で近似する。
+fn iface_auto_eligible(name: &str, loopback: bool, oper_up: bool, p2p: bool) -> bool {
+    !loopback && oper_up && !p2p && !MDNS_IFACE_DENY_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// `SM_MDNS_IFACES`(カンマ区切り)の解釈。未設定/空なら `None`。
+fn forced_iface_names(raw: Option<&str>) -> Option<Vec<String>> {
+    let v: Vec<String> = raw?
+        .split(',')
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+/// mDNS に使う IF を列挙する(規則は [`iface_auto_eligible`] / `SM_MDNS_IFACES`)。
+/// 列挙に失敗したら空(呼び出し側は既定 IF 1 本のフォールバックへ)。
+fn mdns_ifaces() -> Vec<MdnsIface> {
+    let Ok(all) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+    let forced = forced_iface_names(std::env::var("SM_MDNS_IFACES").ok().as_deref());
+    let mut out: Vec<MdnsIface> = Vec::new();
+    for ifa in all {
+        let ok = match &forced {
+            Some(list) => list.contains(&ifa.name),
+            None => {
+                iface_auto_eligible(&ifa.name, ifa.is_loopback(), ifa.is_oper_up(), ifa.is_p2p())
+            }
+        };
+        if !ok {
+            continue;
+        }
+        let pos = match out.iter().position(|e| e.name == ifa.name) {
+            Some(p) => p,
+            None => {
+                out.push(MdnsIface {
+                    name: ifa.name.clone(),
+                    index: ifa.index.unwrap_or(0),
+                    ..MdnsIface::default()
+                });
+                out.len() - 1
+            }
+        };
+        let ent = &mut out[pos];
+        match ifa.addr {
+            if_addrs::IfAddr::V4(a) => ent.v4.push((a.ip, a.netmask)),
+            if_addrs::IfAddr::V6(a) => {
+                if is_v6_link_local(a.ip) {
+                    ent.has_v6_ll = true;
+                }
+                ent.v6.push((a.ip, a.prefixlen));
+            }
+        }
+    }
+    out
+}
+
+/// `ip` が `net/prefix` に含まれるか(v6)。
+fn v6_in_prefix(ip: Ipv6Addr, net: Ipv6Addr, prefix: u8) -> bool {
+    let p = u32::from(prefix.min(128));
+    if p == 0 {
+        return true;
+    }
+    let mask = u128::MAX << (128 - p);
+    (u128::from(ip) & mask) == (u128::from(net) & mask)
+}
+
+/// 応答アドレスの優先順位(小さいほど優先): IPv4 → ルーティング可能な v6
+/// (ULA/GUA。Thread の OMR を含む)→ v6 リンクローカル。
+fn addr_rank(ip: &IpAddr) -> u8 {
+    match ip {
+        IpAddr::V4(_) => 0,
+        IpAddr::V6(v6) if !is_v6_link_local(*v6) => 1,
+        IpAddr::V6(_) => 2,
+    }
+}
+
+/// 応答のアドレス群から接続先を 1 つ選ぶ([`addr_rank`] 順)。fe80 には `scope`
+/// (応答の到着 IF)を埋める。
+fn pick_addr<'a>(
+    addrs: impl IntoIterator<Item = &'a IpAddr>,
+    port: u16,
+    scope: Option<u32>,
+) -> Option<SocketAddr> {
+    let ip = addrs.into_iter().min_by_key(|a| addr_rank(a)).copied()?;
+    let port = if port != 0 { port } else { MATTER_PORT };
+    Some(socket_addr_with_scope(ip, port, scope))
+}
+
+/// ソケットの種類と送信先 IF。
+enum SockKind {
+    /// unix: 5353 共有の v4 ソケット 1 本。各要素 (IF 位置, `IP_MULTICAST_IF` 用アドレス)
+    /// ごとに IF を切り替えて 1 回ずつ送る。IF 位置 `None` は既定 IF(フォールバック)。
+    #[cfg(unix)]
+    V4Shared(Vec<(Option<usize>, Ipv4Addr)>),
+    /// unix: 5353 共有の v6 ソケット 1 本。各要素 (IF 位置, if_index) ごとに
+    /// `ff02::fb%if_index` へ送る。
+    #[cfg(unix)]
+    V6Shared(Vec<(Option<usize>, u32)>),
+    /// Windows: IF ごとのエフェメラルポート QU ソケット(送信 IF 固定済み)。
+    #[cfg(not(unix))]
+    V4Single(Option<usize>),
+}
+
 /// v4 と(unix のみ)v6 の mDNS クエリソケットをまとめて扱う。
 ///
-/// 各ソケットは (ソケット, QU モードか, マルチキャスト宛先) を持ち、応答は
-/// ファミリ非依存の [`MdnsClient::parse_*`] に集約する(design §3)。
+/// マルチホーム(有線 = 既定経路 + WiFi = Matter 網 等)で、既定経路の IF にだけ
+/// 送受信すると別 IF 側のデバイス/OTBR を解決できない。そこで適格な**全 IF**
+/// ([`mdns_ifaces`])でクエリを送り、応答の到着 IF を記録して fe80 の scope に使う。
+/// 応答はファミリ非依存の [`MdnsClient::parse_*`] に集約する(design §3)。
 struct MdnsSockets {
     socks: Vec<MdnsSock>,
-    /// v6 ソケットの scope_id(fe80 連絡先の補完に使う)。
-    v6_scope: Option<u32>,
+    ifaces: Vec<MdnsIface>,
+    trace: bool,
 }
 
 struct MdnsSock {
     sock: UdpSocket,
     /// unicast-response(QU)モードか(Windows のエフェメラルポート等)。
     qu: bool,
-    /// QM 応答/クエリの送信先マルチキャストアドレス。
-    mc_dst: SocketAddr,
+    kind: SockKind,
 }
 
 impl MdnsSockets {
     /// v4(+ unix は v6)ソケットを開く。1 本も開けなければ `None`。
     fn open() -> Option<Self> {
-        let mut socks = Vec::new();
-        // v6 は unix のみ(下の cfg ブロック)。Windows では再代入されず mut が余る。
-        #[cfg_attr(not(unix), allow(unused_mut))]
-        let mut v6_scope = None;
-        if let Some((sock, qu)) = open_mdns_browse_socket() {
-            socks.push(MdnsSock {
-                sock,
-                qu,
-                mc_dst: SocketAddr::from((MDNS_IPV4, MDNS_PORT)),
-            });
+        let trace = mdns_trace();
+        let ifaces = mdns_ifaces();
+        if trace {
+            let list: Vec<String> = ifaces
+                .iter()
+                .map(|i| {
+                    format!(
+                        "{}#{}(v4={} v6ll={})",
+                        i.name,
+                        i.index,
+                        i.v4.first()
+                            .map(|a| a.0.to_string())
+                            .unwrap_or_else(|| "-".into()),
+                        i.has_v6_ll
+                    )
+                })
+                .collect();
+            dis_trace!("mDNS interfaces: [{}]", list.join(", "));
         }
+        let mut socks = Vec::new();
         #[cfg(unix)]
-        if let Some((sock, scope)) = open_mdns_browse_socket_v6() {
-            v6_scope = Some(scope);
-            socks.push(MdnsSock {
-                sock,
-                qu: false,
-                mc_dst: SocketAddr::V6(SocketAddrV6::new(MDNS_IPV6, MDNS_PORT, 0, scope)),
-            });
+        {
+            if let Some(s) = open_mdns_socket_v4_shared(&ifaces) {
+                socks.push(s);
+            }
+            if let Some(s) = open_mdns_socket_v6_shared(&ifaces) {
+                socks.push(s);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            for (i, ifc) in ifaces.iter().enumerate() {
+                let Some(&(ip, _)) = ifc.v4.first() else {
+                    continue;
+                };
+                if let Some(sock) = open_mdns_query_socket(ip) {
+                    socks.push(MdnsSock {
+                        sock,
+                        qu: true,
+                        kind: SockKind::V4Single(Some(i)),
+                    });
+                }
+            }
+            if socks.is_empty() {
+                // 列挙失敗/該当なし: 従来どおり既定経路の IF 1 本。
+                let ip = default_route_local_ipv4().unwrap_or(Ipv4Addr::UNSPECIFIED);
+                if let Some(sock) = open_mdns_query_socket(ip) {
+                    socks.push(MdnsSock {
+                        sock,
+                        qu: true,
+                        kind: SockKind::V4Single(None),
+                    });
+                }
+            }
         }
         if socks.is_empty() {
             None
         } else {
-            Some(Self { socks, v6_scope })
+            Some(Self {
+                socks,
+                ifaces,
+                trace,
+            })
         }
     }
 
-    /// 各ソケットへ、その QU モードに合わせて組んだクエリを送る。
+    fn iface_name(&self, i: Option<usize>) -> &str {
+        i.and_then(|i| self.ifaces.get(i))
+            .map(|f| f.name.as_str())
+            .unwrap_or("default")
+    }
+
+    /// 各ソケット・各 IF へ、その QU モードに合わせて組んだクエリを送る。
     fn send_query<F>(&self, build: F)
     where
         F: Fn(&mut [u8; 128], bool) -> Result<usize, simple_matter::Error>,
     {
         for s in &self.socks {
             let mut buf = [0u8; 128];
-            if let Ok(len) = build(&mut buf, s.qu) {
-                let _ = s.sock.send_to(&buf[..len], s.mc_dst);
+            let Ok(len) = build(&mut buf, s.qu) else {
+                continue;
+            };
+            let pkt = &buf[..len];
+            match &s.kind {
+                #[cfg(unix)]
+                SockKind::V4Shared(targets) => {
+                    let sref = socket2::SockRef::from(&s.sock);
+                    for &(i, ip) in targets {
+                        let _ = sref.set_multicast_if_v4(&ip);
+                        let r = s.sock.send_to(pkt, (MDNS_IPV4, MDNS_PORT));
+                        if self.trace {
+                            dis_trace!(
+                                "query {len}B -> {MDNS_IPV4} via {} ({ip}){}",
+                                self.iface_name(i),
+                                err_suffix(&r)
+                            );
+                        }
+                    }
+                }
+                #[cfg(unix)]
+                SockKind::V6Shared(targets) => {
+                    let sref = socket2::SockRef::from(&s.sock);
+                    for &(i, idx) in targets {
+                        let _ = sref.set_multicast_if_v6(idx);
+                        let dst = SocketAddrV6::new(MDNS_IPV6, MDNS_PORT, 0, idx);
+                        let r = s.sock.send_to(pkt, dst);
+                        if self.trace {
+                            dis_trace!(
+                                "query {len}B -> {dst} via {}{}",
+                                self.iface_name(i),
+                                err_suffix(&r)
+                            );
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                SockKind::V4Single(i) => {
+                    let r = s.sock.send_to(pkt, (MDNS_IPV4, MDNS_PORT));
+                    if self.trace {
+                        dis_trace!(
+                            "query {len}B (QU) -> {MDNS_IPV4} via {}{}",
+                            self.iface_name(*i),
+                            err_suffix(&r)
+                        );
+                    }
+                }
             }
         }
     }
 
     /// いずれかのソケットから 1 パケット受信する(nonblocking、無ければ `None`)。
-    fn recv(&self, buf: &mut [u8]) -> Option<(usize, SocketAddr)> {
+    /// 戻りの 3 要素目は推定した到着 IF(`self.ifaces` の位置)。
+    fn recv(&self, buf: &mut [u8]) -> Option<(usize, SocketAddr, Option<usize>)> {
         for s in &self.socks {
             match s.sock.recv_from(buf) {
-                Ok(x) => return Some(x),
+                Ok((n, src)) => {
+                    #[cfg(not(unix))]
+                    if let SockKind::V4Single(Some(i)) = s.kind {
+                        return Some((n, src, Some(i)));
+                    }
+                    return Some((n, src, self.arrival_iface(src)));
+                }
                 Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
                 Err(_) => {}
             }
         }
         None
+    }
+
+    /// 応答元アドレスから到着 IF を推定する: v6 は recv_from の scope_id(fe80 応答元)、
+    /// それ以外は IF のサブネット/プレフィクス一致。
+    fn arrival_iface(&self, src: SocketAddr) -> Option<usize> {
+        match src {
+            SocketAddr::V6(v6) if v6.scope_id() != 0 => {
+                self.ifaces.iter().position(|f| f.index == v6.scope_id())
+            }
+            SocketAddr::V6(v6) => self.ifaces.iter().position(|f| {
+                f.v6.iter()
+                    .any(|&(net, p)| !is_v6_link_local(net) && v6_in_prefix(*v6.ip(), net, p))
+            }),
+            SocketAddr::V4(v4) => {
+                let ip = u32::from(*v4.ip());
+                self.ifaces.iter().position(|f| {
+                    f.v4.iter().any(|&(a, m)| {
+                        let m = u32::from(m);
+                        (ip & m) == (u32::from(a) & m)
+                    })
+                })
+            }
+        }
+    }
+
+    /// 応答中の fe80 に付ける scope: 到着 IF の if_index → 応答元の scope_id →
+    /// 既定 scope の順。
+    fn rx_scope(&self, src: SocketAddr, iface: Option<usize>) -> Option<u32> {
+        if let Some(idx) = iface
+            .and_then(|i| self.ifaces.get(i))
+            .map(|f| f.index)
+            .filter(|&x| x != 0)
+        {
+            return Some(idx);
+        }
+        match src {
+            SocketAddr::V6(v6) if v6.scope_id() != 0 => Some(v6.scope_id()),
+            _ => default_v6_scope(),
+        }
+    }
+}
+
+/// トレース用: 送信エラーなら ` (err: ..)`。
+fn err_suffix(r: &std::io::Result<usize>) -> String {
+    match r {
+        Ok(_) => String::new(),
+        Err(e) => format!(" (err: {e})"),
     }
 }
 
@@ -182,12 +475,12 @@ pub fn browse_commissionable(
             }
         }
         match socks.recv(&mut rx) {
-            Some((n, src)) => {
+            Some((n, src, iface)) => {
                 let parsed = MdnsClient::parse_commissionable(&rx[..n]);
                 if trace {
-                    let fam = if src.is_ipv6() { "v6" } else { "v4" };
                     dis_trace!(
-                        "rx {n}B from {src} ({fam}) parse={}",
+                        "rx {n}B from {src} via {} parse={}",
+                        socks.iface_name(iface),
                         if parsed.is_some() {
                             "commissionable"
                         } else {
@@ -202,24 +495,13 @@ pub fn browse_commissionable(
                         continue;
                     }
                 }
-                // IPv4 を優先(dual-stack ソケットで扱いやすい)、無ければ最初のアドレス。
-                let picked = node
-                    .addrs
-                    .iter()
-                    .find(|a| a.is_ipv4())
-                    .or_else(|| node.addrs.iter().next())
-                    .copied();
-                if let Some(ip) = picked {
-                    let port = if node.port != 0 {
-                        node.port
-                    } else {
-                        MATTER_PORT
-                    };
+                // IPv4 → ルーティング可能 v6 → fe80(到着 IF の scope 付き)の順。
+                let scope = socks.rx_scope(src, iface);
+                if let Some(addr) = pick_addr(node.addrs.iter(), node.port, scope) {
                     let disc = node
                         .discriminator
                         .map(|d| d.to_string())
                         .unwrap_or_else(|| "?".into());
-                    let addr = socket_addr_with_scope(ip, port, socks.v6_scope);
                     dis_info!("found commissionable node at {addr} (discriminator={disc})");
                     return Ok(addr);
                 }
@@ -266,14 +548,16 @@ pub fn browse_commissionable_list(
             last_query = Instant::now();
         }
         match socks.recv(&mut rx) {
-            Some((n, src)) => {
+            Some((n, src, iface)) => {
                 let ingest = match discriminator {
                     Some(d) => set.ingest_filtered(&rx[..n], d),
                     None => set.ingest(&rx[..n]),
                 };
                 if trace {
-                    let fam = if src.is_ipv6() { "v6" } else { "v4" };
-                    dis_trace!("rx {n}B from {src} ({fam}) ingest={ingest:?}");
+                    dis_trace!(
+                        "rx {n}B from {src} via {} ingest={ingest:?}",
+                        socks.iface_name(iface)
+                    );
                 }
                 if ingest == Ingest::Added {
                     if let Some(node) = set.iter().last() {
@@ -300,12 +584,14 @@ pub struct CommissionableInfo {
     pub commissioning_mode: Option<u8>,
     /// SRV ポート(0 なら既定の 5540 に補完済み)。
     pub port: u16,
-    /// 接続用アドレス(fe80 は scope 付き)。IPv4 を先頭に並べる。
+    /// 接続用アドレス(fe80 は到着 IF の scope 付き)。IPv4 → ルーティング可能 v6 → fe80
+    /// の順に並べる。
     pub addrs: Vec<SocketAddr>,
 }
 
 impl CommissionableInfo {
-    /// 接続先として推す 1 アドレス(IPv4 優先。`browse_commissionable` と同じ規則)。
+    /// 接続先として推す 1 アドレス(IPv4 → ルーティング可能 v6 → fe80。
+    /// `browse_commissionable` と同じ規則)。
     pub fn preferred_addr(&self) -> Option<SocketAddr> {
         self.addrs.first().copied()
     }
@@ -339,13 +625,16 @@ pub fn browse_commissionable_nodes(
             last_query = Instant::now();
         }
         match socks.recv(&mut rx) {
-            Some((n, src)) => {
+            Some((n, src, iface)) => {
                 let ingest = match discriminator {
                     Some(d) => set.ingest_filtered(&rx[..n], d),
                     None => set.ingest(&rx[..n]),
                 };
                 if trace {
-                    dis_trace!("rx {n}B from {src} ingest={ingest:?}");
+                    dis_trace!(
+                        "rx {n}B from {src} via {} ingest={ingest:?}",
+                        socks.iface_name(iface)
+                    );
                 }
                 if ingest != Ingest::Added {
                     continue;
@@ -358,18 +647,15 @@ pub fn browse_commissionable_nodes(
                 } else {
                     MATTER_PORT
                 };
-                // fe80 の scope は応答を受けた IF を優先する(マルチホームで既定経路と
-                // 別の IF にいるデバイス。無ければ v6 ソケットの scope)。
-                let scope = match src {
-                    SocketAddr::V6(v6) if v6.scope_id() != 0 => Some(v6.scope_id()),
-                    _ => socks.v6_scope,
-                };
-                let mut addrs: Vec<SocketAddr> = node
-                    .addrs
-                    .iter()
-                    .map(|ip| socket_addr_with_scope(*ip, port, scope))
+                // fe80 の scope は応答を受けた IF(マルチホームで既定経路と別の IF に
+                // いるデバイス)。並びは IPv4 → ルーティング可能 v6 → fe80。
+                let scope = socks.rx_scope(src, iface);
+                let mut ips: Vec<IpAddr> = node.addrs.iter().copied().collect();
+                ips.sort_by_key(addr_rank);
+                let addrs: Vec<SocketAddr> = ips
+                    .into_iter()
+                    .map(|ip| socket_addr_with_scope(ip, port, scope))
                     .collect();
-                addrs.sort_by_key(|a| !a.is_ipv4());
                 let info = CommissionableInfo {
                     instance: String::from_utf8_lossy(node.instance()).into_owned(),
                     discriminator: node.discriminator,
@@ -459,7 +745,7 @@ fn print_commissionable(
 /// `<compressedFabricId>-<nodeId>._matter._tcp.local` の SRV を解決し、
 /// デバイスの (アドレス, ポート) を返す。
 ///
-/// ソケットは browse と同じ platform 分岐([`open_mdns_browse_socket`])を使う:
+/// ソケットは browse と同じ [`MdnsSockets`](適格な全 IF で送受信)を使う:
 ///
 /// - **Unix**: 5353 共有 bind(QM)。マルチキャスト応答に加えて**デバイスの定期
 ///   announce(30 秒間隔 + 起動時バースト)を受動的に拾える**。Wi-Fi AP / IGMP
@@ -467,7 +753,12 @@ fn print_commissionable(
 ///   クエリ自体が届かないことがあり(実測: E5 NanoC6 + 家庭用 AP)、announce の
 ///   受動受信が唯一の到達経路になる。エフェメラルポートの QU ソケットは
 ///   announce(UDP dst 5353)を受けられないため使わない。
-/// - **Windows**: 5353 は Dnscache が掴むため QU + エフェメラルポート(W3)。
+/// - **Windows**: 5353 は Dnscache が掴むため IF ごとの QU + エフェメラルポート(W3)。
+///
+/// SRV 応答に A/AAAA が同梱されない場合(OTBR の advertising proxy / native
+/// publisher)は `<host>.local` の AAAA を追加クエリで解決する(`--at` と同じ 2 段解決)。
+/// アドレスは IPv4 → ルーティング可能 v6(Thread の OMR 等)→ fe80(到着 IF の scope)
+/// の順に選ぶ。
 pub fn resolve_operational(
     ca: &Ca<Backend>,
     node_id: u64,
@@ -488,45 +779,78 @@ pub fn resolve_operational(
     let start = Instant::now();
     let mut last_query = Instant::now() - MDNS_REQUERY_INTERVAL;
     let mut rx = [0u8; 1500];
+    // 2 段解決の状態: SRV のみ先に得られた場合の target ホスト名(先頭ラベル)とポート。
+    let mut srv_host = [0u8; 63];
+    let mut srv: Option<(usize, u16)> = None;
     while start.elapsed() < timeout {
         if last_query.elapsed() >= MDNS_REQUERY_INTERVAL {
-            socks.send_query(build);
+            match srv {
+                None => socks.send_query(build),
+                Some((hlen, _)) => {
+                    let host = &srv_host[..hlen];
+                    // SRV も再送し、A/AAAA 同梱の応答(別 responder)も拾えるようにする。
+                    socks.send_query(build);
+                    socks.send_query(|buf: &mut [u8; 128], qu: bool| {
+                        MdnsClient::build_resolve_host_aaaa(buf, host, qu)
+                    });
+                }
+            }
             last_query = Instant::now();
             if trace {
-                dis_trace!("operational query sent");
+                dis_trace!(
+                    "operational {} query sent",
+                    if srv.is_none() { "(SRV)" } else { "(SRV+AAAA)" }
+                );
             }
         }
         match socks.recv(&mut rx) {
-            Some((n, src)) => {
+            Some((n, src, iface)) => {
+                let scope = socks.rx_scope(src, iface);
                 let parsed = MdnsClient::parse_operational(&rx[..n], &compressed, node_id);
-                if trace {
-                    let fam = if src.is_ipv6() { "v6" } else { "v4" };
-                    dis_trace!(
-                        "rx {n}B from {src} ({fam}) parse={}",
-                        if parsed.is_some() {
-                            "operational"
-                        } else {
-                            "no-match"
-                        }
-                    );
-                }
                 if let Some(node) = parsed {
-                    // IPv4 優先(design §3)、無ければ最初のアドレス。v6 リンクローカルは
-                    // scope(v6 join に使った if_index)を埋めて CASE 接続可能にする。
-                    let picked = node
-                        .addrs
-                        .iter()
-                        .find(|a| a.is_ipv4())
-                        .or_else(|| node.addrs.iter().next())
-                        .copied();
-                    if let Some(ip) = picked {
-                        let port = if node.port != 0 {
-                            node.port
-                        } else {
-                            MATTER_PORT
-                        };
-                        return Ok(socket_addr_with_scope(ip, port, socks.v6_scope));
+                    if let Some(addr) = pick_addr(node.addrs.iter(), node.port, scope) {
+                        dis_info!(
+                            "operational node resolved at {addr} (answer from {src} via {})",
+                            socks.iface_name(iface)
+                        );
+                        return Ok(addr);
                     }
+                }
+                // SRV のみの応答 → 2 段目(AAAA)へ移行。
+                if srv.is_none() {
+                    if let Some((hlen, port)) = MdnsClient::parse_operational_srv(
+                        &rx[..n],
+                        &compressed,
+                        node_id,
+                        &mut srv_host,
+                    ) {
+                        srv = Some((hlen, port));
+                        dis_info!(
+                            "SRV-only answer from {src} via {}: target={}.local port={port}; \
+                             resolving AAAA...",
+                            socks.iface_name(iface),
+                            String::from_utf8_lossy(&srv_host[..hlen])
+                        );
+                        last_query = Instant::now() - MDNS_REQUERY_INTERVAL;
+                        continue;
+                    }
+                }
+                if let Some((hlen, port)) = srv {
+                    let addrs = MdnsClient::parse_host_addrs(&rx[..n], &srv_host[..hlen]);
+                    if let Some(addr) = pick_addr(addrs.iter(), port, scope) {
+                        dis_info!(
+                            "operational node resolved at {addr} (two-step, answer from {src} \
+                             via {})",
+                            socks.iface_name(iface)
+                        );
+                        return Ok(addr);
+                    }
+                }
+                if trace {
+                    dis_trace!(
+                        "rx {n}B from {src} via {} parse=no-match",
+                        socks.iface_name(iface)
+                    );
                 }
             }
             None => std::thread::sleep(MDNS_POLL_SLEEP),
@@ -876,46 +1200,64 @@ pub fn browse_commissionable_list_at(
     Ok(set.len())
 }
 
-/// commissionable ブラウズ用ソケット。戻りの `bool` は「QU(unicast-response)モードか」。
+/// unix の v4 mDNS ソケット: 224.0.0.251:5353 の共有 bind(SO_REUSEADDR で avahi と共存)。
+/// マルチキャスト応答と定期 announce を受けるので QU 不要。
 ///
-/// - **Unix**: 224.0.0.251:5353 の共有 bind(SO_REUSEADDR で avahi と共存)。
-///   マルチキャスト応答を受けるので QU 不要(`false`)。
-/// - **Windows**: 5353 は内蔵 mDNS(Dnscache)が掴んでいるため、エフェメラルポート +
-///   QU ビットで応答を自ポートへのユニキャストで受ける(RFC 6762 §5.4)。
-fn open_mdns_browse_socket() -> Option<(UdpSocket, bool)> {
-    #[cfg(unix)]
-    {
-        let socket = socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        )
+/// 各 IF のアドレスで 224.0.0.251 に join し、送信は IF ごとに `IP_MULTICAST_IF` を
+/// 切り替えて行う。適格 IF が無ければ従来どおり既定 IF(`INADDR_ANY`)1 本。
+#[cfg(unix)]
+fn open_mdns_socket_v4_shared(ifaces: &[MdnsIface]) -> Option<MdnsSock> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .ok()?;
+    // SO_REUSEADDR のみ(SO_REUSEPORT はマルチキャストを listener 間でロードバランス
+    // して取りこぼす)。
+    socket.set_reuse_address(true).ok()?;
+    socket
+        .bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, MDNS_PORT)).into())
         .ok()?;
-        // SO_REUSEADDR のみ(SO_REUSEPORT はマルチキャストを listener 間でロードバランス
-        // して取りこぼす)。
-        socket.set_reuse_address(true).ok()?;
-        socket
-            .bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, MDNS_PORT)).into())
-            .ok()?;
-        let socket: UdpSocket = socket.into();
+    let socket: UdpSocket = socket.into();
+    let mut targets = Vec::new();
+    for (i, ifc) in ifaces.iter().enumerate() {
+        let Some(&(ip, _)) = ifc.v4.first() else {
+            continue;
+        };
+        // 同一 IF への重複 join(EADDRINUSE)等は無視し、送信対象には含める。
+        let _ = socket.join_multicast_v4(&MDNS_IPV4, &ip);
+        targets.push((Some(i), ip));
+    }
+    if targets.is_empty() {
         socket
             .join_multicast_v4(&MDNS_IPV4, &Ipv4Addr::UNSPECIFIED)
             .ok()?;
-        // 複数ソケット(v4 + v6)を 1 スレッドで多重化するため nonblocking にする。
-        socket.set_nonblocking(true).ok()?;
-        Some((socket, false))
+        targets.push((None, Ipv4Addr::UNSPECIFIED));
     }
-    #[cfg(not(unix))]
-    {
-        open_mdns_query_socket()
-    }
+    // 複数ソケット(v4 + v6)を 1 スレッドで多重化するため nonblocking にする。
+    socket.set_nonblocking(true).ok()?;
+    Some(MdnsSock {
+        sock: socket,
+        qu: false,
+        kind: SockKind::V4Shared(targets),
+    })
 }
 
-/// IPv6(ff02::fb)mDNS クエリソケット(unix、5353 共有 bind + join)。戻りは
-/// (ソケット, scope_id)。リンクローカルが取れなければ `None`。
+/// unix の v6 mDNS ソケット([::]:5353 共有 bind)。fe80 を持つ各 IF の if_index で
+/// ff02::fb に join し、送信は `ff02::fb%<if_index>` へ IF ごとに行う。
+/// 適格 IF が無ければ既定 scope([`default_v6_scope`])1 本、それも無ければ `None`。
 #[cfg(unix)]
-fn open_mdns_browse_socket_v6() -> Option<(UdpSocket, u32)> {
-    let scope = default_v6_scope()?;
+fn open_mdns_socket_v6_shared(ifaces: &[MdnsIface]) -> Option<MdnsSock> {
+    let mut want: Vec<(Option<usize>, u32)> = ifaces
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.has_v6_ll && f.index != 0)
+        .map(|(i, f)| (Some(i), f.index))
+        .collect();
+    if want.is_empty() {
+        want.push((None, default_v6_scope()?));
+    }
     let socket = socket2::Socket::new(
         socket2::Domain::IPV6,
         socket2::Type::DGRAM,
@@ -929,9 +1271,19 @@ fn open_mdns_browse_socket_v6() -> Option<(UdpSocket, u32)> {
         .bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, MDNS_PORT)).into())
         .ok()?;
     let socket: UdpSocket = socket.into();
-    socket.join_multicast_v6(&MDNS_IPV6, scope).ok()?;
+    let targets: Vec<(Option<usize>, u32)> = want
+        .into_iter()
+        .filter(|&(_, idx)| socket.join_multicast_v6(&MDNS_IPV6, idx).is_ok())
+        .collect();
+    if targets.is_empty() {
+        return None;
+    }
     socket.set_nonblocking(true).ok()?;
-    Some((socket, scope))
+    Some(MdnsSock {
+        sock: socket,
+        qu: false,
+        kind: SockKind::V6Shared(targets),
+    })
 }
 
 /// 既定 v6 リンクローカル scope_id(if_index)を推定する。
@@ -992,15 +1344,14 @@ pub fn default_v6_scope() -> Option<u32> {
     None
 }
 
-/// mDNS 解決用ソケット(エフェメラルポート + QU、Windows 用)。戻りの `bool` は
-/// QU モード(常に true)。
+/// mDNS クエリソケット(Windows 用、1 IF に 1 本): エフェメラルポート + QU。
 ///
-/// 仮想アダプタ(WSL/Hyper-V/VPN)が多い環境ではインターフェース未指定だと
-/// マルチキャストの送信/join が LAN 以外の既定 IF に張り付くことがあるため、
-/// デフォルトルートのローカル IPv4 で LAN 向き IF に明示的に固定する。
+/// 5353 は内蔵 mDNS(Dnscache)が掴んでいるため、QU ビットで応答を自ポートへの
+/// ユニキャストで受ける(RFC 6762 §5.4)。送信 IF を `if_ip` に固定し(仮想アダプタ
+/// の多い環境で既定 IF に張り付かないように)、announce も拾えるよう同 IF で join
+/// (best effort)。IPv6 は Windows では扱わない(v4 のみ)。
 #[cfg(not(unix))]
-fn open_mdns_query_socket() -> Option<(UdpSocket, bool)> {
-    let if_ip = default_route_local_ipv4().unwrap_or(Ipv4Addr::UNSPECIFIED);
+fn open_mdns_query_socket(if_ip: Ipv4Addr) -> Option<UdpSocket> {
     let socket = socket2::Socket::new(
         socket2::Domain::IPV4,
         socket2::Type::DGRAM,
@@ -1016,10 +1367,9 @@ fn open_mdns_query_socket() -> Option<(UdpSocket, bool)> {
     let socket: UdpSocket = socket.into();
     // マルチキャスト announce(QU を無視する responder 対策)も拾えるよう join(best effort)。
     let _ = socket.join_multicast_v4(&MDNS_IPV4, &if_ip);
-    socket
-        .set_read_timeout(Some(Duration::from_millis(100)))
-        .ok()?;
-    Some((socket, true))
+    // 複数 IF のソケットを 1 スレッドで多重化するため nonblocking にする。
+    socket.set_nonblocking(true).ok()?;
+    Some(socket)
 }
 
 /// デフォルトルートのローカル IPv4 を推定する(外部宛 UDP の `local_addr` から。
@@ -1031,5 +1381,70 @@ fn default_route_local_ipv4() -> Option<Ipv4Addr> {
     match s.local_addr().ok()? {
         SocketAddr::V4(v4) => Some(*v4.ip()),
         SocketAddr::V6(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iface_rule() {
+        assert!(iface_auto_eligible("wlx242fd017cf60", false, true, false));
+        assert!(iface_auto_eligible("enp5s0", false, true, false));
+        assert!(!iface_auto_eligible("lo", true, true, false));
+        assert!(!iface_auto_eligible("enp8s0", false, false, false));
+        assert!(!iface_auto_eligible("wg0", false, true, true));
+        for n in [
+            "docker0",
+            "br-3aa3bf510582",
+            "veth7a71b14",
+            "virbr0",
+            "incusbr0",
+        ] {
+            assert!(!iface_auto_eligible(n, false, true, false), "{n}");
+        }
+        assert!(!iface_auto_eligible("tailscale0", false, true, false));
+    }
+
+    #[test]
+    fn forced_ifaces_parse() {
+        assert_eq!(forced_iface_names(None), None);
+        assert_eq!(forced_iface_names(Some(" , ")), None);
+        assert_eq!(
+            forced_iface_names(Some("wlan0, eth0")),
+            Some(vec!["wlan0".to_string(), "eth0".to_string()])
+        );
+    }
+
+    #[test]
+    fn pick_prefers_v4_then_routable_v6_then_link_local() {
+        let ll: IpAddr = "fe80::1".parse().unwrap();
+        let omr: IpAddr = "fd5a:3d14:1acf:1::22".parse().unwrap();
+        let v4: IpAddr = "192.168.8.50".parse().unwrap();
+        let a = pick_addr([ll, omr, v4].iter(), 5540, Some(7)).unwrap();
+        assert_eq!(a, "192.168.8.50:5540".parse().unwrap());
+        let a = pick_addr([ll, omr].iter(), 0, Some(7)).unwrap();
+        assert_eq!(a, SocketAddr::new(omr, MATTER_PORT));
+        match pick_addr([ll].iter(), 5540, Some(7)).unwrap() {
+            SocketAddr::V6(v6) => assert_eq!(v6.scope_id(), 7),
+            SocketAddr::V4(_) => panic!(),
+        }
+        assert!(pick_addr([].iter(), 5540, None).is_none());
+    }
+
+    #[test]
+    fn v6_prefix_match() {
+        let net: Ipv6Addr = "fd89:c15c:f759:4833::1".parse().unwrap();
+        assert!(v6_in_prefix(
+            "fd89:c15c:f759:4833::99".parse().unwrap(),
+            net,
+            64
+        ));
+        assert!(!v6_in_prefix(
+            "fd89:c15c:f759:4834::99".parse().unwrap(),
+            net,
+            64
+        ));
     }
 }
