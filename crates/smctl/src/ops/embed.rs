@@ -269,6 +269,12 @@ impl<'a> Exec<'a> {
         self.case_session(node_id).map(|_| ())
     }
 
+    /// CASE 取得を「キャッシュアドレスへの 1 回の試行のみ」に切り替える(true の間、mDNS 再解決を
+    /// せず、応答が無ければ保留中のハンドシェイクを破棄して即エラーを返す)。
+    pub fn set_cached_only(&mut self, on: bool) {
+        self.cached_only = on;
+    }
+
     /// ノードの CASE セッションがプロセス内キャッシュにあるか。
     pub fn is_connected(&self, node_id: u64) -> bool {
         self.cases.iter().any(|(n, _)| *n == node_id)

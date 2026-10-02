@@ -1700,12 +1700,31 @@ impl Ctl<'_> {
                     }
                 }
                 Err(e) => {
-                    self.shared.with_node(node_id, |n| {
-                        n.state = NodeState::Offline;
-                        n.error = Some(e.clone());
-                    });
-                    wlog!(Level::Info, "node {node_id:#x}: not reachable ({e})");
-                    self.schedule_retry(node_id);
+                    // mDNS では見つからないが保存済みアドレスで届くノードがある(OTBR 越しの Thread
+                    // デバイス、mDNS が別インタフェースに出る多ホーム PC 等)。保存済みアドレスへ
+                    // 1 回だけ CASE を試す(再解決なし、最長 5 秒)。
+                    wlog!(
+                        Level::Info,
+                        "node {node_id:#x}: mDNS probe failed ({e}); trying the stored address"
+                    );
+                    self.exec.set_cached_only(true);
+                    let r = self.connect_full(node_id, false);
+                    self.exec.set_cached_only(false);
+                    match r {
+                        Ok(_) => wlog!(Level::Info, "node {node_id:#x} connected (stored address)"),
+                        Err(e2) => {
+                            self.shared.with_node(node_id, |n| {
+                                n.state = NodeState::Offline;
+                                n.error = Some(e.clone());
+                            });
+                            wlog!(
+                                Level::Info,
+                                "node {node_id:#x}: not reachable ({})",
+                                e2.message
+                            );
+                            self.schedule_retry(node_id);
+                        }
+                    }
                 }
             }
         }

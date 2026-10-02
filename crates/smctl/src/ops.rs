@@ -308,6 +308,10 @@ pub struct Exec<'a> {
     /// 埋め込み用: 購読系イベントを表示せずデータとして溜める先(`None` = CLI 表示、
     /// [`embed`] の `enable_sub_capture` で有効化)。
     sub_capture: Option<Vec<embed::SubEvent>>,
+    /// CASE 取得をキャッシュアドレスへの 1 回の試行に限る(mDNS 再解決をしない)。CLI では常に
+    /// false。[`embed`] の `set_cached_only` で切り替える(smweb の自動再接続で、mDNS では解決
+    /// できないが保存済みアドレスで届くノード — OTBR 越しの Thread デバイス等 — を拾うため)。
+    cached_only: bool,
 }
 
 impl<'a> Exec<'a> {
@@ -346,6 +350,7 @@ impl<'a> Exec<'a> {
             batch,
             paa_store,
             sub_capture: None,
+            cached_only: false,
         })
     }
 
@@ -852,6 +857,12 @@ impl<'a> Exec<'a> {
                     );
                 }
             }
+        }
+        if got.is_none() && self.cached_only {
+            // 保留中のハンドシェイクを破棄して slot を空ける(放置するとコアの 60 秒タイムアウトまで
+            // 他ノードの CASE が NoSpace になる)。
+            self.stack.abort_handshake();
+            return Err(format!("cached address {cached} not responding"));
         }
         // 2) mDNS で運用アドレスを再解決して張り直す。
         let (session, used_addr) = match got {
