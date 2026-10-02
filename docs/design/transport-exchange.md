@@ -754,3 +754,82 @@ MRP 仕様(Matter Core §4.12)は「重複を受け取った受信者は改め�
 重複が届く経路なので、テストは「StatusResponse を 1 通落とす → デバイスの再送 datagram を保留 → StatusResponse の
 再送でデバイス側が止まり ctrl 側会話が回収される → 保留していた重複を投入 → 修正前は沈黙、修正後は standalone ACK
 1 通、両側の購読は生存」とした(`duplicate_report_after_closed_exchange_gets_standalone_ack`)。
+
+## マルチ admin 時の容量と退避方針
+
+**背景(実機 2026-10-02/03)**: デバイスは `DefaultStack`(S=4 / E=4 / H=1 / R=2 / SUB=3)で、fabric 2 つ
+(smweb + Tab5)の時点で `sess=4/4` に張り付いていた。満杯時の退避は「Expired → LRU」だけだったため、短命な
+CLI コントローラ(smctl)が CASE を張るたびに Tab5 の購読セッションが LRU として退避され、Tab5 の invoke が
+再 CASE まで ~80 秒止まった(2 回)。退避されたセッションの購読・exchange も即時には掃除されていなかった。
+Apple Home(iPhone + HomePod、各々ワイルドカード購読)・Alexa・Google が加わると SUB=3 / H=1 も足りない。
+
+### 実測サイズ(`core::mem::size_of`、host 64bit。`cargo run -p bloat-check --bin ram-report --release`)
+
+| 要素 | 1 個あたり | 備考 |
+|---|---|---|
+| Session | 152 B | 鍵 2 本 + リプレイ窓 + ヒント(パディングに収まる) |
+| Exchange | 112 B | |
+| Handshake slot | 328 B | PASE/CASE 進行状態 |
+| ReadTxn(P=16) | 984 B | パス 16 本を抱える |
+| Subscription(P=16) | 1048 B | 同上。容量増の主因 |
+| TX バッファ | 1600 B | 据え置き(3 本) |
+
+| プロファイル | S | E | TX | H | R | SUB | `MatterStack` | デバイス合計 |
+|---|---|---|---|---|---|---|---|---|
+| `DefaultStack`(不変) | 4 | 4 | 3 | 1 | 2 | 3 | 16128 B | 26734 B |
+| `MultiAdminStack`(新) | 10 | 6 | 3 | 3 | 3 | 6 | 22048 B | 32654 B |
+
+差分 +5920 B(host)。実機の `.bss`(`SHIM`): ESP32-S3 で 42736 → 48600 B(**+5864 B**)。`SessionManager` 自体は
+退避通知キュー分で +16 B(S=4 で 624 → 640 B)。flash は Cortex-M4F の flash-probe で +912 B(104131 → 105043 B)。
+
+### 容量の決め方
+
+- **S=10**: 常時接続 6(Apple×2 / Google / Alexa / smweb / Tab5)+ ハンドシェイク 2 件ぶん(搬送用 Unsecured +
+  予約 slot で 1 件あたり 2)。1 本 152 B と安いので 8 ではなく 10。
+- **SUB=6**: 上の常時接続 6 が 1 本ずつ購読。**R=3**: 購読の priming / チャンク中 Read の同時数。
+- **E=6**: 購読レポート(initiator)+ 並行 invoke/read。**H=3**: 固まったハンドシェイク(最大 60 秒)が 1〜2 件
+  あっても他のコントローラが Busy にならない。
+- **TX=3 は据え置き**(+1.6 KB/本が AirQ のヒープに効くため)。短命コントローラが ACK せず消えると再送待ちで
+  一時的に `tx=3/3` になる(実機で観測、~30 秒で解消)。
+- `DefaultStack` / `MinimalStack` の数値は変えない。cffi の `type Stack` だけを `MultiAdminStack` にする。
+
+### 退避方針(`SessionManager::eviction_candidate`)
+
+満杯時の犠牲は次の順(同順位内は `last_use` 最小 = LRU)。予約中 slot は対象外。
+
+0. `Expired`
+1. `EvictHint::Disposable` — 生存 exchange の無い Unsecured セッション(ハンドシェイク後の残骸)
+2. **同一ピア(同 fabric + peer node)の古い方**で保護されていないもの。`insert` では挿入するセッションの
+   ピア、加えて「同じピアのより新しいセッションが既にある」セッション(responder は Sigma1 受信時 = 相手が
+   未確定の時点で `reserve` するため、挿入時ではなく「既に置き換わっている古い方」として拾う)
+3. 保護されていないその他
+4. 同一ピアの古い方で `EvictHint::Protected` のもの
+5. `EvictHint::Protected` のその他(= 最後は LRU 全体)
+
+- **ヒントの付け方**: セッション層は購読を知らない。`MatterStack::handle_rx` が**満杯のときだけ**受信処理の
+  直前に全セッションへ付け直す(購読 or 生存 exchange あり → Protected、生存 exchange の無い Unsecured →
+  Disposable、他は Normal)。退避は `handle_rx` 内(Unsecured セッション確保・`reserve`)でしか起きないので
+  これで足りる。いま受信中の Unsecured セッションは Protected にして、自分のハンドシェイクの予約で消えない
+  ようにする。ヒントを付けない利用者(controller)は「Expired → 同一ピアの古い方 → LRU」になる。
+- **依頼との差**: 「同一ピアの古い方」を無条件に 2 番目に置くと、node id を共有する別プロセス(smweb と smctl)
+  の購読セッションが CLI の 1 回の実行で落ちる。保護されていないものだけを 2 番目に、保護付きは 4 番目に下げた。
+- **同一ピアの新 CASE では古いセッションを積極的に閉じない**(空きがある間は共存)。
+- **後始末**: 退避した `SessionId` を `SessionManager` が 2 件まで記録し(`take_evicted`)、`handle_rx` が
+  `recv` 直後に `im.on_session_closed` と当該セッションの exchange close(再送バッファ解放)を行う。
+
+### タスクスタック(AirQ)
+
+スタック本体は static(`SHIM`、`.bss`)だが、`sm_init` が値で組み立ててから書き込むため、構築時の一時値が
+Matter タスクスタック(128 KB)のピークだった(旧: `sm_init` 70960 B + `MatterStack::new` 37232 B)。容量増で
+そのままだと空きが 15084 → 11272 B に減ったので、`sm_init` を `init_owned` / `init_stack`(`#[inline(never)]`)に
+分割し、`MatterStack::new` を `#[inline(always)]` にした(`sm_init` 8512 + `init_stack` 64144 B)。
+実測の空き: **15084 → 45160 B**。
+
+### リスク
+
+- AirQ の内部ヒープが 5.9 KB 減る(定常 71956 → 66324 B、BLE 起動中の `sm_init` 直後 19636 → 13312 B)。
+  BLE コミッショニング中の余裕が最も小さい(NVS を消せないため今回は未検証)。スタック空きが 45 KB できたので、
+  必要なら Matter タスクスタックを 128 → 112 KB に減らしてヒープへ戻せる(未実施)。
+- 全セッションが保護されている状態で新規ハンドシェイクが来ると、購読付きセッションが退避される(5 番目)。
+  新しいピアを Busy で締め出すより回復性が高いという既存方針(§4.3)を維持した。
+- ヒントは満杯時の受信ごとに O(S × (SUB + E)) で再計算する(S=10 で数百回の比較。非満杯時はゼロ)。

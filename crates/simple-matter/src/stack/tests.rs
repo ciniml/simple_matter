@@ -3580,6 +3580,187 @@ mod controller_e2e {
             "final read"
         ));
     }
+    /// マルチ admin: 購読を張ったコントローラのセッションは、同じ node id を使う短命
+    /// コントローラ(CLI)が CASE を張っては捨てる churn でも退避されない
+    /// (transport-exchange.md「マルチ admin 時の容量と退避方針」。実機回帰: smctl の連続
+    /// 実行で Tab5 の購読セッションが LRU 退避され、invoke が ~80 秒止まった)。
+    #[test]
+    fn subscribed_session_survives_short_lived_case_churn() {
+        let crypto = RustCrypto::new(SeqRng(0xC0FF_EE00_1234_5A5A));
+        let fabrics: RefCell<FabricTable<Crb, 5>> = RefCell::new(FabricTable::new());
+        let config = PaseConfig::from_passcode(PASSCODE, &SALT, ITERATIONS).unwrap();
+        let dev_creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
+        let sc = SecureChannel::new(&crypto, SeqRng(0x5C00_0A5A), config, dev_creds);
+        let im = InteractionModel::new(build_device(&fabrics));
+        // SESSIONS=4 の小さいテーブルで満杯退避を確実に起こす。
+        let mut dev: TestStack = MatterStack::new(&crypto, sc, im);
+        let ca = Ca::<Crb>::generate(
+            &crypto,
+            &mut SeqRng(0xCA00_0A5A),
+            FABRIC_ID,
+            COMM_NODE,
+            0xFFF1,
+            0,
+        )
+        .expect("Ca::generate");
+        let ctrl_creds = ControllerCreds::new(&ca, &crypto, 0);
+        let sc_init = ScInitiator::new(&crypto, SeqRng(0x1C00_0A5A), ctrl_creds);
+        let mut ctrl: Ctrl = ControllerStack::new(&crypto, sc_init, ImClient::new());
+        let mut comm = Commissioner::new(&ca, &crypto, AttestationPolicy::Skip);
+        comm.commission(peer(), PASSCODE, DEVICE_NODE, NOW).unwrap();
+        let mut tx = [0u8; 1700];
+        let mut final_phase = comm.phase();
+        for _ in 0..60 {
+            let out = comm.drive(&mut ctrl, NOW, &mut tx);
+            final_phase = out.phase;
+            if let Some(d) = out.send {
+                deliver_and_settle(&mut ctrl, &mut dev, NOW, &tx, d.len);
+            }
+            if matches!(out.phase, Phase::Done { .. } | Phase::Failed { .. }) {
+                break;
+            }
+        }
+        let session = match final_phase {
+            Phase::Done { session } => session,
+            other => panic!("commissioning did not complete: {other:?}"),
+        };
+        let fidx = crate::controller::CONTROLLER_FABRIC_INDEX;
+        let onoff = AttributePath::concrete(EndpointId(1), ClusterId(0x0006), AttributeId(0x0000));
+
+        // 常時接続コントローラが購読を張る(max interval は churn 全体より十分長く)。
+        let mut now = NOW + 1_000;
+        let dir = ctrl
+            .start_subscribe(session, &[onoff], 0, 3600, now, &mut tx)
+            .expect("start_subscribe");
+        deliver_and_settle(&mut ctrl, &mut dev, now, &tx, dir.len);
+        assert!(matches!(
+            ctrl.im_take_event(),
+            Some(ImEvent::SubscribeDone { .. })
+        ));
+        assert_eq!(dev.im().subscription_count(), 1);
+
+        // 短命コントローラ(同じ fabric・同じ node id の別プロセス)を 12 回。
+        for k in 0..12u64 {
+            now += 1_000;
+            let creds = ControllerCreds::new(&ca, &crypto, 0);
+            let sc_init = ScInitiator::new(&crypto, SeqRng(0x1C00_2000 + k), creds);
+            let mut cli: Ctrl = ControllerStack::new(&crypto, sc_init, ImClient::new());
+            let dir = cli
+                .start_case(peer(), fidx, DEVICE_NODE, now, &mut tx)
+                .expect("cli start_case");
+            deliver_and_settle(&mut cli, &mut dev, now, &tx, dir.len);
+            let cli_session = match cli.sc_take_event() {
+                Some(crate::sc::initiator::ScEvent::CaseEstablished { session, .. }) => session,
+                other => panic!("churn {k}: CASE failed: {other:?}"),
+            };
+            let dir = cli
+                .start_read(cli_session, &[onoff], now, &mut tx)
+                .expect("cli start_read");
+            deliver_and_settle(&mut cli, &mut dev, now, &tx, dir.len);
+            assert!(
+                matches!(cli.im_take_event(), Some(ImEvent::ReadDone)),
+                "churn {k}: read failed"
+            );
+            assert_eq!(
+                dev.im().subscription_count(),
+                1,
+                "churn {k}: subscribed session was evicted"
+            );
+            assert!(dev.pool_usage().sessions <= dev.pool_usage().sessions_cap);
+        }
+
+        // 購読を張ったセッションは生きており、即座に read が通る(再 CASE 不要)。
+        now += 1_000;
+        let dir = ctrl
+            .start_read(session, &[onoff], now, &mut tx)
+            .expect("start_read on the subscribed session");
+        deliver_and_settle(&mut ctrl, &mut dev, now, &tx, dir.len);
+        assert!(matches!(ctrl.im_take_event(), Some(ImEvent::ReadDone)));
+        assert_eq!(dev.im().subscription_count(), 1);
+        // 退避されたセッションの exchange は残らない。
+        assert_eq!(dev.pool_usage().exchanges, 0);
+    }
+
+    /// 購読を張ったセッションが(全員保護で)退避された場合、その購読は即座に掃除される。
+    #[test]
+    fn evicted_session_drops_its_subscription() {
+        let crypto = RustCrypto::new(SeqRng(0xC0FF_EE00_1234_5B5B));
+        let fabrics: RefCell<FabricTable<Crb, 5>> = RefCell::new(FabricTable::new());
+        let config = PaseConfig::from_passcode(PASSCODE, &SALT, ITERATIONS).unwrap();
+        let dev_creds = SharedFabricCreds::new(&fabrics, &crypto, 0);
+        let sc = SecureChannel::new(&crypto, SeqRng(0x5C00_0B5B), config, dev_creds);
+        let im = InteractionModel::new(build_device(&fabrics));
+        let mut dev: TestStack = MatterStack::new(&crypto, sc, im);
+        let ca = Ca::<Crb>::generate(
+            &crypto,
+            &mut SeqRng(0xCA00_0B5B),
+            FABRIC_ID,
+            COMM_NODE,
+            0xFFF1,
+            0,
+        )
+        .expect("Ca::generate");
+        let ctrl_creds = ControllerCreds::new(&ca, &crypto, 0);
+        let sc_init = ScInitiator::new(&crypto, SeqRng(0x1C00_0B5B), ctrl_creds);
+        let mut ctrl: Ctrl = ControllerStack::new(&crypto, sc_init, ImClient::new());
+        let mut comm = Commissioner::new(&ca, &crypto, AttestationPolicy::Skip);
+        comm.commission(peer(), PASSCODE, DEVICE_NODE, NOW).unwrap();
+        let mut tx = [0u8; 1700];
+        let mut final_phase = comm.phase();
+        for _ in 0..60 {
+            let out = comm.drive(&mut ctrl, NOW, &mut tx);
+            final_phase = out.phase;
+            if let Some(d) = out.send {
+                deliver_and_settle(&mut ctrl, &mut dev, NOW, &tx, d.len);
+            }
+            if matches!(out.phase, Phase::Done { .. } | Phase::Failed { .. }) {
+                break;
+            }
+        }
+        assert!(matches!(final_phase, Phase::Done { .. }));
+        let fidx = crate::controller::CONTROLLER_FABRIC_INDEX;
+        let onoff = AttributePath::concrete(EndpointId(1), ClusterId(0x0006), AttributeId(0x0000));
+
+        // 購読を張るコントローラを SUBS(=3)本ぶん、さらに張り続ける: テーブル(4)が保護
+        // セッションだけで埋まると、同一ピアの古い購読セッションから退避される。
+        let mut now = NOW + 1_000;
+        let mut peak = 0;
+        for k in 0..8u64 {
+            now += 1_000;
+            let creds = ControllerCreds::new(&ca, &crypto, 0);
+            let sc_init = ScInitiator::new(&crypto, SeqRng(0x1C00_3000 + k), creds);
+            let mut c: Ctrl = ControllerStack::new(&crypto, sc_init, ImClient::new());
+            let dir = c
+                .start_case(peer(), fidx, DEVICE_NODE, now, &mut tx)
+                .expect("start_case");
+            deliver_and_settle(&mut c, &mut dev, now, &tx, dir.len);
+            let s = match c.sc_take_event() {
+                Some(crate::sc::initiator::ScEvent::CaseEstablished { session, .. }) => session,
+                other => panic!("round {k}: CASE failed: {other:?}"),
+            };
+            let dir = c
+                .start_subscribe(s, &[onoff], 0, 3600, now, &mut tx)
+                .expect("start_subscribe");
+            deliver_and_settle(&mut c, &mut dev, now, &tx, dir.len);
+            let _ = c.im_take_event();
+            peak = peak.max(dev.im().subscription_count());
+            // 購読は必ず「生きているセッション」のものだけが残る(幽霊購読なし)。
+            // (各セッションの購読は高々 1 本なので、購読数 = 購読を持つ生存セッション数。)
+            let live = dev
+                .sessions()
+                .iter()
+                .filter(|s| dev.im().has_subscription(s.id()))
+                .count();
+            assert_eq!(
+                dev.im().subscription_count(),
+                live,
+                "round {k}: orphan subscription left behind"
+            );
+        }
+        assert!(peak >= 2, "subscriptions were established");
+        assert_eq!(dev.pool_usage().exchanges, 0);
+    }
+
     // ======================================================================
     // T9: コミッショニング窓を開いて 2 人目のコントローラを迎える(設計 §17.6)
     // ======================================================================

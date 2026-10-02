@@ -55,7 +55,7 @@ use crate::transport::header::{DstNodeId, PacketHeader, PayloadHeader, SecFlags}
 use crate::transport::net::{PeerAddr, MAX_RX_PACKET_SIZE};
 use crate::transport::secure::SecureCodec;
 use crate::transport::session::fixed::FixedVec;
-use crate::transport::session::{SessionId, SessionInit, SessionManager};
+use crate::transport::session::{EvictHint, SessionId, SessionInit, SessionManager};
 use crate::transport::util::{ParseBuf, WriteBuf};
 
 /// スタックが扱う 1 パケットの最大バイト数(TX バッファ・`tx_out` のサイズ目安)。
@@ -195,6 +195,12 @@ impl<
     /// `sc` の `F` は [`SharedFabricCreds`](CASE 用 fabric ビュー)、`im` の `D` は
     /// [`OpCredsCluster::new_shared`](crate::dm::clusters::OpCredsCluster::new_shared) で
     /// **同一の** `RefCell<FabricTable>` を参照するデバイスであること(fabric 共有の前提)。
+    ///
+    /// `#[inline(always)]`: 非インライン版は戻り値(スタック全体)と引数のコピーで
+    /// `size_of::<Self>()` の 2 倍強のフレームを取り、呼び出し側のローカルと合わせて
+    /// タスクスタックを圧迫する(ESP32-S3 実測: 呼び出し側 55.7 KB + 本関数 47.8 KB →
+    /// インライン化で合計 64.1 KB)。
+    #[inline(always)]
     pub fn new(
         crypto: &'s C,
         sc: Sc<'s, C, R, NF, HANDSHAKES>,
@@ -439,16 +445,23 @@ impl<
             return None;
         }
 
+        // 満杯なら、この受信で起こりうる退避(Unsecured セッション確保・ハンドシェイクの
+        // 予約)に備えて退避ヒントを付け直す(transport-exchange.md「マルチ admin 時の
+        // 容量と退避方針」)。
+        self.refresh_evict_hints();
         self.ensure_unsecured_session(datagram, peer, now_ms);
 
-        let report = match self.mgr.recv(
+        let result = self.mgr.recv(
             &mut self.sessions,
             self.crypto,
             peer,
             now_ms,
             datagram,
             &mut self.resp,
-        ) {
+        );
+        // 退避されたセッションの購読・exchange を掃除する(応答の成否に関わらず)。
+        self.reap_evicted_sessions();
+        let report = match result {
             Ok(r) => r,
             Err(_) => return None,
         };
@@ -556,6 +569,44 @@ impl<
         self.stage_deferred_invoke_response(now_ms, tx_out)
     }
 
+    /// セッションテーブルが満杯のとき、各セッションの退避ヒントを付け直す。
+    ///
+    /// - 購読または生存 exchange を持つ → [`EvictHint::Protected`]
+    /// - 生存 exchange の無い Unsecured セッション(ハンドシェイク済みの残骸)→
+    ///   [`EvictHint::Disposable`]
+    /// - それ以外 → [`EvictHint::Normal`]
+    ///
+    /// 退避は受信処理(`handle_rx`)の中でしか起きないため、満杯時にその直前で 1 回
+    /// 計算すれば足りる(O(SESSIONS × (SUBS + EXCHANGES))、定常の非満杯時はゼロコスト)。
+    fn refresh_evict_hints(&mut self) {
+        if !self.sessions.is_full() {
+            return;
+        }
+        let mgr = &self.mgr;
+        self.sessions.set_hints(|s| {
+            let id = s.id();
+            if mgr.has_live_exchanges(id) || mgr.handler().im.has_subscription(id) {
+                EvictHint::Protected
+            } else if !s.is_encrypted() {
+                EvictHint::Disposable
+            } else {
+                EvictHint::Normal
+            }
+        });
+    }
+
+    /// 満杯退避で消えたセッションに紐づく購読・継続と exchange(再送バッファ)を回収する。
+    fn reap_evicted_sessions(&mut self) {
+        while let Some(id) = self.sessions.take_evicted() {
+            self.mgr.handler_mut().im.on_session_closed(id);
+            while let Some(freed) = self.mgr.close_one_for_session(id) {
+                if let Some(buf) = freed {
+                    self.tx_pool.release(buf);
+                }
+            }
+        }
+    }
+
     /// 未確立の unsecured セッションが必要なら(平文パケット・未登録の peer)先に確保する。
     ///
     /// PASE / CASE の第 1 メッセージは session_id=0 の平文で届く。responder はそれを受けるための
@@ -577,6 +628,9 @@ impl<
             // 既存の平文セッションでもピア Node ID が未確定なら、受信ヘッダの
             // source Node ID で確定させる(以降の応答の宛先 echo に使う)。
             session.set_peer_node_id_if_unset(hdr.src_node_id);
+            // いま受信中のセッションは、この後のハンドシェイク予約で退避させない。
+            let id = session.id();
+            self.sessions.set_hint(id, EvictHint::Protected);
             return;
         }
         let mut init = SessionInit::plaintext(peer, 0, 1);
@@ -584,7 +638,9 @@ impl<
         // として echo する(chip 側の非セキュアパケット検証が source/destination の
         // いずれかを必須とするため)。
         init.peer_node_id = hdr.src_node_id;
-        let _ = self.sessions.insert(init, now_ms);
+        if let Ok(id) = self.sessions.insert(init, now_ms) {
+            self.sessions.set_hint(id, EvictHint::Protected);
+        }
     }
 
     /// groupcast datagram を復号して IM(invoke)へ配送する(応答なし。
@@ -1117,6 +1173,13 @@ impl<'s, C: Crypto, const N: usize> NocResolver for SharedFabricCreds<'s, C, N> 
 /// paths は chip-tool のコミッショニング時 ReadCommissioningInfo が 1 リクエストで
 /// 10 本前後の属性パスを送るため、余裕を持って 16 とする。
 pub type DefaultStack<'s, C, R, D> = MatterStack<'s, C, R, D, 5, 4, 4, 3, 1, 2, 3, 16>;
+
+/// マルチ admin デバイス向けプロファイル(複数エコシステムの常時接続コントローラを同時に
+/// 収容する)。`docs/design/transport-exchange.md`「マルチ admin 時の容量と退避方針」。
+///
+/// サイジング: fabric=5 / session=10 / exchange=6 / TX バッファ=3 / handshake=3 /
+/// read=3 / subscribe=6 / paths=16。[`DefaultStack`] との RAM 差は同節の実測表を参照。
+pub type MultiAdminStack<'s, C, R, D> = MatterStack<'s, C, R, D, 5, 10, 6, 3, 3, 3, 6, 16>;
 
 /// 極小プロファイル(単一コントローラ・RAM 最小)。設計 §8.1 の `MinimalStack`。
 ///

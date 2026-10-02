@@ -112,6 +112,26 @@ pub enum SlotState {
     Expired,
 }
 
+/// 満杯時の退避で上位層が与えるヒント([`SessionManager::set_hints`])。
+///
+/// セッション層は購読や exchange を知らないため、統合層([`crate::stack::MatterStack`])が
+/// 満杯時にだけ各セッションへ付け直す(`docs/design/transport-exchange.md`
+/// 「マルチ admin 時の容量と退避方針」)。付けない利用者(controller)では全て
+/// [`Normal`](Self::Normal) で、退避順は「Expired → 同一ピアの古い方 → LRU」になる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EvictHint {
+    /// 用済み(生存 exchange を持たない Unsecured セッション等)。Expired の次に退避する。
+    Disposable,
+    /// ヒントなし(既定)。
+    #[default]
+    Normal,
+    /// 購読または生存 exchange を持つ。他に候補が無いときだけ退避する。
+    Protected,
+}
+
+/// 退避済みセッションの通知キュー長(1 回の受信処理で起こる退避は高々 2 件)。
+const EVICTED_QUEUE: usize = 2;
+
 /// 1 セッションが保持できる CASE peer の CAT 最大数(NOC あたり最大 3、Matter 仕様)。
 pub const MAX_SESSION_CATS: usize = 3;
 
@@ -190,6 +210,8 @@ pub struct Session {
     mode: SessionMode,
     last_use: u64,
     state: SlotState,
+    /// 満杯時退避のヒント(統合層が満杯時に付け直す)。
+    hint: EvictHint,
 }
 
 impl Session {
@@ -319,6 +341,26 @@ impl Session {
         matches!(self.state, SlotState::Reserved)
     }
 
+    /// 満杯時退避のヒントを返す。
+    pub const fn evict_hint(&self) -> EvictHint {
+        self.hint
+    }
+
+    /// CASE 運用セッションなら `(fabric, peer node)` を返す(同一ピア判定用)。
+    fn case_peer(&self) -> Option<(u8, u64)> {
+        match (self.mode, self.peer_node_id) {
+            (SessionMode::Case { fabric_idx }, Some(node)) if !self.is_reserved() => {
+                Some((fabric_idx.get(), node))
+            }
+            _ => None,
+        }
+    }
+
+    /// `other` より後に採番された(= 新しい)セッションなら `true`(採番のラップを許容)。
+    fn is_newer_than(&self, other: &Session) -> bool {
+        (self.id.0.wrapping_sub(other.id.0) as i32) > 0
+    }
+
     /// 最終利用時刻を `now_ms` に更新する。
     fn touch(&mut self, now_ms: u64) {
         self.last_use = now_ms;
@@ -405,6 +447,9 @@ pub struct SessionManager<const SESSIONS: usize> {
     next_id: u32,
     /// ワイヤ Session ID の採番カウンタ(0 と使用中を回避)。
     next_local_sid: u16,
+    /// 満杯退避で消したセッション(上位層が [`take_evicted`](Self::take_evicted) で回収し、
+    /// 購読/exchange を掃除する)。回収されないまま溢れたら古い方から捨てる。
+    evicted: [Option<SessionId>; EVICTED_QUEUE],
 }
 
 impl<const SESSIONS: usize> Default for SessionManager<SESSIONS> {
@@ -420,6 +465,7 @@ impl<const SESSIONS: usize> SessionManager<SESSIONS> {
             sessions: FixedVec::new(),
             next_id: 0,
             next_local_sid: 1,
+            evicted: [None; EVICTED_QUEUE],
         }
     }
 
@@ -527,26 +573,49 @@ impl<const SESSIONS: usize> SessionManager<SESSIONS> {
         Some(&mut self.sessions[i])
     }
 
-    /// 退避(LRU)候補の index を選ぶ。
+    /// 満杯時退避の候補 index を選ぶ(`incoming` = これから入れるセッション)。
     ///
-    /// Expired を最優先、次いで予約でない最古(`last_use` 最小)のセッションを選ぶ。
-    /// いずれも無ければ `None`(= 全 slot が予約中で退避不可)。
+    /// 優先順(小さい tier から。同 tier 内は `last_use` 最小 = LRU):
     ///
-    /// なお「生存 exchange を持たないこと」を退避条件に加えるのは ExchangeManager の
-    /// 実装後(次ピース)。現段階では expired 優先 + LRU のみで判定する(§4.3、乖離)。
-    fn eviction_candidate(&self) -> Option<usize> {
-        let mut best: Option<(usize, u64)> = None;
+    /// 0. [`SlotState::Expired`]
+    /// 1. [`EvictHint::Disposable`](用済みの Unsecured セッション)
+    /// 2. 同一ピア(同じ fabric + peer node)の**古い方**で保護されていないもの。
+    ///    `incoming` が CASE ならそのピアの既存セッション、加えて「同じピアのより新しい
+    ///    セッションが既にある」セッション(予約時点では相手が未確定のため、こちらで拾う)
+    /// 3. 保護されていないその他
+    /// 4. 同一ピアの古い方で [`EvictHint::Protected`] のもの
+    /// 5. [`EvictHint::Protected`] のその他
+    ///
+    /// 予約中([`SlotState::Reserved`])は対象外。候補が無ければ `None`。
+    fn eviction_candidate(&self, incoming: &Session) -> Option<usize> {
+        let incoming_peer = incoming.case_peer();
+        let mut best: Option<(usize, (u8, u64))> = None;
         for (i, s) in self.sessions.iter().enumerate() {
             if s.is_reserved() {
                 continue;
             }
-            if s.is_expired() {
-                // Expired は最優先。即決。
-                return Some(i);
-            }
+            let tier = if s.is_expired() {
+                0
+            } else if s.hint == EvictHint::Disposable {
+                1
+            } else {
+                let peer = s.case_peer();
+                let older_of_same_peer = peer.is_some()
+                    && (peer == incoming_peer
+                        || self.sessions.iter().any(|o| {
+                            !o.is_expired() && o.case_peer() == peer && o.is_newer_than(s)
+                        }));
+                match (s.hint == EvictHint::Protected, older_of_same_peer) {
+                    (false, true) => 2,
+                    (false, false) => 3,
+                    (true, true) => 4,
+                    (true, false) => 5,
+                }
+            };
+            let key = (tier, s.last_use);
             match best {
-                Some((_, ts)) if s.last_use >= ts => {}
-                _ => best = Some((i, s.last_use)),
+                Some((_, k)) if key >= k => {}
+                _ => best = Some((i, key)),
             }
         }
         best.map(|(i, _)| i)
@@ -555,12 +624,55 @@ impl<const SESSIONS: usize> SessionManager<SESSIONS> {
     /// 満杯なら 1 セッションを退避してから push する内部ヘルパ。
     fn push_evicting(&mut self, session: Session) -> Result<SessionId> {
         if self.sessions.is_full() {
-            let victim = self.eviction_candidate().ok_or(Error::NoSpace)?;
-            self.sessions.swap_remove(victim);
+            let victim = self.eviction_candidate(&session).ok_or(Error::NoSpace)?;
+            let gone = self.sessions.swap_remove(victim);
+            self.note_evicted(gone.id);
         }
         let id = session.id;
         self.sessions.push(session).map_err(|_| Error::NoSpace)?;
         Ok(id)
+    }
+
+    /// 退避したセッションを通知キューへ積む(満杯なら最古を捨てる)。
+    fn note_evicted(&mut self, id: SessionId) {
+        if let Some(slot) = self.evicted.iter_mut().find(|e| e.is_none()) {
+            *slot = Some(id);
+        } else {
+            self.evicted.rotate_left(1);
+            self.evicted[EVICTED_QUEUE - 1] = Some(id);
+        }
+    }
+
+    /// 満杯退避で消えたセッションを 1 件取り出す(無ければ `None`)。
+    ///
+    /// 統合層は受信処理のたびに `None` まで呼び、そのセッションの購読・exchange を掃除する。
+    pub fn take_evicted(&mut self) -> Option<SessionId> {
+        let id = self.evicted[0].take()?;
+        self.evicted.rotate_left(1);
+        Some(id)
+    }
+
+    /// 全セッション(予約中を除く)の退避ヒントを `f` の結果で付け直す。
+    ///
+    /// 統合層が満杯時に、購読・生存 exchange の有無から計算して呼ぶ。
+    pub fn set_hints(&mut self, mut f: impl FnMut(&Session) -> EvictHint) {
+        for i in 0..self.sessions.len() {
+            if !self.sessions[i].is_reserved() {
+                let hint = f(&self.sessions[i]);
+                self.sessions[i].hint = hint;
+            }
+        }
+    }
+
+    /// 1 セッションの退避ヒントを設定する。存在すれば `true`。
+    pub fn set_hint(&mut self, id: SessionId, hint: EvictHint) -> bool {
+        match self.index_of(id) {
+            Some(i) => {
+                self.sessions[i].hint = hint;
+                true
+            }
+            None => false,
+        }
     }
 
     /// 確立済みセッションを挿入する(ハンドシェイク完了時に `sc` 層が呼ぶ)。
@@ -592,6 +704,7 @@ impl<const SESSIONS: usize> SessionManager<SESSIONS> {
             mode: init.mode,
             last_use: now_ms,
             state: SlotState::Active,
+            hint: EvictHint::Normal,
         };
         self.push_evicting(session)
     }
@@ -621,8 +734,9 @@ impl<const SESSIONS: usize> SessionManager<SESSIONS> {
             mode: SessionMode::PlainText,
             last_use: now_ms,
             state: SlotState::Reserved,
+            hint: EvictHint::Normal,
         };
-        // 満杯時は insert と同じ方針で退避する(Expired 優先 → 予約以外の LRU)。
+        // 満杯時は insert と同じ方針で退避する([`eviction_candidate`](Self::eviction_candidate))。
         // 新しいハンドシェイクは新鮮なピアの意思表示であり、古いセッションを残して
         // Busy を返し続けるより退避して受け入れる方が回復性が高い(chip も同様)。
         self.push_evicting(session)
@@ -651,6 +765,7 @@ impl<const SESSIONS: usize> SessionManager<SESSIONS> {
         s.rx_window = PeerWindow::new(init.rx_ctr_start);
         s.mode = init.mode;
         s.state = SlotState::Active;
+        s.hint = EvictHint::Normal;
         s.touch(now_ms);
         Ok(())
     }
@@ -1018,6 +1133,181 @@ mod tests {
         assert!(mgr.get(a).is_some());
         assert!(mgr.get(b).is_none(), "expired の b が最優先で退避される");
         assert!(mgr.get(c).is_some());
+    }
+
+    /// `(fabric, node)` を指定した CASE セッションの初期値。
+    fn case_init(port: u16, fabric: u8, node: u64) -> SessionInit {
+        let mut init = secure_init(addr(port), [0x11; 16], fabric);
+        init.peer_node_id = Some(node);
+        init
+    }
+
+    #[test]
+    fn eviction_is_reported_via_take_evicted() {
+        let mut mgr: SessionManager<2> = SessionManager::new();
+        let a = mgr.insert(case_init(1, 1, 10), 100).unwrap();
+        let _b = mgr.insert(case_init(2, 1, 20), 200).unwrap();
+        assert_eq!(mgr.take_evicted(), None);
+        let _c = mgr.insert(case_init(3, 1, 30), 300).unwrap();
+        assert_eq!(mgr.take_evicted(), Some(a));
+        assert_eq!(mgr.take_evicted(), None);
+        // 明示 remove は退避通知に載らない(呼び出し側が自分で掃除する)。
+        mgr.remove(_b);
+        assert_eq!(mgr.take_evicted(), None);
+    }
+
+    #[test]
+    fn disposable_is_evicted_before_older_normal() {
+        let mut mgr: SessionManager<3> = SessionManager::new();
+        let old_case = mgr.insert(case_init(1, 1, 10), 100).unwrap();
+        let plain = mgr
+            .insert(SessionInit::plaintext(addr(2), 0, 0), 500)
+            .unwrap();
+        let other = mgr.insert(case_init(3, 1, 20), 300).unwrap();
+        mgr.set_hints(|s| {
+            if s.is_encrypted() {
+                EvictHint::Normal
+            } else {
+                EvictHint::Disposable
+            }
+        });
+        // LRU は old_case だが、用済みの Unsecured セッションが先に退避される。
+        let _n = mgr.reserve(addr(9), 600).unwrap();
+        assert!(mgr.get(plain).is_none(), "Disposable が先");
+        assert!(mgr.get(old_case).is_some());
+        assert!(mgr.get(other).is_some());
+    }
+
+    #[test]
+    fn expired_beats_disposable() {
+        let mut mgr: SessionManager<2> = SessionManager::new();
+        let plain = mgr
+            .insert(SessionInit::plaintext(addr(1), 0, 0), 100)
+            .unwrap();
+        let dead = mgr.insert(case_init(2, 1, 10), 900).unwrap();
+        mgr.set_hint(plain, EvictHint::Disposable);
+        mgr.set_hint(dead, EvictHint::Protected);
+        mgr.expire(dead);
+        let _n = mgr.reserve(addr(9), 1000).unwrap();
+        assert!(
+            mgr.get(dead).is_none(),
+            "Expired が最優先(保護ヒントより強い)"
+        );
+        assert!(mgr.get(plain).is_some());
+    }
+
+    #[test]
+    fn older_session_of_inserted_peer_is_replaced_before_lru() {
+        let mut mgr: SessionManager<3> = SessionManager::new();
+        let lru_other = mgr.insert(case_init(1, 1, 10), 100).unwrap();
+        let same_old = mgr.insert(case_init(2, 1, 20), 200).unwrap();
+        let other2 = mgr.insert(case_init(3, 2, 20), 300).unwrap(); // 別 fabric の同 node id
+                                                                    // 同じ (fabric=1, node=20) の新セッション → LRU(lru_other)ではなく同一ピアの古い方。
+        let fresh = mgr.insert(case_init(4, 1, 20), 400).unwrap();
+        assert!(
+            mgr.get(same_old).is_none(),
+            "同一ピアの古いセッションを置換"
+        );
+        assert!(mgr.get(lru_other).is_some());
+        assert!(mgr.get(other2).is_some(), "fabric が違えば別ピア");
+        assert!(mgr.get(fresh).is_some());
+    }
+
+    #[test]
+    fn same_peer_sessions_coexist_while_space_remains() {
+        // 同じ node id を 2 プロセスが共有しうるので、空きがある間は古い方を落とさない。
+        let mut mgr: SessionManager<3> = SessionManager::new();
+        let a = mgr.insert(case_init(1, 1, 20), 100).unwrap();
+        let b = mgr.insert(case_init(2, 1, 20), 200).unwrap();
+        let c = mgr.insert(case_init(3, 1, 20), 300).unwrap();
+        assert_eq!(mgr.len(), 3);
+        assert!(mgr.get(a).is_some() && mgr.get(b).is_some() && mgr.get(c).is_some());
+        assert_eq!(mgr.take_evicted(), None);
+    }
+
+    #[test]
+    fn superseded_session_is_evicted_on_reserve_before_lru() {
+        // 予約(ハンドシェイク開始)時点では相手が未確定。既に「同じピアのより新しい
+        // セッション」がある古いセッションを、他ピアの LRU より先に退避する。
+        let mut mgr: SessionManager<3> = SessionManager::new();
+        let lru_other = mgr.insert(case_init(1, 1, 10), 100).unwrap();
+        let old = mgr.insert(case_init(2, 1, 20), 200).unwrap();
+        let newer = mgr.insert(case_init(3, 1, 20), 300).unwrap();
+        // 古い方を最近使ったことにしても「古い方」= 採番順で決まる。
+        mgr.get_mut(old, 900);
+        let _r = mgr.reserve(addr(9), 1000).unwrap();
+        assert!(mgr.get(old).is_none(), "同一ピアの古い方が退避される");
+        assert!(mgr.get(newer).is_some());
+        assert!(mgr.get(lru_other).is_some());
+    }
+
+    #[test]
+    fn protected_sessions_survive_churn_of_unprotected() {
+        let mut mgr: SessionManager<4> = SessionManager::new();
+        // 購読持ち(保護)2 本。最古なので LRU だけなら真っ先に消える。
+        let sub_a = mgr.insert(case_init(1, 1, 10), 10).unwrap();
+        let sub_b = mgr.insert(case_init(2, 2, 10), 20).unwrap();
+        let protect = |mgr: &mut SessionManager<4>| {
+            mgr.set_hints(|s| {
+                if s.id() == sub_a || s.id() == sub_b {
+                    EvictHint::Protected
+                } else {
+                    EvictHint::Normal
+                }
+            })
+        };
+        // 短命セッション(別ピア・同一ピア取り混ぜ)を 20 本流す。
+        for k in 0..20u64 {
+            protect(&mut mgr);
+            let node = if k % 2 == 0 { 10 } else { 100 + k };
+            let id = mgr
+                .insert(case_init(100 + k as u16, 1, node), 1000 + k)
+                .unwrap();
+            assert!(mgr.get(id).is_some());
+            assert!(
+                mgr.get(sub_a).is_some(),
+                "round {k}: 保護セッション A が生存"
+            );
+            assert!(
+                mgr.get(sub_b).is_some(),
+                "round {k}: 保護セッション B が生存"
+            );
+        }
+        assert_eq!(mgr.len(), 4);
+    }
+
+    #[test]
+    fn protected_same_peer_goes_after_unprotected_but_before_other_protected() {
+        let mut mgr: SessionManager<3> = SessionManager::new();
+        let prot_same = mgr.insert(case_init(1, 1, 20), 100).unwrap();
+        let prot_other = mgr.insert(case_init(2, 1, 30), 50).unwrap();
+        let normal = mgr.insert(case_init(3, 1, 40), 900).unwrap();
+        mgr.set_hint(prot_same, EvictHint::Protected);
+        mgr.set_hint(prot_other, EvictHint::Protected);
+        // 1 本目: 保護されていない normal(最も新しいが)から。
+        let n1 = mgr.insert(case_init(4, 1, 20), 1000).unwrap();
+        assert!(mgr.get(normal).is_none());
+        assert!(mgr.get(prot_same).is_some() && mgr.get(prot_other).is_some());
+        // 2 本目: 残りが全て保護なら、同一ピアの古い方(prot_same)を LRU の prot_other より先に。
+        mgr.set_hint(n1, EvictHint::Protected);
+        let _n2 = mgr.insert(case_init(5, 1, 50), 1100).unwrap();
+        assert!(mgr.get(prot_same).is_none(), "保護同士なら同一ピアの古い方");
+        assert!(mgr.get(prot_other).is_some());
+        // 3 本目: 同一ピアの重複が無くなれば保護同士の LRU。
+        mgr.set_hints(|_| EvictHint::Protected);
+        let _n3 = mgr.insert(case_init(6, 1, 60), 1200).unwrap();
+        assert!(mgr.get(prot_other).is_none(), "最後は LRU 全体");
+        assert!(mgr.get(n1).is_some());
+    }
+
+    #[test]
+    fn commit_resets_hint_and_keeps_reserved_out_of_set_hints() {
+        let mut mgr: SessionManager<2> = SessionManager::new();
+        let r = mgr.reserve(addr(1), 100).unwrap();
+        mgr.set_hints(|_| EvictHint::Disposable);
+        assert_eq!(mgr.get(r).unwrap().evict_hint(), EvictHint::Normal);
+        mgr.commit(r, case_init(1, 1, 10), 200).unwrap();
+        assert_eq!(mgr.get(r).unwrap().evict_hint(), EvictHint::Normal);
     }
 
     #[test]

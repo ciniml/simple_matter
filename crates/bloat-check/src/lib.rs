@@ -396,12 +396,17 @@ pub fn component_sizes<
 /// 含める。値は `transport::net::MAX_RX_PACKET_SIZE` に一致。
 const MAX_RX_PACKET_SIZE_2: usize = simple_matter::transport::net::MAX_RX_PACKET_SIZE * 2;
 
-/// `DefaultStack`(NF=5/S=4/E=4/TX=3/H=1/R=2/SUB=3/P=8)の計測。
+/// `DefaultStack`(NF=5/S=4/E=4/TX=3/H=1/R=2/SUB=3/P=16)の計測。
 pub fn default_stack() -> [Row; N_ROWS] {
-    component_sizes::<5, 4, 4, 3, 1, 2, 3, 8>()
+    component_sizes::<5, 4, 4, 3, 1, 2, 3, 16>()
 }
 
-/// `MinimalStack`(NF=2/S=3/E=3/TX=2/H=1/R=1/SUB=2/P=4)の計測。
+/// `MultiAdminStack`(NF=5/S=10/E=6/TX=3/H=3/R=3/SUB=6/P=16)の計測。
+pub fn multi_admin_stack() -> [Row; N_ROWS] {
+    component_sizes::<5, 10, 6, 3, 3, 3, 6, 16>()
+}
+
+/// `MinimalStack`(NF=2/S=3/E=3/TX=2/H=1/R=1/SUB=2/P=12)の計測。
 pub fn minimal_stack() -> [Row; N_ROWS] {
-    component_sizes::<2, 3, 3, 2, 1, 1, 2, 4>()
+    component_sizes::<2, 3, 3, 2, 1, 1, 2, 12>()
 }

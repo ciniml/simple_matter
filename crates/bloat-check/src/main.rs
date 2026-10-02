@@ -15,7 +15,9 @@
 
 #[cfg(not(target_os = "none"))]
 mod report {
-    use bloat_check::{default_stack, minimal_stack, Kind, Row, MAX_PACKET_SIZE};
+    use bloat_check::{
+        default_stack, minimal_stack, multi_admin_stack, Kind, Row, MAX_PACKET_SIZE,
+    };
 
     // 計測レポートは固定ラベルを整形して並べる。print_literal はここでは意図的。
     #[allow(clippy::print_literal)]
@@ -75,11 +77,15 @@ mod report {
         println!("MAX_PACKET_SIZE = {MAX_PACKET_SIZE} B (TX buffers + resp scratch)");
 
         print_profile(
-            "DefaultStack (NF=5 S=4 E=4 TX=3 H=1 R=2 SUB=3 P=8)",
+            "DefaultStack (NF=5 S=4 E=4 TX=3 H=1 R=2 SUB=3 P=16)",
             &default_stack(),
         );
         print_profile(
-            "MinimalStack (NF=2 S=3 E=3 TX=2 H=1 R=1 SUB=2 P=4)",
+            "MultiAdminStack (NF=5 S=10 E=6 TX=3 H=3 R=3 SUB=6 P=16)",
+            &multi_admin_stack(),
+        );
+        print_profile(
+            "MinimalStack (NF=2 S=3 E=3 TX=2 H=1 R=1 SUB=2 P=12)",
             &minimal_stack(),
         );
 

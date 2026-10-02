@@ -391,6 +391,17 @@ impl<H, const EXCHANGES: usize> ExchangeManager<H, EXCHANGES> {
         freed
     }
 
+    /// `session` 上の会話を 1 つ閉じる(セッション退避時の掃除用)。
+    ///
+    /// 会話が無ければ `None`。あれば閉じて `Some(保持していた再送 TX バッファ)` を返すので、
+    /// 呼び出し側は `None` になるまで繰り返し、返ったバッファをプールへ解放すること。
+    pub fn close_one_for_session(&mut self, session: SessionId) -> Option<Option<BufferId>> {
+        let i = self.exchanges.iter().position(|e| e.session == session)?;
+        let freed = self.exchanges[i].mrp.retrans_buffer();
+        self.exchanges.swap_remove(i);
+        Some(freed)
+    }
+
     /// 会話を終端予約する([`HandlerAction::Close`] の宣言を受けた統合層が呼ぶ)。
     ///
     /// 即時 close はせず、MRP の再送・ACK 責務が済み次第 [`poll`](Self::poll) が

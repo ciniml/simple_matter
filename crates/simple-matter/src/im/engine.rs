@@ -790,6 +790,14 @@ impl<D: DataModel, const READS: usize, const SUBS: usize, const PATHS: usize>
         self.subs.len()
     }
 
+    /// `session` 上に購読(確立中を含む)があれば `true`。
+    ///
+    /// 統合層がセッションテーブル満杯時の退避ヒント
+    /// ([`EvictHint::Protected`](crate::transport::session::EvictHint))を決めるのに使う。
+    pub fn has_subscription(&self, session: SessionId) -> bool {
+        self.subs.iter().any(|s| s.session == session)
+    }
+
     /// 進行中のチャンク中 Read / プライミング数。
     pub fn active_read_count(&self) -> usize {
         self.reads.len()

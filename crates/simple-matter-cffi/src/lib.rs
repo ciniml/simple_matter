@@ -59,7 +59,7 @@ use simple_matter::im::engine::InteractionModel;
 use simple_matter::im::events::PRIORITY_INFO;
 use simple_matter::kvs::Kvs;
 use simple_matter::sc::{PaseConfig, SecureChannel};
-use simple_matter::stack::{DefaultStack, MatterStack, SharedFabricCreds};
+use simple_matter::stack::{MatterStack, MultiAdminStack, SharedFabricCreds};
 use simple_matter::tlv::TlvTag;
 use simple_matter::transport::net::PeerAddr;
 
@@ -261,7 +261,7 @@ impl ServerCluster for ShimNetComm {
 const BTP_WINDOW: usize = 6;
 
 // ==========================================================================
-// サイジング(DefaultStack 相当、NF=5 固定)
+// サイジング(MultiAdminStack、NF=5 固定)
 // ==========================================================================
 
 /// fabric テーブル容量(`DefaultStack` と同じ 5)。
@@ -528,7 +528,11 @@ fn build_shim_dac(o: &'static Owned, cfg: &sm_config_t, rng: CRng) -> Option<Shi
         Some(ShimDac::Test(TestDacProvider::new(&crypto).ok()?))
     }
 }
-type Stack = DefaultStack<'static, Backend, CRng, Light>;
+/// デバイスのスタックプロファイル。複数エコシステム(Apple Home の 2 コントローラ・
+/// Google・Alexa・自前コントローラ)を同時に収容するため `MultiAdminStack`
+/// (session=10 / exchange=6 / handshake=3 / read=3 / subscribe=6)を使う
+/// (`docs/design/transport-exchange.md`「マルチ admin 時の容量と退避方針」)。
+type Stack = MultiAdminStack<'static, Backend, CRng, Light>;
 
 /// BasicInformation の既定設定(VID/PID はテスト DAC = 0xFFF1/0x8001)。`sm_init` で
 /// `sm_config_t.product_name` / `serial_number` が与えられれば [`BASIC_CFG`] に反映する。
@@ -1755,6 +1759,62 @@ pub(crate) fn multicast_dst(is_v6: bool, scope_id: u32) -> sm_addr_t {
 // C API
 // ==========================================================================
 
+/// `Shim::owned` を SHIM 上に構築する(`sm_init` の第 1 段)。失敗時は sm_init の戻り値。
+///
+/// `#[inline(never)]`: `Owned`(fabric テーブル等)の一時値を呼び出し元のフレームに残さない。
+///
+/// # SAFETY
+/// `sp` は未初期化の SHIM を指し、`cfg` の DER ポインタは非 NULL のとき len バイト有効。
+#[inline(never)]
+unsafe fn init_owned(sp: *mut Shim, cfg: &sm_config_t, rng: CRng) -> Result<(), i32> {
+    // C 供給の DAC/PAI/CD DER を Owned にコピーする(未指定なら空 = dev DAC)。
+    let dac_store = match unsafe { DacStore::from_config(cfg) } {
+        Ok(s) => s,
+        Err(()) => return Err(-5), // DER が容量超過 / 長さ不整合。
+    };
+    let owned = Owned {
+        crypto: RustCrypto::new(rng),
+        fabrics: RefCell::new(FabricTable::new()),
+        acl: RefCell::new(AclTable::new()),
+        window: RefCell::new(CommissioningWindow::new()),
+        groups: RefCell::new(DefaultGroupStore::new()),
+        dac_store,
+    };
+    unsafe { addr_of_mut!((*sp).owned).write(owned) };
+    Ok(())
+}
+
+/// `Shim::stack` を SHIM 上に構築し、保持すべき PASE 資格情報を返す(`sm_init` の第 2 段)。
+///
+/// `#[inline(never)]`: SecureChannel / InteractionModel / MatterStack の一時値(スタック
+/// プロファイルの数倍)をこの関数のフレームに閉じ込め、戻った時点で解放する。
+///
+/// # SAFETY
+/// `sp` の `owned` は初期化済み(`o` はそれを指す)、`stack` は未初期化であること。
+#[inline(never)]
+unsafe fn init_stack(
+    sp: *mut Shim,
+    o: &'static Owned,
+    cfg: &sm_config_t,
+    rng: CRng,
+) -> Result<DevPase, i32> {
+    // デバイス側 PASE 資格情報(SPAKE2+ verifier のみ。passcode は保持しない)。
+    let dev_pase = DevPase::from_config(cfg).ok_or(-4)?;
+    let config = dev_pase.build().ok_or(-4)?;
+    let creds = SharedFabricCreds::new(&o.fabrics, &o.crypto, 0);
+    let sc = SecureChannel::new(&o.crypto, rng, config, creds);
+    // DAC provider: C 供給の DER/鍵があれば BorrowedDacProvider、無ければ dev DAC。
+    let dac = build_shim_dac(o, cfg, rng).ok_or(-6)?; // None = 鍵復元失敗。
+    let im = InteractionModel::new(build_light(o, rng, cfg.network, dac));
+    let mut stack: Stack = MatterStack::new(&o.crypto, sc, im);
+    stack.set_group_keys(&o.groups);
+    let _ = stack.post_startup_event(basic_cfg().software_version, 0);
+    // 起動時の commissionable 窓に備えて運用鍵ペアを事前生成(CSR 応答短縮)。
+    stack.device_mut().opcreds.pregenerate_keypair();
+    unsafe { addr_of_mut!((*sp).stack).write(stack) };
+    Ok(dev_pase)
+}
+
 /// スタックを初期化する(KVS から fabric/ACL/resumption 復元込み)。0=OK、負値=失敗。
 #[no_mangle]
 pub extern "C" fn sm_init(cfg: *const sm_config_t, now_ms: u64) -> i32 {
@@ -1799,53 +1859,25 @@ pub extern "C" fn sm_init(cfg: *const sm_config_t, now_ms: u64) -> i32 {
     instance_id_bytes[2..8].copy_from_slice(&cfg.mac);
     let instance_id = u64::from_be_bytes(instance_id_bytes);
 
-    // C 供給の DAC/PAI/CD DER を Owned にコピーする(未指定なら空 = dev DAC)。
-    // SAFETY: cfg の DER ポインタは非 NULL のとき len バイト有効という契約。
-    let dac_store = match unsafe { DacStore::from_config(cfg) } {
-        Ok(s) => s,
-        Err(()) => return -5, // DER が容量超過 / 長さ不整合。
-    };
-
-    let owned = Owned {
-        crypto: RustCrypto::new(rng),
-        fabrics: RefCell::new(FabricTable::new()),
-        acl: RefCell::new(AclTable::new()),
-        window: RefCell::new(CommissioningWindow::new()),
-        groups: RefCell::new(DefaultGroupStore::new()),
-        dac_store,
-    };
-
     // SAFETY: 単一インスタンスを in-place 構築する。SHIM は static(不動)なので
     // owned フィールドへの &'static 参照は健全(自己参照はプログラム全生存期間有効)。
+    //
+    // 大きい一時値(Owned / SecureChannel / InteractionModel / MatterStack、合計数十 KB)は
+    // `init_owned` / `init_stack` の中に閉じ込め、sm_init 自身のフレームと、その後に呼ぶ
+    // 復元・広告処理(深い)とが同時にタスクスタックへ載らないようにする(AirQ の Matter
+    // タスクスタックは sm_init がピーク。transport-exchange.md「マルチ admin 時の容量と
+    // 退避方針」)。
     unsafe {
         let sp = SHIM.0.get() as *mut Shim;
-        addr_of_mut!((*sp).owned).write(owned);
+        if let Err(code) = init_owned(sp, cfg, rng) {
+            return code;
+        }
         let o: &'static Owned = &*addr_of!((*sp).owned);
+        let dev_pase = match init_stack(sp, o, cfg, rng) {
+            Ok(d) => d,
+            Err(code) => return code,
+        };
 
-        // デバイス側 PASE 資格情報(SPAKE2+ verifier のみ。passcode は保持しない)。
-        let dev_pase = match DevPase::from_config(cfg) {
-            Some(d) => d,
-            None => return -4,
-        };
-        let config = match dev_pase.build() {
-            Some(c) => c,
-            None => return -4,
-        };
-        let creds = SharedFabricCreds::new(&o.fabrics, &o.crypto, 0);
-        let sc = SecureChannel::new(&o.crypto, rng, config, creds);
-        // DAC provider: C 供給の DER/鍵があれば BorrowedDacProvider、無ければ dev DAC。
-        let dac = match build_shim_dac(o, cfg, rng) {
-            Some(d) => d,
-            None => return -6, // 鍵復元失敗。
-        };
-        let im = InteractionModel::new(build_light(o, rng, cfg.network, dac));
-        let mut stack: Stack = MatterStack::new(&o.crypto, sc, im);
-        stack.set_group_keys(&o.groups);
-        let _ = stack.post_startup_event(basic_cfg().software_version, 0);
-        // 起動時の commissionable 窓に備えて運用鍵ペアを事前生成(CSR 応答短縮)。
-        stack.device_mut().opcreds.pregenerate_keypair();
-
-        addr_of_mut!((*sp).stack).write(stack);
         // Host は sm_set_addrs 前は A/AAAA 無し(--at ユニキャストで解決可)。
         let host = Host::from_mac(&cfg.mac, None, None);
         addr_of_mut!((*sp).mdns).write(MdnsResponder::new(host, MATTER_PORT));
