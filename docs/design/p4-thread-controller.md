@@ -1953,3 +1953,160 @@ int32_t sm_ctrl_revoke_commissioning(uint64_t node_id, uint64_t now_ms);
 - 実機: Tab5 の Share → 表示された manual code で **PC の smctl(別 state-dir)`pairing code`/onnetwork-long** で
   NanoC6・AirQ に 2 fabric 目 → smctl から toggle/read、Tab5 からも引き続き購読・操作できる。tab5ctl で
   `openwindow` → `window` → screenshot(QR 表示)。
+
+## 18. T11: 外部 OTBR の Thread ネットワークへの参加(マルチ admin)
+
+Status: 設計(2026-10-02、コード未変更)。目的: Tab5 が **自前で Thread ネットワークを主宰する**(現状)代わりに、
+**既存の OTBR(ESP-IDF ot_br / NanoC6、WiFi "matter-test"、ch 11 / PAN 0xf592、OMR `fd5a:3d14:1acf:1::/64`)の
+ネットワークへ 1 ノードとして参加**し、PC(smweb/smctl、node 34)が既にコミッション済みの NanoC6 OnOff light
+(`[fd5a:3d14:1acf:1:e635:75ac:d22f:a3e0]:5540`)を **2 人目の admin(Tab5 自身の fabric / CA)** として操作する。
+(T10 は「カメラ QR」= docs/design/tab5-camera-qr.md。)
+
+### 18.1 ゴール / 非ゴール
+
+- ゴール: (1) 「主宰(leader + SRP サーバ)」と「参加(dataset 供給、SRP サーバ無し)」の切替、(2) 参加モードでの
+  Thread ノードのアドレス解決、(3) Tab5 から 2 fabric 目を入れる手順の確立、(4) PC(smweb)側の登録と AirQ 等
+  WiFi デバイスの現行動作を壊さない。
+- 非ゴール: Tab5 自身の border router 化(F8e)、OTBR 側 FW の変更、`_matterc._udp` の DNS-SD 発見による
+  「アドレス入力なし」ペアリング(18.5 の D2 として任意)、主宰モード時代のノード帳の自動移行。
+
+### 18.2 調査結果
+
+**(1) Tab5 側(`ports/esp-idf/examples/tab5_ctrl_app/main`)**
+
+- ネットワーク形成は `sm_ot_hub_form_network`(ot_hub.cpp:171-221)。優先順は **NVS の active dataset**
+  (:176-178)→ Kconfig `SM_THREAD_DATASET_TLV_HEX`(:181-188)→ 新規生成(:190-200)。つまり **既に NVS に
+  自前 dataset がある実機では Kconfig を設定しても無視される**。SRP サーバは無条件で有効化(:216)。参加モードで
+  これを残すと Tab5 が netdata に 2 つ目の SRP サーバを publish し、デバイスの登録先が割れる。
+- 起動は pump タスクから(ctrl_pump.cpp:2201-2223)。`sm_ot_hub_wait_leader`(ot_hub.cpp:231-248)は
+  leader/router だけを成功扱いにするので、child で参加した場合 30 秒待って警告になる(動作は継続)。
+- SRP 逆引き `sm_ot_hub_srp_lookup`(ot_hub.cpp:254-292)は **自分の SRP サーバ帳**を node_id の 16 hex 部分一致で
+  走査する。呼び出しは ctrl_pump.cpp の 2 箇所だけ: `do_refresh_addr`(:1347、失敗時は WiFi mDNS へ
+  フォールバック :1351-1364)と ble-thread の handoff 待ち(:2089-2106)。app_state / node_book / console_dbg は
+  ot_hub を直接呼ばない(console の `refresh` は op 経由、console_dbg.cpp:163,675)。
+  `sm_ot_hub_get_status` は SRP サーバの状態/ホスト数を読む(ot_hub.cpp:329-333、表示用)。
+- UDP ソケットは **netif 非束縛の AF_INET6 1 本**(dual-stack、ctrl_pump.cpp:330-347)。宛先 netif は lwIP の経路
+  選択に任せ、scope_id を付けるのは fe80 宛だけ(:355-365、fe80 は WiFi 優先)。ULA/GUA は scope 0
+  (:1408-1410)。lwIP `ip6_route` は「宛先 /64 が netif の(static な)アドレスと一致」→ RA 由来の経路 →
+  既定 netif の順(IDF 5.4 `lwip/src/core/ipv6/ip6.c`)。主宰モードで ML-EID 宛が OT netif に出ているのは前者。
+- ペアリング: `pair`(`do_pair`、:1388-1456)は **与えたアドレスへ直接 PASE**(発見なし、via は fe80 の scope
+  選択にしか使わない)。`pairble`(`do_pair_ble`、:1937-2194)は BLE → 資格情報投入で、thread 種別では
+  **Tab5 の active dataset をそのまま渡し**(:1959-1961)、handoff は SRP サーバ帳待ち(:2089)。WiFi 種別は
+  mDNS(マルチキャスト + /24 ユニキャスト掃引、:1662-1750)。
+- sdkconfig: `CONFIG_OPENTHREAD_DNS_CLIENT=y`、`SRP_CLIENT` 無効、`BORDER_ROUTER` 無効(sdkconfig:2385-2389)。
+  SRP サーバは custom header で有効化(esp_ot_custom_config.h)。`CONFIG_LWIP_IPV6_ND6_ROUTE_INFO_OPTION_SUPPORT`
+  は **未設定**(sdkconfig:2075)、`LWIP_HOOK_IP6_ROUTE_NONE`(:2121)。WiFi は sdkconfig.local の `SM_WIFI_SSID`。
+
+**(2) デバイス側(`onoff_light_cpp` + `crates/simple-matter-cffi`)— マルチ admin の要**
+
+- ECW を開くと shim は PASE を有効化し、mDNS の commissionable 広告と `commissionable_disc` を更新して
+  `SM_EV_WINDOW_CHANGED` を立てる(lib.rs:1593-1603)。続く `sync_ble_adv` が広告バイト列の差分で
+  `SM_EV_BLE_ADV_CHANGED` を立て(lib.rs:1674-1691)、main.cpp:807-812 が `sm_ble_set_adv` で **BLE 広告を再開**
+  する(ble.cpp:260-273、`CONFIG_SM_ENABLE_BLE` 時)。discriminator は ECM で指定された値になる。
+- 一方 Thread ビルドは **mDNS ソケットを開かない**(main.cpp:886-890)ので shim の commissionable 広告はどこにも
+  出ない。`SM_EV_WINDOW_CHANGED` は main.cpp で **未処理**(:800-846 の switch に無い)で、SRP に `_matterc._udp`
+  を登録するコードも無い。結論: **コミッション済み Thread デバイスの窓は「BLE 広告」か「アドレス既知の UDP 直接
+  PASE(:5540)」でしか到達できない。DNS-SD では発見できない。**
+- 運用広告: `SM_EV_COMMISSIONED`(fabric 増加ごとに発火、lib.rs:1539-1541)→ `maybe_register_srp`
+  (main.cpp:712-722、838-841)→ `sm_ot_srp_register`。しかし ot_thread.cpp:129-131 が `g_srp_registered` で
+  **2 回目以降を即 return**(「単一 fabric・単一登録」)、サービス枠も 1 個(:38-39)、shim の
+  `sm_operational_instance_name` も **先頭 fabric しか返さない**(lib.rs:2790-2802)。結論: **2 つ目の AddNOC は
+  通る(NF=5、lib.rs:268)が、2 fabric 目の `_matter._tcp` インスタンスは SRP に登録されない。** Tab5 の fabric 名
+  では OTBR の DNS-SD にも advertising proxy(mDNS)にも現れない。`SM_EV_FABRIC_REMOVED` 時の登録解除も無い。
+- 影響: Tab5 はペアリング時のアドレスをノード帳に持つので **当面は動く**(OMR prefix が変わるまで)。再解決
+  (`refresh`)は不可。Apple/Google 等の標準コントローラを 2 人目にする場合は運用発見が必須なので致命的。
+
+**(3) 外部ネットワークでの解決手段**
+
+| 案 | 可否 | 根拠 / 条件 |
+|---|---|---|
+| (a) OT DNS client で OTBR の DNS-SD サーバへ `otDnsClientResolveService` | **可(推奨)** | `OPENTHREAD_DNS_CLIENT=y` 済み、`DNS_CLIENT_SERVICE_DISCOVERY_ENABLE` は OT 既定 1。OTBR 側は BORDER_ROUTER で `DNSSD_SERVER_ENABLE=1`(IDF ftd-config.h:556-562)。ただしサーバアドレス自動設定は SRP client 前提(`DEFAULT_SERVER_ADDRESS_AUTO_SET` = SRP_CLIENT 有効時のみ)なので、**netdata の SRP/DNS サービス(service number 0x5d)から OTBR アドレスを自分で引いて** `otDnsQueryConfig` に入れる。Thread 内ユニキャストだけで完結 |
+| (b) WiFi 側 mDNS(OTBR advertising proxy) | 条件付き | 既存 `resolve_via_mdns` が使えるが、esp_hosted はマルチキャスト受信不可(JOURNAL:162-164)で /24 掃引頼み。OTBR の mDNS がユニキャスト QU に応答するか未確認。フォールバックとして現状のまま残す(追加実装なし) |
+| (c) WiFi → OTBR 経由でルーティング(Thread 無線を使わない) | 可(予備) | OTBR は OMR を RA の RIO で広告する。lwIP は RIO 対応コードを持つ(nd6.c `ND6_OPTION_TYPE_ROUTE_INFO`、`LWIP_ND6_SUPPORT_RIO`)が Tab5 は Kconfig 無効。`CONFIG_LWIP_IPV6_ND6_ROUTE_INFO_OPTION_SUPPORT=y` で有効化可。RA は ff02::1(既定グループ)なので受信見込みあり。H2 RCP 不調時の迂回路・切り分け用 |
+
+(a)(b) とも **デバイスが Tab5 fabric のインスタンスを SRP 登録していること**が前提(18.2 (2))。
+
+### 18.3 推奨アーキテクチャ
+
+1. **モード切替**: Kconfig `SM_THREAD_MODE`(choice: `FORM` = 既定・現状 / `JOIN`)+ NVS 上書き(namespace
+   "smui"、key "otmode" と "otjoin_ds"。console `otmode form|join [dataset_hex]` で書いて再起動)。優先は NVS →
+   Kconfig。JOIN では:
+   - dataset は「NVS "otjoin_ds" → Kconfig `SM_THREAD_DATASET_TLV_HEX`」。OT の active dataset と **異なれば
+     `otDatasetSetActiveTlvs` で上書き**(ot_hub.cpp:176-178 の「NVS 優先」を JOIN では逆転)。上書き前に自前
+     dataset を NVS "otform_ds" へ退避し、FORM に戻すとき復元する。JOIN で dataset が空なら Thread を起動せず
+     status に明示(勝手に新規ネットワークを作らない)。
+   - `otSrpServerSetEnabled` を **呼ばない**。待ちは `wait_leader` ではなく attach(child 以上)で成立。
+   - dataset hex(network key を含む)は docs / コミットに書かない。sdkconfig.local(git 管理外)か console で投入。
+2. **ノード解決(JOIN)**: 順に ①OT DNS client(案 a)→ ②既存 WiFi mDNS(案 b、現行コードのまま)→
+   ③ノード帳の保存アドレスを維持。`sm_ot_hub_resolve(node_id, instance_label, out_ip, timeout_ms)` を新設し、FORM は
+   従来の SRP サーバ帳、JOIN は `otDnsClientResolveService("<cfid>-<node>", "_matter._tcp.default.service.arpa.")`
+   を同期ラップ(コールバック → セマフォ)。instance ラベルは `feed_addr_as_mdns` と同じく `sm_ctrl_resolve_start` の
+   QNAME 先頭ラベルから借りる(ctrl_pump.cpp:1752-1760。shim 変更不要)。
+3. **経路**: Tab5 は OT netif に OMR アドレス(OT の SLAAC、`IP6_SLAAC_ENABLE=1`)を持つので、OMR 宛は scope 0 の
+   まま OT netif に出る想定。WiFi デバイス(AirQ = IPv4 運用)は無変更。保険として案 (c) の RIO を有効化しておく。
+4. **2 人目 admin の手順(Tab5 が後から入る。デバイス変更なしで成立する最短経路)**:
+   1. PC(smweb の Share、または `smctl admincommissioning open-window`)で node 34 に ECW を開き、
+      **passcode(数値)** を控える(Tab5 の `pair` は passcode を取る。manual code の復号は Tab5 に無い)。
+   2. Tab5: `pair fd5a:3d14:1acf:1:e635:75ac:d22f:a3e0 <tab5_node_hex> thread <passcode>` — アドレス直指定の
+      on-network PASE → AddTrustedRoot/AddNOC(2 fabric 目)→ 同アドレスで CASE → CommissioningComplete。
+      ネットワーク資格情報は触らない(デバイスは OTBR 網に居るまま)。UI の Pair ダイアログ(via=Thread)でも同じ。
+   3. Tab5: `nodes` / `toggle` / 購読で確認。PC 側 node 34 が引き続き操作できることを確認。
+   - BLE 経路(`pairble <ECM disc> <node> thread <passcode>`)も原理上可能(BLE 広告は再開する)。ただし
+     Tab5 が dataset を再投入するため「同一 dataset の AddOrUpdate/ConnectNetwork を attach 済みデバイスが正しく
+     捌くか」が未検証で、handoff が SRP サーバ帳待ち(:2089)なので P2 の修正後に限る。**第一経路にはしない。**
+   - 逆向き(Tab5 が Share → PC が入る)は T9 のまま動く(PC は OTBR 経由でアドレス到達可能)。
+
+### 18.4 デバイス側の必須/任意変更(`onoff_light_cpp`、cffi)
+
+- **D1(必須・堅牢化)マルチ fabric SRP 登録**: shim に
+  `size_t sm_operational_instance_name_at(uint8_t index, uint8_t *buf, size_t cap)`(fabric 反復の index 番目、
+  無ければ 0。既存 API は index 0 の薄いラッパに)を追加。ot_thread.cpp は `g_srp_registered` を廃し、
+  **NF(5) 個の静的サービス枠**(instance 文字列 + `otSrpClientService`)を持つ `sm_ot_srp_sync(names[], n)` に置換:
+  未登録の名前は `otSrpClientAddService`、消えた名前は `otSrpClientRemoveService`。main.cpp は
+  `SM_EV_COMMISSIONED` / `SM_EV_FABRIC_REMOVED` / ThreadRole(attach) で全 fabric 名を集めて sync を呼ぶ。
+  OT が保持するポインタは静的領域のまま(定常ヒープレス方針に合致)。`CONFIG_OPENTHREAD_SRP_CLIENT_MAX_SERVICES`
+  (既定 5)が NF 以上であることを確認。
+- **D2(任意)`_matterc._udp` の SRP 登録**: `SM_EV_WINDOW_CHANGED` で開閉に合わせ commissionable サービス
+  (サブタイプ `_L<disc>` / `_S<disc>` / `_CM`、TXT D/CM/VP)を登録/削除。shim から TXT 素材を出す API が要るため
+  別ユニット。スマホ系コントローラの on-network 追加に必要、Tab5 の T10 ゴールには不要。
+
+### 18.5 実装ピース(各 1 エージェント)
+
+- **P1 ot_hub モード切替**: Kconfig choice、NVS キー、`sm_ot_hub_start_network()`(form/join 分岐、dataset 上書き・
+  退避、SRP サーバ条件化)、`sm_ot_hub_wait_attached`、`sm_ot_status_t` に `mode` 追加と Network タブ/ステータスバー
+  表示("JOIN child ch11 f592")、console `otmode`。sdkconfig.local に `SM_WIFI_SSID="matter-test"` と dataset。
+  set-target 再ビルド時は `SDKCONFIG_DEFAULTS` に sdkconfig.local を含める(既知の罠)。
+- **P2 解決の抽象化**: `sm_ot_hub_resolve`(FORM = SRP 帳 / JOIN = DNS client、netdata から DNS サーバ発見)、
+  ctrl_pump.cpp:1347 と :2090 を差し替え、JOIN 時の `do_refresh_addr` は DNS → mDNS → 「保存アドレス維持」の順。
+  `sm_ot_hub_dump_srp` は JOIN で netdata のサービス一覧ダンプに。
+- **P3 経路の保険**: `CONFIG_LWIP_IPV6_ND6_ROUTE_INFO_OPTION_SUPPORT=y`、console `route <ipv6>`(`ip6_route` が選ぶ
+  netif と OT/WiFi の保有アドレスを表示)で切り分け可能にする。
+- **P4 デバイス D1**: shim API + テスト(2 fabric で index 0/1 が別名、範囲外 0)、ot_thread.cpp / main.cpp の sync 化。
+  Rust 変更後は `target/<triple>/release/libsimple_matter_cffi.a` を消してから docker ビルド。
+- **P5(任意)D2**。P1 → 実機ゲート A → P2/P3 → P4 → ゲート B の順。P1 だけで 18.3-4 の手順は実行できる。
+
+### 18.6 実機検証(OTBR + NanoC6 light node 34 + Tab5 `/dev/ttyACM4`)
+
+- **ゲート A(P1)**: Tab5 を JOIN で起動 → `status` が role=child/router、ch 11、PAN f592、SRP サーバ無効。
+  OTBR 側 `netdata show` で SRP サーバが 1 つのまま。Tab5 に OMR(`fd5a:3d14:1acf:1::/64`)アドレスが付く。
+  WiFi "matter-test" 接続、AirQ の既存操作が回帰しない。PC で ECW → Tab5 `pair <addr> <node> thread <passcode>` が
+  PAIR COMPLETE → Tab5 から toggle/購読、smweb からも toggle 可(双方向で 10 往復)。デバイス `fabrics=2`。
+- **ゲート B(P2+P4)**: デバイス更新後、OTBR `srp server service` に 2 インスタンス(PC fabric / Tab5 fabric)。
+  Tab5 `refresh <node>` が "DNS -> fd5a:…" で解決。Tab5 再起動後も操作可。Tab5 から RemoveFabric(または
+  unpair)→ SRP から Tab5 側インスタンスだけ消え、PC 側は残る。
+- **ゲート C(回帰)**: `otmode form` で主宰モードへ戻り、退避 dataset で従来ネットワークが復元される。
+- chip-tool を使う場合は attestation 検証 ON(`--bypass-attestation-verifier` は使わない)。
+
+### 18.7 リスク / 未決事項
+
+- **lwIP の経路選択**: OT netif の OMR アドレスが static 扱いでないと /64 一致が効かず、既定 netif(WiFi)へ流れる
+  可能性。P3 の RIO がその場合の受け皿だが、送信元アドレス選択が WiFi 側になり経路が非対称になる。ゲート A で
+  `route` と OTBR のパケット観測で確定させる。駄目なら `LWIP_HOOK_IP6_ROUTE_CUSTOM` で prefix → OT netif を明示。
+- **FTD として参加**: Tab5 が router/leader に昇格し得る(OTBR 停止時に Tab5 がパーティションを引き継ぐと SRP/DNS
+  が消える)。必要なら JOIN では `otThreadSetRouterEligible(false)` で child 固定にするか要判断。
+- **OMR prefix の変化**(OTBR 再構成)でノード帳アドレスが陳腐化 → D1 + P2 が入るまでは手動 `setaddr`。
+- OTBR の DNS-SD サーバが Thread 側 :53 で SRP 登録を返すこと、netdata のサービス形式(unicast 0x5d / anycast 0x5c)
+  は実機で要確認。anycast だけの場合は ALOC を組むか Kconfig で DNS サーバを与える。
+- PASE 中のデバイス負荷(Thread + SRP 更新 + CASE 既存 2 セッション)と exchange プール。2 fabric 同時購読の実測要。
+- 主宰モード時代の Thread ノード(旧 0xaabbccdd 等)は JOIN では到達不能のまま一覧に残る。削除 UI で対処。
+- T10 の番号衝突(カメラ QR)。
