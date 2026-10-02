@@ -80,11 +80,31 @@ uint32_t sm_ot_hub_netif_index();
 // SRP サーバに登録されているホストから、インスタンス名に `node_id` の 16 hex を
 // 含むサービスを探し、そのホストの IPv6 アドレスを out_ip[16] へ書く。
 // Thread では mDNS ではなく SRP がデバイスの運用アドレスの出所になる(F8b)。
-// JOIN モードでは自分の SRP サーバ帳が無いので常に false(呼び出し側は保存アドレス /
-// WiFi mDNS へフォールバックする。OT DNS client による解決は P2)。
+// JOIN モードでは自分の SRP サーバ帳が無いので常に false(JOIN は sm_ot_hub_resolve を使う)。
 bool sm_ot_hub_srp_lookup(uint64_t node_id, uint8_t out_ip[16]);
 
-// SRP サーバの登録内容をログに出す(デバッグ補助)。
+// --- ノード解決(§18.3-2 / P2)---
+//
+// JOIN では自分の SRP サーバ帳が無いので、OTBR の DNS-SD サーバ(SRP サーバと同居、:53)へ
+// OT DNS client で `<instance_label>._matter._tcp.default.service.arpa.` の SRV(+ AAAA)を
+// 問い合わせる。サーバアドレスは Thread netdata の DNS/SRP サービス(enterprise 44970、
+// unicast 0x5d → anycast 0x5c の順)から引く(OT のサーバ自動設定は SRP client 前提で使えない)。
+// `instance_label` は `<compressed-fabric-hex>-<node-id-hex>`(sm_ctrl_resolve_start の
+// QNAME 先頭ラベル)。成功で out_ip[16](リンクローカル以外を優先)/ *out_port を書く。
+// `msg` には結果(成功 = "[addr]:port host …"、失敗 = otError と DNS サーバ)を書く。
+// 呼び出し元タスクで最大 ~timeout_ms ブロックする(OT ロックは待ちの間は保持しない)。
+bool sm_ot_hub_dns_resolve(const char *instance_label, uint8_t out_ip[16], uint16_t *out_port,
+                           uint32_t timeout_ms, char *msg, size_t msgcap);
+
+// netdata から選んだ DNS サーバを `desc` に書く(診断用)。見つからなければ false。
+bool sm_ot_hub_dns_server(char *desc, size_t cap);
+
+// モード共通の解決: FORM = 自分の SRP サーバ帳(sm_ot_hub_srp_lookup)/ JOIN = DNS client。
+bool sm_ot_hub_resolve(uint64_t node_id, const char *instance_label, uint8_t out_ip[16],
+                       uint32_t timeout_ms, char *msg, size_t msgcap);
+
+// SRP サーバの登録内容をログに出す(デバッグ補助)。JOIN では netdata のサービス一覧と
+// 選んだ DNS サーバを出す。
 void sm_ot_hub_dump_srp();
 
 // --- GUI 用のステータス取得(T1)---

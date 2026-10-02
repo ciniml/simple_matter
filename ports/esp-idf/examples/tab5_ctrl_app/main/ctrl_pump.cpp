@@ -144,6 +144,8 @@ const char *op_step_name(uint8_t kind) {
     return "op:revoke_window";
   case SM_UI_OP_FORGET:
     return "op:forget";
+  case SM_UI_OP_DNS_LOOKUP:
+    return "op:dns_lookup";
   default:
     return "op:?";
   }
@@ -915,6 +917,7 @@ void refresh_wifi_status() {
 
 // 前方宣言(実体は「運用アドレス解決」節。T3 で追加した mDNS 解決)。
 bool resolve_via_mdns(uint64_t node_id, uint32_t netif_index, uint64_t timeout_ms);
+bool operational_label(uint64_t node_id, char *out, size_t cap);
 
 // quiet = 周期ポーリング(ステータス行を汚さない)。timeout_ms は CASE 込みの上限。
 // 周期 poll の失敗バックオフ(行 index 別)。成功した操作はこれを解除する。
@@ -1504,23 +1507,46 @@ void do_set_addr(const sm_ui_op_t &op) {
 void do_refresh_addr(uint64_t node_id) {
   // T8(§16.3): 旧アドレス / 旧セッションに紐づく購読の残骸を先に切る。
   drop_subscription(node_id);
-  // JOIN(§18): 自分の SRP サーバ帳は無い。WiFi mDNS を試し、駄目なら **保存アドレスを維持**
-  // する(Thread ノードは `setaddr` で手動更新。OT DNS client による解決は P2)。
+  // FORM: 自分の SRP サーバ帳 → WiFi mDNS。
+  // JOIN(§18.3-2 / P2): OTBR の DNS-SD サーバへ OT DNS client → WiFi mDNS → **保存アドレス維持**。
+  // 既に WiFi / Ethernet と分かっているノードは DNS を飛ばして mDNS へ(Thread 網の DNS に
+  // 居ない。OTBR の discovery proxy が infra 側のアドレスを返しても Thread 側からは使わない)。
   const bool join = sm_ot_hub_mode() == SM_OT_MODE_JOIN;
-  if (!join) {
-    sm_app_set_status("SRP lookup for %016llx ...", (unsigned long long)node_id);
-  }
   uint8_t ip[16];
-  if (!sm_ot_hub_srp_lookup(node_id, ip)) {
+  bool hit = false;
+  char dns_msg[160] = {0};
+  if (join) {
+    const uint8_t tr = node_transport(node_id);
+    char label[64];
+    if (tr == SM_UI_TRANSPORT_WIFI || tr == SM_UI_TRANSPORT_ETH) {
+      snprintf(dns_msg, sizeof(dns_msg), "skipped (non-Thread node)");
+    } else if (!operational_label(node_id, label, sizeof(label))) {
+      snprintf(dns_msg, sizeof(dns_msg), "no instance label");
+    } else {
+      sm_app_set_status("DNS lookup for %016llx ...", (unsigned long long)node_id);
+      hit = sm_ot_hub_resolve(node_id, label, ip, 6000, dns_msg, sizeof(dns_msg));
+      const bool ll = hit && ip[0] == 0xfe && (ip[1] & 0xc0) == 0x80;
+      if (ll) {
+        hit = false; // Thread 越しに使えないリンクローカルしか返らなかった
+        snprintf(dns_msg, sizeof(dns_msg), "only a link-local address");
+      }
+      ESP_LOGI(TAG, "refresh %016llx: DNS %s: %s", (unsigned long long)node_id,
+               hit ? "ok" : "failed", dns_msg);
+    }
+  } else {
+    sm_app_set_status("SRP lookup for %016llx ...", (unsigned long long)node_id);
+    hit = sm_ot_hub_srp_lookup(node_id, ip);
+  }
+  if (!hit) {
     if (!join) {
       sm_ot_hub_dump_srp();
     }
-    // SRP に居ない = Thread ノードではない可能性。WiFi が上がっていれば mDNS で引く
+    // SRP / DNS に居ない = Thread ノードではない可能性。WiFi が上がっていれば mDNS で引く
     // (T3 で追加。WiFi ノードのリブート後再解決もこれで効く)。
     uint32_t widx = sm_wifi_netif_index();
     if (widx != 0) {
-      sm_app_set_status("%s; trying mDNS over WiFi for %016llx ...",
-                        join ? "JOIN mode (no SRP table)" : "not in SRP",
+      sm_app_set_status("%s%s; trying mDNS over WiFi for %016llx ...",
+                        join ? "DNS: " : "not in SRP", join ? dns_msg : "",
                         (unsigned long long)node_id);
       bool ok = resolve_via_mdns(node_id, widx, 8000);
       sm_ctrl_event_t ev;
@@ -1530,9 +1556,9 @@ void do_refresh_addr(uint64_t node_id) {
       refresh_node_addr_view(node_id);
       if (join && !ok) {
         set_node_note(node_id, "addr kept");
-        sm_app_set_status("JOIN mode: mDNS did not resolve %016llx; keeping the stored address "
-                          "(use setaddr)",
-                          (unsigned long long)node_id);
+        sm_app_set_status("JOIN: neither DNS (%s) nor mDNS resolved %016llx; keeping the stored "
+                          "address",
+                          dns_msg, (unsigned long long)node_id);
         return;
       }
       set_node_note(node_id, ok ? "addr updated (mDNS)" : "not found");
@@ -1542,9 +1568,8 @@ void do_refresh_addr(uint64_t node_id) {
     }
     if (join) {
       set_node_note(node_id, "addr kept");
-      sm_app_set_status("JOIN mode: no resolver for %016llx; keeping the stored address "
-                        "(use setaddr)",
-                        (unsigned long long)node_id);
+      sm_app_set_status("JOIN: DNS failed for %016llx (%s); keeping the stored address",
+                        (unsigned long long)node_id, dns_msg);
       return;
     }
     set_node_note(node_id, "not in SRP");
@@ -1563,10 +1588,11 @@ void do_refresh_addr(uint64_t node_id) {
     consume_async_event(ev); // T8
   }
   refresh_node_addr_view(node_id);
-  set_node_note(node_id, rc == 0 ? "addr updated" : "set_node_addr failed");
+  set_node_note(node_id, rc == 0 ? (join ? "addr updated (DNS)" : "addr updated")
+                                 : "set_node_addr failed");
   char buf[64] = {0};
   inet_ntop(AF_INET6, ip, buf, sizeof(buf));
-  sm_app_set_status("SRP -> %s (set_node_addr rc=%d)", buf, rc);
+  sm_app_set_status("%s -> %s (set_node_addr rc=%d)", join ? "DNS" : "SRP", buf, rc);
 }
 
 void do_pair(const sm_ui_op_t &op) {
@@ -1933,6 +1959,44 @@ bool resolve_via_mdns(uint64_t node_id, uint32_t netif_index, uint64_t timeout_m
   return ok;
 }
 
+// operational インスタンス名の先頭ラベル `<compressed-fabric-hex>-<node-id-hex>` を得る
+// (JOIN の DNS 解決用。§18.3-2)。compressed fabric は C++ から見えないので、
+// `sm_ctrl_resolve_start`(副作用なし)が作るクエリの QNAME 先頭ラベルを借りる。
+bool operational_label(uint64_t node_id, char *out, size_t cap) {
+  uint8_t q[256];
+  sm_addr_t qdst = {};
+  size_t qn = sm_ctrl_resolve_start(node_id, nullptr, now_ms(), q, sizeof(q), &qdst);
+  if (qn <= 12 + 1) {
+    return false;
+  }
+  const size_t len = q[12];
+  if (len == 0 || len >= 64 || 13 + len > qn || len + 1 > cap) {
+    return false;
+  }
+  memcpy(out, q + 13, len);
+  out[len] = 0;
+  return true;
+}
+
+// JOIN の `dns <node>` コンソール操作(§18 / P2): 解決してログへ出すだけ(ノード帳は触らない)。
+void do_dns_lookup(uint64_t node_id) {
+  char label[64];
+  if (!operational_label(node_id, label, sizeof(label))) {
+    sm_app_set_status("DNS %016llx: no instance label (controller not ready?)",
+                      (unsigned long long)node_id);
+    return;
+  }
+  char msg[160] = {0};
+  uint8_t ip[16];
+  uint16_t port = 0;
+  char srv[96] = {0};
+  bool have_srv = sm_ot_hub_dns_server(srv, sizeof(srv));
+  ESP_LOGI(TAG, "dns %016llx: instance %s; server %s%s", (unsigned long long)node_id, label,
+           have_srv ? "" : "not found: ", srv);
+  bool ok = sm_ot_hub_dns_resolve(label, ip, &port, 6000, msg, sizeof(msg));
+  sm_app_set_status("DNS %016llx %s: %s", (unsigned long long)node_id, ok ? "OK" : "FAILED", msg);
+}
+
 // SRP で引いたアドレスを「mDNS 応答」に仕立ててシムへ渡す(Thread ノードの handoff)。
 //
 // シムの照合はインスタンス名 `<compressed-fabric-hex>-<node-id-hex>._matter._tcp.local` に
@@ -2283,8 +2347,13 @@ void do_pair_ble(const sm_ui_op_t &op) {
   if (thread_kind) {
     sm_app_set_status("BLE done; waiting for the device to register in SRP ...");
     uint8_t ip[16];
-    for (int i = 0; i < 60 && !resolved; ++i) { // 最大 ~120 秒
-      if (sm_ot_hub_srp_lookup(op.node_id, ip)) {
+    // FORM = 自分の SRP サーバ帳 / JOIN = OTBR の DNS-SD(§18 / P2)。
+    char label[64] = {0};
+    operational_label(op.node_id, label, sizeof(label));
+    const uint64_t handoff_until = now_ms() + 120000; // 最大 ~120 秒
+    while (!resolved && now_ms() < handoff_until) {
+      char rmsg[160];
+      if (sm_ot_hub_resolve(op.node_id, label, ip, 4000, rmsg, sizeof(rmsg))) {
         resolved = feed_addr_as_mdns(op.node_id, ip, CONFIG_SM_TARGET_PORT);
         if (!resolved) {
           // 最低限ノード帳だけでも直す(handoff は再開しない = 既知の制約)。
@@ -2558,6 +2627,9 @@ void pump_task(void *) {
           break;
         case SM_UI_OP_FORGET:
           do_forget(op.node_id);
+          break;
+        case SM_UI_OP_DNS_LOOKUP:
+          do_dns_lookup(op.node_id);
           break;
         }
       }

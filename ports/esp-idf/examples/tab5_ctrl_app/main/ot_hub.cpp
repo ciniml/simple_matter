@@ -14,6 +14,7 @@
 
 #include "sdkconfig.h"
 
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 
@@ -27,17 +28,21 @@
 #include "esp_vfs_eventfd.h"
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "nvs.h"
 
 #include "openthread/dataset.h"
 #include "openthread/dataset_ftd.h"
+#include "openthread/dns_client.h"
 #include "openthread/instance.h"
 #include "openthread/ip6.h"
 #include "openthread/link.h"
+#include "openthread/netdata.h"
 #include "openthread/srp_server.h"
 #include "openthread/thread.h"
+#include "openthread/thread_ftd.h"
 
 namespace {
 
@@ -399,6 +404,18 @@ bool sm_ot_hub_start_network() {
     log_dataset_tlvs(ds);
   }
 
+  // JOIN(§18.7 / P2): **router 不適格(FED = rx-on の FTD 子)で参加**する。適格のままだと、
+  // 起動直後に親が見つからない間(実機で ~15 秒)に Tab5 が自分のパーティションの leader に
+  // なり、~75 秒後に OTBR 側へ併合されるまで別網に居た(その間 SRP/DNS も OTBR ノードも見えない)。
+  // 不適格なら親が見つかるまで detached のまま attach を繰り返すだけで、パーティションは作らない。
+  // attach 後も適格へは戻さない(OTBR が落ちたときに Tab5 が網を引き継ぐと SRP/DNS の無い
+  // パーティションになる。Tab5 は経路の中継役を担う必要が無い)。FORM は従来どおり適格(leader)。
+  // この設定は OT の settings に保存されないので毎回明示する。
+  err = otThreadSetRouterEligible(inst, mode == SM_OT_MODE_FORM);
+  if (err != OT_ERROR_NONE) {
+    ESP_LOGW(TAG, "otThreadSetRouterEligible(%d) -> otError %d", (int)(mode == SM_OT_MODE_FORM),
+             (int)err);
+  }
   err = otIp6SetEnabled(inst, true);
   if (err == OT_ERROR_NONE) {
     err = otThreadSetEnabled(inst, true);
@@ -493,9 +510,304 @@ uint32_t sm_ot_hub_netif_index() {
   return g_ot_netif ? (uint32_t)esp_netif_get_netif_impl_index(g_ot_netif) : 0;
 }
 
+// --- JOIN: OT DNS client による解決(§18.3-2 / P2)---
+namespace {
+
+constexpr uint32_t THREAD_ENTERPRISE = 44970;   // netdata の Thread サービス(IANA 44970)
+constexpr uint8_t SVC_DNS_SRP_ANYCAST = 0x5c;   // service data = [0x5c, seq]
+constexpr uint8_t SVC_DNS_SRP_UNICAST = 0x5d;   // service data = [0x5d(, addr16, port2(, ver))]
+constexpr uint16_t DNS_PORT = 53;                // OT の DNS-SD サーバ(SRP サーバと同居)の固定ポート
+
+__attribute__((format(printf, 3, 4))) void put_msg(char *msg, size_t cap, const char *fmt, ...) {
+  if (msg == nullptr || cap == 0) {
+    return;
+  }
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(msg, cap, fmt, ap);
+  va_end(ap);
+}
+
+bool is_link_local(const otIp6Address &a) {
+  return a.mFields.m8[0] == 0xfe && (a.mFields.m8[1] & 0xc0) == 0x80;
+}
+
+// ML プレフィクス + 0000:00ff:fe00:<rloc/aloc16>(RLOC / ALOC)。OT ロック保持中に呼ぶ。
+void compose_locator(otInstance *inst, uint16_t loc16, otIp6Address &out) {
+  memset(&out, 0, sizeof(out));
+  const otMeshLocalPrefix *ml = otThreadGetMeshLocalPrefix(inst);
+  if (ml != nullptr) {
+    memcpy(out.mFields.m8, ml->m8, 8);
+  }
+  out.mFields.m8[11] = 0xff;
+  out.mFields.m8[12] = 0xfe;
+  out.mFields.m8[14] = (uint8_t)(loc16 >> 8);
+  out.mFields.m8[15] = (uint8_t)loc16;
+}
+
+// netdata から DNS/SRP サーバを選ぶ。OT ロック保持中に呼ぶ。
+// OT の DNS client のサーバ自動設定(DEFAULT_SERVER_ADDRESS_AUTO_SET)は SRP client 前提で
+// 本アプリでは使えないので、同じ規則を自前で辿る:
+//   1. unicast(0x5d)— アドレスが service data 側([0x5d][addr16][port2])
+//   2. unicast(0x5d)— アドレスが server data 側([addr16][port2])/ port だけなら server の RLOC
+//   3. anycast(0x5c)— ALOC = ML プレフィクス::ff:fe00:fc10+serviceId
+// ポートは netdata の値(= **SRP** サーバのポート)ではなく DNS の 53 を使う(OT の DNS-SD
+// サーバは SRP サーバと同じホストの :53 で答える。OT 自身の自動設定もアドレスだけを流用する)。
+bool find_dns_server(otInstance *inst, otIp6Address &out, char *desc, size_t cap) {
+  bool have_srv = false, have_srvr = false, have_any = false;
+  otIp6Address a_srv = {}, a_srvr = {}, a_any = {};
+  uint16_t rloc_srv = 0, rloc_srvr = 0, rloc_any = 0;
+  otNetworkDataIterator it = OT_NETWORK_DATA_ITERATOR_INIT;
+  otServiceConfig cfg;
+  while (otNetDataGetNextService(inst, &it, &cfg) == OT_ERROR_NONE) {
+    if (cfg.mEnterpriseNumber != THREAD_ENTERPRISE || cfg.mServiceDataLength < 1) {
+      continue;
+    }
+    const uint8_t num = cfg.mServiceData[0];
+    if (num == SVC_DNS_SRP_UNICAST) {
+      if (cfg.mServiceDataLength >= 1 + 18) {
+        if (!have_srv) {
+          memcpy(a_srv.mFields.m8, &cfg.mServiceData[1], 16);
+          rloc_srv = cfg.mServerConfig.mRloc16;
+          have_srv = true;
+        }
+      } else if (cfg.mServerConfig.mServerDataLength >= 18) {
+        if (!have_srvr) {
+          memcpy(a_srvr.mFields.m8, cfg.mServerConfig.mServerData, 16);
+          rloc_srvr = cfg.mServerConfig.mRloc16;
+          have_srvr = true;
+        }
+      } else if (cfg.mServerConfig.mServerDataLength == 2) {
+        if (!have_srvr) {
+          compose_locator(inst, cfg.mServerConfig.mRloc16, a_srvr);
+          rloc_srvr = cfg.mServerConfig.mRloc16;
+          have_srvr = true;
+        }
+      }
+    } else if (num == SVC_DNS_SRP_ANYCAST && !have_any) {
+      compose_locator(inst, (uint16_t)(0xfc10 + cfg.mServiceId), a_any);
+      rloc_any = cfg.mServerConfig.mRloc16;
+      have_any = true;
+    }
+  }
+  const char *kind = nullptr;
+  uint16_t rloc = 0;
+  if (have_srv) {
+    out = a_srv, kind = "unicast/service-data", rloc = rloc_srv;
+  } else if (have_srvr) {
+    out = a_srvr, kind = "unicast/server-data", rloc = rloc_srvr;
+  } else if (have_any) {
+    out = a_any, kind = "anycast", rloc = rloc_any;
+  } else {
+    if (desc != nullptr && cap > 0) {
+      snprintf(desc, cap, "no DNS/SRP service in netdata");
+    }
+    return false;
+  }
+  if (desc != nullptr && cap > 0) {
+    char abuf[OT_IP6_ADDRESS_STRING_SIZE];
+    otIp6AddressToString(&out, abuf, sizeof(abuf));
+    snprintf(desc, cap, "[%s]:%u (%s, server rloc 0x%04x)", abuf, (unsigned)DNS_PORT, kind,
+             (unsigned)rloc);
+  }
+  return true;
+}
+
+void dump_netdata_services() {
+  esp_openthread_lock_acquire(portMAX_DELAY);
+  otInstance *inst = esp_openthread_get_instance();
+  otNetworkDataIterator it = OT_NETWORK_DATA_ITERATOR_INIT;
+  otServiceConfig cfg;
+  int n = 0;
+  while (otNetDataGetNextService(inst, &it, &cfg) == OT_ERROR_NONE) {
+    char sd[2 * OT_SERVICE_DATA_MAX_SIZE + 1] = {0};
+    char vd[2 * OT_SERVER_DATA_MAX_SIZE + 1] = {0};
+    for (uint8_t i = 0; i < cfg.mServiceDataLength && i < OT_SERVICE_DATA_MAX_SIZE; ++i) {
+      snprintf(sd + 2 * i, 3, "%02x", cfg.mServiceData[i]);
+    }
+    for (uint8_t i = 0; i < cfg.mServerConfig.mServerDataLength && i < OT_SERVER_DATA_MAX_SIZE;
+         ++i) {
+      snprintf(vd + 2 * i, 3, "%02x", cfg.mServerConfig.mServerData[i]);
+    }
+    ESP_LOGI(TAG, "netdata service: %lu %s %s %s rloc 0x%04x id %u",
+             (unsigned long)cfg.mEnterpriseNumber, sd, vd[0] ? vd : "-",
+             cfg.mServerConfig.mStable ? "s" : "-", (unsigned)cfg.mServerConfig.mRloc16,
+             (unsigned)cfg.mServiceId);
+    ++n;
+  }
+  char desc[96];
+  otIp6Address srv;
+  bool ok = find_dns_server(inst, srv, desc, sizeof(desc));
+  esp_openthread_lock_release();
+  ESP_LOGI(TAG, "netdata services: %d; DNS server %s%s", n, ok ? "" : "not found: ", desc);
+}
+
+// DNS client の同期ラップ。コールバックは OT タスク(OT ロック保持)で走る。
+// 待ちがタイムアウトした後に遅れて来たコールバックは世代番号で捨てる。
+struct DnsWait {
+  SemaphoreHandle_t sem = nullptr;
+  uint32_t gen = 0; // 読み書きは全て OT ロック下
+  otError err = OT_ERROR_NONE;
+  bool have_ip = false;
+  uint8_t ip[16] = {0};
+  uint16_t port = 0;
+  char host[96] = {0};
+};
+DnsWait g_dns;
+
+void dns_service_cb(otError err, const otDnsServiceResponse *resp, void *ctx) {
+  if ((uint32_t)(uintptr_t)ctx != g_dns.gen) {
+    return; // 古い問い合わせ
+  }
+  g_dns.err = err;
+  g_dns.have_ip = false;
+  if (err == OT_ERROR_NONE) {
+    otDnsServiceInfo info;
+    memset(&info, 0, sizeof(info));
+    info.mHostNameBuffer = g_dns.host;
+    info.mHostNameBufferSize = sizeof(g_dns.host);
+    otError e = otDnsServiceResponseGetServiceInfo(resp, &info);
+    if (e == OT_ERROR_NONE) {
+      g_dns.port = info.mPort;
+      // AAAA を全部見て、リンクローカル以外の最初のものを採る(SRP 登録は通常 OMR / ML-EID)。
+      otIp6Address a;
+      bool picked_ll = false;
+      for (uint16_t i = 0; i < 8; ++i) {
+        if (otDnsServiceResponseGetHostAddress(resp, g_dns.host, i, &a, nullptr) != OT_ERROR_NONE) {
+          break;
+        }
+        char abuf[OT_IP6_ADDRESS_STRING_SIZE];
+        otIp6AddressToString(&a, abuf, sizeof(abuf));
+        ESP_LOGI(TAG, "DNS: %s AAAA[%u] %s", g_dns.host, (unsigned)i, abuf);
+        if (!g_dns.have_ip || (picked_ll && !is_link_local(a))) {
+          memcpy(g_dns.ip, a.mFields.m8, 16);
+          picked_ll = is_link_local(a);
+          g_dns.have_ip = true;
+        }
+      }
+      if (!g_dns.have_ip && !otIp6IsAddressUnspecified(&info.mHostAddress)) {
+        memcpy(g_dns.ip, info.mHostAddress.mFields.m8, 16);
+        g_dns.have_ip = true;
+      }
+      if (!g_dns.have_ip) {
+        g_dns.err = OT_ERROR_NOT_FOUND; // SRV はあるが AAAA が無い
+      }
+    } else {
+      g_dns.err = e;
+    }
+  }
+  xSemaphoreGive(g_dns.sem);
+}
+
+} // namespace
+
+bool sm_ot_hub_dns_server(char *desc, size_t cap) {
+  if (!g_ot_ready) {
+    if (desc != nullptr && cap > 0) {
+      snprintf(desc, cap, "OT not ready");
+    }
+    return false;
+  }
+  esp_openthread_lock_acquire(portMAX_DELAY);
+  otIp6Address srv;
+  bool ok = find_dns_server(esp_openthread_get_instance(), srv, desc, cap);
+  esp_openthread_lock_release();
+  return ok;
+}
+
+bool sm_ot_hub_dns_resolve(const char *instance_label, uint8_t out_ip[16], uint16_t *out_port,
+                           uint32_t timeout_ms, char *msg, size_t msgcap) {
+  if (instance_label == nullptr || instance_label[0] == 0) {
+    put_msg(msg, msgcap, "no instance label");
+    return false;
+  }
+  if (!g_ot_ready || !sm_ot_hub_is_attached()) {
+    put_msg(msg, msgcap, "Thread not attached");
+    return false;
+  }
+  if (g_dns.sem == nullptr) {
+    g_dns.sem = xSemaphoreCreateBinary();
+    if (g_dns.sem == nullptr) {
+      put_msg(msg, msgcap, "no memory");
+      return false;
+    }
+  }
+  if (timeout_ms < 2000) {
+    timeout_ms = 2000;
+  }
+  esp_openthread_lock_acquire(portMAX_DELAY);
+  otInstance *inst = esp_openthread_get_instance();
+  char sdesc[96] = {0};
+  otDnsQueryConfig cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  if (!find_dns_server(inst, cfg.mServerSockAddr.mAddress, sdesc, sizeof(sdesc))) {
+    esp_openthread_lock_release();
+    put_msg(msg, msgcap, "%s", sdesc);
+    return false;
+  }
+  cfg.mServerSockAddr.mPort = DNS_PORT;
+  // 1 回あたりの応答待ち × 試行回数がこちらの待ち時間に収まるようにする(コールバックが
+  // 必ず先に来る = 世代の取りこぼしを避ける)。
+  cfg.mMaxTxAttempts = 2;
+  cfg.mResponseTimeout = timeout_ms / 2 > 500 ? timeout_ms / 2 - 250 : 500;
+  cfg.mRecursionFlag = OT_DNS_FLAG_NO_RECURSION;
+  cfg.mNat64Mode = OT_DNS_NAT64_DISALLOW;
+  cfg.mServiceMode = OT_DNS_SERVICE_MODE_SRV;
+  cfg.mTransportProto = OT_DNS_TRANSPORT_UDP;
+  const uint32_t gen = ++g_dns.gen;
+  xSemaphoreTake(g_dns.sem, 0); // 前回の取り残しを捨てる
+  g_dns.err = OT_ERROR_RESPONSE_TIMEOUT;
+  g_dns.have_ip = false;
+  g_dns.host[0] = 0;
+  otError err = otDnsClientResolveServiceAndHostAddress(
+      inst, instance_label, "_matter._tcp.default.service.arpa.", dns_service_cb,
+      (void *)(uintptr_t)gen, &cfg);
+  esp_openthread_lock_release();
+  ESP_LOGI(TAG, "DNS: resolve %s._matter._tcp.default.service.arpa via %s -> otError %d",
+           instance_label, sdesc, (int)err);
+  if (err != OT_ERROR_NONE) {
+    put_msg(msg, msgcap, "query not sent (otError %d %s)", (int)err, otThreadErrorToString(err));
+    return false;
+  }
+  bool got = xSemaphoreTake(g_dns.sem, pdMS_TO_TICKS(timeout_ms + 1000)) == pdTRUE;
+  esp_openthread_lock_acquire(portMAX_DELAY);
+  if (!got) {
+    ++g_dns.gen; // 以後のコールバックは捨てる
+  }
+  const otError rerr = got ? g_dns.err : OT_ERROR_RESPONSE_TIMEOUT;
+  const bool ok = got && rerr == OT_ERROR_NONE && g_dns.have_ip;
+  if (ok) {
+    memcpy(out_ip, g_dns.ip, 16);
+    if (out_port != nullptr) {
+      *out_port = g_dns.port;
+    }
+    char abuf[OT_IP6_ADDRESS_STRING_SIZE];
+    otIp6Address a;
+    memcpy(a.mFields.m8, g_dns.ip, 16);
+    otIp6AddressToString(&a, abuf, sizeof(abuf));
+    put_msg(msg, msgcap, "[%s]:%u host %s (server %s)", abuf, (unsigned)g_dns.port, g_dns.host, sdesc);
+  } else {
+    put_msg(msg, msgcap, "otError %d %s (server %s)", (int)rerr, otThreadErrorToString(rerr), sdesc);
+  }
+  esp_openthread_lock_release();
+  return ok;
+}
+
+bool sm_ot_hub_resolve(uint64_t node_id, const char *instance_label, uint8_t out_ip[16],
+                       uint32_t timeout_ms, char *msg, size_t msgcap) {
+  if (sm_ot_hub_mode() == SM_OT_MODE_FORM) {
+    bool ok = sm_ot_hub_srp_lookup(node_id, out_ip);
+    if (msg != nullptr && msgcap > 0) {
+      snprintf(msg, msgcap, ok ? "SRP table hit" : "not in the SRP table");
+    }
+    return ok;
+  }
+  return sm_ot_hub_dns_resolve(instance_label, out_ip, nullptr, timeout_ms, msg, msgcap);
+}
+
 bool sm_ot_hub_srp_lookup(uint64_t node_id, uint8_t out_ip[16]) {
   if (sm_ot_hub_mode() == SM_OT_MODE_JOIN) {
-    return false; // 自分の SRP サーバ帳は無い(§18.2。解決の抽象化は P2)
+    return false; // 自分の SRP サーバ帳は無い(§18.2。JOIN は sm_ot_hub_resolve → DNS client)
   }
   char want[17];
   node_hex(node_id, want);
@@ -537,6 +849,10 @@ bool sm_ot_hub_srp_lookup(uint64_t node_id, uint8_t out_ip[16]) {
 }
 
 void sm_ot_hub_dump_srp() {
+  if (sm_ot_hub_mode() == SM_OT_MODE_JOIN) {
+    dump_netdata_services(); // 自分の SRP サーバ帳は無い。代わりに netdata のサービス一覧
+    return;
+  }
   esp_openthread_lock_acquire(portMAX_DELAY);
   otInstance *inst = esp_openthread_get_instance();
   const otSrpServerHost *host = nullptr;

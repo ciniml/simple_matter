@@ -231,6 +231,28 @@ int cmd_pair(int argc, char **argv) {
   return 0;
 }
 
+// §18(T11 / P2): `dns <node_hex>` — OTBR の DNS-SD サーバ(netdata から発見)へ OT DNS client で
+// `<cfid>-<node>._matter._tcp.default.service.arpa` を問い合わせ、結果をログ/LAST に出す
+// (ノード帳は変えない。更新は `refresh`)。サーバは即時に表示する。
+int cmd_dns(int argc, char **argv) {
+  if (argc < 2) {
+    char srv[96] = {0};
+    bool ok = sm_ot_hub_dns_server(srv, sizeof(srv));
+    printf("DNSSERVER %s%s\n", ok ? "" : "none: ", srv);
+    printf("ERR usage: dns <node_hex>\n");
+    return 1;
+  }
+  char srv[96] = {0};
+  bool ok = sm_ot_hub_dns_server(srv, sizeof(srv));
+  printf("DNSSERVER %s%s\n", ok ? "" : "none: ", srv);
+  sm_ui_op_t op = {};
+  op.kind = SM_UI_OP_DNS_LOOKUP;
+  op.node_id = parse_hex(argv[1]);
+  printf(sm_app_post_op(&op) ? "OK queued (result: \"DNS <node> OK|FAILED\" in the log / LAST)\n"
+                             : "ERR queue full\n");
+  return 0;
+}
+
 int cmd_refresh(int argc, char **argv) {
   if (argc < 2) {
     printf("ERR usage: refresh <node_hex>\n");
@@ -764,8 +786,10 @@ void sm_console_start() {
   reg("revoke", "revoke <node_hex> (T9: close the commissioning window)", cmd_revoke);
   reg("window", "show the last commissioning window (manual code / QR / seconds left)",
       cmd_window);
-  reg("refresh", "refresh <node_hex> (SRP/mDNS re-resolve + kind/transport re-detect)",
+  reg("refresh", "refresh <node_hex> (SRP|DNS/mDNS re-resolve + kind/transport re-detect)",
       cmd_refresh);
+  reg("dns", "dns <node_hex> (JOIN: resolve via the OTBR DNS-SD server found in netdata)",
+      cmd_dns);
   reg("forget", "forget <node_hex> (remove from this controller only; no RemoveFabric)",
       cmd_forget);
   // T5b / T5c

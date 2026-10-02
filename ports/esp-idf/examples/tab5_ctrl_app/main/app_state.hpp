@@ -28,7 +28,8 @@ enum sm_ui_op_kind_t : uint8_t {
   SM_UI_OP_SET_ADDR = 5,     // 運用アドレスを直接指定(ipv6 欄に v4/v6 リテラル。T5a)
   SM_UI_OP_OPEN_WINDOW = 6,  // ECM コミッショニングウィンドウを開く(T9、§17.4)
   SM_UI_OP_REVOKE_WINDOW = 7, // 開いたウィンドウを閉じる(RevokeCommissioning。T9)
-  SM_UI_OP_FORGET = 8 // ノードを Tab5 の帳簿からだけ消す(デバイスへは何も送らない)
+  SM_UI_OP_FORGET = 8, // ノードを Tab5 の帳簿からだけ消す(デバイスへは何も送らない)
+  SM_UI_OP_DNS_LOOKUP = 9 // JOIN: OTBR の DNS-SD で解決して結果を出すだけ(§18 P2、console `dns`)
 };
 
 // PAIR の経路。0/1 は on-network(リンクローカル宛の sin6_scope_id をどちらの
