@@ -981,18 +981,24 @@ static void matter_task(void *) {
     // 追従のため上限を短く(select は queue で起きないので 20ms 周期で拾う)。
     uint64_t cap_ms = ble_conn_active ? 20 : 1000;
     uint64_t dl = stack.next_deadline(now);
-    struct timeval tv;
+    uint64_t wait;
     if (dl == SM_NO_DEADLINE) {
-      tv.tv_sec = cap_ms / 1000;
-      tv.tv_usec = (cap_ms % 1000) * 1000;
+      wait = cap_ms;
     } else {
-      uint64_t wait = (dl > now) ? (dl - now) : 0;
+      wait = (dl > now) ? (dl - now) : 0;
       if (wait > cap_ms) {
         wait = cap_ms;
       }
-      tv.tv_sec = wait / 1000;
-      tv.tv_usec = (wait % 1000) * 1000;
     }
+    // 下限 10ms(=1 tick @ FREERTOS_HZ=100)。これ未満だと select() が 0 tick に丸められ即リターンし、
+    // matter タスクが CPU を手放さず busy-spin して IDLE を餓死させる(C6 実機: フェイルセーフ巻き戻し後に
+    // next_deadline が即時を返し続け task_wdt が発火、2026-10-02)。AirQ ポートと同じ対処。
+    if (wait < 10) {
+      wait = 10;
+    }
+    struct timeval tv;
+    tv.tv_sec = wait / 1000;
+    tv.tv_usec = (wait % 1000) * 1000;
 
     fd_set rfds;
     FD_ZERO(&rfds);
