@@ -500,6 +500,7 @@ impl<'a> Exec<'a> {
                 {
                     send_dir(&self.socket, &self.tx, &dir);
                 }
+                crate::wire::log_rx_drop("udp", self.stack.last_rx_drop(), self.stack.rx_diag());
             }
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock

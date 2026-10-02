@@ -3580,6 +3580,236 @@ mod controller_e2e {
             "final read"
         ));
     }
+    /// 双方が commission 済みのペア(デバイス・CA)を作り、resumption 素材を持たない
+    /// **新しい**コントローラを返す(BLE→UDP handoff の運用 CASE と同じくフル CASE になる)。
+    fn commissioned_pair_with_fresh_ctrl<'a>(
+        crypto: &'a Crb,
+        fabrics: &'a RefCell<FabricTable<Crb, 5>>,
+        ca: &'a Ca<Crb>,
+        seed: u64,
+    ) -> (TestStack<'a>, Ctrl<'a>) {
+        let config = PaseConfig::from_passcode(PASSCODE, &SALT, ITERATIONS).unwrap();
+        let dev_creds = SharedFabricCreds::new(fabrics, crypto, 0);
+        let sc = SecureChannel::new(crypto, SeqRng(seed ^ 0x5C00), config, dev_creds);
+        let im = InteractionModel::new(build_device(fabrics));
+        let mut dev: TestStack = MatterStack::new(crypto, sc, im);
+        let ctrl_creds = ControllerCreds::new(ca, crypto, 0);
+        let sc_init = ScInitiator::new(crypto, SeqRng(seed ^ 0x1C00), ctrl_creds);
+        let mut ctrl: Ctrl = ControllerStack::new(crypto, sc_init, ImClient::new());
+        let mut comm = Commissioner::new(ca, crypto, AttestationPolicy::Skip);
+        comm.commission(peer(), PASSCODE, DEVICE_NODE, NOW).unwrap();
+        let mut tx = [0u8; 1700];
+        let mut final_phase = comm.phase();
+        for _ in 0..60 {
+            let out = comm.drive(&mut ctrl, NOW, &mut tx);
+            final_phase = out.phase;
+            if let Some(d) = out.send {
+                deliver_and_settle(&mut ctrl, &mut dev, NOW, &tx, d.len);
+            }
+            if matches!(out.phase, Phase::Done { .. } | Phase::Failed { .. }) {
+                break;
+            }
+        }
+        assert!(
+            matches!(final_phase, Phase::Done { .. }),
+            "commissioning did not complete: {final_phase:?}"
+        );
+        let ctrl_creds = ControllerCreds::new(ca, crypto, 0);
+        let sc_init = ScInitiator::new(crypto, SeqRng(seed ^ 0x1C01), ctrl_creds);
+        (dev, ControllerStack::new(crypto, sc_init, ImClient::new()))
+    }
+
+    /// 応答の遅い市販デバイス(chip 系)は Sigma1 にまず **standalone ACK** を返し、
+    /// その後で Sigma2 を送る(Sigma2 の計算が ACK タイムアウトを超えるため)。
+    /// 以前は standalone ACK(SC 0x10)が initiator の SC ハンドラへディスパッチされ
+    /// `Err(InvalidState)` → exchange 層が会話を終端予約 → poll が回収し、続く Sigma2 を
+    /// 「未知会話への応答」として黙って捨てていた(Sigma3 も失敗イベントも出ず、
+    /// BLE→Thread handoff の CASE がタイムアウト。2026-10-03 smweb 実機)。
+    #[test]
+    fn case_initiator_survives_standalone_ack_before_sigma2() {
+        let crypto = RustCrypto::new(SeqRng(0xC0FF_EE00_1234_5ACC));
+        let fabrics: RefCell<FabricTable<Crb, 5>> = RefCell::new(FabricTable::new());
+        let ca = Ca::<Crb>::generate(
+            &crypto,
+            &mut SeqRng(0xCA00_00AC),
+            FABRIC_ID,
+            COMM_NODE,
+            0xFFF1,
+            0,
+        )
+        .expect("Ca::generate");
+        let (mut dev, mut ctrl) =
+            commissioned_pair_with_fresh_ctrl(&crypto, &fabrics, &ca, 0x00AC_0001);
+        let fidx = crate::controller::CONTROLLER_FABRIC_INDEX;
+
+        let mut now = NOW + 10_000;
+        let mut tx = [0u8; 1700];
+        let mut txd = [0u8; 1700];
+        let dir = ctrl
+            .start_case(peer(), fidx, DEVICE_NODE, now, &mut tx)
+            .expect("start_case");
+        // デバイスは Sigma2 を返すが、まだ届けない(計算の遅いデバイスの模擬)。
+        let mut s1 = [0u8; 1700];
+        s1[..dir.len].copy_from_slice(&tx[..dir.len]);
+        let s2 = dev
+            .handle_rx(&mut s1[..dir.len], ctrl_addr(), now, &mut txd)
+            .expect("device answers Sigma1");
+        let mut held = [0u8; 1700];
+        held[..s2.len].copy_from_slice(&txd[..s2.len]);
+        let held_len = s2.len;
+
+        // Sigma1 の再送 → デバイスは重複として standalone ACK を返す → コントローラへ届ける。
+        let mut acks = 0;
+        for _ in 0..12 {
+            now += 300;
+            let mut o = [0u8; 1700];
+            while let Some(d) = ctrl.poll(now, &mut o) {
+                let mut b = [0u8; 1700];
+                b[..d.len].copy_from_slice(&o[..d.len]);
+                assert!(dev
+                    .handle_rx(&mut b[..d.len], ctrl_addr(), now, &mut txd)
+                    .is_none());
+            }
+            while let Some(d) = dev.poll(now, &mut o) {
+                let mut b = [0u8; 1700];
+                b[..d.len].copy_from_slice(&o[..d.len]);
+                // デバイスの Sigma2 再送は捨て、standalone ACK だけを届ける。
+                if d.len < 40 {
+                    assert!(ctrl
+                        .handle_rx(&mut b[..d.len], peer(), now, &mut o)
+                        .is_none());
+                    acks += 1;
+                }
+            }
+            if acks > 0 {
+                break;
+            }
+        }
+        assert!(acks > 0, "device never sent a standalone ACK");
+        // コントローラ側の回収 poll(実機では受信待ちループが毎回 poll する)。
+        for _ in 0..3 {
+            now += 50;
+            let mut o = [0u8; 1700];
+            while ctrl.poll(now, &mut o).is_some() {}
+        }
+
+        // standalone ACK はドロップ扱い(診断)にならない。
+        assert_eq!(ctrl.last_rx_drop(), None);
+        // 遅れて届いた Sigma2 で Sigma3 を返し、CASE が確立すること。
+        now += 50;
+        let held_copy = held;
+        let sigma3 = ctrl.handle_rx(&mut held[..held_len], peer(), now, &mut tx);
+        assert!(
+            sigma3.is_some(),
+            "Sigma2 after a standalone ACK was silently dropped (diag: {:?})",
+            ctrl.rx_diag()
+        );
+        let d = sigma3.unwrap();
+        ping_pong(&mut ctrl, &mut dev, now, &tx[..d.len], true);
+        flush(&mut ctrl, &mut dev, now);
+        match ctrl.sc_take_event() {
+            Some(crate::sc::initiator::ScEvent::CaseEstablished { resumed, .. }) => {
+                assert!(!resumed, "fresh controller must run full CASE")
+            }
+            other => panic!("CASE not established: {other:?}"),
+        }
+        // 診断: 同じ Sigma2 の再受信は重複として記録される(黙殺の可視化)。
+        let mut again = held_copy;
+        let before = ctrl.rx_diag();
+        assert!(ctrl
+            .handle_rx(&mut again[..held_len], peer(), now + 10, &mut tx)
+            .is_none());
+        assert_eq!(
+            ctrl.last_rx_drop(),
+            Some(crate::controller::RxDrop::Duplicate)
+        );
+        assert_eq!(ctrl.rx_diag().duplicates, before.duplicates + 1);
+    }
+
+    /// 応答側(デバイス)の鏡像: Sigma2 送出後、Sigma3 より先にコントローラの standalone ACK が
+    /// 届いても、SC 応答側の会話が回収されず Sigma3 を受理して確立すること。
+    #[test]
+    fn case_responder_survives_standalone_ack_before_sigma3() {
+        let crypto = RustCrypto::new(SeqRng(0xC0FF_EE00_1234_5ACD));
+        let fabrics: RefCell<FabricTable<Crb, 5>> = RefCell::new(FabricTable::new());
+        let ca = Ca::<Crb>::generate(
+            &crypto,
+            &mut SeqRng(0xCA00_00AD),
+            FABRIC_ID,
+            COMM_NODE,
+            0xFFF1,
+            0,
+        )
+        .expect("Ca::generate");
+        let (mut dev, mut ctrl) =
+            commissioned_pair_with_fresh_ctrl(&crypto, &fabrics, &ca, 0x00AD_0001);
+        let fidx = crate::controller::CONTROLLER_FABRIC_INDEX;
+
+        let mut now = NOW + 10_000;
+        let mut tx = [0u8; 1700];
+        let mut txd = [0u8; 1700];
+        let dir = ctrl
+            .start_case(peer(), fidx, DEVICE_NODE, now, &mut tx)
+            .expect("start_case");
+        let mut s1 = [0u8; 1700];
+        s1[..dir.len].copy_from_slice(&tx[..dir.len]);
+        let s2 = dev
+            .handle_rx(&mut s1[..dir.len], ctrl_addr(), now, &mut txd)
+            .expect("device answers Sigma1");
+        let mut s2b = [0u8; 1700];
+        s2b[..s2.len].copy_from_slice(&txd[..s2.len]);
+        let s3 = ctrl
+            .handle_rx(&mut s2b[..s2.len], peer(), now, &mut tx)
+            .expect("controller answers Sigma2");
+        // Sigma3 はまだ届けない。デバイスの Sigma2 再送 → コントローラが重複として
+        // standalone ACK → デバイスへ届ける。
+        let mut held = [0u8; 1700];
+        held[..s3.len].copy_from_slice(&tx[..s3.len]);
+        let held_len = s3.len;
+        let mut acks = 0;
+        for _ in 0..12 {
+            now += 300;
+            let mut o = [0u8; 1700];
+            while let Some(d) = dev.poll(now, &mut o) {
+                let mut b = [0u8; 1700];
+                b[..d.len].copy_from_slice(&o[..d.len]);
+                let _ = ctrl.handle_rx(&mut b[..d.len], peer(), now, &mut txd);
+            }
+            while let Some(d) = ctrl.poll(now, &mut o) {
+                let mut b = [0u8; 1700];
+                b[..d.len].copy_from_slice(&o[..d.len]);
+                if d.len < 40 {
+                    assert!(dev
+                        .handle_rx(&mut b[..d.len], ctrl_addr(), now, &mut txd)
+                        .is_none());
+                    acks += 1;
+                }
+            }
+            if acks > 0 {
+                break;
+            }
+        }
+        assert!(acks > 0, "controller never sent a standalone ACK");
+        for _ in 0..3 {
+            now += 50;
+            let mut o = [0u8; 1700];
+            while dev.poll(now, &mut o).is_some() {}
+        }
+        now += 50;
+        let status = dev.handle_rx(&mut held[..held_len], ctrl_addr(), now, &mut txd);
+        assert!(
+            status.is_some(),
+            "device dropped Sigma3 after a standalone ACK"
+        );
+        let d = status.unwrap();
+        ping_pong(&mut ctrl, &mut dev, now, &txd[..d.len], false);
+        flush(&mut ctrl, &mut dev, now);
+        match ctrl.sc_take_event() {
+            Some(crate::sc::initiator::ScEvent::CaseEstablished { .. }) => {}
+            other => panic!("CASE not established: {other:?}"),
+        }
+    }
+
     /// マルチ admin: 購読を張ったコントローラのセッションは、同じ node id を使う短命
     /// コントローラ(CLI)が CASE を張っては捨てる churn でも退避されない
     /// (transport-exchange.md「マルチ admin 時の容量と退避方針」。実機回帰: smctl の連続

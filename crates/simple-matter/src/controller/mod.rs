@@ -183,6 +183,55 @@ pub struct ControllerStack<
     /// ストライドを空ける。初期値 1・ストライド 256(PASE の非セキュアメッセージは 3 通のみ、
     /// 再送は同一カウンタなので 256 の間隔で衝突しない)。
     next_unsecured_tx_ctr: u32,
+    /// 受信ドロップの診断カウンタ([`rx_diag`](Self::rx_diag))。挙動には影響しない。
+    rx_diag: RxDiag,
+    /// 直近の `handle_rx` が黙って捨てた理由([`last_rx_drop`](Self::last_rx_drop))。
+    last_rx_drop: Option<RxDrop>,
+}
+
+/// `handle_rx` が応答もハンドラ処理も起こさずに終えた受信の理由(診断用)。
+///
+/// 統合層(smctl / smweb の trace ログ等)が「黙って捨てられた受信」を可視化するために
+/// 使う。値を見ても見なくても挙動は変わらない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RxDrop {
+    /// 会話層より前で拒否した(未知セッション = `NotFound`、復号失敗 = `Crypto`、
+    /// ヘッダ不正 = `Decode` 等)。
+    Recv(Error),
+    /// リプレイ窓で重複と判定した(必要なら再 ACK だけ武装する。再送の受信では正常)。
+    Duplicate,
+    /// 未知の会話(終端・回収済み、または role 不一致)への応答 / ACK だったので無視した。
+    UnknownExchange,
+    /// ハンドラが処理を拒否した(`Err`。状態違反・未対応 opcode 等)。会話は終端予約済み。
+    Rejected(Error),
+}
+
+/// 受信ドロップの累積カウンタと直近の理由([`ControllerStack::rx_diag`])。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RxDiag {
+    /// [`RxDrop::Recv`] の累計。
+    pub recv_errors: u32,
+    /// [`RxDrop::Duplicate`] の累計。
+    pub duplicates: u32,
+    /// [`RxDrop::UnknownExchange`] の累計。
+    pub unknown_exchange: u32,
+    /// [`RxDrop::Rejected`] の累計。
+    pub rejected: u32,
+    /// 最後に記録したドロップ理由。
+    pub last: Option<RxDrop>,
+}
+
+impl RxDiag {
+    fn record(&mut self, d: RxDrop) {
+        let c = match d {
+            RxDrop::Recv(_) => &mut self.recv_errors,
+            RxDrop::Duplicate => &mut self.duplicates,
+            RxDrop::UnknownExchange => &mut self.unknown_exchange,
+            RxDrop::Rejected(_) => &mut self.rejected,
+        };
+        *c = c.saturating_add(1);
+        self.last = Some(d);
+    }
 }
 
 /// unsecured セッションを新規確保するたびに [`ControllerStack::next_unsecured_tx_ctr`] を
@@ -212,6 +261,8 @@ impl<
             tx_pool: BufferPool::new(),
             resp: [0u8; MAX_PACKET_SIZE],
             ephemeral_node_id,
+            rx_diag: RxDiag::default(),
+            last_rx_drop: None,
             // 既存の単一 unsecured セッション経路(PASE→CASE 同一ピア)では従来どおり M:1 から
             // 始まる。跨トランスポートで 2 本目を張ったときだけ 257,... と続く。
             next_unsecured_tx_ctr: 1,
@@ -433,6 +484,7 @@ impl<
         tx_out: &mut [u8],
     ) -> Option<SendDirective> {
         self.drive_ticks(now_ms);
+        self.last_rx_drop = None;
 
         let report = match self.mgr.recv(
             &mut self.sessions,
@@ -443,8 +495,18 @@ impl<
             &mut self.resp,
         ) {
             Ok(r) => r,
-            Err(_) => return None,
+            Err(e) => {
+                self.note_rx_drop(RxDrop::Recv(e));
+                return None;
+            }
         };
+        if report.duplicate {
+            self.note_rx_drop(RxDrop::Duplicate);
+        } else if report.unknown_exchange {
+            self.note_rx_drop(RxDrop::UnknownExchange);
+        } else if let Some(e) = report.handler_error {
+            self.note_rx_drop(RxDrop::Rejected(e));
+        }
 
         if let Some(freed) = report.freed_tx {
             self.tx_pool.release(freed);
@@ -497,6 +559,22 @@ impl<
         }
 
         dir
+    }
+
+    fn note_rx_drop(&mut self, d: RxDrop) {
+        self.rx_diag.record(d);
+        self.last_rx_drop = Some(d);
+    }
+
+    /// 直近の [`handle_rx`](Self::handle_rx) が受信を黙って捨てた理由(捨てていなければ
+    /// `None`)。診断用で挙動には影響しない。
+    pub fn last_rx_drop(&self) -> Option<RxDrop> {
+        self.last_rx_drop
+    }
+
+    /// 受信ドロップの累積カウンタ(診断用)。
+    pub fn rx_diag(&self) -> RxDiag {
+        self.rx_diag
     }
 
     /// 時間駆動の送出を 1 件返す(MRP 再送・standalone ACK)。`None` になるまで繰り返す。

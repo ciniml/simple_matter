@@ -505,6 +505,7 @@ async fn service_ctrl(
             btp.send(&txc[..d.len], now)?;
             flush_c1(gatt, btp, conn, mtu, now).await?;
         }
+        crate::wire::log_rx_drop("ble", ctrl.last_rx_drop(), ctrl.rx_diag());
     }
     // 閉じた exchange の回収(ble-btp.md §11-4)。BTP では再送/ACK は生じないが poll は必須。
     while let Some(d) = ctrl.poll(now, &mut txc) {

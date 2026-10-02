@@ -97,6 +97,7 @@ pub fn settle(
                 if let Some(dir) = stack.handle_rx(&mut rx[..n], PeerAddr::Udp(src), now, tx) {
                     send_dir(socket, tx, &dir);
                 }
+                crate::wire::log_rx_drop("udp", stack.last_rx_drop(), stack.rx_diag());
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
             Err(e) => return Err(format!("recv: {e}")),

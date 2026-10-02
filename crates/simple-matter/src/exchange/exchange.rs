@@ -185,6 +185,10 @@ pub struct RecvReport {
     pub dispatched: bool,
     /// ハンドラが返したアクション(未ディスパッチなら [`HandlerAction::None`])。
     pub action: HandlerAction,
+    /// 未知の会話への応答(またはACK)だったため無視したなら `true`(診断用)。
+    pub unknown_exchange: bool,
+    /// ハンドラが処理を拒否した(`Err`)なら、そのエラー(診断用。会話は終端予約済み)。
+    pub handler_error: Option<Error>,
 }
 
 /// [`ExchangeManager::poll`] が返す、単一の期限到達アクション。
@@ -609,15 +613,35 @@ impl<H, const EXCHANGES: usize> ExchangeManager<H, EXCHANGES> {
             });
         }
 
+        // MRP Standalone Acknowledgement(SC 0x10)は MRP 層だけのメッセージで、プロトコル
+        // ハンドラへは渡さない(chip も exchange 層で ACK を処理して delegate へは上げない)。
+        // 以前はハンドラへディスパッチして `Err` → 終端予約していたため、応答の遅いデバイス
+        // (Sigma1 にまず standalone ACK を返してから Sigma2 を送る chip 系の市販品)で
+        // initiator のハンドシェイク会話が回収され、続く Sigma2 を「未知会話への応答」として
+        // 黙って捨てていた(2026-10-03 smweb 実機、BLE→Thread handoff の CASE 不成立)。
+        let standalone_ack = phdr.proto_id == SECURE_CHANNEL_PROTOCOL_ID
+            && phdr.proto_opcode == MRP_STANDALONE_ACK_OPCODE;
+
         // 会話照合 or 新規 responder 生成(§5.5)。
         let idx = match self.match_index(session, phdr.exch_id, phdr.is_initiator()) {
             Some(i) => i,
             None => {
+                if standalone_ack {
+                    // 未知会話への ACK は解除すべき再送が無い。会話も生成しない
+                    // (生成すると迷子 ACK のたびに会話が残る)。
+                    return Ok(RecvReport {
+                        unknown_exchange: true,
+                        ..Default::default()
+                    });
+                }
                 if phdr.is_initiator() {
                     self.create_responder(session, phdr.exch_id)?
                 } else {
                     // 未知会話への応答 = 無視(role 不一致 / 消滅済み会話)。
-                    return Ok(RecvReport::default());
+                    return Ok(RecvReport {
+                        unknown_exchange: true,
+                        ..Default::default()
+                    });
                 }
             }
         };
@@ -644,10 +668,17 @@ impl<H, const EXCHANGES: usize> ExchangeManager<H, EXCHANGES> {
             duplicate: false,
             dispatched: false,
             action: HandlerAction::None,
+            unknown_exchange: false,
+            handler_error: None,
         };
 
         // MRP レベルの重複(古いカウンタへの ACK など)はディスパッチしない。
         if outcome.duplicate {
+            return Ok(report);
+        }
+        // standalone ACK は piggyback ACK 処理(上の post_recv)で役目を終える。会話の
+        // 終端判断は所有者(ハンドラ / 統合層)に委ねる(ここで終端予約しない)。
+        if standalone_ack {
             return Ok(report);
         }
 
@@ -666,7 +697,8 @@ impl<H, const EXCHANGES: usize> ExchangeManager<H, EXCHANGES> {
                 report.action = action;
                 report.dispatched = true;
             }
-            Err(_) => {
+            Err(e) => {
+                report.handler_error = Some(e);
                 // ハンドラが処理を拒否した(未対応 Protocol ID / opcode、状態違反、
                 // 復号・デコード失敗など)。この会話に後続の責務は無いので終端予約する。
                 // 予約しないと、特にこの受信で新規生成した responder 会話が
@@ -1012,6 +1044,11 @@ mod tests {
 
     /// 受信ワイヤメッセージを `out` に組み立て、長さを返す(1 datagram)。
     fn build_incoming<C: Crypto>(crypto: &C, m: &Incoming, out: &mut [u8]) -> usize {
+        build_incoming_op(crypto, m, 0x08, out)
+    }
+
+    /// [`build_incoming`] の opcode 指定版。
+    fn build_incoming_op<C: Crypto>(crypto: &C, m: &Incoming, opcode: u8, out: &mut [u8]) -> usize {
         let mut flags = 0u8;
         if m.initiator {
             flags |= ExchFlags::INITIATOR;
@@ -1028,7 +1065,7 @@ mod tests {
         };
         let phdr = PayloadHeader {
             exch_flags: ExchFlags::from_bits(flags),
-            proto_opcode: 0x08,
+            proto_opcode: opcode,
             exch_id: m.exch_id,
             proto_id: m.proto_id,
             vendor_id: None,
@@ -1534,6 +1571,103 @@ mod tests {
         assert!(!report.dispatched);
         assert!(report.exchange.is_none());
         assert_eq!(mgr.len(), 0);
+    }
+
+    /// standalone ACK(SC 0x10)は MRP 層で処理し、ハンドラへディスパッチしない。
+    /// 会話も終端予約しない(以前はハンドラの `Err` で終端予約され、ACK の後に届く
+    /// Sigma2 が「未知会話への応答」として黙って捨てられた。2026-10-03 実機)。
+    #[test]
+    fn standalone_ack_is_not_dispatched_and_keeps_exchange() {
+        let mut sessions: SessionManager<2> = SessionManager::new();
+        let peer = addr(5540);
+        let key = [0x33u8; 16];
+        let sid_val = encrypted_session(&mut sessions, peer, key);
+        let wire_sid = sessions.get(sid_val).unwrap().local_session_id();
+        let peer_node = 0x5555_6666_7777_8888u64;
+        let mut mgr: ExchangeManager<RecordingDispatcher, 4> = null_mgr();
+        let ex = mgr.open_initiator(sid_val).unwrap();
+        let mut pool: BufferPool<2, 1024> = BufferPool::new();
+        let out = Outgoing {
+            proto_id: 0x0000,
+            opcode: 0x30,
+            payload: &[0x15, 0x18],
+        };
+        let sent = mgr
+            .send_reliable(
+                &mut sessions,
+                &crypto(),
+                &mut pool,
+                ex,
+                &out,
+                SendTiming {
+                    now_ms: 100,
+                    jitter_rand: 0,
+                },
+            )
+            .unwrap();
+        // ピアの standalone ACK(ack_ctr=100、応答側なので I フラグなし)。
+        let m_ack = Incoming {
+            key: Some((key, peer_node)),
+            wire_session_id: wire_sid,
+            ctr: 7,
+            exch_id: ex.exch_id(),
+            proto_id: SECURE_CHANNEL_PROTOCOL_ID,
+            reliable: false,
+            ack_ctr: Some(100),
+            initiator: false,
+        };
+        let mut wire = [0u8; 256];
+        let n = build_incoming_op(&crypto(), &m_ack, MRP_STANDALONE_ACK_OPCODE, &mut wire);
+        let report = mgr
+            .recv(
+                &mut sessions,
+                &crypto(),
+                peer,
+                150,
+                &mut wire[..n],
+                &mut [0u8; 512],
+            )
+            .unwrap();
+        assert_eq!(report.freed_tx, Some(sent.buf));
+        assert_eq!(report.exchange, Some(ex));
+        assert!(!report.dispatched);
+        assert_eq!(report.handler_error, None);
+        assert_eq!(
+            mgr.handler().calls,
+            0,
+            "standalone ACK must not reach handlers"
+        );
+        pool.release(sent.buf);
+        // 終端予約されていない: poll しても会話は回収されない。
+        assert!(matches!(mgr.poll(200, 0), PollAction::Idle { .. }));
+        assert_eq!(mgr.len(), 1);
+
+        // 未知会話への迷子 standalone ACK(I フラグ付き)は会話を生成しない。
+        let m_stray = Incoming {
+            key: Some((key, peer_node)),
+            wire_session_id: wire_sid,
+            ctr: 8,
+            exch_id: 0x4242,
+            proto_id: SECURE_CHANNEL_PROTOCOL_ID,
+            reliable: false,
+            ack_ctr: Some(99),
+            initiator: true,
+        };
+        let n = build_incoming_op(&crypto(), &m_stray, MRP_STANDALONE_ACK_OPCODE, &mut wire);
+        let report = mgr
+            .recv(
+                &mut sessions,
+                &crypto(),
+                peer,
+                250,
+                &mut wire[..n],
+                &mut [0u8; 512],
+            )
+            .unwrap();
+        assert!(report.exchange.is_none());
+        assert!(report.unknown_exchange);
+        assert_eq!(mgr.len(), 1);
+        assert_eq!(mgr.handler().calls, 0);
     }
 
     #[test]

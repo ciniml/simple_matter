@@ -17,6 +17,7 @@
 
 use std::sync::Mutex;
 
+use simple_matter::controller::{RxDiag, RxDrop};
 use simple_matter::transport::header::{DstNodeId, PacketHeader, PayloadHeader};
 use simple_matter::transport::util::ParseBuf;
 
@@ -41,6 +42,29 @@ pub fn log_tx(transport: &'static str, buf: &[u8], dest: &str) {
 /// 受信メッセージを観測する。
 pub fn log_rx(transport: &'static str, buf: &[u8], src: &str) {
     log_msg(transport, false, buf, src);
+}
+
+/// 直前の `handle_rx` が受信を**黙って捨てた**なら、その理由と累計を出す
+/// (`--log-level trace` または `SM_RX_TRACE=1`)。挙動は変えない(観測のみ)。
+///
+/// 例: 未知会話への応答(会話が先に回収されていた)、ハンドラの拒否(状態違反)、
+/// 未知セッション / 復号失敗、リプレイ窓の重複。
+pub fn log_rx_drop(transport: &'static str, drop: Option<RxDrop>, diag: RxDiag) {
+    let Some(d) = drop else {
+        return;
+    };
+    let env_forced = std::env::var_os("SM_RX_TRACE").is_some();
+    if !(env_forced || crate::log::wants(Level::Trace)) {
+        return;
+    }
+    crate::log::trace_forced(
+        env_forced,
+        transport,
+        format_args!(
+            "rx dropped: {d:?} (totals: recv_err={} dup={} unknown_exch={} rejected={})",
+            diag.recv_errors, diag.duplicates, diag.unknown_exchange, diag.rejected
+        ),
+    );
 }
 
 fn log_msg(transport: &'static str, tx: bool, buf: &[u8], peer: &str) {
