@@ -7,3 +7,6 @@
 // 呼び出し前に nvs_flash_init / esp_netif_init / esp_event_loop_create_default と
 // sm_app_state_init() を済ませておくこと。
 void sm_ctrl_pump_start();
+
+// BTP handshake の MTU 上書き(-1 = リンク MTU)。console_dbg の blemtu が設定する。
+extern int g_ble_hs_mtu_override;

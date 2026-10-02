@@ -12,6 +12,9 @@
 //     実機 P9 の発見。xTaskCreateStatic の形は hub と同じ)
 
 #include "ctrl_pump.hpp"
+
+// BTP handshake の MTU 上書き(-1 = リンク MTU をそのまま使う)。コンソール blemtu で設定。
+int g_ble_hs_mtu_override = -1;
 #include <errno.h>
 #include <lwip/inet.h>
 
@@ -2110,13 +2113,23 @@ bool drive_ble_phase(const sm_ui_op_t &op, uint64_t timeout_ms) {
   uint64_t until = now_ms() + timeout_ms;
   uint8_t frag[256];
   bool subscribed = false;
+  bool discovered = false;     // C1/C2/CCCD のハンドル確定
+  bool subscribe_sent = false; // handshake request を書いた後に C2 subscribe を開始したか
   bool done = false;
   while (now_ms() < until && !done) {
     BleCentralMsg m;
     while (xQueueReceive(q, &m, 0) == pdTRUE) {
       switch (m.kind) {
-      case BleCentralEvent::Connected:
-        sm_ctrl_ble_event(SM_BLE_CONNECTED, m.mtu, nullptr, 0, now_ms());
+      case BleCentralEvent::Connected: {
+        // BTP handshake に載せる ATT MTU。コンソール blemtu で上書きできる(相互運用の切り分け用:
+        // PC(BlueZ、MTU 不明 = 既定 20 バイト)からは応答する市販デバイスが、Tab5 の MTU 247 では
+        // handshake に応答しない事例の検証)。
+        uint16_t hs_mtu = g_ble_hs_mtu_override >= 0 ? (uint16_t)g_ble_hs_mtu_override : m.mtu;
+        if (hs_mtu != m.mtu) {
+          ESP_LOGI(TAG, "BTP handshake MTU override: %u (link MTU %u)", (unsigned)hs_mtu, (unsigned)m.mtu);
+        }
+        sm_ctrl_ble_event(SM_BLE_CONNECTED, hs_mtu, nullptr, 0, now_ms());
+      }
         set_ble_stage(SM_UI_BLE_CONNECTED);
         if (m.peer_mac_valid) {
           memcpy(g_ble_peer_mac, m.peer_mac, 6);
@@ -2124,6 +2137,10 @@ bool drive_ble_phase(const sm_ui_op_t &op, uint64_t timeout_ms) {
         }
         sm_app_set_status("BLE connected (MTU=%u); discovering the Matter GATT service",
                           (unsigned)m.mtu);
+        break;
+      case BleCentralEvent::Discovered:
+        discovered = true;
+        sm_app_set_status("BLE GATT discovered; sending BTP handshake");
         break;
       case BleCentralEvent::Subscribed:
         sm_ctrl_ble_event(SM_BLE_C2_SUBSCRIBED, 0, nullptr, 0, now_ms());
@@ -2149,12 +2166,23 @@ bool drive_ble_phase(const sm_ui_op_t &op, uint64_t timeout_ms) {
     }
     drain_mdns_to_cache(); // announce は ConnectNetwork 成功直後に流れる(取り逃し防止)
     // シムが積んだ BTP フラグメントを C1 write で送る。
-    // **C2 subscribe 完了まで write しない**(C1 handle は GATT 発見の完了で確定する。
-    //  CONNECTED 直後の handshake request はシムが退避しているので取りこぼさない。F7b 実機バグ)。
+    // GATT 発見(C1 handle 確定)まで write しない(CONNECTED 直後の handshake request はシムが
+    // 退避しているので取りこぼさない。F7b 実機バグ)。BTP の確立順序は「handshake request を C1 に
+    // 書く → C2 を subscribe → 相手が handshake response を indicate」。subscribe を先にすると
+    // chip 系の市販デバイス(TP-Link Tapo P110M)は handshake に応答しない(実機、2026-10-03)。
     size_t n;
-    while (subscribed && (n = sm_ctrl_ble_poll(now_ms(), frag, sizeof(frag))) > 0) {
+    while ((subscribed || (discovered && !subscribe_sent)) &&
+           (n = sm_ctrl_ble_poll(now_ms(), frag, sizeof(frag))) > 0) {
       if (!sm_ble_central_write_c1(frag, n)) {
         ESP_LOGW(TAG, "C1 write failed (%u bytes)", (unsigned)n);
+      }
+      if (!subscribed && !subscribe_sent) {
+        // handshake request(最初の C1 write)の直後に C2 を subscribe する。
+        subscribe_sent = true;
+        if (!sm_ble_central_subscribe_c2()) {
+          ESP_LOGW(TAG, "C2 subscribe could not be started");
+        }
+        break;
       }
     }
     sm_ctrl_event_t ev;

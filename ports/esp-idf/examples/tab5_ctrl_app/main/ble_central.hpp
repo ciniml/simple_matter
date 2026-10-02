@@ -22,7 +22,8 @@
 enum class BleCentralEvent : uint8_t {
   Connected,    // arg = ATT MTU
   Disconnected, //
-  Subscribed,   // C2 indication の subscribe 完了(= C1 handle も確定済み)
+  Discovered,   // C1 / C2 / C2 CCCD のハンドル確定(この後 handshake を C1 に書き、C2 を subscribe する)
+  Subscribed,   // C2 indication の subscribe 完了
   Indication,   // frag = 受信 1 BTP フラグメント
   ScanTimeout,  // discriminator 一致の広告が見つからないままスキャンが終わった
 };
@@ -73,6 +74,11 @@ void sm_ble_central_stop();
 
 // C1(write without response)で 1 BTP フラグメントを送る。失敗は false。
 bool sm_ble_central_write_c1(const uint8_t *frag, size_t len);
+
+// C2 の CCCD に indication 有効化を書く(完了で Subscribed イベント)。BTP は「handshake request を
+// C1 に書く → C2 を subscribe → 相手が handshake response を indicate」の順序が必須(chip 系の
+// ペリフェラルは subscribe を受けた時点で handshake request が無いと応答しない)。
+bool sm_ble_central_subscribe_c2();
 
 // 現在の接続を切断する(BLE フェーズ完了後の handoff)。
 void sm_ble_central_disconnect();

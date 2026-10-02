@@ -8,6 +8,7 @@
 #include "console_dbg.hpp"
 
 #include "app_state.hpp"
+#include "ctrl_pump.hpp"
 #include "display_gfx.hpp"
 #include "ot_hub.hpp"
 
@@ -188,6 +189,19 @@ int cmd_read(int argc, char **argv) {
   op.kind = SM_UI_OP_READ_ONOFF;
   op.node_id = parse_hex(argv[1]);
   printf(sm_app_post_op(&op) ? "OK queued\n" : "ERR queue full\n");
+  return 0;
+}
+
+int cmd_blemtu(int argc, char **argv) {
+  // blemtu [<n>|auto] : BTP handshake に載せる ATT MTU を上書きする(0 = 不明扱い → 20 バイト断片)。
+  if (argc >= 2) {
+    if (strcmp(argv[1], "auto") == 0) {
+      g_ble_hs_mtu_override = -1;
+    } else {
+      g_ble_hs_mtu_override = (int)strtoul(argv[1], nullptr, 10);
+    }
+  }
+  printf("BLEMTU override=%d\n", g_ble_hs_mtu_override);
   return 0;
 }
 
@@ -778,6 +792,7 @@ void sm_console_start() {
   reg("toggle", "toggle <node_hex>", cmd_toggle);
   reg("read", "read <node_hex>", cmd_read);
   reg("pairble", "pairble <disc> <node_hex> [wifi|thread] [passcode]", cmd_pairble);
+  reg("blemtu", "blemtu [<n>|auto]  (BTP handshake MTU override; 0 = unknown -> 20-byte fragments)", cmd_blemtu);
   reg("pair", "pair <ipv6> <node_hex> [thread|wifi] [passcode]", cmd_pair);
   reg("udptest", "udptest <port> <secs>", cmd_udptest);
   reg("setaddr", "setaddr <node_hex> <ip> [wifi|thread]", cmd_setaddr);

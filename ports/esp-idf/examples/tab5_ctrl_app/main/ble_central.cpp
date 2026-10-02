@@ -8,6 +8,7 @@
 
 #include "esp_log.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "esp_hosted.h"
 #include "host/ble_gap.h"
@@ -109,6 +110,12 @@ bool adv_matches(const uint8_t *data, uint8_t len) {
 
 // ---- GATT 発見チェーン: svc(0xFFF6)→ C1/C2 → C2 CCCD subscribe ----
 
+// 接続ごとに C2 の CCCD を 1 回だけ書く(記述子探索は C2 から終端まで走査するため、後続の
+// キャラクタリスティック(C3 等)や他サービスの CCCD まで書いてしまい、相手によっては同時に
+// 複数の ATT 要求が走って handshake を取りこぼす)。
+static bool s_cccd_written = false;
+static uint16_t s_c2_cccd_handle = 0;
+
 int on_cccd_write(uint16_t conn, const struct ble_gatt_error *err, struct ble_gatt_attr *attr,
                   void *arg) {
   (void)conn;
@@ -129,9 +136,12 @@ int on_dsc_disc(uint16_t conn, const struct ble_gatt_error *err, uint16_t chr_va
   (void)arg;
   if (err->status == 0 && dsc != nullptr) {
     // CCCD = 0x2902。indication 有効化(0x0002)を書く。
-    if (ble_uuid_u16(&dsc->uuid.u) == 0x2902) {
-      static const uint8_t val[2] = {0x02, 0x00};
-      ble_gattc_write_flat(conn, dsc->handle, val, sizeof(val), on_cccd_write, nullptr);
+    if (ble_uuid_u16(&dsc->uuid.u) == 0x2902 && !s_cccd_written) {
+      // ここでは書かない(handshake request を C1 に書いた後で subscribe する。BTP の順序)。
+      s_cccd_written = true;
+      s_c2_cccd_handle = dsc->handle;
+      ESP_LOGI(TAG, "C2 CCCD at handle %u (C2 value %u)", dsc->handle, s_c2_val_handle);
+      push(BleCentralEvent::Discovered, 0, nullptr, 0);
     }
   }
   return 0;
@@ -328,6 +338,14 @@ int gap_event(struct ble_gap_event *event, void *arg) {
     uint8_t buf[256];
     uint16_t copied = om_len > sizeof(buf) ? (uint16_t)sizeof(buf) : om_len;
     ble_hs_mbuf_to_flat(event->notify_rx.om, buf, copied, &copied);
+    if (event->notify_rx.attr_handle != s_c2_val_handle) {
+      ESP_LOGW(TAG, "ignoring %s on handle %u (C2 is %u, %u bytes)",
+               event->notify_rx.indication ? "indication" : "notification", event->notify_rx.attr_handle,
+               s_c2_val_handle, (unsigned)copied);
+      return 0;
+    }
+    ESP_LOGI(TAG, "C2 %s %u bytes: %02x %02x %02x", event->notify_rx.indication ? "ind" : "ntf", (unsigned)copied,
+             copied > 0 ? buf[0] : 0, copied > 1 ? buf[1] : 0, copied > 2 ? buf[2] : 0);
     push(BleCentralEvent::Indication, 0, buf, copied);
     return 0;
   }
@@ -451,6 +469,8 @@ bool sm_ble_central_start(uint16_t discriminator, uint32_t scan_ms) {
   s_c2_val_handle = 0;
   s_svc_start = s_svc_end = 0;
   s_att_mtu = 0;
+  s_cccd_written = false;
+  s_c2_cccd_handle = 0;
   s_want_disc = discriminator;
   s_scan_ms = (int32_t)scan_ms;
   start_scan();
@@ -468,11 +488,71 @@ void sm_ble_central_stop() {
   s_svc_start = s_svc_end = 0;
 }
 
+// C1 書き込みの完了待ち(ATT Write Response / エラー)。
+static SemaphoreHandle_t s_c1_wr_sem = nullptr;
+static volatile int s_c1_wr_status = 0;
+
+static int on_c1_write(uint16_t conn, const struct ble_gatt_error *error, struct ble_gatt_attr *attr, void *arg) {
+  (void)conn;
+  (void)attr;
+  (void)arg;
+  s_c1_wr_status = error ? error->status : 0;
+  if (s_c1_wr_sem) {
+    xSemaphoreGive(s_c1_wr_sem);
+  }
+  return 0;
+}
+
+// Matter の C1 は Write(ATT Write Request、応答あり)で書く(Core Spec §4.19.4。C1 の
+// プロパティは Write のみ)。以前は Write Without Response で送っており、それを受け付けない
+// 市販デバイス(TP-Link Tapo P110M)では BTP handshake request が黙って捨てられ、PASE が
+// 始まらないまま 120 秒でタイムアウトしていた。1 フラグメントずつ応答を待って送り(ATT は
+// 同時に 1 要求)、ATT エラー応答は相手が受理していないので少し待って最大 3 回再送する。
 bool sm_ble_central_write_c1(const uint8_t *frag, size_t len) {
   if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || s_c1_val_handle == 0) {
     return false;
   }
-  return ble_gattc_write_no_rsp_flat(s_conn_handle, s_c1_val_handle, frag, (uint16_t)len) == 0;
+  if (!s_c1_wr_sem) {
+    s_c1_wr_sem = xSemaphoreCreateBinary();
+    if (!s_c1_wr_sem) {
+      return false;
+    }
+  }
+  for (int attempt = 0; attempt <= 3; attempt++) {
+    xSemaphoreTake(s_c1_wr_sem, 0); // 前回の取り残しを捨てる
+    s_c1_wr_status = 0;
+    int rc = ble_gattc_write_flat(s_conn_handle, s_c1_val_handle, frag, (uint16_t)len, on_c1_write, nullptr);
+    if (rc != 0) {
+      ESP_LOGW(TAG, "C1 write start rc=%d", rc);
+      return false;
+    }
+    if (xSemaphoreTake(s_c1_wr_sem, pdMS_TO_TICKS(3000)) != pdTRUE) {
+      ESP_LOGW(TAG, "C1 write: no response within 3 s");
+      return false;
+    }
+    int st = s_c1_wr_status;
+    if (st == 0) {
+      ESP_LOGI(TAG, "C1 write ok %u bytes: %02x %02x %02x", (unsigned)len, frag[0], len > 1 ? frag[1] : 0,
+               len > 2 ? frag[2] : 0);
+      return true;
+    }
+    // ATT エラー応答は BLE_HS_ERR_ATT_BASE(0x100)+ ATT エラーコード。
+    bool att_error = st > BLE_HS_ERR_ATT_BASE && st < BLE_HS_ERR_ATT_BASE + 0x100;
+    ESP_LOGW(TAG, "C1 write rejected status=0x%x%s", st, att_error && attempt < 3 ? "; retrying" : "");
+    if (!att_error) {
+      return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(150 * (attempt + 1)));
+  }
+  return false;
+}
+
+bool sm_ble_central_subscribe_c2() {
+  if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || s_c2_cccd_handle == 0) {
+    return false;
+  }
+  static const uint8_t val[2] = {0x02, 0x00};
+  return ble_gattc_write_flat(s_conn_handle, s_c2_cccd_handle, val, sizeof(val), on_cccd_write, nullptr) == 0;
 }
 
 void sm_ble_central_disconnect() {
@@ -489,6 +569,7 @@ QueueHandle_t sm_ble_central_queue() { return nullptr; }
 bool sm_ble_central_start(uint16_t, uint32_t) { return false; }
 void sm_ble_central_stop() {}
 bool sm_ble_central_write_c1(const uint8_t *, size_t) { return false; }
+bool sm_ble_central_subscribe_c2() { return false; }
 void sm_ble_central_disconnect() {}
 
 #endif
