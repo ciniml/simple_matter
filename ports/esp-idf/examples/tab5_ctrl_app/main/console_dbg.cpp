@@ -63,9 +63,12 @@ int cmd_nodes(int, char **) {
         break;
       }
     }
-    printf("NODE %016llx kind=%u onoff=%d aq=%u subscribed=%u window=%s addr=%s note=\"%s\"\n",
-           (unsigned long long)n.node_id, n.kind, (int)n.onoff, n.aq, n.subscribed, win, n.addr,
-           n.note);
+    // transport=wifi|thread|eth|?(EP0 NetworkCommissioning FeatureMap 由来。? = 未取得)。
+    static const char *TP[] = {"?", "wifi", "thread", "eth"};
+    printf("NODE %016llx kind=%u transport=%s onoff=%d aq=%u subscribed=%u window=%s addr=%s "
+           "note=\"%s\"\n",
+           (unsigned long long)n.node_id, n.kind, n.transport < 4 ? TP[n.transport] : "?",
+           (int)n.onoff, n.aq, n.subscribed, win, n.addr, n.note);
     if (n.kind == 2) {
       printf("SENSOR %016llx co2=%s%.1f pm25=%s%.1f temp_c100=%s%ld hum_p100=%s%ld\n",
              (unsigned long long)n.node_id, n.has_co2 ? "" : "-", n.has_co2 ? n.co2 : 0.0f,
@@ -236,6 +239,24 @@ int cmd_refresh(int argc, char **argv) {
   sm_ui_op_t op = {};
   op.kind = SM_UI_OP_REFRESH_ADDR;
   op.node_id = parse_hex(argv[1]);
+  printf(sm_app_post_op(&op) ? "OK queued\n" : "ERR queue full\n");
+  return 0;
+}
+
+// forget <node_hex>: Tab5 の帳簿からだけ消す(ノード帳 + 種別/トランスポートの
+// キャッシュ + 購読。デバイスへは何も送らない = RemoveFabric しない)。
+int cmd_forget(int argc, char **argv) {
+  if (argc < 2) {
+    printf("ERR usage: forget <node_hex>\n");
+    return 1;
+  }
+  sm_ui_op_t op = {};
+  op.kind = SM_UI_OP_FORGET;
+  op.node_id = parse_hex(argv[1]);
+  if (op.node_id == 0) {
+    printf("ERR node id must be non-zero\n");
+    return 1;
+  }
   printf(sm_app_post_op(&op) ? "OK queued\n" : "ERR queue full\n");
   return 0;
 }
@@ -743,7 +764,10 @@ void sm_console_start() {
   reg("revoke", "revoke <node_hex> (T9: close the commissioning window)", cmd_revoke);
   reg("window", "show the last commissioning window (manual code / QR / seconds left)",
       cmd_window);
-  reg("refresh", "refresh <node_hex> (SRP/mDNS re-resolve + kind re-detect)", cmd_refresh);
+  reg("refresh", "refresh <node_hex> (SRP/mDNS re-resolve + kind/transport re-detect)",
+      cmd_refresh);
+  reg("forget", "forget <node_hex> (remove from this controller only; no RemoveFabric)",
+      cmd_forget);
   // T5b / T5c
   reg("tap", "tap <x> <y> (synthetic touch)", cmd_tap);
   reg("swipe", "swipe <x1> <y1> <x2> <y2> [ms]", cmd_swipe);

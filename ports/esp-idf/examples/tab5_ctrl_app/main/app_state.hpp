@@ -27,7 +27,8 @@ enum sm_ui_op_kind_t : uint8_t {
   SM_UI_OP_PAIR_BLE = 4,     // BLE コミッショニング(T3、§11)
   SM_UI_OP_SET_ADDR = 5,     // 運用アドレスを直接指定(ipv6 欄に v4/v6 リテラル。T5a)
   SM_UI_OP_OPEN_WINDOW = 6,  // ECM コミッショニングウィンドウを開く(T9、§17.4)
-  SM_UI_OP_REVOKE_WINDOW = 7 // 開いたウィンドウを閉じる(RevokeCommissioning。T9)
+  SM_UI_OP_REVOKE_WINDOW = 7, // 開いたウィンドウを閉じる(RevokeCommissioning。T9)
+  SM_UI_OP_FORGET = 8 // ノードを Tab5 の帳簿からだけ消す(デバイスへは何も送らない)
 };
 
 // PAIR の経路。0/1 は on-network(リンクローカル宛の sin6_scope_id をどちらの
@@ -71,6 +72,30 @@ enum sm_ui_node_kind_t : uint8_t {
   SM_UI_KIND_SENSOR = 2
 };
 
+// ノードの接続トランスポート。EP0 NetworkCommissioning(0x0031)の FeatureMap(0xFFFC)
+// bit0 = WiFi / bit1 = Thread / bit2 = Ethernet から決める。種別と同じ NVS エントリに
+// キャッシュする(読めなければ UNKNOWN のまま、次に通信が成立したとき再取得)。
+enum sm_ui_transport_t : uint8_t {
+  SM_UI_TRANSPORT_UNKNOWN = 0,
+  SM_UI_TRANSPORT_WIFI = 1,
+  SM_UI_TRANSPORT_THREAD = 2,
+  SM_UI_TRANSPORT_ETH = 3
+};
+
+// 表示用の短いラベル("WiFi" / "Thread" / "Eth"。UNKNOWN は "")。
+inline const char *sm_ui_transport_label(uint8_t t) {
+  switch (t) {
+  case SM_UI_TRANSPORT_WIFI:
+    return "WiFi";
+  case SM_UI_TRANSPORT_THREAD:
+    return "Thread";
+  case SM_UI_TRANSPORT_ETH:
+    return "Eth";
+  default:
+    return "";
+  }
+}
+
 // センサ属性のスロット(周期 poll はこの順に 1 周期 1 属性ずつ回す。§12.3 の 2)。
 enum sm_ui_sensor_slot_t : uint8_t {
   SM_UI_SLOT_AQ = 0,   // EP1 0x005B/0 (u8, AirQualityEnum 0..6)
@@ -91,6 +116,7 @@ struct sm_ui_node_t {
 
   // --- T4: ノード種別とセンサ値(§12.3 の 4)---
   uint8_t kind; // sm_ui_node_kind_t
+  uint8_t transport; // sm_ui_transport_t(WiFi / Thread / Ethernet。未取得は UNKNOWN)
 
   // --- T8: 属性 Subscribe(§16.3)---
   // 1 = このノードへの購読が生きている(= 周期 read を止めており、表示は

@@ -155,3 +155,73 @@ size_t sm_node_ids_from_nvs(uint64_t *out, size_t cap) {
   ESP_LOGI(TAG, "node book: %u node id(s) from NVS blob (%u bytes)", (unsigned)n, (unsigned)len);
   return n;
 }
+
+bool sm_node_book_remove_from_nvs(uint64_t node_id) {
+  nvs_handle_t h;
+  if (nvs_open(SM_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+    return false;
+  }
+  static uint8_t blob[NODES_BLOB_CAP];
+  size_t len = sizeof(blob);
+  if (nvs_get_blob(h, NODES_KEY, blob, &len) != ESP_OK) {
+    nvs_close(h);
+    return false;
+  }
+  // 深さ 3 のエントリ struct(開始 control byte 〜 END)のうち、tag 0 が node_id の
+  // ものの範囲を探す。エントリは anonymous struct なので開始は 1 バイト。
+  const uint8_t *p = blob;
+  const uint8_t *end = blob + len;
+  int depth = 0;
+  const uint8_t *entry_start = nullptr;
+  bool match = false;
+  const uint8_t *cut_from = nullptr;
+  const uint8_t *cut_to = nullptr;
+  for (;;) {
+    const uint8_t *elem = p;
+    int tag = -1;
+    uint8_t type = 0;
+    uint64_t uval = 0;
+    const uint8_t *bytes = nullptr;
+    size_t blen = 0;
+    if (!tlv_next(&p, end, &tag, &type, &uval, &bytes, &blen)) {
+      break;
+    }
+    if (type == TLV_STRUCT || type == TLV_ARRAY || type == TLV_LIST) {
+      ++depth;
+      if (depth == 3) {
+        entry_start = elem;
+        match = false;
+      }
+      continue;
+    }
+    if (type == TLV_END) {
+      if (depth == 3 && match && entry_start != nullptr) {
+        cut_from = entry_start;
+        cut_to = p;
+        break;
+      }
+      --depth;
+      if (depth <= 0) {
+        break;
+      }
+      continue;
+    }
+    if (depth == 3 && tag == 0 && type <= 0x07 && uval == node_id) {
+      match = true;
+    }
+  }
+  if (cut_from == nullptr) {
+    nvs_close(h);
+    return false;
+  }
+  const size_t cut = (size_t)(cut_to - cut_from);
+  memmove(blob + (cut_from - blob), cut_to, (size_t)(end - cut_to));
+  esp_err_t err = nvs_set_blob(h, NODES_KEY, blob, len - cut);
+  if (err == ESP_OK) {
+    err = nvs_commit(h);
+  }
+  nvs_close(h);
+  ESP_LOGI(TAG, "node book: removed %016llx (%u -> %u bytes): %s", (unsigned long long)node_id,
+           (unsigned)len, (unsigned)(len - cut), esp_err_to_name(err));
+  return err == ESP_OK;
+}

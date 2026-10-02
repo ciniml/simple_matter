@@ -11,7 +11,10 @@
 //                       1: array of struct { 0: u64 node_id, 1: utf8 label,
 //                                            2: bytes ip, 3: u16 port } }
 //
-// 読み取り専用。書き込みは常にシム(sm_ctrl_*)が行う。
+// 基本は読み取り専用で、書き込みはシム(sm_ctrl_*)が行う。唯一の例外が
+// `sm_node_book_remove_from_nvs`(`forget`): シムにノード削除の入口が無いので、
+// blob から該当エントリのバイト列を抜いて書き戻す(呼び出し側がシムを再 init して
+// 読み直させる)。
 
 #pragma once
 
@@ -21,3 +24,9 @@
 // NVS の "smctl"/"nods" を読んで NodeId を `out` へ書く。戻り値 = 書いた件数。
 // NVS 未初期化 / キー無し / パース失敗はすべて 0(エラーではなく「居ない」扱い)。
 size_t sm_node_ids_from_nvs(uint64_t *out, size_t cap);
+
+// NVS の "smctl"/"nods" から `node_id` のエントリを取り除いて書き戻す。
+// 戻り値: 取り除けたら true(該当無し / NVS エラー / パース失敗は false で blob は不変)。
+// シムのメモリ上のノード帳は変わらないので、呼び出し側が sm_ctrl_deinit → sm_ctrl_init
+// で読み直させること(そうしないと次の保存で復活する)。
+bool sm_node_book_remove_from_nvs(uint64_t node_id);

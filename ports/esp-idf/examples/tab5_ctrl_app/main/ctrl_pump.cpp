@@ -19,6 +19,7 @@
 
 #include "app_state.hpp"
 #include "ble_central.hpp"
+#include "esp_system.h"
 #include "node_book.hpp"
 #include "ot_hub.hpp"
 #include "wifi_sta.hpp"
@@ -141,14 +142,22 @@ const char *op_step_name(uint8_t kind) {
     return "op:open_window";
   case SM_UI_OP_REVOKE_WINDOW:
     return "op:revoke_window";
+  case SM_UI_OP_FORGET:
+    return "op:forget";
   default:
     return "op:?";
   }
 }
 constexpr const char *SM_NVS_NAMESPACE = "smctl";
 // ノード種別のキャッシュ(T4、§12.3 の 1)。key = NodeId の hex(下位 60bit、15 桁 =
-// NVS のキー長上限)、値 = sm_ui_node_kind_t。
+// NVS のキー長上限)、値 = 下位 4bit が sm_ui_node_kind_t、上位 4bit が
+// sm_ui_transport_t(トランスポート追加前のエントリは上位 0 = UNKNOWN → 再取得)。
 constexpr const char *SM_UI_NVS_NAMESPACE = "smui";
+
+// NetworkCommissioning(EP0 / 0x0031)の FeatureMap。bit0=WiFi bit1=Thread bit2=Ethernet。
+constexpr uint16_t EP_ROOT = 0;
+constexpr uint32_t CL_NETWORK_COMMISSIONING = 0x0031;
+constexpr uint32_t ATTR_FEATURE_MAP = 0xFFFC;
 
 // OnOff クラスタ。
 constexpr uint16_t EP_ONOFF = 1;
@@ -158,7 +167,6 @@ constexpr uint32_t ATTR_ONOFF = 0x0000;
 
 // AdministratorCommissioning(EP0 / 0x003C。T9、§17.3)。WindowStatus は
 // 0=閉 1=ECM 2=BC。窓を開く / 閉じるのはシムの専用 API 経由(timed invoke が要る)。
-constexpr uint16_t EP_ROOT = 0;
 constexpr uint32_t CL_ADMIN_COMM = 0x003C;
 constexpr uint32_t ATTR_WINDOW_STATUS = 0x0000;
 
@@ -576,22 +584,32 @@ void kind_key(uint64_t node_id, char out[16]) {
   snprintf(out, 16, "%015llx", (unsigned long long)(node_id & 0x0FFFFFFFFFFFFFFFull));
 }
 
-uint8_t kind_cache_get(uint64_t node_id) {
+// キャッシュ 1 バイト = (transport << 4) | kind。無い / 壊れている項目は UNKNOWN。
+void node_cache_get(uint64_t node_id, uint8_t *kind, uint8_t *transport) {
+  *kind = SM_UI_KIND_UNKNOWN;
+  *transport = SM_UI_TRANSPORT_UNKNOWN;
   char k[16];
   kind_key(node_id, k);
   nvs_handle_t h;
   if (nvs_open(SM_UI_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
-    return SM_UI_KIND_UNKNOWN;
+    return;
   }
-  uint8_t v = SM_UI_KIND_UNKNOWN;
+  uint8_t v = 0;
   if (nvs_get_u8(h, k, &v) != ESP_OK) {
-    v = SM_UI_KIND_UNKNOWN;
+    v = 0;
   }
   nvs_close(h);
-  return v > SM_UI_KIND_SENSOR ? (uint8_t)SM_UI_KIND_UNKNOWN : v;
+  const uint8_t kd = (uint8_t)(v & 0x0F);
+  const uint8_t tp = (uint8_t)(v >> 4);
+  if (kd == SM_UI_KIND_UNKNOWN || kd > SM_UI_KIND_SENSOR) {
+    return; // 種別が無いエントリは丸ごと無効(トランスポートだけは持たない)
+  }
+  *kind = kd;
+  *transport = tp > SM_UI_TRANSPORT_ETH ? (uint8_t)SM_UI_TRANSPORT_UNKNOWN : tp;
 }
 
-void kind_cache_set(uint64_t node_id, uint8_t kind) {
+// kind == UNKNOWN ならエントリを消す(⟳ の再検出 / forget)。
+void node_cache_set(uint64_t node_id, uint8_t kind, uint8_t transport) {
   char k[16];
   kind_key(node_id, k);
   nvs_handle_t h;
@@ -599,13 +617,36 @@ void kind_cache_set(uint64_t node_id, uint8_t kind) {
     return;
   }
   if (kind == SM_UI_KIND_UNKNOWN) {
-    nvs_erase_key(h, k); // 再検出のためにキャッシュを捨てる(⟳ ボタン)
+    nvs_erase_key(h, k);
   } else {
-    nvs_set_u8(h, k, kind);
+    nvs_set_u8(h, k, (uint8_t)((transport << 4) | (kind & 0x0F)));
   }
   nvs_commit(h);
   nvs_close(h);
 }
+
+// ---- トランスポート(WiFi / Thread / Ethernet)----
+
+uint8_t node_transport(uint64_t node_id) {
+  sm_ui_snapshot_t *s = sm_app_lock();
+  size_t i = node_index(s, node_id);
+  uint8_t t = i < SM_UI_MAX_NODES ? s->nodes[i].transport : (uint8_t)SM_UI_TRANSPORT_UNKNOWN;
+  sm_app_unlock();
+  return t;
+}
+
+void set_node_transport(uint64_t node_id, uint8_t transport) {
+  sm_ui_snapshot_t *s = sm_app_lock();
+  size_t i = node_index(s, node_id);
+  if (i < SM_UI_MAX_NODES) {
+    s->nodes[i].transport = transport;
+  }
+  sm_app_unlock();
+}
+
+// トランスポート取得の再試行を控える時刻(行 index 別。読めないデバイスへ毎 tick
+// 打たないため。rebuild_node_list で 0 に戻る)。
+uint64_t g_transport_retry_until[SM_UI_MAX_NODES] = {};
 
 // センサ値 1 件を書き込む(has_* も併せて更新。null / 失敗は has=false)。
 void set_node_sensor(uint64_t node_id, uint8_t slot, bool has, uint64_t raw) {
@@ -795,7 +836,7 @@ void rebuild_node_list() {
     row.onoff = -1;
     row.busy = 0;
     // 種別は NVS キャッシュから引く(無ければ UNKNOWN = 初回 poll で検出する)。
-    row.kind = kind_cache_get(ids[i]);
+    node_cache_get(ids[i], &row.kind, &row.transport);
     if (present) {
       format_addr(a, row.addr, sizeof(row.addr));
     } else {
@@ -808,10 +849,13 @@ void rebuild_node_list() {
         char addr[64];
         memcpy(addr, row.addr, sizeof(addr));
         uint8_t kind = row.kind != SM_UI_KIND_UNKNOWN ? row.kind : old[j].kind;
+        uint8_t transport =
+            row.transport != SM_UI_TRANSPORT_UNKNOWN ? row.transport : old[j].transport;
         row = old[j];
         row.node_id = id;
         memcpy(row.addr, addr, sizeof(addr));
         row.kind = kind;
+        row.transport = transport;
         row.busy = 0;
         break;
       }
@@ -824,6 +868,7 @@ void rebuild_node_list() {
     bool active = i < s->node_count && sm_ctrl_is_subscribed(s->nodes[i].node_id);
     g_sub[i] = active ? (uint8_t)SUB_ACTIVE : (uint8_t)SUB_NONE;
     g_sub_retry_until[i] = 0;
+    g_transport_retry_until[i] = 0;
     if (i < s->node_count) {
       s->nodes[i].subscribed = active ? 1 : 0;
     }
@@ -1037,14 +1082,73 @@ uint8_t probe_node_kind(uint64_t node_id, uint64_t timeout_ms) {
   return SM_UI_KIND_UNKNOWN;
 }
 
+// トランスポートを実機に問い合わせる: EP0 NetworkCommissioning の FeatureMap(u32)。
+// bit0 = WiFi / bit1 = Thread / bit2 = Ethernet(複数立っていたら下位ビット優先)。
+// 読めない / null / どのビットも無い → UNKNOWN。
+uint8_t probe_node_transport(uint64_t node_id, uint64_t timeout_ms) {
+  static constexpr SensorAttrPath kFeatureMap = {EP_ROOT, CL_NETWORK_COMMISSIONING,
+                                                 ATTR_FEATURE_MAP, "NetCommFeatureMap"};
+  uint64_t raw = 0;
+  bool is_null = false;
+  if (!do_read_scalar(node_id, kFeatureMap, timeout_ms, &raw, &is_null) || is_null) {
+    return SM_UI_TRANSPORT_UNKNOWN;
+  }
+  if (raw & 0x1) {
+    return SM_UI_TRANSPORT_WIFI;
+  }
+  if (raw & 0x2) {
+    return SM_UI_TRANSPORT_THREAD;
+  }
+  if (raw & 0x4) {
+    return SM_UI_TRANSPORT_ETH;
+  }
+  return SM_UI_TRANSPORT_UNKNOWN;
+}
+
+// トランスポートを取得して表示 + キャッシュへ反映する。**種別が確定しているノードに
+// だけ呼ぶ**(キャッシュは種別と同じエントリ)。失敗しても種別には触れず、2 分は
+// 再試行しない。
+uint8_t resolve_node_transport(uint64_t node_id, uint8_t kind, uint64_t timeout_ms) {
+  uint8_t transport = probe_node_transport(node_id, timeout_ms);
+  size_t slot = slot_of(node_id);
+  if (transport == SM_UI_TRANSPORT_UNKNOWN) {
+    if (slot < SM_UI_MAX_NODES) {
+      g_transport_retry_until[slot] = now_ms() + 120000;
+    }
+    return transport;
+  }
+  set_node_transport(node_id, transport);
+  node_cache_set(node_id, kind, transport);
+  ESP_LOGI(TAG, "node %016llx transport = %s", (unsigned long long)node_id,
+           sm_ui_transport_label(transport));
+  return transport;
+}
+
+// 通信が成立した直後に呼ぶ: トランスポート未取得(= 旧キャッシュ / 前回読めなかった)
+// なら 1 回だけ取りに行く。既知 / 種別未確定 / 再試行待ちなら何もしない。
+void ensure_node_transport(uint64_t node_id) {
+  uint8_t kind = node_kind(node_id);
+  size_t slot = slot_of(node_id);
+  if (kind == SM_UI_KIND_UNKNOWN || slot >= SM_UI_MAX_NODES ||
+      node_transport(node_id) != SM_UI_TRANSPORT_UNKNOWN ||
+      now_ms() < g_transport_retry_until[slot]) {
+    return;
+  }
+  resolve_node_transport(node_id, kind, 10000);
+}
+
 // 種別を確定させてキャッシュへ書く。確定できなければ UNKNOWN のまま(次の poll で再挑戦)。
+// 種別が確定したら続けてトランスポートも取る(こちらの失敗は種別判定に影響しない)。
 uint8_t resolve_node_kind(uint64_t node_id, uint64_t timeout_ms) {
   uint8_t kind = probe_node_kind(node_id, timeout_ms);
   set_node_kind(node_id, kind);
   if (kind != SM_UI_KIND_UNKNOWN) {
-    kind_cache_set(node_id, kind);
+    node_cache_set(node_id, kind, node_transport(node_id));
     ESP_LOGI(TAG, "node %016llx detected as %s", (unsigned long long)node_id,
              kind == SM_UI_KIND_SENSOR ? "air-quality sensor" : "on/off light");
+    if (node_transport(node_id) == SM_UI_TRANSPORT_UNKNOWN) {
+      resolve_node_transport(node_id, kind, timeout_ms);
+    }
   }
   return kind;
 }
@@ -1117,6 +1221,62 @@ void after_pair_complete(uint64_t node_id) {
     do_read_sensor_all(node_id, true, 20000);
   }
   // LIGHT は probe_node_kind が OnOff を読んだ時点でバッジが埋まっている。
+}
+
+// ---- forget: ノードを Tab5 の帳簿からだけ消す ----
+//
+// デバイスへは何も送らない(RemoveFabric しない = 不達の残骸ノードでも即終わる)。
+// シム(crates/、無改造)にノード削除の入口が無いので、
+//   1. 購読を捨てる  2. NVS の "nods" blob から該当エントリを抜く
+//   3. 種別 / トランスポートのキャッシュと resumption 素材(rsm<node>)を消す
+//   4. sm_ctrl_deinit → sm_ctrl_init で KVS から読み直させる
+// の順で行う。4 で他ノードのセッション / 購読も落ちるが、次の poll tick で
+// CASE(resumption)+ 再購読が自動で張り直される。
+uint8_t *g_ctx_mem = nullptr;
+size_t g_ctx_len = 0;
+sm_ctrl_config_t g_ctx_cfg;
+
+void do_forget(uint64_t node_id) {
+  sm_addr_t a = {};
+  if (!sm_ctrl_node_addr(node_id, &a)) {
+    sm_app_set_status("forget %016llx: not in the node book", (unsigned long long)node_id);
+    return;
+  }
+  drop_subscription(node_id);
+  resub_now_clear(node_id);
+  if (!sm_node_book_remove_from_nvs(node_id)) {
+    sm_app_set_status("forget %016llx: could not rewrite the node book",
+                      (unsigned long long)node_id);
+    return;
+  }
+  node_cache_set(node_id, SM_UI_KIND_UNKNOWN, SM_UI_TRANSPORT_UNKNOWN);
+  char rsm[24];
+  snprintf(rsm, sizeof(rsm), "rsm%016llX", (unsigned long long)node_id);
+  kvs_delete(nullptr, rsm);
+
+  sm_ctrl_deinit();
+  int rc = sm_ctrl_init(g_ctx_mem, g_ctx_len, &g_ctx_cfg, now_ms());
+  if (rc != 0) {
+    // 帳簿は書き換え済みなので、再起動すれば整合した状態で上がる。
+    ESP_LOGE(TAG, "forget: sm_ctrl_init failed (rc=%d); restarting", rc);
+    sm_app_set_status("forget: controller re-init failed (rc=%d); restarting", rc);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+  }
+  {
+    sm_ui_snapshot_t *s = sm_app_lock();
+    if (s->window.node_id == node_id) {
+      s->window = sm_ui_window_t{};
+    }
+    sm_app_unlock();
+  }
+  for (size_t i = 0; i < SM_UI_MAX_NODES; ++i) {
+    g_backoff_until[i] = 0; // 行 index が詰まるので持ち越さない
+    g_resub_now[i] = 0;     // 再 init で購読は全て消えた(poll tick が張り直す)
+  }
+  rebuild_node_list();
+  sm_app_set_status("forgot node %016llx (local only; %u node(s) left)",
+                    (unsigned long long)node_id, (unsigned)sm_ctrl_node_count());
 }
 
 void do_toggle(uint64_t node_id) {
@@ -2303,6 +2463,9 @@ void pump_task(void *) {
   cfg.rng_fill = rng_fill;
 
   int rc = sm_ctrl_init((uint8_t *)mem, rounded, &cfg, now_ms());
+  g_ctx_mem = (uint8_t *)mem; // forget の再 init 用に覚えておく
+  g_ctx_len = rounded;
+  g_ctx_cfg = cfg;
   if (rc != 0) {
     sm_app_set_status("sm_ctrl_init failed (rc=%d)", rc);
     heap_caps_free(mem);
@@ -2367,8 +2530,13 @@ void pump_task(void *) {
           set_node_busy(op.node_id, true);
           do_refresh_addr(op.node_id);
           // ⟳ は種別の再検出も兼ねる(誤判別からの復帰導線。§12.3 の 1)。
-          kind_cache_set(op.node_id, SM_UI_KIND_UNKNOWN);
+          // トランスポートも同じキャッシュエントリなので一緒に取り直す。
+          node_cache_set(op.node_id, SM_UI_KIND_UNKNOWN, SM_UI_TRANSPORT_UNKNOWN);
           set_node_kind(op.node_id, SM_UI_KIND_UNKNOWN);
+          set_node_transport(op.node_id, SM_UI_TRANSPORT_UNKNOWN);
+          if (size_t tslot = slot_of(op.node_id); tslot < SM_UI_MAX_NODES) {
+            g_transport_retry_until[tslot] = 0;
+          }
           clear_node_sensors(op.node_id);
           resolve_node_kind(op.node_id, 15000);
           set_node_busy(op.node_id, false);
@@ -2387,6 +2555,9 @@ void pump_task(void *) {
           break;
         case SM_UI_OP_REVOKE_WINDOW:
           do_revoke_window(op.node_id);
+          break;
+        case SM_UI_OP_FORGET:
+          do_forget(op.node_id);
           break;
         }
       }
@@ -2497,6 +2668,9 @@ void pump_task(void *) {
         }
         set_node_subscribed(resub_id, sub_ok);
         set_node_note(resub_id, sub_ok ? "subscribed" : "subscribe failed");
+        if (sub_ok) {
+          ensure_node_transport(resub_id);
+        }
         continue; // 次の周回で UI op / 通常 tick に戻る
       }
     }
@@ -2565,6 +2739,7 @@ void pump_task(void *) {
             set_node_note(id, sub_ok ? "subscribed" : "subscribe failed");
             if (sub_ok) {
               g_backoff_until[slot] = 0; // 通信は成立している
+              ensure_node_transport(id); // 旧キャッシュ(トランスポート無し)の補完
             }
             set_node_busy(id, false);
             continue; // read はしない(成功ならプライミング、失敗なら次の tick で read)
@@ -2579,6 +2754,9 @@ void pump_task(void *) {
             ok = do_read_sensor_all(id, true, 10000);
           } else {
             ok = do_read_onoff(id, true, 10000);
+          }
+          if (ok) {
+            ensure_node_transport(id);
           }
           set_node_busy(id, false);
           if (slot < SM_UI_MAX_NODES) {

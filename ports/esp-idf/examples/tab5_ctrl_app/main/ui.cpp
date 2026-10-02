@@ -131,6 +131,7 @@ struct SensorCard {
 struct LightTile {
   lv_obj_t *root = nullptr;
   lv_obj_t *lbl_id = nullptr;
+  lv_obj_t *lbl_transport = nullptr; // "Thread" / "WiFi" / "Eth"(未取得なら空)
   lv_obj_t *badge = nullptr;
   lv_obj_t *lbl_badge = nullptr;
 };
@@ -806,7 +807,13 @@ void refresh_devices() {
     const bool sensor = (n.kind == SM_UI_KIND_SENSOR);
     lv_label_set_text_fmt(w.lbl_id, "Node 0x%016llx%s", (unsigned long long)n.node_id,
                           sensor ? "   [air quality]" : "");
-    lv_label_set_text(w.lbl_addr, n.addr);
+    // アドレス行の先頭にトランスポート("Thread" / "WiFi" / "Eth"。未取得なら無し)。
+    const char *tp = sm_ui_transport_label(n.transport);
+    if (tp[0] != 0) {
+      lv_label_set_text_fmt(w.lbl_addr, "%s   %s", tp, n.addr);
+    } else {
+      lv_label_set_text(w.lbl_addr, n.addr);
+    }
     lv_obj_t *bl = (lv_obj_t *)lv_obj_get_user_data(w.badge);
     if (sensor) {
       // AirQuality の 6 段階(未取得 / Unknown はグレーの "?")。
@@ -938,8 +945,14 @@ void build_light_tile(size_t i) {
   lv_obj_set_flex_align(t.root, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
   lv_obj_set_style_pad_column(t.root, 12, 0);
 
-  t.lbl_id = make_label(t.root, &lv_font_montserrat_20, COL_TEXT, "-");
-  lv_obj_set_width(t.lbl_id, 120);
+  // 左カラム: NodeId の下に小さくトランスポート。
+  lv_obj_t *col = lv_obj_create(t.root);
+  lv_obj_remove_style_all(col);
+  lv_obj_set_size(col, 120, LIGHT_TILE_H - 20);
+  lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+  t.lbl_id = make_label(col, &lv_font_montserrat_20, COL_TEXT, "-");
+  t.lbl_transport = make_label(col, &lv_font_montserrat_14, COL_DIM, "");
 
   t.badge = lv_obj_create(t.root);
   style_panel(t.badge, COL_OFF);
@@ -1027,11 +1040,16 @@ void refresh_dashboard() {
       SensorCard &c = g_ui.cards[ci++];
       lv_label_set_text_fmt(c.lbl_title, "AirQ 0x..%04x",
                             (unsigned)(uint16_t)(n.node_id & 0xFFFFull));
+      // 右肩の淡色ラベル: トランスポート("WiFi" 等。未取得なら無し)+ 鮮度。
+      const char *tp = sm_ui_transport_label(n.transport);
+      const char *sep = tp[0] != 0 ? "   " : "";
       if (n.last_update_ms == 0 || g_snap.now_ms < n.last_update_ms) {
-        lv_label_set_text(c.lbl_age, n.busy ? "reading ..." : "never updated");
+        lv_label_set_text_fmt(c.lbl_age, "%s%s%s", tp, sep,
+                              n.busy ? "reading ..." : "never updated");
       } else {
         uint32_t age = (uint32_t)((g_snap.now_ms - n.last_update_ms) / 1000ull);
-        lv_label_set_text_fmt(c.lbl_age, "updated %us ago", (unsigned)(age > 99999 ? 99999 : age));
+        lv_label_set_text_fmt(c.lbl_age, "%s%s" "updated %us ago", tp, sep,
+                              (unsigned)(age > 99999 ? 99999 : age));
       }
 
       // AirQuality(既存 AQ_STYLE を流用。未取得 / Unknown はグレーの "-")。
@@ -1074,6 +1092,7 @@ void refresh_dashboard() {
       }
       LightTile &t = g_ui.lights[li++];
       lv_label_set_text_fmt(t.lbl_id, "0x..%04x", (unsigned)(uint16_t)(n.node_id & 0xFFFFull));
+      lv_label_set_text(t.lbl_transport, sm_ui_transport_label(n.transport));
       if (n.onoff > 0) {
         lv_obj_set_style_bg_color(t.badge, lv_color_hex(COL_ON), 0);
         lv_label_set_text(t.lbl_badge, "ON");
