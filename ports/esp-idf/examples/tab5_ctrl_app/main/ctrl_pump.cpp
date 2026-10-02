@@ -837,6 +837,8 @@ void refresh_thread_status() {
   sm_ot_hub_get_status(&st);
   sm_ui_snapshot_t *s = sm_app_lock();
   s->now_ms = now_ms(); // T6: UI の「updated N s ago」の基準時刻
+  s->ot_mode = st.mode;
+  s->ot_started = st.started;
   s->role = st.role;
   s->rloc16 = st.rloc16;
   s->channel = st.channel;
@@ -1342,15 +1344,23 @@ void do_set_addr(const sm_ui_op_t &op) {
 void do_refresh_addr(uint64_t node_id) {
   // T8(§16.3): 旧アドレス / 旧セッションに紐づく購読の残骸を先に切る。
   drop_subscription(node_id);
-  sm_app_set_status("SRP lookup for %016llx ...", (unsigned long long)node_id);
+  // JOIN(§18): 自分の SRP サーバ帳は無い。WiFi mDNS を試し、駄目なら **保存アドレスを維持**
+  // する(Thread ノードは `setaddr` で手動更新。OT DNS client による解決は P2)。
+  const bool join = sm_ot_hub_mode() == SM_OT_MODE_JOIN;
+  if (!join) {
+    sm_app_set_status("SRP lookup for %016llx ...", (unsigned long long)node_id);
+  }
   uint8_t ip[16];
   if (!sm_ot_hub_srp_lookup(node_id, ip)) {
-    sm_ot_hub_dump_srp();
+    if (!join) {
+      sm_ot_hub_dump_srp();
+    }
     // SRP に居ない = Thread ノードではない可能性。WiFi が上がっていれば mDNS で引く
     // (T3 で追加。WiFi ノードのリブート後再解決もこれで効く)。
     uint32_t widx = sm_wifi_netif_index();
     if (widx != 0) {
-      sm_app_set_status("not in SRP; trying mDNS over WiFi for %016llx ...",
+      sm_app_set_status("%s; trying mDNS over WiFi for %016llx ...",
+                        join ? "JOIN mode (no SRP table)" : "not in SRP",
                         (unsigned long long)node_id);
       bool ok = resolve_via_mdns(node_id, widx, 8000);
       sm_ctrl_event_t ev;
@@ -1358,8 +1368,22 @@ void do_refresh_addr(uint64_t node_id) {
         consume_async_event(ev); // T8
       }
       refresh_node_addr_view(node_id);
+      if (join && !ok) {
+        set_node_note(node_id, "addr kept");
+        sm_app_set_status("JOIN mode: mDNS did not resolve %016llx; keeping the stored address "
+                          "(use setaddr)",
+                          (unsigned long long)node_id);
+        return;
+      }
       set_node_note(node_id, ok ? "addr updated (mDNS)" : "not found");
       sm_app_set_status(ok ? "mDNS resolved %016llx" : "neither SRP nor mDNS knows %016llx",
+                        (unsigned long long)node_id);
+      return;
+    }
+    if (join) {
+      set_node_note(node_id, "addr kept");
+      sm_app_set_status("JOIN mode: no resolver for %016llx; keeping the stored address "
+                        "(use setaddr)",
                         (unsigned long long)node_id);
       return;
     }
@@ -1953,6 +1977,19 @@ void do_pair_ble(const sm_ui_op_t &op) {
     return;
   }
 
+  // JOIN(§18.3-4): ble-thread の handoff は自分の SRP サーバ帳待ちなので成立しない
+  // (デバイスを半端にコミッションしたまま 120 秒待って失敗する)。P2(OT DNS client)まで
+  // 入口で断る。JOIN での Thread デバイスは on-network(`pair <ipv6> ...`)で組む。
+  if (thread_kind && sm_ot_hub_mode() == SM_OT_MODE_JOIN) {
+    sm_ui_snapshot_t *s = sm_app_lock();
+    s->pair_state = 3;
+    s->ble_stage = SM_UI_BLE_FAILED;
+    sm_app_unlock();
+    sm_app_set_status("BLE->Thread pairing is not available in JOIN mode yet; "
+                      "pair on-network by IPv6 address");
+    return;
+  }
+
   // --- 資格情報(ダイアログでは入力させない。Tab5 が既に持っているものを使う)---
   uint8_t dataset[254];
   size_t dataset_len = 0;
@@ -2204,12 +2241,22 @@ void pump_task(void *) {
     vTaskDelete(nullptr);
     return;
   }
-  if (!sm_ot_hub_form_network()) {
+  const bool join = sm_ot_hub_mode() == SM_OT_MODE_JOIN;
+  const bool thread_up = sm_ot_hub_start_network();
+  if (!thread_up && !join) {
     sm_app_set_status("failed to form/restore the Thread network");
     vTaskDelete(nullptr);
     return;
   }
-  {
+  if (!thread_up) {
+    // JOIN で dataset が無い / 適用失敗: Thread は起動しない(勝手に新規ネットワークを
+    // 作らない)。コントローラ自体は WiFi デバイス用に動かし続ける。
+    refresh_thread_status();
+    sm_app_set_status("JOIN mode: no usable dataset; Thread is NOT started "
+                      "(console: otmode join <dataset-hex>)");
+    vTaskDelay(pdMS_TO_TICKS(3000)); // 画面/ログで読める時間だけ残す
+  }
+  if (thread_up) {
     // active dataset TLV(デバイス側プリセット用。ネットワーク情報タブと QR の素材)。
     char hex[SM_UI_DATASET_HEX_CAP];
     size_t n = sm_ot_hub_dataset_hex(hex, sizeof(hex));
@@ -2218,8 +2265,15 @@ void pump_task(void *) {
     sm_app_unlock();
   }
   refresh_thread_status();
-  sm_app_set_status("thread up; waiting for leader/router role ...");
-  sm_ot_hub_wait_leader(30000);
+  if (thread_up && join) {
+    sm_app_set_status("thread up (JOIN); waiting to attach to the external network ...");
+    if (!sm_ot_hub_wait_attached(60000)) {
+      sm_app_set_status("JOIN: not attached yet (still trying in the background)");
+    }
+  } else if (thread_up) {
+    sm_app_set_status("thread up; waiting for leader/router role ...");
+    sm_ot_hub_wait_leader(30000);
+  }
   refresh_thread_status();
 
   // --- 2. 供給メモリ(PSRAM 優先)に context を確保して sm_ctrl_init ---

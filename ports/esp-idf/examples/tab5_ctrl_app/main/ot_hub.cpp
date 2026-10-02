@@ -7,6 +7,8 @@
 //   - radio_mode = RADIO_MODE_UART_RCP(H2 の ot_rcp と spinel over UART)
 //   - SRP は「クライアント」ではなく「サーバ」(このハブがネットワーク主宰)
 //   - dataset を復元/生成して自分が leader になる
+// §18(T11 / P1)で「FORM(上記)/ JOIN(外部ネットワークへ参加、SRP サーバ無し)」の
+// モード切替を足した(sm_ot_hub_start_network)。
 
 #include "ot_hub.hpp"
 
@@ -27,6 +29,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "nvs.h"
+
 #include "openthread/dataset.h"
 #include "openthread/dataset_ftd.h"
 #include "openthread/instance.h"
@@ -41,6 +45,50 @@ constexpr const char *TAG = "ot_hub";
 
 esp_netif_t *g_ot_netif = nullptr;
 volatile bool g_ot_ready = false;
+volatile bool g_started = false; // Thread を起動したか(JOIN で dataset 無しなら false のまま)
+
+// --- モード切替の永続化(§18.3-1)。UI 用 namespace "smui" に同居させる ---
+constexpr const char *MODE_NS = "smui";
+constexpr const char *KEY_MODE = "otmode";       // u8: sm_ot_mode_t
+constexpr const char *KEY_JOIN_DS = "otjoin_ds"; // blob: JOIN で適用する dataset TLV
+constexpr const char *KEY_FORM_DS = "otform_ds"; // blob: JOIN 中に退避した自前 dataset TLV
+
+int g_mode = -1; // 未決定。起動後は固定(切替は NVS に書いて再起動)
+
+size_t nvs_get_ds(const char *key, uint8_t *out, size_t cap) {
+  nvs_handle_t h;
+  if (nvs_open(MODE_NS, NVS_READONLY, &h) != ESP_OK) {
+    return 0;
+  }
+  size_t len = cap;
+  esp_err_t err = nvs_get_blob(h, key, out, &len);
+  nvs_close(h);
+  return err == ESP_OK ? len : 0;
+}
+
+bool nvs_set_ds(const char *key, const uint8_t *val, size_t len) {
+  nvs_handle_t h;
+  if (nvs_open(MODE_NS, NVS_READWRITE, &h) != ESP_OK) {
+    return false;
+  }
+  esp_err_t err = nvs_set_blob(h, key, val, len);
+  if (err == ESP_OK) {
+    err = nvs_commit(h);
+  }
+  nvs_close(h);
+  return err == ESP_OK;
+}
+
+void nvs_erase_ds(const char *key) {
+  nvs_handle_t h;
+  if (nvs_open(MODE_NS, NVS_READWRITE, &h) != ESP_OK) {
+    return;
+  }
+  if (nvs_erase_key(h, key) == ESP_OK) {
+    nvs_commit(h);
+  }
+  nvs_close(h);
+}
 
 // OT スタックタスク(esp_openthread_launch_mainloop でブロックする)。
 void ot_task(void *) {
@@ -93,8 +141,19 @@ size_t hex_to_bytes(const char *hex, uint8_t *out, size_t cap) {
   }
   for (size_t i = 0; i < n / 2; ++i) {
     unsigned v = 0;
-    if (sscanf(hex + 2 * i, "%2x", &v) != 1) {
-      return 0;
+    for (int k = 0; k < 2; ++k) {
+      char c = hex[2 * i + k];
+      unsigned d;
+      if (c >= '0' && c <= '9') {
+        d = (unsigned)(c - '0');
+      } else if (c >= 'a' && c <= 'f') {
+        d = (unsigned)(c - 'a' + 10);
+      } else if (c >= 'A' && c <= 'F') {
+        d = (unsigned)(c - 'A' + 10);
+      } else {
+        return 0;
+      }
+      v = (v << 4) | d;
     }
     out[i] = (uint8_t)v;
   }
@@ -168,55 +227,191 @@ bool sm_ot_hub_wait_ready(uint32_t timeout_ms) {
   return g_ot_ready;
 }
 
-bool sm_ot_hub_form_network() {
+sm_ot_mode_t sm_ot_hub_mode() {
+  if (g_mode < 0) {
+#if CONFIG_SM_THREAD_MODE_JOIN
+    uint8_t m = SM_OT_MODE_JOIN;
+#else
+    uint8_t m = SM_OT_MODE_FORM;
+#endif
+    nvs_handle_t h;
+    if (nvs_open(MODE_NS, NVS_READONLY, &h) == ESP_OK) {
+      uint8_t v = 0;
+      if (nvs_get_u8(h, KEY_MODE, &v) == ESP_OK && v <= SM_OT_MODE_JOIN) {
+        m = v;
+      }
+      nvs_close(h);
+    }
+    g_mode = m;
+  }
+  return (sm_ot_mode_t)g_mode;
+}
+
+const char *sm_ot_hub_mode_name(sm_ot_mode_t m) { return m == SM_OT_MODE_JOIN ? "JOIN" : "FORM"; }
+
+bool sm_ot_hub_mode_save(sm_ot_mode_t mode, const char *dataset_hex) {
+  if (dataset_hex != nullptr && dataset_hex[0] != 0) {
+    uint8_t tlv[OT_OPERATIONAL_DATASET_MAX_LENGTH];
+    size_t n = hex_to_bytes(dataset_hex, tlv, sizeof(tlv));
+    if (n == 0 || !nvs_set_ds(KEY_JOIN_DS, tlv, n)) {
+      return false;
+    }
+  }
+  nvs_handle_t h;
+  if (nvs_open(MODE_NS, NVS_READWRITE, &h) != ESP_OK) {
+    return false;
+  }
+  esp_err_t err = nvs_set_u8(h, KEY_MODE, (uint8_t)mode);
+  if (err == ESP_OK) {
+    err = nvs_commit(h);
+  }
+  nvs_close(h);
+  return err == ESP_OK;
+}
+
+const char *sm_ot_hub_join_dataset_source() {
+  uint8_t tlv[OT_OPERATIONAL_DATASET_MAX_LENGTH];
+  if (nvs_get_ds(KEY_JOIN_DS, tlv, sizeof(tlv)) > 0) {
+    return "nvs";
+  }
+  return CONFIG_SM_THREAD_DATASET_TLV_HEX[0] != 0 ? "kconfig" : "none";
+}
+
+namespace {
+
+// FORM: 従来動作(+ JOIN から戻ったときの自前 dataset の復元)。OT ロック保持中に呼ぶ。
+otError prepare_dataset_form(otInstance *inst, otOperationalDatasetTlvs &ds) {
+  memset(&ds, 0, sizeof(ds));
+  otError err = otDatasetGetActiveTlvs(inst, &ds);
+  // (0) JOIN 中に退避した自前 dataset があれば復元する(§18.6 ゲート C)。
+  {
+    uint8_t bak[OT_OPERATIONAL_DATASET_MAX_LENGTH];
+    size_t bn = nvs_get_ds(KEY_FORM_DS, bak, sizeof(bak));
+    if (bn > 0) {
+      if (err != OT_ERROR_NONE || ds.mLength != bn || memcmp(ds.mTlvs, bak, bn) != 0) {
+        memset(&ds, 0, sizeof(ds));
+        memcpy(ds.mTlvs, bak, bn);
+        ds.mLength = (uint8_t)bn;
+        err = otDatasetSetActiveTlvs(inst, &ds);
+        ESP_LOGI(TAG, "FORM: restored own dataset from backup (%u bytes) -> otError %d",
+                 (unsigned)bn, (int)err);
+      }
+      if (err == OT_ERROR_NONE) {
+        nvs_erase_ds(KEY_FORM_DS);
+      }
+      return err;
+    }
+  }
+  if (err == OT_ERROR_NONE && ds.mLength > 0) {
+    ESP_LOGI(TAG, "restored active dataset from NVS");
+    return OT_ERROR_NONE;
+  }
+  uint8_t tlv[OT_OPERATIONAL_DATASET_MAX_LENGTH];
+  size_t n = hex_to_bytes(CONFIG_SM_THREAD_DATASET_TLV_HEX, tlv, sizeof(tlv));
+  if (n > 0) {
+    // (2) Kconfig の TLV hex を適用する(既存 Thread ネットワークに合わせる場合)。
+    memset(&ds, 0, sizeof(ds));
+    memcpy(ds.mTlvs, tlv, n);
+    ds.mLength = (uint8_t)n;
+    err = otDatasetSetActiveTlvs(inst, &ds);
+    ESP_LOGI(TAG, "applied dataset from Kconfig (%u bytes) -> otError %d", (unsigned)n, (int)err);
+  } else {
+    // (3) 新規ネットワークを生成する(このハブが主宰 = leader になる)。
+    otOperationalDataset fresh;
+    memset(&fresh, 0, sizeof(fresh));
+    err = otDatasetCreateNewNetwork(inst, &fresh);
+    if (err == OT_ERROR_NONE) {
+      err = otDatasetSetActive(inst, &fresh);
+    }
+    if (err == OT_ERROR_NONE) {
+      err = otDatasetGetActiveTlvs(inst, &ds);
+    }
+    ESP_LOGI(TAG, "created new Thread network -> otError %d", (int)err);
+  }
+  return err;
+}
+
+// JOIN: 与えられた dataset を active にする(NVS の active より優先)。OT ロック保持中に呼ぶ。
+// dataset が無ければ OT_ERROR_NOT_FOUND(呼び出し側は Thread を起動しない)。
+otError prepare_dataset_join(otInstance *inst, otOperationalDatasetTlvs &ds) {
+  uint8_t tlv[OT_OPERATIONAL_DATASET_MAX_LENGTH];
+  const char *src = "nvs";
+  size_t n = nvs_get_ds(KEY_JOIN_DS, tlv, sizeof(tlv));
+  if (n == 0) {
+    src = "kconfig";
+    n = hex_to_bytes(CONFIG_SM_THREAD_DATASET_TLV_HEX, tlv, sizeof(tlv));
+  }
+  if (n == 0) {
+    return OT_ERROR_NOT_FOUND;
+  }
+  otOperationalDatasetTlvs cur;
+  memset(&cur, 0, sizeof(cur));
+  otError err = otDatasetGetActiveTlvs(inst, &cur);
+  const bool have_cur = (err == OT_ERROR_NONE && cur.mLength > 0);
+  memset(&ds, 0, sizeof(ds));
+  memcpy(ds.mTlvs, tlv, n);
+  ds.mLength = (uint8_t)n;
+  if (have_cur && cur.mLength == n && memcmp(cur.mTlvs, tlv, n) == 0) {
+    ESP_LOGI(TAG, "JOIN: active dataset already matches the join dataset (%s)", src);
+    return OT_ERROR_NONE;
+  }
+  if (have_cur) {
+    // 自前 dataset の退避は **未退避のときだけ**(JOIN dataset を差し替えた 2 回目以降に、
+    // 前回の JOIN dataset で自前のものを潰さない)。
+    uint8_t bak[OT_OPERATIONAL_DATASET_MAX_LENGTH];
+    if (nvs_get_ds(KEY_FORM_DS, bak, sizeof(bak)) == 0) {
+      if (!nvs_set_ds(KEY_FORM_DS, cur.mTlvs, cur.mLength)) {
+        ESP_LOGE(TAG, "JOIN: failed to back up the own dataset; not overwriting it");
+        return OT_ERROR_FAILED;
+      }
+      ESP_LOGI(TAG, "JOIN: backed up the own dataset (%u bytes) to NVS", (unsigned)cur.mLength);
+    }
+  }
+  err = otDatasetSetActiveTlvs(inst, &ds);
+  ESP_LOGI(TAG, "JOIN: applied join dataset from %s (%u bytes) -> otError %d", src, (unsigned)n,
+           (int)err);
+  return err;
+}
+
+} // namespace
+
+bool sm_ot_hub_start_network() {
+  const sm_ot_mode_t mode = sm_ot_hub_mode();
+  ESP_LOGI(TAG, "thread mode = %s", sm_ot_hub_mode_name(mode));
   esp_openthread_lock_acquire(portMAX_DELAY);
   otInstance *inst = esp_openthread_get_instance();
   otOperationalDatasetTlvs ds;
-  memset(&ds, 0, sizeof(ds));
-  otError err = otDatasetGetActiveTlvs(inst, &ds);
-  if (err == OT_ERROR_NONE && ds.mLength > 0) {
-    ESP_LOGI(TAG, "restored active dataset from NVS");
-  } else {
-    uint8_t tlv[OT_OPERATIONAL_DATASET_MAX_LENGTH];
-    size_t n = hex_to_bytes(CONFIG_SM_THREAD_DATASET_TLV_HEX, tlv, sizeof(tlv));
-    if (n > 0) {
-      // (2) Kconfig の TLV hex を適用する(既存 Thread ネットワークに合わせる場合)。
-      memset(&ds, 0, sizeof(ds));
-      memcpy(ds.mTlvs, tlv, n);
-      ds.mLength = (uint8_t)n;
-      err = otDatasetSetActiveTlvs(inst, &ds);
-      ESP_LOGI(TAG, "applied dataset from Kconfig (%u bytes) -> otError %d", (unsigned)n, (int)err);
-    } else {
-      // (3) 新規ネットワークを生成する(このハブが主宰 = leader になる)。
-      otOperationalDataset fresh;
-      memset(&fresh, 0, sizeof(fresh));
-      err = otDatasetCreateNewNetwork(inst, &fresh);
-      if (err == OT_ERROR_NONE) {
-        err = otDatasetSetActive(inst, &fresh);
-      }
-      if (err == OT_ERROR_NONE) {
-        err = otDatasetGetActiveTlvs(inst, &ds);
-      }
-      ESP_LOGI(TAG, "created new Thread network -> otError %d", (int)err);
-    }
-  }
+  otError err = (mode == SM_OT_MODE_JOIN) ? prepare_dataset_join(inst, ds)
+                                          : prepare_dataset_form(inst, ds);
   if (err != OT_ERROR_NONE) {
     esp_openthread_lock_release();
-    ESP_LOGE(TAG, "dataset setup failed: %d", (int)err);
+    if (mode == SM_OT_MODE_JOIN && err == OT_ERROR_NOT_FOUND) {
+      ESP_LOGE(TAG, "JOIN: no dataset (use `otmode join <hex>` or CONFIG_SM_THREAD_DATASET_TLV_HEX);"
+                    " Thread is NOT started");
+    } else {
+      ESP_LOGE(TAG, "dataset setup failed: %d", (int)err);
+    }
     return false;
   }
-  log_dataset_tlvs(ds);
+  if (mode == SM_OT_MODE_FORM) {
+    // 自前ネットワークの dataset はデバイス側プリセット用にログへ出す(従来動作)。
+    // JOIN の dataset は他人のネットワークの鍵なのでログに出さない。
+    log_dataset_tlvs(ds);
+  }
 
   err = otIp6SetEnabled(inst, true);
   if (err == OT_ERROR_NONE) {
     err = otThreadSetEnabled(inst, true);
   }
-  if (err == OT_ERROR_NONE) {
+  if (err == OT_ERROR_NONE && mode == SM_OT_MODE_FORM) {
     // SRP サーバ: デバイスの `_matter._tcp` 登録を受ける(このハブが DNS-SD の出所)。
+    // JOIN では有効化しない(netdata に 2 つ目の SRP サーバを publish すると登録先が割れる)。
     otSrpServerSetEnabled(inst, true);
   }
   esp_openthread_lock_release();
-  ESP_LOGI(TAG, "thread start -> otError %d (SRP server enabled)", (int)err);
+  g_started = (err == OT_ERROR_NONE);
+  ESP_LOGI(TAG, "thread start -> otError %d (%s, SRP server %s)", (int)err,
+           sm_ot_hub_mode_name(mode), mode == SM_OT_MODE_FORM ? "enabled" : "not started");
   return err == OT_ERROR_NONE;
 }
 
@@ -247,11 +442,61 @@ bool sm_ot_hub_wait_leader(uint32_t timeout_ms) {
   }
 }
 
+bool sm_ot_hub_wait_attached(uint32_t timeout_ms) {
+  uint32_t waited = 0;
+  for (;;) {
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    otDeviceRole role = otThreadGetDeviceRole(esp_openthread_get_instance());
+    esp_openthread_lock_release();
+    if (role == OT_DEVICE_ROLE_CHILD || role == OT_DEVICE_ROLE_ROUTER ||
+        role == OT_DEVICE_ROLE_LEADER) {
+      ESP_LOGI(TAG, "thread attached, role = %d", (int)role);
+      return true;
+    }
+    if (waited >= timeout_ms) {
+      ESP_LOGW(TAG, "still not attached (role=%d)", (int)role);
+      return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+    waited += 500;
+  }
+}
+
+size_t sm_ot_hub_addrs(char *out, size_t cap) {
+  if (out == nullptr || cap == 0) {
+    return 0;
+  }
+  out[0] = 0;
+  if (!g_ot_ready) {
+    return 0;
+  }
+  size_t n = 0, used = 0;
+  esp_openthread_lock_acquire(portMAX_DELAY);
+  otInstance *inst = esp_openthread_get_instance();
+  for (const otNetifAddress *a = inst ? otIp6GetUnicastAddresses(inst) : nullptr; a != nullptr;
+       a = a->mNext) {
+    char buf[OT_IP6_ADDRESS_STRING_SIZE];
+    otIp6AddressToString(&a->mAddress, buf, sizeof(buf));
+    int w = snprintf(out + used, cap - used, "%s\n", buf);
+    if (w < 0 || (size_t)w >= cap - used) {
+      out[used] = 0;
+      break;
+    }
+    used += (size_t)w;
+    ++n;
+  }
+  esp_openthread_lock_release();
+  return n;
+}
+
 uint32_t sm_ot_hub_netif_index() {
   return g_ot_netif ? (uint32_t)esp_netif_get_netif_impl_index(g_ot_netif) : 0;
 }
 
 bool sm_ot_hub_srp_lookup(uint64_t node_id, uint8_t out_ip[16]) {
+  if (sm_ot_hub_mode() == SM_OT_MODE_JOIN) {
+    return false; // 自分の SRP サーバ帳は無い(§18.2。解決の抽象化は P2)
+  }
   char want[17];
   node_hex(node_id, want);
   bool found = false;
@@ -312,6 +557,8 @@ void sm_ot_hub_get_status(sm_ot_status_t *out) {
     return;
   }
   memset(out, 0, sizeof(*out));
+  out->mode = (uint8_t)sm_ot_hub_mode();
+  out->started = g_started;
   if (!g_ot_ready) {
     return;
   }

@@ -2068,7 +2068,7 @@ Status: 設計(2026-10-02、コード未変更)。目的: Tab5 が **自前で T
   (既定 5)が NF 以上であることを確認。
 - **D2(任意)`_matterc._udp` の SRP 登録**: `SM_EV_WINDOW_CHANGED` で開閉に合わせ commissionable サービス
   (サブタイプ `_L<disc>` / `_S<disc>` / `_CM`、TXT D/CM/VP)を登録/削除。shim から TXT 素材を出す API が要るため
-  別ユニット。スマホ系コントローラの on-network 追加に必要、Tab5 の T10 ゴールには不要。
+  別ユニット。スマホ系コントローラの on-network 追加に必要、Tab5 の T11 ゴールには不要。
 
 ### 18.5 実装ピース(各 1 エージェント)
 
@@ -2109,4 +2109,4 @@ Status: 設計(2026-10-02、コード未変更)。目的: Tab5 が **自前で T
   は実機で要確認。anycast だけの場合は ALOC を組むか Kconfig で DNS サーバを与える。
 - PASE 中のデバイス負荷(Thread + SRP 更新 + CASE 既存 2 セッション)と exchange プール。2 fabric 同時購読の実測要。
 - 主宰モード時代の Thread ノード(旧 0xaabbccdd 等)は JOIN では到達不能のまま一覧に残る。削除 UI で対処。
-- T10 の番号衝突(カメラ QR)。
+- (番号: 本節は T11。T10 はカメラ QR。)

@@ -30,13 +30,32 @@ menu "tab5_ctrl_app configuration"
 
     comment "Thread network"
 
+    choice SM_THREAD_MODE
+        prompt "Thread mode (FORM = host an own network, JOIN = join an external one)"
+        default SM_THREAD_MODE_FORM
+        help
+            FORM: 自前のネットワークを主宰する(dataset 復元/生成、leader、SRP サーバ)。
+            JOIN: 外部(OTBR 等)のネットワークへ参加する。SM_THREAD_DATASET_TLV_HEX
+            (または console `otmode join <hex>` で NVS に入れた dataset)を active に
+            適用し、SRP サーバは起動しない。dataset が空なら Thread を起動しない。
+            NVS("smui"/"otmode"、console `otmode form|join`)があればそちらが優先。
+            docs/design/p4-thread-controller.md §18。
+
+        config SM_THREAD_MODE_FORM
+            bool "FORM (leader + SRP server)"
+        config SM_THREAD_MODE_JOIN
+            bool "JOIN (attach to an external network)"
+    endchoice
+
     config SM_THREAD_DATASET_TLV_HEX
         string "Active dataset TLV (hex, empty = create a new network)"
         default ""
         help
             空にすると起動時に otDatasetCreateNewNetwork で新規ネットワークを生成する
             (生成された TLV は起動ログと画面の Network タブに出る)。
-            NVS に保存済みの dataset があればそちらが優先される。
+            FORM: NVS に保存済みの dataset があればそちらが優先される。
+            JOIN: 参加先の dataset(NVS "otjoin_ds" が無いときに使う)。network key を
+            含むので sdkconfig.defaults ではなく git 管理外の sdkconfig.local に書くこと。
 
     comment "WiFi (on-board ESP32-C6 over SDIO -- esp_hosted / esp_wifi_remote)"
 

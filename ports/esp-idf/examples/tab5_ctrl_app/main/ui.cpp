@@ -173,6 +173,9 @@ struct Ui {
   // Network タブ
   lv_obj_t *lbl_net = nullptr;
   lv_obj_t *lbl_dataset = nullptr;
+  lv_obj_t *lbl_dataset_title = nullptr; // §18: モードで文言を変える
+  lv_obj_t *lbl_qr_hint = nullptr;
+  int net_mode_shown = -1;
   lv_obj_t *qr = nullptr;
   char qr_data[SM_UI_DATASET_HEX_CAP] = {};
   // Pair ダイアログ
@@ -721,10 +724,16 @@ void on_reload(lv_event_t *) {
 
 void refresh_status_bar() {
   const char *role = (g_snap.role >= 0 && g_snap.role <= 4) ? ROLE_NAME[g_snap.role] : "?";
+  // §18: モード(FORM/JOIN)を role の前に出す("Thread JOIN Child ...")。
+  const bool join = g_snap.ot_mode == 1;
+  if (join && !g_snap.ot_started) {
+    role = "no dataset";
+  }
   lv_label_set_text_fmt(g_ui.lbl_thread,
-                        LV_SYMBOL_WIFI " Thread %s   net=%s  ch=%u  pan=0x%04x  rloc=0x%04x   "
+                        LV_SYMBOL_WIFI " Thread %s %s   net=%s  ch=%u  pan=0x%04x  rloc=0x%04x   "
                                        "SRP:%s(%u)   nodes:%u",
-                        role, g_snap.netname[0] ? g_snap.netname : "-", (unsigned)g_snap.channel,
+                        join ? "JOIN" : "FORM", role, g_snap.netname[0] ? g_snap.netname : "-",
+                        (unsigned)g_snap.channel,
                         (unsigned)g_snap.panid, (unsigned)g_snap.rloc16,
                         g_snap.srp_enabled ? "on" : "off", (unsigned)g_snap.srp_hosts,
                         (unsigned)g_snap.node_count);
@@ -1081,7 +1090,12 @@ void refresh_dashboard() {
 
 void refresh_network_tab() {
   const char *role = (g_snap.role >= 0 && g_snap.role <= 4) ? ROLE_NAME[g_snap.role] : "?";
+  const bool join = g_snap.ot_mode == 1;
+  if (join && !g_snap.ot_started) {
+    role = "not started (no dataset; console: otmode join <hex>)";
+  }
   lv_label_set_text_fmt(g_ui.lbl_net,
+                        "Mode        %s\n"
                         "Role        %s\n"
                         "Network     %s\n"
                         "Channel     %u\n"
@@ -1089,10 +1103,36 @@ void refresh_network_tab() {
                         "RLOC16      0x%04x\n"
                         "SRP server  %s (%u host(s) registered)\n"
                         "Controller  %s",
+                        join ? "JOIN (member of an external network)"
+                             : "FORM (this hub hosts the network)",
                         role, g_snap.netname[0] ? g_snap.netname : "-", (unsigned)g_snap.channel,
                         (unsigned)g_snap.panid, (unsigned)g_snap.rloc16,
-                        g_snap.srp_enabled ? "enabled" : "disabled", (unsigned)g_snap.srp_hosts,
-                        g_snap.ctrl_ready ? "ready" : "starting ...");
+                        join ? "not used in JOIN mode" : (g_snap.srp_enabled ? "enabled" : "disabled"),
+                        (unsigned)g_snap.srp_hosts, g_snap.ctrl_ready ? "ready" : "starting ...");
+  // dataset 見出し / QR の説明はモードで変える(JOIN では Tab5 の持ち物ではなく参加先の
+  // ネットワークの dataset。「この Tab5 が主宰」と読める文言にしない)。
+  if (g_ui.net_mode_shown != (int)g_snap.ot_mode) {
+    g_ui.net_mode_shown = (int)g_snap.ot_mode;
+    if (g_ui.lbl_dataset_title != nullptr) {
+      lv_label_set_text(g_ui.lbl_dataset_title,
+                        join ? "Active dataset TLV (external network joined by this Tab5):"
+                             : "Active dataset TLV (preset this on the devices):");
+    }
+    if (g_ui.lbl_qr_hint != nullptr) {
+      lv_label_set_text(g_ui.lbl_qr_hint, join ? "dataset of the joined\n(external) network"
+                                               : "scan to copy the\nactive dataset TLV");
+    }
+    if (g_ui.lbl_empty != nullptr) {
+      lv_label_set_text(g_ui.lbl_empty,
+                        join ? "No commissioned device yet.\n"
+                               "JOIN mode: this Tab5 is a member of an external Thread network.\n"
+                               "Open a commissioning window on the device from its current\n"
+                               "controller, then use \"Pair new device\" with its IPv6 address."
+                             : "No commissioned device yet.\n"
+                               "Attach a device to this Thread network (see the Network tab for\n"
+                               "the active dataset), then use \"Pair new device\".");
+    }
+  }
   if (strcmp(g_ui.qr_data, g_snap.dataset_hex) != 0) {
     snprintf(g_ui.qr_data, sizeof(g_ui.qr_data), "%s", g_snap.dataset_hex);
     lv_label_set_text(g_ui.lbl_dataset,
@@ -1320,8 +1360,8 @@ void sm_ui_create() {
   lv_obj_set_flex_flow(left, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_row(left, 10, 0);
   g_ui.lbl_net = make_label(left, &lv_font_montserrat_20, COL_TEXT, "Thread starting ...");
-  make_label(left, &lv_font_montserrat_16, COL_ACCENT,
-             "Active dataset TLV (preset this on the devices):");
+  g_ui.lbl_dataset_title = make_label(left, &lv_font_montserrat_16, COL_ACCENT,
+                                      "Active dataset TLV (preset this on the devices):");
   g_ui.lbl_dataset = make_label(left, &lv_font_montserrat_14, COL_TEXT, "(no active dataset yet)");
   lv_label_set_long_mode(g_ui.lbl_dataset, LV_LABEL_LONG_WRAP);
   lv_obj_set_width(g_ui.lbl_dataset, g_scr_w - 430);
@@ -1343,7 +1383,8 @@ void sm_ui_create() {
 #else
   make_label(right, &lv_font_montserrat_14, COL_DIM, "(LV_USE_QRCODE is disabled)");
 #endif
-  make_label(right, &lv_font_montserrat_14, COL_DIM, "scan to copy the\nactive dataset TLV");
+  g_ui.lbl_qr_hint =
+      make_label(right, &lv_font_montserrat_14, COL_DIM, "scan to copy the\nactive dataset TLV");
 
   // --- 3. 反映タイマ ---
   lv_timer_create(tick_cb, 500, nullptr);

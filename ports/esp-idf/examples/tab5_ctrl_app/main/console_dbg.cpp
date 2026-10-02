@@ -9,6 +9,7 @@
 
 #include "app_state.hpp"
 #include "display_gfx.hpp"
+#include "ot_hub.hpp"
 
 #include <cinttypes>
 #include <cstdio>
@@ -18,6 +19,7 @@
 #include "driver/usb_serial_jtag.h"
 #include "esp_console.h"
 #include "esp_heap_caps.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lvgl.h"
@@ -86,6 +88,15 @@ int cmd_status(int, char **) {
   // console_repl の stack protection fault → リブート)。コンソールは単一タスク。
   static sm_ui_snapshot_t snap;
   sm_app_snapshot_get(&snap);
+  // §18: thread_mode=FORM|JOIN、thread_role_name、srp(サーバ稼働)、ch / pan を足した
+  // (既存キーは位置も名前も不変 = 既存スクリプト互換)。
+  static const char *RN[] = {"disabled", "detached", "child", "router", "leader"};
+  printf("THREAD thread_mode=%s started=%d thread_role_name=%s ch=%u pan=0x%04x rloc=0x%04x "
+         "net=\"%s\" srp=%d srp_hosts=%u\n",
+         snap.ot_mode == 1 ? "JOIN" : "FORM", (int)snap.ot_started,
+         (snap.role >= 0 && snap.role <= 4) ? RN[snap.role] : "?", (unsigned)snap.channel,
+         (unsigned)snap.panid, (unsigned)snap.rloc16, snap.netname, (int)snap.srp_enabled,
+         (unsigned)snap.srp_hosts);
   printf("STATUS thread_role=%d wifi_state=%u wifi_ip4=%s wifi_ll=%s wifi_gua_ok=%d ble=%u "
          "pair_state=%u pair_phase=%u ble_stage=%u nodes=%u\n",
          snap.role, snap.wifi_state, snap.wifi_ip4[0] ? snap.wifi_ip4 : "-",
@@ -93,6 +104,63 @@ int cmd_status(int, char **) {
          snap.ble_stage, (unsigned)snap.node_count);
   printf("LAST \"%s\"\n", snap.status);
   printf("OK\n");
+  return 0;
+}
+
+// §18(T11 / P1): Thread モードの表示と切替。
+//   otmode                      現在のモード / role / SRP サーバ / OT netif のアドレス
+//   otmode form                 主宰モードへ(退避した自前 dataset を復元)。保存して再起動
+//   otmode join [dataset-hex]   参加モードへ。hex 省略時は保存済み(NVS)→ Kconfig の dataset
+// これは sm_ctrl_* を呼ばない(ot_hub は内部で OT ロックを取る / NVS 書き込みのみ)。
+// dataset hex は network key を含むのでエコーしない。
+int cmd_otmode(int argc, char **argv) {
+  if (argc < 2) {
+    static sm_ot_status_t st;
+    sm_ot_hub_get_status(&st);
+    static const char *RN[] = {"disabled", "detached", "child", "router", "leader"};
+    printf("OTMODE mode=%s started=%d role=%s ch=%u pan=0x%04x rloc=0x%04x net=\"%s\" "
+           "srp_server=%d srp_hosts=%u join_dataset=%s\n",
+           sm_ot_hub_mode_name((sm_ot_mode_t)st.mode), (int)st.started,
+           (st.role >= 0 && st.role <= 4) ? RN[st.role] : "?", (unsigned)st.channel,
+           (unsigned)st.panid, (unsigned)st.rloc16, st.netname, (int)st.srp_enabled,
+           (unsigned)st.srp_hosts, sm_ot_hub_join_dataset_source());
+    static char addrs[12 * 48];
+    size_t n = sm_ot_hub_addrs(addrs, sizeof(addrs));
+    printf("OTADDRS %u\n", (unsigned)n);
+    for (char *p = addrs; *p != 0;) {
+      char *e = strchr(p, '\n');
+      if (e == nullptr) {
+        break;
+      }
+      *e = 0;
+      printf("OTADDR %s\n", p);
+      p = e + 1;
+    }
+    printf("OK\n");
+    return 0;
+  }
+  sm_ot_mode_t mode;
+  if (strcmp(argv[1], "form") == 0) {
+    mode = SM_OT_MODE_FORM;
+  } else if (strcmp(argv[1], "join") == 0) {
+    mode = SM_OT_MODE_JOIN;
+  } else {
+    printf("ERR usage: otmode [form | join [dataset-hex]]\n");
+    return 1;
+  }
+  const char *hex = (mode == SM_OT_MODE_JOIN && argc >= 3) ? argv[2] : nullptr;
+  if (!sm_ot_hub_mode_save(mode, hex)) {
+    printf("ERR could not save (bad dataset hex or NVS error)\n");
+    return 1;
+  }
+  if (mode == SM_OT_MODE_JOIN && strcmp(sm_ot_hub_join_dataset_source(), "none") == 0) {
+    printf("WARN no join dataset stored and CONFIG_SM_THREAD_DATASET_TLV_HEX is empty: "
+           "Thread will not start\n");
+  }
+  printf("OK saved mode=%s; rebooting\n", sm_ot_hub_mode_name(mode));
+  fflush(stdout);
+  vTaskDelay(pdMS_TO_TICKS(300));
+  esp_restart();
   return 0;
 }
 
@@ -651,7 +719,8 @@ void sm_console_start() {
   esp_console_repl_t *repl = nullptr;
   esp_console_repl_config_t repl_cfg = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
   repl_cfg.prompt = "tab5>";
-  repl_cfg.max_cmdline_length = 128;
+  // `otmode join <dataset-hex>` は最大 2*254 桁の hex を 1 行で受ける(§18)。
+  repl_cfg.max_cmdline_length = 640;
   // float printf + ソケット操作(udptest)を REPL タスクで行うので余裕を持たせる。
   repl_cfg.task_stack_size = 16384;
   esp_console_dev_usb_serial_jtag_config_t hw = ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
@@ -661,6 +730,8 @@ void sm_console_start() {
   }
   reg("nodes", "list nodes", cmd_nodes);
   reg("status", "controller status", cmd_status);
+  reg("otmode", "otmode [form | join [dataset-hex]] (show / switch the Thread mode; reboots)",
+      cmd_otmode);
   reg("toggle", "toggle <node_hex>", cmd_toggle);
   reg("read", "read <node_hex>", cmd_read);
   reg("pairble", "pairble <disc> <node_hex> [wifi|thread] [passcode]", cmd_pairble);

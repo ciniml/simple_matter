@@ -148,6 +148,8 @@ struct sm_ui_snapshot_t {
   uint64_t now_ms;
 
   // --- Thread ---
+  uint8_t ot_mode;  // sm_ot_mode_t(0=FORM 主宰 / 1=JOIN 外部ネットワークへ参加、§18)
+  bool ot_started;  // Thread を起動したか(JOIN で dataset 無しなら false)
   int role;         // otDeviceRole
   uint16_t rloc16;
   uint8_t channel;
