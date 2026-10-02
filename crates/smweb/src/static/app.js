@@ -259,6 +259,58 @@ function sensorCard(n) {
   return card;
 }
 
+/**
+ * Contact sensor (BooleanState 0x0045): StateValue true = contact = closed (ContactSensor
+ * device type). Battery from PowerSource.BatPercentRemaining (0.5 % units) when subscribed.
+ */
+function contactCard(n) {
+  const card = el("div", { class: "card" + (n.state === "online" ? "" : " inactive") }, cardHead(n));
+  const tiles = el("div", { class: "tiles" });
+  const tile = (ep, cluster, attr, label, r) => {
+    const e = nodeValue(n, ep, cluster, attr);
+    const graphing = charts.has(chartKey("dash", n.node_id, ep, cluster, attr));
+    const toggle = () => { toggleChart("dash", n.node_id, ep, cluster, attr, label); renderDashboard(); };
+    return el("div", {
+      class: `tile ${r.cls}` + (graphing ? " graphing" : ""),
+      title: (e ? `ep${ep} dataVersion ${e.data_version}` : `ep${ep}`) + "\nclick: show / hide history graph",
+      role: "button", tabindex: "0",
+      onclick: toggle,
+      onkeydown: (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggle(); } },
+    },
+      el("div", { class: "t-label", text: label }),
+      el("div", { class: "t-value" + (r.isText ? " text" : ""), text: r.text }),
+      el("div", { class: "t-unit", text: r.unit || " " }),
+    );
+  };
+  const paths = n.sub_paths || [];
+  const stateEps = n.model
+    ? n.model.endpoints.filter((e) => e.clusters.some((c) => c.id === 0x0045)).map((e) => e.ep)
+    : paths.filter((p) => p.cluster === 0x0045).map((p) => p.ep);
+  for (const ep of stateEps) {
+    const e = nodeValue(n, ep, 0x0045, 0);
+    let r = { text: "—", unit: "", cls: "none", isText: true };
+    if (e && e.value === true) r = { text: "Closed", unit: "contact", cls: "good", isText: true };
+    else if (e && e.value === false) r = { text: "Open", unit: "no contact", cls: "warn", isText: true };
+    const label = stateEps.length > 1 ? `Contact (ep${ep})` : "Contact";
+    tiles.appendChild(tile(ep, 0x0045, 0, label, r));
+  }
+  for (const p of paths.filter((p) => p.cluster === 0x002f && p.attr === 0x000c)) {
+    const e = nodeValue(n, p.ep, 0x002f, 0x000c);
+    let r = { text: "—", unit: "%", cls: "none" };
+    if (e && typeof e.value === "number") {
+      const pct = e.value * 0.5;
+      r = { text: numStr(pct, 0), unit: "%", cls: pct <= 10 ? "bad" : pct <= 25 ? "warn" : "neutral" };
+    }
+    tiles.appendChild(tile(p.ep, 0x002f, 0x000c, "Battery", r));
+  }
+  if (stateEps.length === 0) card.appendChild(el("div", { class: "muted", text: "(not described yet — connect from Devices)" }));
+  card.appendChild(tiles);
+  if ((n.watch || []).length) card.appendChild(watchKv(n));
+  if (n.error && n.state !== "online") card.appendChild(el("div", { class: "muted small", text: n.error }));
+  card.appendChild(chartsBox(n));
+  return card;
+}
+
 /** The dashboard card's open graphs (persistent elements, moved into the fresh card). */
 function chartsBox(n) {
   const box = el("div", { class: "card-charts" });
@@ -342,6 +394,7 @@ function renderDashboard() {
   $("#dash-empty").hidden = list.length !== 0;
   for (const n of list) {
     if (n.kind === "sensor") sensors.appendChild(sensorCard(n));
+    else if (n.kind === "contact") sensors.appendChild(contactCard(n));
     else if (n.kind === "light") lights.appendChild(lightCard(n));
     else others.appendChild(otherCard(n));
   }

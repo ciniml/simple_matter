@@ -41,6 +41,10 @@ pub const CO2: u32 = 0x040D;
 pub const PM25: u32 = 0x042A;
 pub const TEMPERATURE: u32 = 0x0402;
 pub const HUMIDITY: u32 = 0x0405;
+pub const BOOLEAN_STATE: u32 = 0x0045;
+pub const POWER_SOURCE: u32 = 0x002F;
+/// PowerSource.BatPercentRemaining(0.5 % 単位)。
+pub const BAT_PERCENT_REMAINING: u32 = 0x000C;
 
 /// SENSOR の既定購読クラスタ(いずれも属性 0: AirQuality / MeasuredValue)。
 pub const SENSOR_CLUSTERS: [u32; 5] = [AIR_QUALITY, CO2, PM25, TEMPERATURE, HUMIDITY];
@@ -258,6 +262,8 @@ pub fn classify(model: &NodeModel) -> NodeKind {
         NodeKind::Sensor
     } else if model.has_cluster(ON_OFF) {
         NodeKind::Light
+    } else if model.has_cluster(BOOLEAN_STATE) {
+        NodeKind::Contact
     } else {
         NodeKind::Other
     }
@@ -281,6 +287,20 @@ pub fn default_paths(kind: NodeKind, model: &NodeModel) -> Vec<AttrPath> {
                     .any(|e| e.ep == ep && e.has_cluster(LEVEL_CONTROL))
                 {
                     out.push(AttrPath::new(ep, LEVEL_CONTROL, 0));
+                }
+            }
+        }
+        NodeKind::Contact => {
+            for ep in model.endpoints_with(BOOLEAN_STATE) {
+                out.push(AttrPath::new(ep, BOOLEAN_STATE, 0));
+            }
+            // 電池残量。AttributeList が空のまま返すデバイス(Aqara Door and Window Sensor P2)
+            // があるので、一覧が空なら載っているものとして購読する。
+            for e in &model.endpoints {
+                if let Some(c) = e.clusters.iter().find(|c| c.id == POWER_SOURCE) {
+                    if c.attrs.is_empty() || c.attrs.iter().any(|a| a.id == BAT_PERCENT_REMAINING) {
+                        out.push(AttrPath::new(e.ep, POWER_SOURCE, BAT_PERCENT_REMAINING));
+                    }
                 }
             }
         }
@@ -474,6 +494,44 @@ mod tests {
         );
         assert_eq!(classify(&both), NodeKind::Sensor);
         assert_eq!(classify(&NodeModel::default()), NodeKind::Other);
+    }
+
+    /// ドア・窓センサ(Aqara Door and Window Sensor P2 の構成): ep1 = ContactSensor(BooleanState)、
+    /// ep2 = PowerSource(AttributeList が空)。CONTACT に分類し、状態値と電池残量を購読する。
+    #[test]
+    fn contact_sensor_kind_and_paths() {
+        let mut servers = BTreeMap::new();
+        servers.insert(1, vec![0x0003, BOOLEAN_STATE]);
+        servers.insert(2, vec![POWER_SOURCE]);
+        let mut attr_lists = BTreeMap::new();
+        attr_lists.insert((2u16, POWER_SOURCE), Vec::new());
+        let m = build_model(
+            &[1, 2],
+            &BTreeMap::new(),
+            &servers,
+            &attr_lists,
+            BasicInfo::default(),
+            0,
+        );
+        assert_eq!(classify(&m), NodeKind::Contact);
+        assert_eq!(
+            default_paths(NodeKind::Contact, &m),
+            vec![
+                AttrPath::new(1, BOOLEAN_STATE, 0),
+                AttrPath::new(2, POWER_SOURCE, BAT_PERCENT_REMAINING),
+            ]
+        );
+        // OnOff があれば LIGHT 優先(接点を持つスマートプラグ等)。
+        servers.insert(3, vec![ON_OFF]);
+        let plug = build_model(
+            &[1, 2, 3],
+            &BTreeMap::new(),
+            &servers,
+            &BTreeMap::new(),
+            BasicInfo::default(),
+            0,
+        );
+        assert_eq!(classify(&plug), NodeKind::Light);
     }
 
     #[test]

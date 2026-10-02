@@ -28,6 +28,8 @@ pub enum NodeKind {
     Sensor,
     /// OnOff(0x0006)あり。
     Light,
+    /// BooleanState(0x0045)あり(ドア・窓の接点センサ等)。状態値と電池残量を購読する。
+    Contact,
     /// 上記以外(既定購読なし。ユーザーの watch のみ)。
     #[default]
     Other,

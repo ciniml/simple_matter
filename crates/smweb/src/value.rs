@@ -280,6 +280,10 @@ pub fn display_hint(cluster: u32, attr: u32) -> Option<Value> {
         0x0404 if measured => Some(json!({ "unit": "m³/h", "scale": 0.1 })),
         0x040D | 0x0413 if measured => Some(json!({ "unit": "ppm" })),
         0x042A | 0x042C | 0x042D if measured => Some(json!({ "unit": "µg/m³" })),
+        // PowerSource: BatVoltage(mV)/ BatPercentRemaining(0.5 % 単位)/ BatChargeLevel(enum8)。
+        0x002F if attr == 0x000B => Some(json!({ "unit": "mV" })),
+        0x002F if attr == 0x000C => Some(json!({ "unit": "%", "scale": 0.5 })),
+        0x002F if attr == 0x000E => Some(json!({ "enum": ["OK", "Warning", "Critical"] })),
         _ => None,
     }
 }

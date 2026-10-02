@@ -517,7 +517,8 @@ fn thread_main(g: Globals, rx: Receiver<Request>, shared: Shared, stop: Arc<Atom
                 let mut n = NodeSnap::new(e.node_id, e.label.clone(), addr_string(e.last_addr));
                 // ラベルの正は nodes.tlv(smctl と共有)。smweb.json の控えは表示に使わない。
                 if let Some(st) = store.nodes.get(&e.node_id) {
-                    n.kind = st.kind;
+                    // 種別は保存済みモデルから引き直す(種別が増えたとき、Describe し直さずに反映する)。
+                    n.kind = st.model.as_ref().map_or(st.kind, describe::classify);
                     n.model = st.model.clone();
                     n.watch = st.watch.clone();
                 }

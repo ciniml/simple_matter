@@ -207,6 +207,7 @@ Tab5 T4/T8 の種別判定を踏襲する:
 |---|---|---|
 | SENSOR | どこかの EP に AirQuality(0x005B) | AirQuality.AirQuality、CO2(0x040D).MeasuredValue、PM2.5(0x042A).MeasuredValue、Temperature(0x0402).MeasuredValue、RelativeHumidity(0x0405).MeasuredValue(存在する EP を Describe から決める) |
 | LIGHT | OnOff(0x0006)あり | OnOff.OnOff、(あれば)LevelControl.CurrentLevel、ColorControl 主要属性 |
+| CONTACT | 上記以外で BooleanState(0x0045)あり(ドア・窓センサ) | BooleanState.StateValue(true = 接触 = 閉)、(あれば)PowerSource(0x002F).BatPercentRemaining(0.5 % 単位)。PowerSource の AttributeList を空で返すデバイス(Aqara Door and Window Sensor P2)があるため、一覧が空なら購読対象に含める |
 | その他 | 上記以外 | 購読なし。ユーザーが属性を選んで「ウォッチ」(§5.4) |
 
 購読は **ノード 1 本**(複数パス、min 0 / max 60 s)にまとめる(デバイス側 SUBS=3 の制約。
@@ -223,7 +224,8 @@ AirQ は Apple/Alexa/Google + smweb で上限に当たり得るため、1 本厳
 ### 5.4 画面(単一ページ)
 
 1. **Dashboard**(既定): ノードごとのカード。SENSOR は 5 タイル(しきい値で色分け、
-   Tab5 T6 と同じ閾値)、LIGHT は状態 + Toggle ボタン。オフライン/stale はグレー。
+   Tab5 T6 と同じ閾値)、LIGHT は状態 + Toggle ボタン、CONTACT は Closed / Open と電池残量の
+   タイル。オフライン/stale はグレー。
 2. **Devices**: ノード一覧(NodeId、ラベル、種別、アドレス、状態)。行を開くと
    Describe の木(EP → クラスタ → 属性)を表示し、属性の「読む」「書く」「ウォッチ」、
    クラスタのコマンド実行(表にあるものは名前と引数フォーム、無いものは TLV hex)。

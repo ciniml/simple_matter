@@ -32,6 +32,7 @@ pub mod network_commissioning;
 pub mod occupancy_sensing;
 pub mod on_off;
 pub mod operational_credentials;
+pub mod power_source;
 pub mod pressure_measurement;
 pub mod relative_humidity_measurement;
 pub mod switch;
@@ -188,6 +189,7 @@ pub static CLUSTERS: &[&ClusterDef] = &[
     &descriptor::DEF,                    // 0x001D
     &access_control::DEF,                // 0x001F
     &basic_information::DEF,             // 0x0028
+    &power_source::DEF,                  // 0x002F
     &general_commissioning::DEF,         // 0x0030
     &network_commissioning::DEF,         // 0x0031
     &general_diagnostics::DEF,           // 0x0033
