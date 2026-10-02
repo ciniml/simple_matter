@@ -325,7 +325,10 @@ impl Session {
     }
 
     /// 受信パケットがこのセッション宛かを判定する(ユニキャストのみ)。
-    fn matches_rx(&self, peer: PeerAddr, pkt: &PacketHeader) -> bool {
+    ///
+    /// `exact_addr` が true ならピアアドレスの完全一致を要求する。false のときは、同じピアが
+    /// 別の自アドレスから応答した場合に限りアドレス不一致を許容する(下記)。
+    fn matches_rx(&self, peer: PeerAddr, pkt: &PacketHeader, exact_addr: bool) -> bool {
         if self.is_reserved() {
             return false;
         }
@@ -337,10 +340,6 @@ impl Session {
         if self.local_session_id != pkt.session_id {
             return false;
         }
-        // ピアアドレスの一致(IPv4-mapped IPv6 を吸収するため正規化して比較)。
-        if self.peer_addr.canonical() != peer.canonical() {
-            return false;
-        }
         // ピア Node ID の一致(いずれかが未確定なら不問)。
         let node_ok = match (self.peer_node_id, pkt.src_node_id) {
             (Some(a), Some(b)) => a == b,
@@ -350,11 +349,36 @@ impl Session {
             return false;
         }
         // Unsecured セッションは、宛先 Node ID の echo でも曖昧性を解消する。
+        let mut echoed_local_node = false;
         if !self.is_encrypted() && self.local_node_id != 0 {
             if let DstNodeId::Unicast(dst) = pkt.dst {
                 if dst != self.local_node_id {
                     return false;
                 }
+                echoed_local_node = true;
+            }
+        }
+        // ピアアドレスの一致(IPv4-mapped IPv6 を吸収するため正規化して比較)。
+        //
+        // ただし複数の IPv6 アドレスを持つピアは、こちらが送った宛先とは別の自アドレスを送信元に
+        // 選んで応答することがある(送信元アドレス選択は相手の宛先 = こちらの送信元との最長一致。
+        // 実機: OTBR が WiFi 側に 2 つ目の ULA プレフィックスを広告した後、AirQ が Sigma1 への応答を
+        // 別プレフィックスのアドレスから返し、コントローラが全て捨てて CASE が成立しなくなった)。
+        // Matter のセッションはアドレスに束縛されない(chip も暗号セッションは Session ID + MIC、
+        // 未認証セッションはエフェメラル Node ID で照合する)ので、同じトランスポート種別なら
+        //   - 暗号セッション: ワイヤ Session ID の一致(このあと MIC で認証される)
+        //   - Unsecured: こちらのエフェメラル Node ID が宛先に echo されている
+        // の場合に限りアドレス不一致を許容する。送信先(`peer_addr`)は更新しない。
+        if self.peer_addr.canonical() != peer.canonical() {
+            if exact_addr {
+                return false;
+            }
+            let same_transport = matches!(
+                (&self.peer_addr, &peer),
+                (PeerAddr::Udp(_), PeerAddr::Udp(_))
+            );
+            if !(same_transport && (self.is_encrypted() || echoed_local_node)) {
+                return false;
             }
         }
         true
@@ -466,7 +490,24 @@ impl<const SESSIONS: usize> SessionManager<SESSIONS> {
         pkt: &PacketHeader,
         now_ms: u64,
     ) -> Option<&mut Session> {
-        let i = self.sessions.iter().position(|s| s.matches_rx(peer, pkt))?;
+        // アドレスまで一致するセッションを優先する。エフェメラル Node ID は同一スタックの複数の
+        // Unsecured セッションで共有されうる(実機: 別ノード宛の古いハンドシェイク用セッションが
+        // 残っていると、緩い照合だけでは応答をそちらへ取り違える)ため、緩い照合は完全一致が
+        // 無いときのフォールバックに限る。
+        let i = self
+            .sessions
+            .iter()
+            .position(|s| s.matches_rx(peer, pkt, true))
+            .or_else(|| {
+                // 緩い照合の候補が複数あるときは、直近に使われたもの(= いま応答を待っている
+                // ハンドシェイク)を選ぶ。
+                self.sessions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.matches_rx(peer, pkt, false))
+                    .max_by_key(|(_, s)| s.last_use)
+                    .map(|(i, _)| i)
+            })?;
         self.sessions[i].touch(now_ms);
         Some(&mut self.sessions[i])
     }
@@ -877,14 +918,66 @@ mod tests {
         let found = mgr.find_for_rx(addr(5540), &pkt, 20).unwrap();
         assert_eq!(found.id(), id);
 
-        // アドレス違いは不一致。
-        assert!(mgr.find_for_rx(addr(9999), &pkt, 20).is_none());
+        // 暗号セッションはアドレスに束縛しない(複数アドレスを持つピアが別の送信元から応答しうる。
+        // Session ID が一致すれば照合し、正当性は MIC で確認する)。
+        assert_eq!(mgr.find_for_rx(addr(9999), &pkt, 20).unwrap().id(), id);
+        // Session ID 違いは不一致。
+        let other = PacketHeader {
+            session_id: sid.wrapping_add(1),
+            ..pkt
+        };
+        assert!(mgr.find_for_rx(addr(5540), &other, 20).is_none());
 
         // (fabric, node) 照合。
         let fab = NonZeroU8::new(2).unwrap();
         let by_node = mgr.find_for_node(fab, 0x5555_6666_7777_8888, 30).unwrap();
         assert_eq!(by_node.id(), id);
         assert!(mgr.find_for_node(fab, 0xDEAD, 30).is_none());
+    }
+
+    /// Unsecured セッション(initiator 側、エフェメラル Node ID あり)は、応答の宛先 Node ID に自分の
+    /// エフェメラル ID が echo されていれば、送信元アドレスが違っても照合する(実機: 複数 ULA を持つ
+    /// デバイスが Sigma1 の宛先とは別のアドレスから応答した)。echo が無い/違う場合は従来どおり不一致。
+    #[test]
+    fn unsecured_rx_matches_by_echoed_ephemeral_node_id_across_addresses() {
+        let mut mgr: SessionManager<4> = SessionManager::new();
+        let mut init = SessionInit::plaintext(addr(5540), 0, 0);
+        init.local_node_id = 0x1122_3344_5566_7788;
+        let id = mgr.insert(init, 0).unwrap();
+
+        let reply = PacketHeader {
+            session_id: 0,
+            sec_flags: SecFlags::from_bits(0),
+            ctr: 1,
+            src_node_id: None,
+            dst: DstNodeId::Unicast(0x1122_3344_5566_7788),
+        };
+        // 同じアドレス、別アドレスのどちらからでも照合する。
+        assert_eq!(mgr.find_for_rx(addr(5540), &reply, 1).unwrap().id(), id);
+        assert_eq!(mgr.find_for_rx(addr(7777), &reply, 1).unwrap().id(), id);
+
+        // 同じエフェメラル ID の Unsecured セッションが複数あるときは、アドレス一致を優先する。
+        let mut init2 = SessionInit::plaintext(addr(7777), 0, 0);
+        init2.local_node_id = 0x1122_3344_5566_7788;
+        let id2 = mgr.insert(init2, 0).unwrap();
+        assert_eq!(mgr.find_for_rx(addr(7777), &reply, 1).unwrap().id(), id2);
+        assert_eq!(mgr.find_for_rx(addr(5540), &reply, 1).unwrap().id(), id);
+        assert!(mgr.remove(id2).is_some());
+
+        // 宛先 Node ID が違えば不一致。
+        let wrong = PacketHeader {
+            dst: DstNodeId::Unicast(0xDEAD),
+            ..reply
+        };
+        assert!(mgr.find_for_rx(addr(5540), &wrong, 1).is_none());
+
+        // echo が無い平文パケットは、アドレスが違えば不一致(responder 側の新規ハンドシェイク等)。
+        let no_echo = PacketHeader {
+            dst: DstNodeId::None,
+            ..reply
+        };
+        assert!(mgr.find_for_rx(addr(7777), &no_echo, 1).is_none());
+        assert_eq!(mgr.find_for_rx(addr(5540), &no_echo, 1).unwrap().id(), id);
     }
 
     #[test]
