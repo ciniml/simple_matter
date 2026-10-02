@@ -278,14 +278,22 @@ pub fn parse_pair_request(body: &Value, ble: bool) -> Result<PairRequest, ApiErr
     })
 }
 
-/// 既定の node ID: 既存の最大 + 1(空なら 1)。運用範囲を超えるなら最小の空き番号。
-pub fn next_free_node_id(existing: &[u64]) -> u64 {
-    match existing.iter().copied().max() {
-        None => 1,
-        Some(m) if m < MAX_OPERATIONAL_NODE_ID => m + 1,
-        Some(_) => (1..=MAX_OPERATIONAL_NODE_ID)
+/// 既定の node ID: 既存の最大 + 1(空なら 1)と、保存済みの採番下限 `floor`(過去に払い出した
+/// ID の次。0 = 未設定)の大きい方。失敗したコミッショニングの ID を再利用しない。
+/// 運用範囲を超えるなら最小の空き番号。
+pub fn next_free_node_id(existing: &[u64], floor: u64) -> u64 {
+    let after_max = existing
+        .iter()
+        .copied()
+        .max()
+        .map_or(1, |m| m.saturating_add(1));
+    let id = after_max.max(floor).max(1);
+    if id <= MAX_OPERATIONAL_NODE_ID {
+        id
+    } else {
+        (1..=MAX_OPERATIONAL_NODE_ID)
             .find(|id| !existing.contains(id))
-            .unwrap_or(1),
+            .unwrap_or(1)
     }
 }
 
@@ -478,10 +486,15 @@ mod tests {
 
     #[test]
     fn next_free_id() {
-        assert_eq!(next_free_node_id(&[]), 1);
-        assert_eq!(next_free_node_id(&[33]), 34);
-        assert_eq!(next_free_node_id(&[5, 1, 3]), 6);
-        assert_eq!(next_free_node_id(&[1, MAX_OPERATIONAL_NODE_ID]), 2);
+        assert_eq!(next_free_node_id(&[], 0), 1);
+        assert_eq!(next_free_node_id(&[33], 0), 34);
+        assert_eq!(next_free_node_id(&[5, 1, 3], 0), 6);
+        assert_eq!(next_free_node_id(&[1, MAX_OPERATIONAL_NODE_ID], 0), 2);
+        // 失敗したコミッショニングで払い出した ID(下限 3 = 2 まで使用済み)は再利用しない。
+        assert_eq!(next_free_node_id(&[1], 3), 3);
+        assert_eq!(next_free_node_id(&[], 3), 3);
+        // 下限より既存の最大が大きければそちら。
+        assert_eq!(next_free_node_id(&[9], 3), 10);
     }
 
     #[test]

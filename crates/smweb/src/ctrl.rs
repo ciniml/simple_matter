@@ -1309,8 +1309,13 @@ impl Ctl<'_> {
                 )))
             }
             Some(id) => id,
-            None => next_free_node_id(&known),
+            None => next_free_node_id(&known, self.store.next_node_id),
         };
+        // 払い出した ID は失敗しても再利用しない(Thread の SRP 名衝突を避ける。store.rs 参照)。
+        if node_id >= self.store.next_node_id {
+            self.store.next_node_id = node_id.saturating_add(1);
+            self.save_store();
+        }
         let how = match &job.target {
             PairTarget::Udp(a) => format!("UDP {a}"),
             PairTarget::Ble { wifi: Some(_), .. } => "BLE + Wi-Fi".to_string(),

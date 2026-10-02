@@ -40,6 +40,16 @@ pub struct Store {
     /// node ID(10 進文字列キー)→ 保存内容。
     #[serde(default)]
     pub nodes: BTreeMap<u64, StoredNode>,
+    /// 次に自動採番する node ID の下限(0 = 未設定)。コミッショニング開始時に進め、失敗しても
+    /// 戻さない。同じ ID を別デバイスへ再利用すると、Thread では SRP の運用インスタンス名
+    /// `<fabric>-<node>` が前のデバイスの名前と衝突し(OTBR は key-lease の約 7.9 日予約する)、
+    /// 新しいデバイスの SRP 更新が全体ごと拒否される(実機: NanoC6 ライトの広告が全部消えた)。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub next_node_id: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 impl Default for Store {
@@ -47,6 +57,7 @@ impl Default for Store {
         Self {
             version: VERSION,
             nodes: BTreeMap::new(),
+            next_node_id: 0,
         }
     }
 }
