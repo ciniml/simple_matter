@@ -10,6 +10,7 @@
 //! Dashboard / Devices / Log の単一ページ。
 //! W3: Pairing(on-network / address / BLE-WiFi / BLE-Thread、進捗は WS)+ unpair / ラベル +
 //! Share(コミッショニングウィンドウ + manual code / QR)+ commissionable 探索 + Pair タブ。
+//! W5: 数値属性の履歴(`smweb-history.bin`)+ `GET /api/nodes/{id}/history` + グラフ表示。
 //!
 //! `smctl` と同じ状態ディレクトリを共有するが、**同時実行は非サポート**(§4.4)。
 
@@ -34,6 +35,7 @@ mod api;
 mod ctrl;
 mod describe;
 mod error;
+mod history;
 mod model;
 mod onboarding;
 mod pairing;
@@ -50,6 +52,7 @@ options:
   --paa-trust-store-path <dir>   verify attestation against PAA certs (*.der)
   --bypass-attestation           skip device attestation entirely
   --timeout <secs>               per-operation timeout (default 20)
+  --history-points <n>           points kept per numeric attribute (default 2880)
   --ble-adapter <name>           BLE adapter for BLE pairing (sets SM_BLE_ADAPTER, e.g. hci1)
   --log <level>                  error|warn|info|debug|trace (default: $SMCTL_LOG or info)
   -h, --help                     show this help
@@ -67,6 +70,8 @@ struct Opts {
     globals: Globals,
     /// `--ble-adapter`(`SM_BLE_ADAPTER` として smctl の BLE ランナーへ渡す)。
     ble_adapter: Option<String>,
+    /// `--history-points`(1 系列あたりの履歴点数、§9.1)。
+    history_points: usize,
 }
 
 /// 引数をパースする。`Ok(None)` は `--help`。
@@ -75,6 +80,7 @@ fn parse_args(args: &[String]) -> Result<Option<Opts>, String> {
     g.timeout = Duration::from_secs_f64(DEFAULT_TIMEOUT_S);
     let mut bind: SocketAddr = DEFAULT_BIND.parse().expect("default bind");
     let mut ble_adapter = None;
+    let mut history_points = history::DEFAULT_POINTS;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let (flag, inline) = match a.split_once('=') {
@@ -117,6 +123,19 @@ fn parse_args(args: &[String]) -> Result<Option<Opts>, String> {
                 }
                 ble_adapter = Some(v);
             }
+            "--history-points" => {
+                let v = value(flag)?;
+                history_points = v
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| (1..=history::MAX_POINTS).contains(n))
+                    .ok_or_else(|| {
+                        format!(
+                            "invalid --history-points {v:?} (1..={})",
+                            history::MAX_POINTS
+                        )
+                    })?;
+            }
             "--log" | "--log-level" => g.log_level = Some(Level::parse(&value(flag)?)?),
             other => return Err(format!("unknown argument {other:?} (see --help)")),
         }
@@ -125,6 +144,7 @@ fn parse_args(args: &[String]) -> Result<Option<Opts>, String> {
         bind,
         globals: g,
         ble_adapter,
+        history_points,
     }))
 }
 
@@ -182,7 +202,8 @@ fn main() -> ExitCode {
         }
     };
 
-    let (handle, thread) = ctrl::spawn(opts.globals.clone());
+    let (handle, thread) = ctrl::spawn(opts.globals.clone(), opts.history_points);
+    let handle_for_exit = handle.clone();
     {
         let events = handle.events.clone();
         smctl::log::set_hook(Box::new(move |l, tag, msg| {
@@ -217,6 +238,8 @@ fn main() -> ExitCode {
     if !thread.shutdown(Duration::from_secs(3)) {
         wlog!(Level::Debug, "controller thread still busy; exiting anyway");
     }
+    // 履歴の終了時保存(スレッドが保存済みなら dirty でないので何もしない)。
+    handle_for_exit.save_history();
     rt.shutdown_timeout(Duration::from_millis(500));
     match r {
         Ok(()) => ExitCode::SUCCESS,
@@ -263,6 +286,7 @@ mod tests {
         assert_eq!(o.bind.to_string(), "127.0.0.1:8080");
         assert_eq!(o.globals.timeout, Duration::from_secs(20));
         assert!(!o.globals.bypass_attestation);
+        assert_eq!(o.history_points, 2880);
     }
 
     #[test]
@@ -292,6 +316,15 @@ mod tests {
         assert!(parse_args(&args(&["--bind", "nope"])).is_err());
         assert!(parse_args(&args(&["--timeout", "0"])).is_err());
         assert!(parse_args(&args(&["--bogus"])).is_err());
+        assert_eq!(
+            parse_args(&args(&["--history-points", "100"]))
+                .unwrap()
+                .unwrap()
+                .history_points,
+            100
+        );
+        assert!(parse_args(&args(&["--history-points", "0"])).is_err());
+        assert!(parse_args(&args(&["--history-points", "x"])).is_err());
         assert!(parse_args(&args(&["--state-dir"])).is_err());
     }
 }

@@ -91,7 +91,8 @@ h3 { font-size: 14px; margin: 0 0 6px; }
   border-radius: 10px;
   padding: 12px 14px;
 }
-.card.inactive { opacity: 0.55; filter: grayscale(0.8); }
+.card.inactive > :not(.card-charts) { opacity: 0.55; filter: grayscale(0.8); }
+/* History stays meaningful while offline: the graphs are not greyed out. */
 .card-head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; margin-bottom: 10px; }
 .card-head .title { font-weight: 600; font-size: 15px; }
 .card-head .ago { margin-left: auto; font-size: 12px; color: var(--muted); }
@@ -118,6 +119,46 @@ h3 { font-size: 14px; margin: 0 0 6px; }
 .tile.extremelypoor { background: var(--t-xpoor); }
 .tile.neutral { background: var(--t-neutral); }
 .tile.none { background: var(--t-none); }
+.tile { cursor: pointer; }
+.tile.graphing { outline: 3px solid var(--accent); outline-offset: 2px; }
+.tile:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+/* W5 history charts */
+.card-charts:empty { display: none; }
+.card-charts { display: grid; gap: 10px; margin-top: 12px; }
+.chart { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; background: var(--card); min-width: 0; }
+.chart-head { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 4px; }
+.chart-title { font-weight: 600; }
+.chart-stats { display: flex; gap: 4px 14px; flex-wrap: wrap; margin-bottom: 2px; font-variant-numeric: tabular-nums; }
+.chart-stats > span { white-space: nowrap; }
+.chart-head .seg { display: flex; margin-left: auto; }
+.chart-head .seg button { border-radius: 0; background: transparent; color: var(--fg); border: 1px solid var(--border); margin-left: -1px; padding: 2px 8px; }
+.chart-head .seg button:first-child { border-radius: 6px 0 0 6px; }
+.chart-head .seg button:last-child { border-radius: 0 6px 6px 0; }
+.chart-head .seg button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.chart-close { padding: 2px 8px; }
+.chart-body { position: relative; width: 100%; overflow: hidden; }
+.chart-svg { display: block; }
+.chart-svg text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.chart-svg text.empty { font-size: 13px; }
+.chart-svg .grid { stroke: var(--border); stroke-width: 1; }
+.chart-svg .axis, .chart-svg .tick { stroke: var(--muted); stroke-width: 1; }
+.chart-svg .line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.chart-svg .line.hold { stroke-dasharray: 4 4; opacity: 0.55; }
+.chart-svg .pt { fill: var(--accent); stroke: var(--card); stroke-width: 1.5; }
+.chart-svg .hover line { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; }
+.chart-svg .hover circle { fill: var(--accent); stroke: var(--card); stroke-width: 2; }
+.chart-svg .band { fill-opacity: 0.13; }
+.chart-svg .band.good { fill: var(--t-good); }
+.chart-svg .band.fair { fill: var(--t-fair); }
+.chart-svg .band.warn, .chart-svg .band.moderate { fill: var(--t-mod); }
+.chart-svg .band.poor { fill: var(--t-poor); }
+.chart-svg .band.bad, .chart-svg .band.verypoor { fill: var(--t-vpoor); }
+.chart-svg .band.extremelypoor { fill: var(--t-xpoor); }
+.chart-svg .band.none { fill: var(--t-none); }
+.chart-tip { position: absolute; pointer-events: none; background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; font-size: 12px; white-space: nowrap; box-shadow: 0 2px 6px rgba(0,0,0,.15); }
+a.graph-link { color: var(--accent); text-decoration: none; border-bottom: 1px dashed var(--accent); justify-self: start; }
+a.graph-link.active { font-weight: 600; }
+tr.graph-row > td { padding: 6px 0 10px; }
 .light-card { min-width: 240px; }
 .light-state { font-size: 28px; font-weight: 700; margin: 4px 0 10px; }
 .light-state.on { color: var(--ok); }

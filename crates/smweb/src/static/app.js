@@ -1,6 +1,7 @@
-// smweb UI (W3): Dashboard / Devices / Pair / Log, live from the WebSocket.
+// smweb UI (W5): Dashboard / Devices / Pair / Log, live from the WebSocket.
 // Plain ES2020, no build step. The only dependency is the vendored MIT QR generator
-// (/qrcode.js, global `qrcode`) used by the Share panel.
+// (/qrcode.js, global `qrcode`) used by the Share panel. History charts are drawn by
+// /chart.js (global `SmChart`, pure SVG builder).
 "use strict";
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -150,6 +151,21 @@ function hasCluster(n, cluster) {
 const AQ_CLASS = ["none", "good", "fair", "moderate", "poor", "verypoor", "extremelypoor"];
 const AQ_NAME = ["Unknown", "Good", "Fair", "Moderate", "Poor", "VeryPoor", "ExtremelyPoor"];
 
+/**
+ * Threshold bands per cluster (MeasuredValue / AirQuality, raw units): [from, to, class].
+ * Shared by the tile colors and the chart backgrounds (Tab5 T6 thresholds).
+ */
+const BANDS = {
+  0x040d: [[-Infinity, 1000, "good"], [1000, 2000, "warn"], [2000, Infinity, "bad"]],
+  0x042a: [[-Infinity, 35, "good"], [35, 75, "warn"], [75, Infinity, "bad"]],
+  0x005b: AQ_CLASS.map((cls, i) => [i - 0.5, i + 0.5, cls]),
+};
+
+function bandClass(cluster, v) {
+  const b = (BANDS[cluster] || []).find(([from, to]) => v >= from && v < to);
+  return b ? b[2] : "neutral";
+}
+
 /** Sensor tile definitions (Tab5 T6 layout). */
 const SENSOR_TILES = [
   {
@@ -158,11 +174,11 @@ const SENSOR_TILES = [
   },
   {
     cluster: 0x040d, label: "CO2",
-    render: (v) => ({ text: numStr(v, 0), unit: "ppm", cls: v >= 2000 ? "bad" : v >= 1000 ? "warn" : "good" }),
+    render: (v) => ({ text: numStr(v, 0), unit: "ppm", cls: bandClass(0x040d, v) }),
   },
   {
     cluster: 0x042a, label: "PM2.5",
-    render: (v) => ({ text: numStr(v, 1), unit: "µg/m³", cls: v >= 75 ? "bad" : v >= 35 ? "warn" : "good" }),
+    render: (v) => ({ text: numStr(v, 1), unit: "µg/m³", cls: bandClass(0x042a, v) }),
   },
   {
     cluster: 0x0402, label: "Temperature",
@@ -195,7 +211,14 @@ function sensorCard(n) {
     let r = { text: "—", unit: "", cls: "none" };
     if (e && typeof e.value === "number") r = t.render(e.value);
     else if (e && e.value === null) r = { text: "null", unit: "", cls: "none" };
-    tiles.appendChild(el("div", { class: `tile ${r.cls}`, title: e ? `ep${ep} dataVersion ${e.data_version}` : `ep${ep}` },
+    const graphing = charts.has(chartKey("dash", n.node_id, ep, t.cluster, 0));
+    tiles.appendChild(el("div", {
+      class: `tile ${r.cls}` + (graphing ? " graphing" : ""),
+      title: (e ? `ep${ep} dataVersion ${e.data_version}` : `ep${ep}`) + "\nclick: show / hide history graph",
+      role: "button", tabindex: "0",
+      onclick: () => { toggleChart("dash", n.node_id, ep, t.cluster, 0, t.label); renderDashboard(); },
+      onkeydown: (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggleChart("dash", n.node_id, ep, t.cluster, 0, t.label); renderDashboard(); } },
+    },
       el("div", { class: "t-label", text: t.label }),
       el("div", { class: "t-value" + (r.isText ? " text" : ""), text: r.text }),
       el("div", { class: "t-unit", text: r.unit || " " }),
@@ -204,7 +227,15 @@ function sensorCard(n) {
   card.appendChild(tiles);
   if ((n.watch || []).length) card.appendChild(watchKv(n));
   if (n.error && n.state !== "online") card.appendChild(el("div", { class: "muted small", text: n.error }));
+  card.appendChild(chartsBox(n));
   return card;
+}
+
+/** The dashboard card's open graphs (persistent elements, moved into the fresh card). */
+function chartsBox(n) {
+  const box = el("div", { class: "card-charts" });
+  for (const ch of chartsFor("dash", n.node_id)) box.appendChild(ch.el);
+  return box;
 }
 
 async function lightCmd(n, ep, cmd, btnRow) {
@@ -238,6 +269,7 @@ function lightCard(n) {
   }
   if (eps.length === 0) card.appendChild(el("div", { class: "muted", text: "(not described yet — connect from Devices)" }));
   if ((n.watch || []).length) card.appendChild(watchKv(n));
+  card.appendChild(chartsBox(n));
   return card;
 }
 
@@ -248,8 +280,14 @@ function watchKv(n) {
     const c = clusterById.get(p.cluster);
     const a = attrDef(p.cluster, p.attr);
     const e = nodeValue(n, p.ep, p.cluster, p.attr);
+    const name = `ep${p.ep} ${c ? c.name : hex(p.cluster)}.${a ? a.name : hex(p.attr)}`;
+    const graphable = isNumericAttr(p.cluster, p.attr);
+    const graphing = charts.has(chartKey("dash", n.node_id, p.ep, p.cluster, p.attr));
     kv.append(
-      el("span", { class: "muted", text: `ep${p.ep} ${c ? c.name : hex(p.cluster)}.${a ? a.name : hex(p.attr)}` }),
+      graphable
+        ? el("a", { href: "#", class: "graph-link" + (graphing ? " active" : ""), title: "show / hide history graph", text: name,
+          onclick: (ev) => { ev.preventDefault(); toggleChart("dash", n.node_id, p.ep, p.cluster, p.attr, name); renderDashboard(); } })
+        : el("span", { class: "muted", text: name }),
       el("span", { class: "mono", text: e ? fmtValue(p.cluster, p.attr, e.value) : "—" }),
     );
   }
@@ -261,6 +299,7 @@ function otherCard(n) {
   if ((n.watch || []).length === 0) {
     card.appendChild(el("div", { class: "muted small", text: "No watched attributes. Use Watch in the Devices tab." }));
   } else card.appendChild(watchKv(n));
+  card.appendChild(chartsBox(n));
   return card;
 }
 
@@ -278,7 +317,280 @@ function renderDashboard() {
     else if (n.kind === "light") lights.appendChild(lightCard(n));
     else others.appendChild(otherCard(n));
   }
+  for (const ch of charts.values()) if (ch.where === "dash") fitChart(ch);
 }
+
+// ---------------------------------------------------------------------------
+// History charts (W5): /api/nodes/{id}/history + live `attr` events
+// ---------------------------------------------------------------------------
+
+const C = window.SmChart;
+const RANGES = [["1h", 3600e3], ["6h", 6 * 3600e3], ["24h", 86400e3], ["all", 0]];
+/** Client-side buffer bound per chart (the server keeps --history-points). */
+const CHART_MAX_POINTS = 100000;
+/** Open charts: key ("dash|dev:node/ep/cluster/attr") -> chart. Insertion order = display order. */
+const charts = new Map();
+const chartKey = (where, nodeId, ep, cluster, attr) => `${where}:${nodeId}/${ep}/${cluster}/${attr}`;
+let chartSeq = 0;
+
+function isNumericAttr(cluster, attr, kind) {
+  const k = kind || (attrDef(cluster, attr) || {}).kind;
+  return C.NUMERIC_KINDS.has(k);
+}
+
+function seriesName(cluster, attr) {
+  const c = clusterById.get(cluster);
+  const a = attrDef(cluster, attr);
+  return `${c ? c.name : hex(cluster)}.${a ? a.name : hex(attr)}`;
+}
+
+function chartMeta(ch) {
+  const h = attrDef(ch.cluster, ch.attr) || {};
+  const m = ch.meta || {};
+  return { kind: m.kind || h.kind, unit: m.unit || h.unit, scale: m.scale || h.scale, enum: m.enum || h.enum };
+}
+
+function toggleChart(where, nodeId, ep, cluster, attr, title) {
+  const key = chartKey(where, nodeId, ep, cluster, attr);
+  if (charts.has(key)) {
+    closeChart(key);
+    return false;
+  }
+  openChart(where, nodeId, ep, cluster, attr, title);
+  return true;
+}
+
+function openChart(where, nodeId, ep, cluster, attr, title) {
+  const key = chartKey(where, nodeId, ep, cluster, attr);
+  let saved = null;
+  try {
+    saved = localStorage.getItem("smweb.chartRange");
+  } catch (_) { /* storage unavailable */ }
+  const ch = {
+    key, where, nodeId, ep, cluster, attr,
+    title: title || `ep${ep} ${seriesName(cluster, attr)}`,
+    range: RANGES.some((r) => r[0] === saved) ? saved : "6h",
+    points: [], pending: [], loaded: false, error: null, meta: null, geom: null,
+    clipId: `clip${++chartSeq}`,
+  };
+  ch.el = el("div", { class: "chart", dataset: { key } });
+  ch.head = el("div", { class: "chart-head" });
+  ch.body = el("div", { class: "chart-body" });
+  ch.tip = el("div", { class: "chart-tip", hidden: true });
+  ch.statsRow = el("div", { class: "chart-stats small" });
+  ch.el.append(ch.head, ch.statsRow, ch.body);
+  ch.body.addEventListener("mousemove", (ev) => chartHover(ch, ev));
+  ch.body.addEventListener("mouseleave", () => chartHover(ch, null));
+  charts.set(key, ch);
+  renderChartHead(ch);
+  loadChart(ch);
+  return ch;
+}
+
+function closeChart(key) {
+  const ch = charts.get(key);
+  if (!ch) return;
+  charts.delete(key);
+  const row = ch.el.closest("tr.graph-row");
+  if (row) row.remove();
+  ch.el.remove();
+  if (ch.where === "dash") scheduleDashboard();
+  else {
+    const btn = document.getElementById(`gbtn-${ch.nodeId}-${ch.ep}-${ch.cluster}-${ch.attr}`);
+    if (btn) btn.textContent = "Graph";
+  }
+}
+
+function closeNodeCharts(nodeId) {
+  for (const ch of [...charts.values()]) if (ch.nodeId === nodeId) closeChart(ch.key);
+}
+
+async function loadChart(ch) {
+  ch.loaded = false;
+  ch.pending = [];
+  renderChart(ch);
+  const q = `ep=${ch.ep}&cluster=${ch.cluster}&attr=${ch.attr}&limit=${CHART_MAX_POINTS}`;
+  const r = await api("GET", `/api/nodes/${ch.nodeId}/history?${q}`);
+  if (!charts.has(ch.key)) return;
+  if (!r.ok) {
+    ch.error = errText(r);
+    ch.loaded = true;
+    renderChart(ch);
+    return;
+  }
+  ch.error = null;
+  ch.meta = { kind: r.data.kind, unit: r.data.unit, scale: r.data.scale, enum: r.data.enum };
+  ch.points = r.data.points || [];
+  ch.loaded = true;
+  for (const [t, v] of ch.pending) addChartPoint(ch, t, v);
+  ch.pending = [];
+  renderChartHead(ch);
+  renderChart(ch);
+}
+
+function addChartPoint(ch, t, v) {
+  if (!ch.loaded) {
+    ch.pending.push([t, v]);
+    return;
+  }
+  const last = ch.points[ch.points.length - 1];
+  if (last && (t < last[0] || (t === last[0] && v === last[1]))) return;
+  ch.points.push([t, v]);
+  if (ch.points.length > CHART_MAX_POINTS) ch.points.splice(0, ch.points.length - CHART_MAX_POINTS);
+}
+
+/** WS `attr` -> every open chart of that series. */
+function chartsOnAttr(ev) {
+  const v = C.numericOf(ev.value);
+  if (v === null) return;
+  for (const ch of charts.values()) {
+    if (ch.nodeId === ev.node_id && ch.ep === ev.ep && ch.cluster === ev.cluster && ch.attr === ev.attr) {
+      addChartPoint(ch, ev.ts, v);
+      scheduleChart(ch);
+    }
+  }
+}
+
+const chartsDirty = new Set();
+let chartTimer = null;
+function scheduleChart(ch) {
+  chartsDirty.add(ch);
+  if (chartTimer) return;
+  chartTimer = setTimeout(() => {
+    chartTimer = null;
+    for (const c of chartsDirty) if (charts.has(c.key)) renderChart(c);
+    chartsDirty.clear();
+  }, 200);
+}
+
+function chartWindow(ch) {
+  const now = Date.now();
+  const span = RANGES.find((r) => r[0] === ch.range)[1];
+  if (span) return [now - span, now];
+  const first = ch.points.length ? ch.points[0][0] : now - 3600e3;
+  return [Math.min(first, now - 60e3), now];
+}
+
+function renderChartHead(ch) {
+  ch.head.textContent = "";
+  const seg = el("div", { class: "seg" });
+  for (const [name] of RANGES) {
+    seg.appendChild(el("button", {
+      type: "button", class: "small" + (ch.range === name ? " active" : ""), text: name,
+      onclick: () => {
+        ch.range = name;
+        try {
+          localStorage.setItem("smweb.chartRange", name);
+        } catch (_) { /* storage unavailable */ }
+        renderChartHead(ch);
+        renderChart(ch);
+      },
+    }));
+  }
+  ch.stats = ch.statsRow;
+  ch.head.append(
+    el("span", { class: "chart-title", text: ch.title }),
+    seg,
+    el("button", { type: "button", class: "small secondary chart-close", title: "close graph", text: "×", onclick: () => closeChart(ch.key) }),
+  );
+}
+
+function renderChart(ch) {
+  const meta = chartMeta(ch);
+  const [t0, t1] = chartWindow(ch);
+  if (ch.stats) {
+    const s = C.stats(ch.points, t0, t1);
+    if (!ch.loaded) ch.stats.textContent = "loading…";
+    else if (ch.error) ch.stats.textContent = ch.error;
+    else if (!s.latest) ch.stats.textContent = "no history yet";
+    else {
+      ch.stats.textContent = "";
+      const item = (k, v) => el("span", {}, el("span", { class: "muted", text: k + " " }), el("b", { text: v }));
+      ch.stats.append(item("latest", C.fmtValue(s.latest[1], meta)));
+      if (s.count) ch.stats.append(item("min", C.fmtValue(s.min, meta)), item("max", C.fmtValue(s.max, meta)));
+      ch.stats.append(el("span", { class: "muted", text: `${s.count} pt` }));
+    }
+  }
+  const width = ch.body.clientWidth || (ch.el.parentElement && ch.el.parentElement.clientWidth) || 640;
+  const n = nodes.get(ch.nodeId);
+  const bands = ch.attr === 0 ? chartBands(ch.cluster) : null;
+  const r = C.chartSvg(ch.points, {
+    width, height: 190, t0, t1, meta, bands, clipId: ch.clipId,
+    live: !!n && n.state === "online", label: ch.title,
+  });
+  ch.geom = r.geom;
+  ch.body.innerHTML = r.svg;
+  ch.body.appendChild(ch.tip);
+  ch.tip.hidden = true;
+}
+
+/** Threshold bands for the chart background, in display units (same table as the tiles). */
+function chartBands(cluster) {
+  const b = BANDS[cluster];
+  if (!b) return null;
+  const s = (attrDef(cluster, 0) || {}).scale || 1;
+  return b.map(([from, to, cls]) => [from * s, to * s, cls]);
+}
+
+function chartHover(ch, ev) {
+  const svg = ch.body.querySelector("svg");
+  const old = svg && svg.querySelector(".hover");
+  if (old) old.remove();
+  if (!ev || !svg || !ch.geom) {
+    ch.tip.hidden = true;
+    return;
+  }
+  const rect = svg.getBoundingClientRect();
+  const px = ev.clientX - rect.left;
+  const g = ch.geom;
+  if (px < g.L || px > g.L + g.pw) {
+    ch.tip.hidden = true;
+    return;
+  }
+  const p = C.nearest(g, px);
+  if (!p) {
+    ch.tip.hidden = true;
+    return;
+  }
+  const NS = "http://www.w3.org/2000/svg";
+  const grp = document.createElementNS(NS, "g");
+  grp.setAttribute("class", "hover");
+  const line = document.createElementNS(NS, "line");
+  line.setAttribute("x1", p[2]); line.setAttribute("x2", p[2]);
+  line.setAttribute("y1", g.T); line.setAttribute("y2", g.T + g.ph);
+  const dot = document.createElementNS(NS, "circle");
+  dot.setAttribute("cx", p[2]); dot.setAttribute("cy", p[3]); dot.setAttribute("r", 4);
+  grp.append(line, dot);
+  svg.appendChild(grp);
+  ch.tip.textContent = "";
+  ch.tip.append(
+    el("b", { text: C.fmtValue(p[1], chartMeta(ch)) }),
+    el("span", { class: "muted", text: " " + new Date(p[0]).toLocaleString() }),
+  );
+  ch.tip.hidden = false;
+  const tw = ch.tip.offsetWidth;
+  let x = p[2] + 12;
+  if (x + tw > rect.width) x = p[2] - tw - 12;
+  ch.tip.style.left = `${Math.max(0, x)}px`;
+  ch.tip.style.top = `${Math.max(0, p[3] - 34)}px`;
+}
+
+/** Charts of a node for one place (dashboard card / devices row), in opening order. */
+const chartsFor = (where, nodeId) => [...charts.values()].filter((c) => c.where === where && c.nodeId === nodeId);
+
+/** After (re)attaching a chart element: re-fit when the width it was drawn at is off. */
+function fitChart(ch) {
+  const w = ch.body.clientWidth;
+  if (w && ch.geom && Math.abs(w - ch.geom.W) > 2) renderChart(ch);
+}
+
+// Slide the time window / re-fit widths.
+setInterval(() => { for (const ch of charts.values()) renderChart(ch); }, 15000);
+let resizeTimer = null;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => { for (const ch of charts.values()) renderChart(ch); }, 150);
+});
 
 // ---------------------------------------------------------------------------
 // Devices
@@ -397,13 +709,38 @@ function attrTable(n, ep, c) {
         }
       },
     });
-    tbody.appendChild(el("tr", {},
+    const gkey = chartKey("dev", n.node_id, ep, c.id, a.id);
+    const graphRow = (ch) => el("tr", { class: "graph-row" }, el("td", { colspan: "5" }, ch.el));
+    let graphBtn = null;
+    if (isNumericAttr(c.id, a.id, a.kind)) {
+      graphBtn = el("button", {
+        type: "button", class: "small secondary", id: `gbtn-${n.node_id}-${ep}-${c.id}-${a.id}`,
+        text: charts.has(gkey) ? "Hide graph" : "Graph", title: "history graph (numeric attribute)",
+        onclick: () => {
+          if (charts.has(gkey)) {
+            closeChart(gkey);
+            return;
+          }
+          const ch = openChart("dev", n.node_id, ep, c.id, a.id, `ep${ep} ${c.name || hex(c.id)}.${a.name || hex(a.id)}`);
+          tr.after(graphRow(ch));
+          graphBtn.textContent = "Hide graph";
+          fitChart(ch);
+        },
+      });
+    }
+    const tr = el("tr", {},
       el("td", { class: "mono", text: hex(a.id) }),
       el("td", { text: a.name || "" }),
       el("td", { class: "muted", text: a.kind || "" }),
       valueCell(n, ep, c.id, a.id),
-      el("td", {}, el("div", { class: "btn-row" }, readBtn, watchBtn)),
-    ));
+      el("td", {}, el("div", { class: "btn-row" }, readBtn, watchBtn, graphBtn)),
+    );
+    tbody.appendChild(tr);
+    if (charts.has(gkey)) {
+      const ch = charts.get(gkey);
+      tbody.appendChild(graphRow(ch));
+      setTimeout(() => fitChart(ch), 0);
+    }
   }
   table.appendChild(tbody);
   return table;
@@ -1243,6 +1580,10 @@ function onEvent(ev) {
       nodes.clear();
       values.clear();
       for (const n of ev.nodes) setNode(n);
+      for (const ch of [...charts.values()]) {
+        if (nodes.has(ch.nodeId)) loadChart(ch); // refill what was missed while disconnected
+        else closeChart(ch.key);
+      }
       renderDashboard();
       renderDevices();
       break;
@@ -1277,6 +1618,7 @@ function onEvent(ev) {
       n.last_report = ev.ts;
       const td = document.getElementById(`val-${ev.node_id}-${ev.ep}-${ev.cluster}-${ev.attr}`);
       if (td) fillValueCell(td, n, ev.ep, ev.cluster, ev.attr);
+      chartsOnAttr(ev);
       scheduleDashboard();
       const c = clusterById.get(ev.cluster);
       const a = attrDef(ev.cluster, ev.attr);
@@ -1320,6 +1662,7 @@ function onEvent(ev) {
       break;
     }
     case "node_removed":
+      closeNodeCharts(ev.node_id);
       if (nodes.has(ev.node_id)) removeNodeLocal(ev.node_id);
       if (share && share.nodeId === ev.node_id) closeModal();
       appendLog(`${t} [node] ${ev.node_id}: removed`);

@@ -20,6 +20,10 @@
 //! コントローラスレッドを専有する(その間は他の Command と UDP 受信が止まる)。UDP pairing 中は
 //! 既存の購読をローカルで外しておく(コアの `Commissioner` は IM イベントを 1 本のキューから
 //! 取り出すため、他ノードの購読レポートが割り込むとフェーズ機械が Protocol 失敗になる)。
+//!
+//! W5: `Event::Attr` を流すとき数値属性を [`History`] に積む(§9.1)。`Arc<RwLock<History>>`
+//! を REST と共有し、60 秒ごと(変化があれば)とスレッド終了時に `smweb-history.bin` へ保存。
+//! unpair で系列を消す。
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
@@ -49,6 +53,7 @@ use tokio::sync::{broadcast, oneshot};
 
 use crate::describe::{self, backoff};
 use crate::error::{ApiError, ErrorCode};
+use crate::history::{self, History};
 use crate::model::{
     unix_now, unix_now_ms, AttrPath, AttrValue, Event, Info, NodeKind, NodeSnap, NodeState,
     Snapshot,
@@ -80,6 +85,8 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const PAIR_MIN_TIMEOUT: Duration = Duration::from_secs(60);
 /// AdministratorCommissioning(0x003C)。
 const ADMIN_COMMISSIONING: u32 = 0x003C;
+/// 履歴の定期保存間隔(§9.1)。
+const HISTORY_SAVE_EVERY: Duration = Duration::from_secs(60);
 
 /// コントローラへの要求(§4.2 の W2 部分集合)。
 ///
@@ -224,6 +231,9 @@ pub struct CtrlHandle {
     tx: SyncSender<Request>,
     pub events: broadcast::Sender<Event>,
     pub snapshot: Arc<RwLock<Snapshot>>,
+    /// 属性値の履歴(§9。REST はコントローラを待たずに読む)。
+    pub history: Arc<RwLock<History>>,
+    history_path: PathBuf,
     wait: Duration,
     op_seq: Arc<AtomicU64>,
 }
@@ -287,6 +297,22 @@ impl CtrlHandle {
             Err(p) => p.into_inner().clone(),
         }
     }
+
+    /// 履歴を読む(毒化しても中身は使う)。
+    pub fn with_history<R>(&self, f: impl FnOnce(&History) -> R) -> R {
+        match self.history.read() {
+            Ok(h) => f(&h),
+            Err(p) => f(&p.into_inner()),
+        }
+    }
+
+    /// 履歴を(変化があれば)保存する。コントローラスレッドが終了時の保存に
+    /// 間に合わなかったときの main 側の保険(保存処理は直列化されている)。
+    pub fn save_history(&self) {
+        if let Err(e) = history::save_shared(&self.history, &self.history_path) {
+            wlog!(Level::Warn, "history: {e}");
+        }
+    }
 }
 
 /// コントローラスレッドの停止用ハンドル(main が保持)。
@@ -319,6 +345,7 @@ impl CtrlThread {
 struct Shared {
     events: broadcast::Sender<Event>,
     snapshot: Arc<RwLock<Snapshot>>,
+    history: Arc<RwLock<History>>,
 }
 
 impl Shared {
@@ -332,6 +359,14 @@ impl Shared {
 
     fn with_node<R>(&self, node_id: u64, f: impl FnOnce(&mut NodeSnap) -> R) -> Option<R> {
         self.with(|s| s.node_mut(node_id).map(f))
+    }
+
+    fn with_history<R>(&self, f: impl FnOnce(&mut History) -> R) -> R {
+        let mut g = match self.history.write() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        f(&mut g)
     }
 
     fn emit(&self, e: Event) {
@@ -386,7 +421,8 @@ fn addr_string(a: SocketAddr) -> Option<String> {
 /// コントローラスレッドを起動し、ハンドルを返す。
 ///
 /// `g` は smctl と同じ共通オプション(state_dir / timeout / attestation 関連)。
-pub fn spawn(g: Globals) -> (CtrlHandle, CtrlThread) {
+/// `history_points` は 1 系列あたりの履歴点数(`--history-points`、§9.1)。
+pub fn spawn(g: Globals, history_points: usize) -> (CtrlHandle, CtrlThread) {
     let (tx, rx) = mpsc::sync_channel::<Request>(QUEUE_CAP);
     let (events, _) = broadcast::channel(EVENT_CAP);
     let snapshot = Arc::new(RwLock::new(Snapshot {
@@ -398,9 +434,12 @@ pub fn spawn(g: Globals) -> (CtrlHandle, CtrlThread) {
         },
         nodes: Vec::new(),
     }));
+    let history = Arc::new(RwLock::new(History::new(history_points)));
+    let history_path = history::path(&g.state_dir);
     let shared = Shared {
         events: events.clone(),
         snapshot: snapshot.clone(),
+        history: history.clone(),
     };
     let wait = g.timeout + REPLY_MARGIN;
     let stop = Arc::new(AtomicBool::new(false));
@@ -414,6 +453,8 @@ pub fn spawn(g: Globals) -> (CtrlHandle, CtrlThread) {
             tx,
             events,
             snapshot,
+            history,
+            history_path,
             wait,
             op_seq: Arc::new(AtomicU64::new(0)),
         },
@@ -482,6 +523,33 @@ fn thread_main(g: Globals, rx: Receiver<Request>, shared: Shared, stop: Arc<Atom
             })
             .collect();
     });
+    // 履歴(§9.1)。壊れていれば .bad へ退避して空から。アドレス帳に無いノードの系列は捨てる。
+    let history_path = history::path(&g.state_dir);
+    {
+        let cap = shared.with_history(|h| h.cap());
+        let (mut h, err) = History::load_or_quarantine(&history_path, cap);
+        if let Some(e) = err {
+            wlog!(
+                Level::Warn,
+                "history: {e}; moved it to {} and starting empty",
+                history::bad_path(&history_path).display()
+            );
+        }
+        let ids: Vec<u64> = entries.iter().map(|e| e.node_id).collect();
+        let dropped = h.retain_nodes(&ids);
+        wlog!(
+            Level::Info,
+            "history: {} series from {}{}",
+            h.len(),
+            history_path.display(),
+            if dropped > 0 {
+                format!(" ({dropped} series of removed nodes dropped)")
+            } else {
+                String::new()
+            }
+        );
+        shared.with_history(|cur| *cur = h);
+    }
     wlog!(
         Level::Info,
         "loaded {} node(s) from {} ({} cached model(s) in {})",
@@ -530,6 +598,8 @@ fn thread_main(g: Globals, rx: Receiver<Request>, shared: Shared, stop: Arc<Atom
         shared,
         store,
         store_path,
+        history_path,
+        history_saved: Instant::now(),
         state_dir: g.state_dir.clone(),
         subs: Vec::new(),
         retry: BTreeMap::new(),
@@ -588,7 +658,11 @@ fn thread_main(g: Globals, rx: Receiver<Request>, shared: Shared, stop: Arc<Atom
             std::thread::sleep(Duration::from_millis(50));
         }
         ctl.pump_sub_events();
+        if ctl.history_saved.elapsed() >= HISTORY_SAVE_EVERY {
+            ctl.save_history();
+        }
     }
+    ctl.save_history();
     wlog!(Level::Info, "controller thread stopped");
 }
 
@@ -639,6 +713,10 @@ struct Ctl<'a> {
     shared: Shared,
     store: Store,
     store_path: PathBuf,
+    /// `<state-dir>/smweb-history.bin`。
+    history_path: PathBuf,
+    /// 最後に履歴を保存(または保存を試行)した時刻。
+    history_saved: Instant,
     state_dir: PathBuf,
     subs: Vec<SubRec>,
     retry: BTreeMap<u64, Retry>,
@@ -933,6 +1011,20 @@ impl Ctl<'_> {
         Ok(())
     }
 
+    /// 履歴を(変化があれば)保存する。
+    fn save_history(&mut self) {
+        self.history_saved = Instant::now();
+        match history::save_shared(&self.shared.history, &self.history_path) {
+            Ok(true) => wlog!(
+                Level::Debug,
+                "history saved to {}",
+                self.history_path.display()
+            ),
+            Ok(false) => {}
+            Err(e) => wlog!(Level::Warn, "history: {e}"),
+        }
+    }
+
     fn save_store(&self) {
         let st = self.exec.state_dir();
         let r = st.lock().and_then(|_l| self.store.save(&self.store_path));
@@ -1063,6 +1155,10 @@ impl Ctl<'_> {
         for it in items {
             if let Some(v) = item_value(it, ts) {
                 let ev = Event::attr(node_id, &v);
+                // 数値属性だけ履歴に積む(文字列・raw・ステータスは record が弾く、§9.1)。
+                let path = AttrPath::new(v.ep, v.cluster, v.attr);
+                self.shared
+                    .with_history(|h| h.record(node_id, path, v.ts, &v.value));
                 self.shared.with_node(node_id, |n| n.update_value(v));
                 self.shared.emit(ev);
             }
@@ -1373,6 +1469,10 @@ impl Ctl<'_> {
             .with(|s| s.nodes.retain(|n| n.node_id != node_id));
         if self.store.nodes.remove(&node_id).is_some() {
             self.save_store();
+        }
+        // 履歴の系列も消す(§9.1)。消えたことをすぐファイルにも反映する。
+        if self.shared.with_history(|h| h.remove_node(node_id)) > 0 {
+            self.save_history();
         }
         self.shared.emit(Event::NodeRemoved { node_id });
     }

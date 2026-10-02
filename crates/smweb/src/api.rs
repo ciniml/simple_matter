@@ -4,6 +4,9 @@
 //! `DELETE/PATCH /api/nodes/{id}`(unpair / ラベル)、`/api/nodes/{id}/window`(Share)、
 //! `GET /api/discover/commissionable`。mDNS ブラウズは ControllerStack を使わないので
 //! コントローラスレッドを塞がないよう `spawn_blocking` で行う。
+//!
+//! W5: `GET /api/nodes/{id}/history`(系列一覧 / `?ep=&cluster=&attr=&since=&limit=` の点列、
+//! §9.2)。履歴は共有の `RwLock<History>` を読むだけでコントローラを待たない。
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -44,6 +47,7 @@ const INDEX_HTML: &str = include_str!("static/index.html");
 const APP_JS: &str = include_str!("static/app.js");
 const APP_CSS: &str = include_str!("static/app.css");
 const QRCODE_JS: &str = include_str!("static/qrcode.js");
+const CHART_JS: &str = include_str!("static/chart.js");
 
 /// pairing の HTTP 側待ち時間(BLE-WiFi は scan + BLE 90 s + join 待ち 120 s + UDP 30 s)。
 const PAIR_WAIT: Duration = Duration::from_secs(600);
@@ -61,6 +65,7 @@ pub fn router(h: CtrlHandle) -> Router {
         .route("/api/info", get(info))
         .route("/api/nodes", get(list_nodes))
         .route("/qrcode.js", get(qrcode_js))
+        .route("/chart.js", get(chart_js))
         .route(
             "/api/nodes/:id",
             get(get_node).delete(unpair).patch(patch_node),
@@ -74,6 +79,7 @@ pub fn router(h: CtrlHandle) -> Router {
         .route("/api/nodes/:id/connect", post(connect))
         .route("/api/nodes/:id/describe", post(describe))
         .route("/api/nodes/:id/watch", post(watch_add).delete(watch_remove))
+        .route("/api/nodes/:id/history", get(history))
         .route(
             "/api/nodes/:id/attr/:ep/:cluster/:attr",
             get(read_attr).put(write_attr),
@@ -107,6 +113,13 @@ async fn qrcode_js() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         QRCODE_JS,
+    )
+}
+
+async fn chart_js() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        CHART_JS,
     )
 }
 
@@ -308,6 +321,82 @@ async fn invoke(
     })
     .await
     .map(Json)
+}
+
+/// `/history` のクエリ: 系列の指定(全部無し = 一覧)と `since` / `limit`。
+#[derive(Debug, PartialEq)]
+pub enum HistoryQuery {
+    List,
+    Series {
+        path: AttrPath,
+        since: u64,
+        limit: usize,
+    },
+}
+
+/// `?ep=&cluster=&attr=&since=&limit=` をパースする(cluster / attr は表の名前も可)。
+pub fn parse_history_query(
+    q: &HashMap<String, String>,
+    default_limit: usize,
+) -> Result<HistoryQuery, ApiError> {
+    let get = |k: &str| q.get(k).map(|s| s.trim()).filter(|s| !s.is_empty());
+    let (ep, cluster, attr) = (get("ep"), get("cluster"), get("attr"));
+    if ep.is_none() && cluster.is_none() && attr.is_none() {
+        return Ok(HistoryQuery::List);
+    }
+    let (Some(ep), Some(cluster), Some(attr)) = (ep, cluster, attr) else {
+        return Err(ApiError::bad_request(
+            "give all of ep, cluster and attr (or none to list the series)",
+        ));
+    };
+    let ep = parse_endpoint(ep)?;
+    let (cluster, def) = resolve_cluster(cluster)?;
+    let attr = resolve_attr(def, attr)?;
+    let since = match get("since") {
+        None => 0,
+        Some(s) => s
+            .parse::<u64>()
+            .map_err(|_| ApiError::bad_request("since must be unix milliseconds"))?,
+    };
+    let limit = match get("limit") {
+        None => default_limit,
+        Some(s) => s
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n >= 1)
+            .ok_or_else(|| ApiError::bad_request("limit must be a positive integer"))?,
+    };
+    Ok(HistoryQuery::Series {
+        path: AttrPath::new(ep, cluster.0, attr.0),
+        since,
+        limit,
+    })
+}
+
+/// `GET /api/nodes/{id}/history[?ep=&cluster=&attr=&since=&limit=]`(§9.2)。
+/// 履歴を読むだけ(コントローラを待たない)。
+async fn history(
+    State(h): State<CtrlHandle>,
+    Path(id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let node_id = parse_id(&id)?;
+    if h.snapshot
+        .read()
+        .map(|s| s.node(node_id).is_none())
+        .unwrap_or(false)
+    {
+        return Err(ApiError::not_found(format!(
+            "node {node_id:#x} is not in the address book"
+        )));
+    }
+    let q = parse_history_query(&q, crate::history::DEFAULT_POINTS)?;
+    Ok(Json(h.with_history(|hist| match q {
+        HistoryQuery::List => crate::history::list_json(hist, node_id),
+        HistoryQuery::Series { path, since, limit } => {
+            crate::history::query_json(hist, node_id, path, since, limit)
+        }
+    })))
 }
 
 async fn clusters() -> ApiResult {
@@ -641,6 +730,64 @@ mod tests {
         assert_eq!(v["product_id"], 0x8001);
         assert_eq!(v["addrs"][0], "192.168.8.163:5540");
         assert_eq!(v["commissioning_mode"], 2);
+    }
+
+    #[test]
+    fn history_query_parsing() {
+        let q = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            parse_history_query(&q(&[]), 2880).unwrap(),
+            HistoryQuery::List
+        );
+        assert_eq!(
+            parse_history_query(&q(&[("since", "5")]), 2880).unwrap(),
+            HistoryQuery::List
+        );
+        assert_eq!(
+            parse_history_query(
+                &q(&[("ep", "1"), ("cluster", "0x040D"), ("attr", "0")]),
+                2880
+            )
+            .unwrap(),
+            HistoryQuery::Series {
+                path: AttrPath::new(1, 0x040D, 0),
+                since: 0,
+                limit: 2880
+            }
+        );
+        assert_eq!(
+            parse_history_query(
+                &q(&[
+                    ("ep", "2"),
+                    ("cluster", "temperature-measurement"),
+                    ("attr", "measured-value"),
+                    ("since", "1700000000000"),
+                    ("limit", "10"),
+                ]),
+                2880
+            )
+            .unwrap(),
+            HistoryQuery::Series {
+                path: AttrPath::new(2, 0x0402, 0),
+                since: 1_700_000_000_000,
+                limit: 10
+            }
+        );
+        assert!(parse_history_query(&q(&[("ep", "1"), ("cluster", "6")]), 2880).is_err());
+        let base = [("ep", "1"), ("cluster", "6"), ("attr", "0")];
+        let with = |k: &'static str, v: &'static str| {
+            let mut m = q(&base);
+            m.insert(k.into(), v.into());
+            m
+        };
+        assert!(parse_history_query(&with("limit", "0"), 2880).is_err());
+        assert!(parse_history_query(&with("limit", "x"), 2880).is_err());
+        assert!(parse_history_query(&with("since", "-1"), 2880).is_err());
     }
 
     #[test]
